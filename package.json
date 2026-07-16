@@ -1,0 +1,39 @@
+{
+  "name": "ariava",
+  "version": "0.1.4",
+  "description": "Embrace agent as a part of you.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "ariava": "apps/bridge/dist/public-cli.js"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "apps/bridge/dist",
+    "packages/protocol/dist",
+    "packages/shared-utils/dist",
+    "extensions/pi/bundle"
+  ],
+  "workspaces": [
+    "apps/bridge",
+    "extensions/pi",
+    "packages/*"
+  ],
+  "scripts": {
+    "boundary:check": "node ./scripts/assert-repository-boundaries.mjs --mode public-candidate --root .",
+    "build": "bun run build:protocol && bun run build:shared-utils && bun run build:bridge && bun run build:pi-bundle",
+    "build:protocol": "bun run ./scripts/build-public-package.mjs protocol",
+    "build:shared-utils": "bun run ./scripts/build-public-package.mjs shared-utils",
+    "build:bridge": "bun build ./apps/bridge/src/cli.ts ./apps/bridge/src/public-cli.ts --outdir ./apps/bridge/dist --target node --format esm",
+    "build:pi-bundle": "bun run --cwd extensions/pi build && node ./scripts/build-pi-release-bundle.mjs",
+    "package:assert": "npm pack --dry-run --json > /tmp/ariava-pack-dry-run.json && node ./scripts/assert-npm-package.mjs /tmp/ariava-pack-dry-run.json",
+    "prepublishOnly": "node ./scripts/assert-publication-readme.mjs",
+    "test": "bun test ./scripts ./packages/protocol/test ./packages/shared-utils/test ./apps/bridge/test && bun run --cwd extensions/pi test",
+    "verify": "bun run boundary:check && bun run build && bun run --cwd extensions/pi typecheck && bun run test && bun run package:assert"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "bun-types": "^1.3.14"
+  }
+}

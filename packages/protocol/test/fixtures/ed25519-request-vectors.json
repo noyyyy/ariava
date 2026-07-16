@@ -1,0 +1,40 @@
+{
+  "name": "rfc8032-seed-ownerless-v2-requests",
+  "privateKeySeedHex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "publicKey": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+  "fingerprint": "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+  "vectors": [
+    {
+      "name": "empty-body-sorted-query",
+      "entityType": "host",
+      "entityId": "host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "keyId": "key_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "method": "POST",
+      "path": "/v2/bridge/enroll",
+      "query": "platform=macos&mode=first",
+      "canonicalQuery": "mode=first&platform=macos",
+      "bodyUtf8": "",
+      "contentSha256": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "timestamp": "2026-07-15T12:34:56.789Z",
+      "nonce": "AAECAwQFBgcICQoLDA0ODw",
+      "canonicalText": "ariava-request-v1\nhost\nhost_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk\nkey_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk\nPOST\n/v2/bridge/enroll\nmode=first&platform=macos\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU\n2026-07-15T12:34:56.789Z\nAAECAwQFBgcICQoLDA0ODw",
+      "signature": "sODXdKkzQxUFFPJWICoKXTiL22JBfLGDYIXxaJ2S4lkJX-TyJ4UvJVfwiUd7hlhDMh3WyRFG2QuA16dODCnKAQ"
+    },
+    {
+      "name": "unicode-json-body",
+      "entityType": "watch",
+      "entityId": "watch_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "keyId": "key_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "method": "POST",
+      "path": "/v2/commands",
+      "query": "",
+      "canonicalQuery": "",
+      "bodyUtf8": "{\"text\":\"继续处理 café\"}",
+      "contentSha256": "2WLyxip_a4A0PZaheOD34j5UAXmVYlJyJeEIzUrey5k",
+      "timestamp": "2026-07-15T12:35:00.000Z",
+      "nonce": "Dw4NDAsKCQgHBgUEAwIBAA",
+      "canonicalText": "ariava-request-v1\nwatch\nwatch_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk\nkey_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk\nPOST\n/v2/commands\n\n2WLyxip_a4A0PZaheOD34j5UAXmVYlJyJeEIzUrey5k\n2026-07-15T12:35:00.000Z\nDw4NDAsKCQgHBgUEAwIBAA",
+      "signature": "zGbwZ88kpdU0U7L2jAddN4_PEQvY9SXuLCJO7qZj-tE4lrRIWlNKK6_wypH5exBChFNF-M0zNh5MQJ-7TemoBA"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "name": "@ariava/protocol",
+  "version": "0.1.4",
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./commands": {
+      "types": "./dist/commands.d.ts",
+      "default": "./dist/commands.js"
+    },
+    "./events": {
+      "types": "./dist/events.d.ts",
+      "default": "./dist/events.js"
+    },
+    "./hosts": {
+      "types": "./dist/hosts.d.ts",
+      "default": "./dist/hosts.js"
+    },
+    "./identity": {
+      "types": "./dist/identity.d.ts",
+      "default": "./dist/identity.js"
+    },
+    "./pairing": {
+      "types": "./dist/pairing.d.ts",
+      "default": "./dist/pairing.js"
+    },
+    "./request-signing": {
+      "types": "./dist/request-signing.d.ts",
+      "default": "./dist/request-signing.js"
+    },
+    "./sessions": {
+      "types": "./dist/sessions.d.ts",
+      "default": "./dist/sessions.js"
+    },
+    "./validation": {
+      "types": "./dist/validation.d.ts",
+      "default": "./dist/validation.js"
+    },
+    "./fixtures/ed25519-request-vectors": "./dist/fixtures/ed25519-request-vectors.json"
+  }
+}

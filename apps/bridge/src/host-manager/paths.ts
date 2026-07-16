@@ -1,0 +1,23 @@
+import { homedir } from 'node:os';
+import { isAbsolute, join, resolve } from 'node:path';
+
+const configuredRoot = process.env.XDG_CONFIG_HOME?.trim();
+export const ARIAVA_CONFIG_ROOT = resolve(configuredRoot && isAbsolute(configuredRoot) ? configuredRoot : join(homedir(), '.config'), 'ariava');
+export const ARIAVA_CONFIG_PATH = join(ARIAVA_CONFIG_ROOT, 'config.json');
+export const ARIAVA_INSTALL_PATH = join(ARIAVA_CONFIG_ROOT, 'install.json');
+export const ARIAVA_AGENT_ADAPTER_CONFIG_PATH = join(ARIAVA_CONFIG_ROOT, 'agent-adapter.json');
+export const ARIAVA_HOST_IDENTITY_PATH = join(ARIAVA_CONFIG_ROOT, 'host-identity.json');
+export const ARIAVA_STATE_DIR = join(ARIAVA_CONFIG_ROOT, 'state');
+export const ARIAVA_STATE_PATH = join(ARIAVA_STATE_DIR, 'bridge-state.json');
+export const ARIAVA_LOG_DIR = join(ARIAVA_CONFIG_ROOT, 'logs');
+export const ARIAVA_STDOUT_LOG_PATH = join(ARIAVA_LOG_DIR, 'bridge.stdout.log');
+export const ARIAVA_STDERR_LOG_PATH = join(ARIAVA_LOG_DIR, 'bridge.stderr.log');
+export const ARIAVA_TMP_DIR = join(ARIAVA_CONFIG_ROOT, 'tmp');
+export const ARIAVA_LAUNCH_AGENTS_DIR = join(homedir(), 'Library', 'LaunchAgents');
+export const ARIAVA_LAUNCHD_LABEL = 'io.noyx.ariava.bridge';
+export const ARIAVA_LAUNCHD_PLIST_PATH = join(ARIAVA_LAUNCH_AGENTS_DIR, `${ARIAVA_LAUNCHD_LABEL}.plist`);
+export const ARIAVA_SYSTEMD_USER_DIR = join(homedir(), '.config', 'systemd', 'user');
+export const ARIAVA_SYSTEMD_SERVICE_ID = 'ariava.service';
+export const ARIAVA_SYSTEMD_UNIT_PATH = join(ARIAVA_SYSTEMD_USER_DIR, ARIAVA_SYSTEMD_SERVICE_ID);
+export const ARIAVA_PI_EXTENSION_DIR = join(homedir(), '.pi', 'agent', 'extensions', 'ariava-pi');
+export const ARIAVA_PI_MANAGED_METADATA_PATH = join(ARIAVA_PI_EXTENSION_DIR, '.ariava-managed.json');

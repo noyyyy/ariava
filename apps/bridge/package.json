@@ -1,0 +1,14 @@
+{
+  "name": "@ariava/bridge",
+  "version": "0.1.4",
+  "type": "module",
+  "dependencies": {
+    "@ariava/protocol": "workspace:*",
+    "@ariava/shared-utils": "workspace:*"
+  },
+  "scripts": {
+    "dev": "bun run ./src/cli.ts daemon",
+    "simulate": "bun run ./src/cli.ts simulate",
+    "cli": "node ./dist/public-cli.js"
+  }
+}

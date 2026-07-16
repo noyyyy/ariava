@@ -1,0 +1,12 @@
+.DS_Store
+node_modules/
+apps/*/dist/
+packages/*/dist/
+extensions/pi/dist/
+extensions/pi/bundle/
+.state*/
+.simulate-*/
+tmp/
+.env
+.env.*
+!.env.example

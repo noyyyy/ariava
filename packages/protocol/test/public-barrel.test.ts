@@ -1,0 +1,63 @@
+import { describe, expect, test } from 'bun:test';
+import * as protocol from '../src';
+
+const INTENDED_RUNTIME_EXPORTS = [
+  'BRIDGE_STATUSES',
+  'COMMAND_TYPES',
+  'ENTITY_TYPES',
+  'EVENT_TYPES',
+  'HOST_PLATFORMS',
+  'IDENTITY_ALGORITHM',
+  'IDENTITY_STATUSES',
+  'KEY_STATUSES',
+  'LINK_REVOKE_REASONS',
+  'PAIRING_CODE_ALPHABET',
+  'PAIRING_CODE_LIMITS',
+  'REQUEST_SIGNATURE_DOMAIN',
+  'RequestCanonicalizationError',
+  'SESSION_HANDLE_ACTIONS',
+  'SESSION_STATUSES',
+  'SIGNED_REQUEST_HEADER_NAMES',
+  'SIGNED_REQUEST_LIMITS',
+  'assertRestrictedDynamicValue',
+  'base64UrlDecode',
+  'base64UrlEncode',
+  'buildCanonicalRequest',
+  'buildRequestTarget',
+  'canonicalizePath',
+  'canonicalizeQuery',
+  'compareEventCursors',
+  'contentSha256',
+  'createSignedRequestHeaders',
+  'deriveEntityIdentity',
+  'derivePublicKeyFingerprint',
+  'eventCursorCovers',
+  'formatPairingCode',
+  'isBridgeStatus',
+  'isCanonicalTimestamp',
+  'isCommandExpired',
+  'isEntityType',
+  'isHostPlatform',
+  'isIdentityStatus',
+  'isKeyStatus',
+  'isLinkRevokeReason',
+  'isRestrictedDynamicValue',
+  'isRotationOperationId',
+  'isUserVisibleActionableAlert',
+  'normalizeMarkSessionReadRequest',
+  'normalizePairingCode',
+  'sha256',
+  'statusToStateLabel',
+  'validateCommandType',
+  'validateHostEnrollmentRequest',
+  'validateHostEnrollmentRequestSyntax',
+  'validateHostMetadataUpdateRequest',
+  'validateIdentityRevokeRequest',
+  'validateSignedRequestHeaders',
+] as const;
+
+describe('public protocol barrel', () => {
+  test('exports the reviewed runtime contract and no private implementation symbols', () => {
+    expect(Object.keys(protocol).sort()).toEqual([...INTENDED_RUNTIME_EXPORTS].sort());
+  });
+});

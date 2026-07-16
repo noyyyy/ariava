@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "compilerOptions": {
+    "types": ["bun-types", "node"],
+    "moduleResolution": "Bundler",
+    "typeRoots": ["./node_modules/@types", "./node_modules"],
+    "maxNodeModuleJsDepth": 3
+  },
+  "exclude": ["test/adapter.test.ts"]
+}
