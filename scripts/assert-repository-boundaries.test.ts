@@ -90,6 +90,17 @@ describe('repository boundary assertion', () => {
     expect(result.exitCode, output(result)).toBe(0);
   });
 
+  test('ignores only Git metadata in a cloned public candidate', () => {
+    const root = makeRoot();
+    populateAllowedCandidate(root);
+    write(root, '.git/config', '[core]\n\trepositoryformatversion = 0\n');
+    write(root, '.github/private.txt', 'unexpected');
+    const result = run(root, 'public-candidate');
+    expect(result.exitCode).toBe(1);
+    expect(output(result)).not.toContain('.git/config');
+    expect(output(result)).toContain('[UNEXPECTED_CANDIDATE_FILE] .github/private.txt');
+  });
+
   test('strict transition is a failing regression gate and report-only is explicit', () => {
     const root = makeRoot();
     populateTransition(root);

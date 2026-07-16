@@ -191,7 +191,7 @@ async function inspect({ mode, root, manifest }) {
   const ignoredPrefixes = mode === 'transition'
     ? [...manifest.excludedPaths.filter((path) => path.startsWith('.') || path === 'node_modules'), 'docs']
     : [
-      'node_modules', 'apps/bridge/node_modules', 'extensions/pi/node_modules', 'packages/protocol/node_modules', 'packages/shared-utils/node_modules',
+      '.git', 'node_modules', 'apps/bridge/node_modules', 'extensions/pi/node_modules', 'packages/protocol/node_modules', 'packages/shared-utils/node_modules',
     ];
   const { files, symlinks } = await walk(root, ignoredPrefixes);
   const present = new Set([...files.map(({ path }) => path), ...symlinks.map(({ path }) => path)]);
