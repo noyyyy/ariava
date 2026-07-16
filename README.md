@@ -21,7 +21,7 @@ ariava install pi
 
 `ariava install pi` runs Pi's package installer for `npm:@ariava/pi-extension`, which records the package in Pi's global `settings.json` so Pi updates do not drop it.
 
-The Watch command surface is intentionally limited to `reply` and `interrupt`. Ariava does not expose arbitrary shell execution, a remote terminal, or a transcript browser.
+Ariava does not expose arbitrary shell execution, a remote terminal, or a transcript browser.
 
 ## Build from source
 

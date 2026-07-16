@@ -13,6 +13,6 @@ bun install --frozen-lockfile
 bun run verify
 ```
 
-Please preserve Ariava's security boundaries, including the `reply` and `interrupt` command allowlist and the loopback-only authenticated Agent Adapter.
+Please preserve Ariava's security boundaries, including the loopback-only authenticated Agent Adapter.
 
 Contributions are licensed under the Apache License 2.0 under this repository's license terms.

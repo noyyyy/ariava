@@ -4,7 +4,6 @@ This repository contains the Ariava Bridge, pi extension, protocol, and shared u
 
 ## Boundaries
 
-- Keep the Watch command surface limited to `reply` and `interrupt`.
 - Do not add arbitrary shell execution, unrestricted stdin, remote TTY, or generic command passthrough.
 - Keep the Agent Adapter loopback-only and authenticated.
 - Do not add Relay, watchOS, APNs, Cloudflare deployment, TestFlight, screenshots, private product documentation, or production credentials.
