@@ -186,9 +186,12 @@ function safeAbsolutePath(value: unknown): value is string {
 }
 
 function isAssetSource(value: unknown): value is NonNullable<AriavaInstallMetadata['bridgeSource']> {
-  if (!isRecord(value) || (value.kind !== 'release-bundle' && value.kind !== 'dev-repo' && value.kind !== 'explicit-path')
+  if (!isRecord(value)
+    || (value.kind !== 'release-bundle' && value.kind !== 'npm-package' && value.kind !== 'dev-repo' && value.kind !== 'explicit-path')
     || typeof value.updatedAt !== 'string' || value.updatedAt.length === 0) return false;
   if (value.path !== undefined && !safeAbsolutePath(value.path)) return false;
+  if (value.package !== undefined && (typeof value.package !== 'string' || value.package.length === 0)) return false;
+  if (value.kind === 'npm-package') return typeof value.package === 'string';
   return value.kind === 'release-bundle' || typeof value.path === 'string';
 }
 

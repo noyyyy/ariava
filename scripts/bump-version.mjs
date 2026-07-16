@@ -247,5 +247,3 @@ console.log(`${prefix} ${current} -> ${next}`);
 console.log('Next steps:');
 console.log('  bun run verify:public');
 console.log('  ./scripts/publish-npm-safe.sh --publish --otp <6-digit-code>');
-console.log('If the @ariava npm scope is available and should be published too:');
-console.log('  ./scripts/publish-npm-safe.sh --include-pi-extension --publish --otp <6-digit-code>');

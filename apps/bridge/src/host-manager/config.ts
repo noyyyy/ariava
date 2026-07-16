@@ -36,11 +36,12 @@ export interface AriavaUserConfig {
   pollIntervalMs?: number;
 }
 
-export type AssetSourceKind = 'release-bundle' | 'dev-repo' | 'explicit-path';
+export type AssetSourceKind = 'release-bundle' | 'npm-package' | 'dev-repo' | 'explicit-path';
 
 export interface AriavaAssetSource {
   kind: AssetSourceKind;
   path?: string;
+  package?: string;
   updatedAt: string;
 }
 

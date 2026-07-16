@@ -5,7 +5,6 @@ PUBLISH=0
 OTP=""
 SKIP_INSTALL=0
 SKIP_VERIFY=0
-INCLUDE_PI_EXTENSION=0
 
 usage() {
   cat <<'EOF'
@@ -18,7 +17,7 @@ Runs Ariava's safe npm release checklist:
   4. Run npm pack --dry-run for the public ariava package
   5. Create a tarball with npm pack
   6. Install the tarball globally and smoke-test ariava help/status/doctor
-  7. Optionally pack/publish the generated @ariava/pi-extension package
+  7. Pack/publish the generated @ariava/pi-extension package
   8. Publish only when --publish is explicitly provided
 
 Options:
@@ -26,16 +25,12 @@ Options:
   --otp <code>    Pass a 2FA OTP to npm publish
   --skip-install  Skip bun install
   --skip-verify   Skip bun run verify:public
-  --include-pi-extension
-                   Also pack/publish extensions/pi/bundle as @ariava/pi-extension
   -h, --help      Show this help
 
 Examples:
   ./scripts/publish-npm-safe.sh
   ./scripts/publish-npm-safe.sh --publish --otp 123456
   ./scripts/publish-npm-safe.sh --publish
-  ./scripts/publish-npm-safe.sh --include-pi-extension
-  ./scripts/publish-npm-safe.sh --include-pi-extension --publish --otp 123456
 EOF
 }
 
@@ -74,10 +69,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-verify)
       SKIP_VERIFY=1
-      shift
-      ;;
-    --include-pi-extension)
-      INCLUDE_PI_EXTENSION=1
       shift
       ;;
     -h|--help)
@@ -142,10 +133,8 @@ else
   log "Skipping bun run verify:public"
 fi
 
-if [[ ${INCLUDE_PI_EXTENSION} -eq 1 ]]; then
-  log "Building pi extension npm package bundle"
-  bun run build:pi-bundle
-fi
+log "Building pi extension npm package bundle"
+bun run build:pi-bundle
 
 log "Checking that the generated Public Core README is publishable"
 node "${SCRIPT_DIR}/assert-publication-readme.mjs" --root "${REPO_ROOT}"
@@ -181,13 +170,11 @@ node "${SCRIPT_DIR}/assert-cli-envelope.mjs" "${SMOKE_DOCTOR_JSON}" doctor "${DO
 log "Removing global smoke-test install"
 npm uninstall -g "${PACKAGE_NAME}"
 
-if [[ ${INCLUDE_PI_EXTENSION} -eq 1 ]]; then
-  log "Checking ${PI_EXTENSION_PACKAGE_NAME} package contents with npm pack --dry-run"
-  (cd "${PI_EXTENSION_BUNDLE_DIR}" && npm pack --dry-run)
+log "Checking ${PI_EXTENSION_PACKAGE_NAME} package contents with npm pack --dry-run"
+(cd "${PI_EXTENSION_BUNDLE_DIR}" && npm pack --dry-run)
 
-  log "Creating ${PI_EXTENSION_PACKAGE_NAME} tarball"
-  (cd "${PI_EXTENSION_BUNDLE_DIR}" && npm pack)
-fi
+log "Creating ${PI_EXTENSION_PACKAGE_NAME} tarball"
+(cd "${PI_EXTENSION_BUNDLE_DIR}" && npm pack)
 
 if [[ ${PUBLISH} -eq 1 ]]; then
   log "Publishing ${PACKAGE_NAME}@${PACKAGE_VERSION} to npm"
@@ -196,21 +183,16 @@ if [[ ${PUBLISH} -eq 1 ]]; then
   else
     npm publish --access public
   fi
-  if [[ ${INCLUDE_PI_EXTENSION} -eq 1 ]]; then
-    log "Publishing ${PI_EXTENSION_PACKAGE_NAME} to npm"
-    if [[ -n "${OTP}" ]]; then
-      (cd "${PI_EXTENSION_BUNDLE_DIR}" && npm publish --access public --otp "${OTP}")
-    else
-      (cd "${PI_EXTENSION_BUNDLE_DIR}" && npm publish --access public)
-    fi
-    log "Published ${PI_EXTENSION_PACKAGE_NAME}"
+  log "Publishing ${PI_EXTENSION_PACKAGE_NAME} to npm"
+  if [[ -n "${OTP}" ]]; then
+    (cd "${PI_EXTENSION_BUNDLE_DIR}" && npm publish --access public --otp "${OTP}")
+  else
+    (cd "${PI_EXTENSION_BUNDLE_DIR}" && npm publish --access public)
   fi
+  log "Published ${PI_EXTENSION_PACKAGE_NAME}"
   log "Published ${PACKAGE_NAME}@${PACKAGE_VERSION}"
 else
   log "Dry run complete; package was NOT published"
   printf 'To publish, run:\n'
   printf '  ./scripts/publish-npm-safe.sh --publish --otp <6-digit-code>\n'
-  if [[ ${INCLUDE_PI_EXTENSION} -eq 1 ]]; then
-    printf '  ./scripts/publish-npm-safe.sh --include-pi-extension --publish --otp <6-digit-code>\n'
-  fi
 fi

@@ -1,7 +1,7 @@
 <!-- ARIAVA_PUBLIC_CORE_README: PUBLISHABLE -->
-# Ariava Public Core
+# Ariava
 
-Ariava is an Apple Watch-first collaboration system for coding agents. This repository contains the auditable local components: the Ariava Bridge, the pi extension, and their public protocol and shared utilities. The cloud Relay and watchOS application are separate product components and are not included here.
+**Live Your Life. Your Agents Stay Close.**
 
 ## Install and initialize
 
@@ -12,14 +12,16 @@ ariava service install
 ariava service status
 ```
 
-Install the bundled pi extension and reload pi:
+Install the official Pi package and reload pi:
 
 ```bash
 ariava install pi
 # Run /reload in an open pi session, or restart pi.
 ```
 
-The Watch command surface is intentionally limited to `reply` and `interrupt`. Ariava does not expose arbitrary shell execution or a remote terminal.
+`ariava install pi` runs Pi's package installer for `npm:@ariava/pi-extension`, which records the package in Pi's global `settings.json` so Pi updates do not drop it.
+
+The Watch command surface is intentionally limited to `reply` and `interrupt`. Ariava does not expose arbitrary shell execution, a remote terminal, or a transcript browser.
 
 ## Build from source
 

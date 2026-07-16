@@ -1,11 +1,18 @@
 # Contributing
 
-Thank you for contributing to Ariava Public Core.
+Thanks for your interest in contributing to Ariava.
 
-1. Create a focused branch and keep changes within the public Bridge, pi extension, protocol, shared utilities, or public tooling boundary.
-2. Do not submit Relay/watchOS implementation, production credentials, internal URLs, screenshots, user data, or complete logs.
-3. Preserve the Watch command allowlist (`reply` and `interrupt`) and loopback-only Agent Adapter security model.
-4. Run `bun install --frozen-lockfile` and `bun run verify` before opening a pull request.
-5. Describe behavior changes, tests, and any compatibility considerations in the pull request.
+For feature changes, we recommend opening a pull request to discuss the idea, scope, and approach before investing in a full implementation.
 
-Contributions are licensed under Apache License 2.0 under the repository's license terms.
+For fixes, feel free to submit a pull request. Please describe the problem, the fix, and the validation you performed.
+
+Before submitting a pull request, run:
+
+```bash
+bun install --frozen-lockfile
+bun run verify
+```
+
+Please preserve Ariava's security boundaries, including the `reply` and `interrupt` command allowlist and the loopback-only authenticated Agent Adapter.
+
+Contributions are licensed under the Apache License 2.0 under this repository's license terms.

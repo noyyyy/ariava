@@ -164,15 +164,16 @@ describe('public ariava CLI', () => {
     expect(body.data.managed).toBe(false);
   });
 
-  test('install pi resolves release bundle from CLI package location instead of cwd', async () => {
+  test('install pi delegates to Pi package management and persists the npm package', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     const workdir = mkdtempSync(join(tmpdir(), 'ariava-random-cwd-'));
     roots.push(home, workdir);
+    const isolated = createIsolatedPublicCliEnvironment(home, { ARIAVA_TEST_PACKAGE_VERSION: '0.1.4' });
 
     const proc = Bun.spawn({
       cmd: [bunPath, 'run', cliPath, 'install', 'pi', '--json'],
       cwd: workdir,
-      env: isolatedEnv(home),
+      env: isolated.env,
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -181,9 +182,10 @@ describe('public ariava CLI', () => {
     expect(exitCode, stderr).toBe(0);
     const body = JSON.parse(stdout);
     expect(body.ok).toBe(true);
-    expect(body.data.managedPath).toBe(join(home, '.pi', 'agent', 'extensions', 'ariava-pi'));
-    expect(body.data.source.kind).toBe('release-bundle');
-    expect(body.data.source.path).toBe(join(process.cwd(), 'extensions', 'pi', 'bundle'));
+    expect(body.data.managedPath).toBe(join(home, '.pi', 'agent', 'npm', 'node_modules', '@ariava', 'pi-extension'));
+    expect(body.data.source).toMatchObject({ kind: 'npm-package', package: 'npm:@ariava/pi-extension' });
+    expect(readFileSync(isolated.piLogPath, 'utf8')).toContain('install npm:@ariava/pi-extension');
+    expect(JSON.parse(readFileSync(join(home, '.pi', 'agent', 'settings.json'), 'utf8')).packages).toContain('npm:@ariava/pi-extension');
   });
 
   test('service status shows relay base url and log paths in text output', async () => {
@@ -362,7 +364,7 @@ describe('public ariava CLI', () => {
     expect(config.agentAdapterSecret).toMatch(/^[0-9a-f]{64}$/);
     expect(stdout).not.toContain(config.agentAdapterSecret);
 
-    expect(body.data.piExtension.record.managedPath).toBe(join(home, '.pi', 'agent', 'extensions', 'ariava-pi'));
+    expect(body.data.piExtension.record.managedPath).toBe(join(home, '.pi', 'agent', 'npm', 'node_modules', '@ariava', 'pi-extension'));
   });
 
   test('macOS CLI preserves foreign systemd metadata and reports mismatch safely', async () => {
@@ -438,11 +440,16 @@ describe('public ariava CLI', () => {
       environment: Record<string, string>,
       ...args: string[]
     ) {
+      const isolated = createIsolatedPublicCliEnvironment(home);
       const env: Record<string, string> = {
+        ...(isolated.env as Record<string, string>),
         HOME: home,
-        PATH: process.env.PATH ?? '',
         ARIAVA_TEST_SCENARIO: scenario,
         ARIAVA_TEST_MANAGER_CALLS_PATH: retainedManagerCallsPath(home),
+        ARIAVA_RELAY_BASE_URL: '',
+        ARIAVA_HOST_ID: '',
+        ARIAVA_HOST_NAME: '',
+        ARIAVA_AGENT_ADAPTER_PORT: '',
       };
       for (const name of ['TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL']) {
         const value = process.env[name];

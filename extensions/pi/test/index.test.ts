@@ -670,10 +670,11 @@ describe('ariavaPiExtension', () => {
     expect(script).not.toContain('npm install');
   });
 
-  test('safe npm publish script can include the generated pi extension package', () => {
+  test('safe npm publish script always includes the generated pi extension package', () => {
     const script = readFileSync(new URL('../../../scripts/publish-npm-safe.sh', import.meta.url), 'utf8');
 
-    expect(script).toContain('--include-pi-extension');
+    expect(script).not.toContain('--include-pi-extension');
+    expect(script).toContain('Pack/publish the generated @ariava/pi-extension package');
     expect(script).toContain('bun run build:pi-bundle');
     expect(script).toContain('PI_EXTENSION_PACKAGE_NAME="@ariava/pi-extension"');
     expect(script).toContain('npm publish --access public');

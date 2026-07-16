@@ -24,6 +24,7 @@ import {
   createServiceManager,
   getPiExtensionStatus,
   installPiExtension,
+  installPiPackage,
   loadInstallMetadata,
   loadInstallMetadataDetailed,
   loadUserConfig,
@@ -31,9 +32,10 @@ import {
   okEnvelope,
   printJson,
   removePiExtension,
+  removePiPackage,
   resolveAriavaConfig,
   resolveDevPiSource,
-  resolveReleasePiSource,
+  upgradePiPackage,
   saveInstallMetadata,
   saveUserConfig,
   supportError,
@@ -475,16 +477,15 @@ async function runService(deps: PublicCliDependencies, argv: string[], json: boo
 
 async function runInstall(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
   if (argv[0] !== 'pi') throw new Error('Usage: ariava install pi');
-  const sourcePath = resolveReleasePiSource(PACKAGE_ROOT);
-  const record = installPiExtension({ sourcePath, sourceKind: 'release-bundle', version: RELEASE_PI_VERSION });
+  const record = installPiPackage();
   mergeInstallMetadata({ piExtension: record, piSource: record.source });
-  print(deps, json, okEnvelope('ok', 'Installed Ariava pi extension.', record), `Installed pi extension to ${record.managedPath}. Reload pi or run /reload.`);
+  print(deps, json, okEnvelope('ok', 'Installed Ariava pi package.', record), `Installed ${record.source.package} through pi at ${record.managedPath}. Reload pi or run /reload.`);
 }
 
 async function runUpgrade(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
   if (argv[0] === 'pi') {
     const record = upgradePiExtension();
-    print(deps, json, okEnvelope('ok', 'Upgraded Ariava pi extension.', record), `Upgraded pi extension at ${record.managedPath}. Reload pi or run /reload.`);
+    print(deps, json, okEnvelope('ok', 'Upgraded Ariava pi package.', record), `Upgraded ${record.source.package} through pi at ${record.managedPath}. Reload pi or run /reload.`);
     return;
   }
 
@@ -530,8 +531,7 @@ function reconcileUserConfig(deps: PublicCliDependencies): { updated: boolean; c
 }
 
 function upgradePiExtension() {
-  const sourcePath = resolveReleasePiSource(PACKAGE_ROOT);
-  const record = installPiExtension({ sourcePath, sourceKind: 'release-bundle', version: RELEASE_PI_VERSION, force: true });
+  const record = upgradePiPackage();
   mergeInstallMetadata({ piExtension: record, piSource: record.source });
   return record;
 }
@@ -628,10 +628,10 @@ export function detectPackageManager(deps: Pick<PublicCliDependencies, 'currentA
 
 async function runRemove(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
   if (argv[0] !== 'pi') throw new Error('Usage: ariava remove pi');
-  removePiExtension();
+  removePiPackage();
   const installMetadata = loadInstallMetadata();
   mergeInstallMetadata({ ...installMetadata, piExtension: undefined, piSource: undefined });
-  print(deps, json, okEnvelope('ok', 'Removed Ariava pi extension.', {}), 'Removed pi extension.');
+  print(deps, json, okEnvelope('ok', 'Removed Ariava pi package.', {}), 'Removed Ariava pi package through pi.');
 }
 
 async function runDev(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
@@ -705,7 +705,7 @@ async function runUninstall(deps: PublicCliDependencies, argv: string[], json: b
     manager.uninstall(currentService);
   }
 
-  if (removePi) removePiExtension();
+  if (removePi) removePiPackage();
 
   if (purge) {
     deps.removePath(ARIAVA_CONFIG_ROOT);

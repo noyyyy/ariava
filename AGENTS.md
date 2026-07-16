@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This repository is Ariava Public Core. It contains the local Bridge, pi extension, public protocol, and shared utilities.
+This repository contains the Ariava Bridge, pi extension, protocol, and shared utilities.
 
 ## Boundaries
 
