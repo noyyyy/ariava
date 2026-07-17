@@ -34,7 +34,7 @@ const cases: Array<{ name: string; method: string; path: string; body?: unknown;
   { name: 'enroll', method: 'POST', path: '/v2/bridge/enroll', body: enrollment, invoke: (c) => c.enrollHost(enrollment) },
   { name: 'metadata update', method: 'PUT', path: '/v2/bridge/registration', body: metadata, invoke: (c) => c.updateHost(metadata) },
   { name: 'heartbeat', method: 'PUT', path: '/v2/bridge/registration', body: metadata, invoke: (c) => c.heartbeat(metadata) },
-  { name: 'pair', method: 'POST', path: '/v2/bridge/pair-watch', body: { pairingCode: 'ABCDEFGH' }, invoke: (c) => c.pairWatch('ABCDEFGH') },
+  { name: 'pair', method: 'POST', path: '/v2/bridge/pair-watch', body: { pairingCode: 'PEYX7K' }, invoke: (c) => c.pairWatch('peyx7k') },
   { name: 'list watches', method: 'GET', path: '/v2/bridge/watches', invoke: (c) => c.listWatches() },
   { name: 'remove watch', method: 'DELETE', path: `/v2/bridge/watches/${watchId}`, body: {}, invoke: (c) => c.removeWatch(watchId) },
   { name: 'event', method: 'POST', path: '/v2/bridge/events', body: { event, session }, invoke: (c) => c.publishEvent(event, session) },
@@ -69,6 +69,22 @@ describe('RelayClient signed v2 requests', () => {
       expect(signer.inputs[0]!.contentSha256).toBe(await contentSha256(text));
     });
   }
+
+  test('rejects invalid pairing codes before signing or sending a request', () => {
+    for (const pairingCode of ['ABCDEFGH', 'ABCD-EFGH', ' PEYX7K', 'PEYX7K ']) {
+      const signer = new RecordingSigner();
+      let fetchCalls = 0;
+      const client = new RelayClient({
+        baseUrl: 'https://relay.example/',
+        signer,
+        fetch: async () => { fetchCalls += 1; return Response.json({ ok: true }); },
+      });
+
+      expect(() => client.pairWatch(pairingCode)).toThrow('exactly 6 Crockford symbols');
+      expect(fetchCalls).toBe(0);
+      expect(signer.inputs).toHaveLength(0);
+    }
+  });
 
   test('uses restricted path targets for session reads and watch removal', () => {
     const client = new RelayClient({ baseUrl: 'https://relay.example', signer: new RecordingSigner(), fetch: async () => Response.json({ ok: true }) });

@@ -47,7 +47,7 @@ describe('identity-safe public CLI', () => {
   });
 
   test.each([
-    [['pair', 'ABCDEFGH'], '/v2/bridge/pair-watch'],
+    [['pair', 'peyx7k'], '/v2/bridge/pair-watch'],
     [['watches', 'list'], '/v2/bridge/watches'],
     [['watches', 'remove', `watch_${'C'.repeat(43)}`], `/v2/bridge/watches/watch_${'C'.repeat(43)}`],
   ] as const)('public %s ensures metadata/enrollment before link API', async (argv, finalPath) => {
@@ -56,22 +56,41 @@ describe('identity-safe public CLI', () => {
     const identity = await new LinuxJsonHostIdentityStore(identityPath).createFirstRun();
     let config: any = { identity: publicIdentityMetadata(identity), hostName: 'Linux host' };
     const paths: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      const request = new Request(input);
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
       const path = new URL(request.url).pathname; paths.push(path);
       if (path === '/v2/bridge/registration') return new Response('missing', { status: 404 });
       if (path === '/v2/bridge/enroll') return Response.json({ host: hostProjection(identity.hostId) });
       if (path === '/v2/bridge/watches') return Response.json({ watches: [] });
-      if (path === '/v2/bridge/pair-watch') return Response.json({
-        host: hostProjection(identity.hostId),
-        watchDevice: { watchDeviceId: `watch_${'C'.repeat(43)}` },
-      });
+      if (path === '/v2/bridge/pair-watch') {
+        expect(await request.json()).toEqual({ pairingCode: 'PEYX7K' });
+        return Response.json({
+          host: hostProjection(identity.hostId),
+          watchDevice: { watchDeviceId: `watch_${'C'.repeat(43)}` },
+        });
+      }
       return Response.json({ ok: true });
     }) as typeof fetch;
     const output: string[] = []; const errors: string[] = [];
     const code = await runPublicCli([...argv, '--json'], cliDeps(root, identityPath, () => config, (next) => { config = next; }, output, errors));
     expect(code, errors.join('')).toBe(0);
     expect(paths).toEqual(['/v2/bridge/registration', '/v2/bridge/enroll', finalPath]);
+  });
+
+  test('rejects invalid pair codes before identity loading, enrollment, or Relay requests', async () => {
+    for (const pairingCode of ['ABCDEFGH', 'ABCD-EFGH', ' PEYX7K', 'PEYX7K ']) {
+      const root = mkdtempSync(join(tmpdir(), 'ariava-invalid-pair-cli-')); roots.push(root);
+      const output: string[] = []; const errors: string[] = [];
+      let storeCalls = 0; let fetchCalls = 0;
+      globalThis.fetch = (async () => { fetchCalls += 1; return Response.json({ ok: true }); }) as typeof fetch;
+      const deps = cliDeps(root, join(root, 'identity.json'), () => ({}), () => {}, output, errors);
+      deps.createHostIdentityStore = () => { storeCalls += 1; throw new Error('identity should not load'); };
+
+      expect(await runPublicCli(['pair', pairingCode, '--json'], deps)).toBe(1);
+      expect(JSON.parse(errors[0]!).message).toContain('exactly 6 Crockford symbols');
+      expect(storeCalls).toBe(0);
+      expect(fetchCalls).toBe(0);
+    }
   });
 
   test('preserves typed HostIdentityError code in CLI errors', async () => {

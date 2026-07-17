@@ -165,7 +165,7 @@ describe('BridgeDaemon', () => {
         return Response.json({ host: { hostId: identity.hostId, hostName: 'Linux host', platform: 'linux', bridgeVersion: '0.1.2', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
       }
       if (url.pathname === '/v2/bridge/pair-watch') {
-        expect(await request.json()).toEqual({ pairingCode: 'ABCDEFGH' });
+        expect(await request.json()).toEqual({ pairingCode: 'PEYX7K' });
         return Response.json({
           host: { hostId: identity.hostId, hostName: 'Linux host', platform: 'linux', bridgeVersion: '0.1.2', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' },
           watchDevice: { watchDeviceId: `watch_${'C'.repeat(43)}`, selectedHostIds: [identity.hostId], registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), pairingStatus: 'paired' },
@@ -179,7 +179,7 @@ describe('BridgeDaemon', () => {
       identity: publicIdentityMetadata(identity),
       bridgeVersion: '0.1.2', relayBaseUrl: `http://127.0.0.1:${server.port}`, identityPath,
       configPath: join(root, 'config.json'), statePath: join(root, 'state.json'), agentAdapter: { ...config.agentAdapter, configPath: join(root, 'adapter.json') } });
-    const result = await new BridgeDaemon(config).pairWatch('ABCDEFGH');
+    const result = await new BridgeDaemon(config).pairWatch('peyx7k');
     expect(result.watchDevice.watchDeviceId).toBe(`watch_${'C'.repeat(43)}`);
     expect(paths).toEqual(['/v2/bridge/registration', '/v2/bridge/enroll', '/v2/bridge/pair-watch']);
   });

@@ -23,6 +23,7 @@ import {
   base64UrlEncode,
   buildRequestTarget,
   contentSha256,
+  normalizePairingCode,
 } from '@ariava/protocol';
 import type { HostRequestSigner } from './identity';
 
@@ -111,7 +112,7 @@ export class RelayClient {
   }
 
   pairWatch(pairingCode: string): Promise<BridgePairWatchResponse> {
-    return this.request('POST', '/v2/bridge/pair-watch', { pairingCode });
+    return this.request('POST', '/v2/bridge/pair-watch', { pairingCode: normalizePairingCode(pairingCode) });
   }
 
   listWatches(): Promise<{ watches: LinkedWatchProjection[] }> {
