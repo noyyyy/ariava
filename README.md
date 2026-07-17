@@ -14,10 +14,10 @@
   <img src="https://img.shields.io/badge/Pi-supported-7c3aed?style=flat-square" alt="Pi supported">
 </p>
 
-Ariava keeps coding agents close through a local Bridge and a focused Pi integration. This repository contains the auditable local components: the Bridge, Pi extension, canonical protocol, and shared utilities.
+Ariava keeps your coding agents close, wherever you are.
 
 > [!WARNING]
-> Ariava is early-stage, pre-1.0 software. Breaking changes to configuration, protocols, installation, and workflows are expected.
+> Ariava is early-stage. Expect breaking changes.
 
 ## Getting Started
 
