@@ -1,9 +1,33 @@
 <!-- ARIAVA_PUBLIC_CORE_README: PUBLISHABLE -->
-# Ariava
+<p align="center">
+  <img src="https://raw.githubusercontent.com/noyyyy/ariava/main/ariava.png" alt="Ariava" width="160" height="160">
+</p>
 
-**Live Your Life. Your Agents Stay Close.**
+<h1 align="center">Ariava</h1>
 
-## Install and initialize
+<p align="center"><strong>Live Your Life. Your Agents Stay Close.</strong></p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/ariava"><img src="https://img.shields.io/npm/v/ariava?style=flat-square&label=npm" alt="npm version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache 2.0 license"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%2FWSL-lightgrey?style=flat-square" alt="macOS and Linux/WSL">
+  <img src="https://img.shields.io/badge/Pi-supported-7c3aed?style=flat-square" alt="Pi supported">
+</p>
+
+Ariava keeps coding agents close through a local Bridge and a focused Pi integration. This repository contains the auditable local components: the Bridge, Pi extension, canonical protocol, and shared utilities.
+
+> [!WARNING]
+> Ariava is early-stage, pre-1.0 software. Breaking changes to configuration, protocols, installation, and workflows are expected.
+
+## Getting Started
+
+### Requirements
+
+- Node.js and npm
+- macOS, or Linux/WSL with a reachable systemd user service manager
+- [Pi](https://github.com/badlogic/pi-mono) if you want the Pi integration
+
+Install Ariava globally, initialize the Host, and install its user-scoped service:
 
 ```bash
 npm install --global ariava
@@ -12,26 +36,51 @@ ariava service install
 ariava service status
 ```
 
-Install the official Pi package and reload pi:
+If you are not using a local Relay, configure its URL before starting the service:
+
+```bash
+ariava config set relayBaseUrl https://your-relay.example.com
+ariava service restart
+```
+
+Install the Pi package, then run `/reload` in an open Pi session or restart Pi:
 
 ```bash
 ariava install pi
-# Run /reload in an open pi session, or restart pi.
 ```
 
-`ariava install pi` runs Pi's package installer for `npm:@ariava/pi-extension`, which records the package in Pi's global `settings.json` so Pi updates do not drop it.
+## Usage
 
-Ariava does not expose arbitrary shell execution, a remote terminal, or a transcript browser.
-
-## Build from source
-
-Requirements: Bun and Node.js.
+Check the Host, pair with a valid pairing code, inspect linked devices, or view service logs:
 
 ```bash
+ariava status
+ariava pair <PAIRING_CODE>
+ariava watches list
+ariava logs
+```
+
+The command surface is intentionally narrow. Ariava does not expose arbitrary shell execution, unrestricted input, a remote terminal, or a transcript browser.
+
+## Build from Source
+
+Requirements: [Bun](https://bun.sh/) and Node.js.
+
+```bash
+git clone https://github.com/noyyyy/ariava.git
+cd ariava
 bun install --frozen-lockfile
 bun run verify
 ```
 
-## License and security
+## Contributing
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE). Report security issues using the private process in [SECURITY.md](SECURITY.md); do not post identities, adapter secrets, configuration files, or complete logs in a public issue.
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and include the validation you performed.
+
+## Security
+
+Report suspected vulnerabilities privately by following [SECURITY.md](SECURITY.md). Never post identities, adapter secrets, configuration files, pairing material, or complete logs in a public issue.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
