@@ -47,7 +47,7 @@ describe('identity-safe public CLI', () => {
   });
 
   test.each([
-    [['pair', 'ABCDEFGH'], '/v2/bridge/pair-watch'],
+    [['pair', 'PEYX7K'], '/v2/bridge/pair-watch'],
     [['watches', 'list'], '/v2/bridge/watches'],
     [['watches', 'remove', `watch_${'C'.repeat(43)}`], `/v2/bridge/watches/watch_${'C'.repeat(43)}`],
   ] as const)('public %s ensures metadata/enrollment before link API', async (argv, finalPath) => {

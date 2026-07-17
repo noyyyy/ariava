@@ -38,11 +38,14 @@ describe('protocol helpers', () => {
     expect(LINK_REVOKE_REASONS).toContain('device_replaced');
   });
 
-  test('normalizes the approved Crockford pairing form', () => {
-    expect(normalizePairingCode('abcd-efgh')).toBe('ABCDEFGH');
-    expect(formatPairingCode('ABCDEFGH')).toBe('ABCD-EFGH');
-    expect(() => normalizePairingCode('ABCI-EFGH')).toThrow('exactly 8 Crockford symbols');
-    for (const invalid of ['AB-CD-EFGH', 'ABCDEFG-H', 'ABCD--EFGH', ' ABCD-EFGH', 'ABCD-EFGH ']) expect(() => normalizePairingCode(invalid)).toThrow();
+  test('normalizes the approved six-symbol Crockford pairing form', () => {
+    expect(normalizePairingCode('peyx7k')).toBe('PEYX7K');
+    expect(formatPairingCode('PEYX7K')).toBe('PEYX7K');
+    expect(() => normalizePairingCode('ABCDEFGH')).toThrow('exactly 6 Crockford symbols');
+    expect(() => normalizePairingCode('ABCD-EFGH')).toThrow('exactly 6 Crockford symbols');
+    for (const invalid of ['PEYX7', 'PEYX7K0', 'PEY-X7K', ' PEYX7K', 'PEYX7K ', 'PEYI7K']) {
+      expect(() => normalizePairingCode(invalid)).toThrow();
+    }
   });
 
   test('keeps canonical actionable event behavior public', () => {

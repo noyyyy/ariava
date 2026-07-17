@@ -2,8 +2,8 @@ import type { HostProjection } from './hosts.js';
 
 export const PAIRING_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ' as const;
 export const PAIRING_CODE_LIMITS = {
-  codeSymbols: 8,
-  codeDisplayCharacters: 9,
+  codeSymbols: 6,
+  codeDisplayCharacters: 6,
   ttlMs: 300_000,
 } as const;
 
@@ -45,17 +45,15 @@ export interface LinkedWatchProjection {
 
 export function normalizePairingCode(value: string): string {
   const upper = value.toUpperCase();
-  if (!/^(?:[0-9A-HJKMNP-TV-Z]{8}|[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4})$/u.test(upper)) {
-    throw new TypeError('pairing code must be exactly 8 Crockford symbols or ABCD-EFGH');
+  if (!/^[0-9A-HJKMNP-TV-Z]{6}$/u.test(upper)) {
+    throw new TypeError('pairing code must be exactly 6 Crockford symbols');
   }
-  const normalized = upper.length === PAIRING_CODE_LIMITS.codeDisplayCharacters ? `${upper.slice(0, 4)}${upper.slice(5)}` : upper;
-  for (const symbol of normalized) {
+  for (const symbol of upper) {
     if (!PAIRING_CODE_ALPHABET.includes(symbol)) throw new TypeError('pairing code contains an unsupported symbol');
   }
-  return normalized;
+  return upper;
 }
 
 export function formatPairingCode(value: string): string {
-  const normalized = normalizePairingCode(value);
-  return `${normalized.slice(0, 4)}-${normalized.slice(4)}`;
+  return normalizePairingCode(value);
 }

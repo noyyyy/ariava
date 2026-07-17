@@ -40,7 +40,7 @@ async function main(): Promise<void> {
   if (command === 'pair-watch' || command === 'pair') {
     const config = loadBridgeConfig();
     const daemon = new BridgeDaemon(config);
-    const pairingCode = process.argv[3]?.trim();
+    const pairingCode = process.argv[3];
     if (!pairingCode) throw new Error('Usage: ariava pair <PAIRING_CODE>');
     const result = await daemon.pairWatch(pairingCode);
     printJson({ ok: true, ...result, relayBaseUrl: config.relayBaseUrl });

@@ -29,7 +29,9 @@ class FakeKeychain implements KeychainCommandRunner {
     const account = args[args.indexOf('-a') + 1];
     if (args[0] === 'find-generic-password') {
       const value = this.items.get(account);
-      return value ? { status: 0, stdout: value, stderr: '' } : { status: 44, stdout: new Uint8Array(), stderr: 'could not be found' };
+      return value
+        ? { status: 0, stdout: Buffer.from(`${Buffer.from(value).toString('hex')}\n`, 'utf8'), stderr: '' }
+        : { status: 44, stdout: new Uint8Array(), stderr: 'could not be found' };
     }
     if (args[0] === 'delete-generic-password') {
       this.items.delete(account);
@@ -61,6 +63,13 @@ describe('MacOSKeychainHostIdentityStore', () => {
       storageReference: { type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: identity.hostId },
       ownerIntegrity: true, permissionIntegrity: true, metadataIntegrity: true, pendingRotation: false,
     });
+  });
+
+  test('decodes hexadecimal security -w output before validating key material', async () => {
+    const runner = new FakeKeychain();
+    const store = new MacOSKeychainHostIdentityStore(metadataPath(), runner);
+    const identity = await store.createFirstRun();
+    expect((await store.load())?.keyId).toBe(identity.keyId);
   });
 
   test('keeps pending key in approved hostId.pending item until promote', async () => {

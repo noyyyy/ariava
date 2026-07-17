@@ -67,9 +67,9 @@ describe('frozen v2 foundation constants', () => {
 
   test('exports public pairing syntax and client TTL only', () => {
     expect(PAIRING_CODE_ALPHABET).toBe('0123456789ABCDEFGHJKMNPQRSTVWXYZ');
-    expect(PAIRING_CODE_LIMITS).toEqual({ codeSymbols: 8, codeDisplayCharacters: 9, ttlMs: 300_000 });
-    expect(formatPairingCode('ABCDEFGH')).toBe('ABCD-EFGH');
-    expect(normalizePairingCode('abcd-efgh')).toBe('ABCDEFGH');
+    expect(PAIRING_CODE_LIMITS).toEqual({ codeSymbols: 6, codeDisplayCharacters: 6, ttlMs: 300_000 });
+    expect(formatPairingCode('PEYX7K')).toBe('PEYX7K');
+    expect(normalizePairingCode('peyx7k')).toBe('PEYX7K');
   });
 
   test('freezes rotation operation ID format and length', () => {
