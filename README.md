@@ -14,10 +14,8 @@
   <img src="https://img.shields.io/badge/Pi-supported-7c3aed?style=flat-square" alt="Pi supported">
 </p>
 
-Ariava keeps your coding agents close, wherever you are.
-
 > [!WARNING]
-> Ariava is early-stage. Expect breaking changes.
+> Ariava is early-stage. Breaking changes are expected.
 
 ## Getting Started
 
@@ -25,7 +23,7 @@ Ariava keeps your coding agents close, wherever you are.
 
 - Node.js and npm
 - macOS, or Linux/WSL with a reachable systemd user service manager
-- [Pi](https://github.com/badlogic/pi-mono) if you want the Pi integration
+- [Pi](https://pi.dev/)
 
 Install Ariava globally, initialize the Host, and install its user-scoped service:
 
@@ -36,14 +34,14 @@ ariava service install
 ariava service status
 ```
 
-If you are not using a local Relay, configure its URL before starting the service:
+Set your Relay URL, then restart the service:
 
 ```bash
 ariava config set relayBaseUrl https://your-relay.example.com
 ariava service restart
 ```
 
-Install the Pi package, then run `/reload` in an open Pi session or restart Pi:
+Install the Pi extension, then run `/reload` in an open Pi session or restart Pi:
 
 ```bash
 ariava install pi
