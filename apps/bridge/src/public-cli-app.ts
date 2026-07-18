@@ -1,3 +1,4 @@
+import { normalizePairingCode } from '@ariava/protocol';
 import { existsSync, lstatSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { dirname, isAbsolute, resolve } from 'node:path';
@@ -311,9 +312,10 @@ async function runDoctor(deps: PublicCliDependencies, json: boolean): Promise<nu
 async function runPair(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
   const pairingCode = argv[0];
   if (!pairingCode) throw new Error('Usage: ariava pair <PAIRING_CODE>');
+  const normalizedPairingCode = normalizePairingCode(pairingCode);
   const context = await loadIdentityClient(deps);
   await ensureHostEnrollment(context);
-  const result = await context.client.pairWatch(pairingCode);
+  const result = await context.client.pairWatch(normalizedPairingCode);
   print(deps, json, okEnvelope('ok', 'Watch paired successfully.', result),
     `Paired watch ${result.watchDevice.watchDeviceId} with host ${result.host.hostName} (${result.host.hostId})`);
 }
@@ -393,18 +395,13 @@ async function loadIdentityClient(deps: PublicCliDependencies): Promise<Identity
 }
 
 async function ensureHostEnrollment(context: IdentityClientContext): Promise<void> {
-  try {
-    await context.client.updateHost(context.metadata);
-  } catch (error) {
-    if (!(error instanceof RelayClientError) || error.status !== 404) throw error;
-    await context.client.enrollHost({
-      hostId: context.identity.hostId,
-      keyId: context.identity.keyId,
-      algorithm: context.identity.algorithm,
-      publicKey: context.identity.publicKey,
-      ...context.metadata,
-    });
-  }
+  await context.client.enrollHost({
+    hostId: context.identity.hostId,
+    keyId: context.identity.keyId,
+    algorithm: context.identity.algorithm,
+    publicKey: context.identity.publicKey,
+    ...context.metadata,
+  });
 }
 
 function hostMetadataContext(deps: PublicCliDependencies) {

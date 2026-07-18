@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { normalizePairingCode } from '@ariava/protocol';
 import { BridgeDaemon, loadBridgeConfig } from './daemon';
 import { RelayClientError } from './relay-client';
 import { buildSimulatedEvent, buildSimulatedSession, type SimulationScenario } from './simulate';
@@ -40,9 +41,9 @@ async function main(): Promise<void> {
   if (command === 'pair-watch' || command === 'pair') {
     const config = loadBridgeConfig();
     const daemon = new BridgeDaemon(config);
-    const pairingCode = process.argv[3]?.trim();
+    const pairingCode = process.argv[3];
     if (!pairingCode) throw new Error('Usage: ariava pair <PAIRING_CODE>');
-    const result = await daemon.pairWatch(pairingCode);
+    const result = await daemon.pairWatch(normalizePairingCode(pairingCode));
     printJson({ ok: true, ...result, relayBaseUrl: config.relayBaseUrl });
     return;
   }

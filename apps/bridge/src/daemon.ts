@@ -8,7 +8,6 @@ import type {
   CanonicalEvent,
   CanonicalSessionState,
   HostEnrollmentRequest,
-  HostMetadataUpdateRequest,
   HostProjection,
 } from '@ariava/protocol';
 import { createId, isoNow, sleep } from '@ariava/shared-utils';
@@ -22,7 +21,7 @@ import { probeHostPlatform } from './host-platform';
 import { loadUserConfig, resolveAriavaConfig, resolvePersistedAriavaConfig } from './host-manager';
 import { ensureAriavaSecureDirectories, pathHasFilesystemEvidence, readSecureJson, redactSensitive } from './host-manager/secure-files';
 import { HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostIdentity, type HostIdentityStore } from './identity';
-import { RelayClient, RelayClientError } from './relay-client';
+import { RelayClient } from './relay-client';
 import { BridgeStateStore } from './state-store';
 import type { AgentDriver, BridgeConfig, BridgeSyncResult } from './types';
 
@@ -132,10 +131,9 @@ export class BridgeDaemon {
 
   async syncOnce(): Promise<BridgeSyncResult> {
     await this.validateStartup();
-    const metadata = this.buildHostMetadata();
     let offline = false;
     try {
-      await this.registerHostPresence(metadata);
+      await this.registerHostPresence();
     } catch {
       const prior = this.stateStore.getHost();
       if (prior) this.stateStore.setHost({ ...prior, bridgeStatus: 'degraded' });
@@ -163,7 +161,7 @@ export class BridgeDaemon {
 
   async pairWatch(pairingCode: string): Promise<BridgePairWatchResponse> {
     await this.validateStartup();
-    await this.registerHostPresence(this.buildHostMetadata());
+    await this.registerHostPresence();
     return this.client().pairWatch(pairingCode);
   }
 
@@ -189,18 +187,12 @@ export class BridgeDaemon {
     return { hostName: this.config.hostName, platform: this.config.hostPlatform, bridgeVersion: this.config.bridgeVersion };
   }
 
-  private async registerHostPresence(metadata: HostMetadataUpdateRequest): Promise<void> {
+  private async registerHostPresence(): Promise<void> {
     const identity = await this.resolveIdentityStore().load();
     if (!identity || !this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
       throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Host identity changed while daemon was running');
     }
-    let response;
-    try {
-      response = await this.client().updateHost(metadata);
-    } catch (error) {
-      if (!(error instanceof RelayClientError) || error.status !== 404) throw error;
-      response = await this.client().enrollHost(this.buildEnrollment(identity));
-    }
+    const response = await this.client().enrollHost(this.buildEnrollment(identity));
     this.stateStore.setHost(response.host);
   }
 

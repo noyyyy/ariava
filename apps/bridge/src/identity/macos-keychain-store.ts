@@ -286,7 +286,7 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
   private readItem(account: string): Uint8Array {
     const result = this.runner.run(MACOS_SECURITY_PATH, ['find-generic-password', '-s', MACOS_IDENTITY_KEYCHAIN_SERVICE, '-a', account, '-w']);
     if (result.status !== 0 || result.error || result.stdout.byteLength === 0) this.failKeychain('read', result, true);
-    return result.stdout;
+    return decodeSecurityPassword(result.stdout);
   }
 
   private itemExists(account: string): boolean {
@@ -410,6 +410,14 @@ function isPublicIdentityMetadata(value: HostIdentityMetadata): boolean {
 
 function samePending(left: MacIdentityMetadataFile['pending'], right: NonNullable<MacIdentityMetadataFile['pending']>): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function decodeSecurityPassword(stdout: Uint8Array): Uint8Array {
+  const encoded = Buffer.from(stdout).toString('utf8').trimEnd();
+  if (!/^(?:[0-9a-f]{2})+$/iu.test(encoded)) {
+    throw new HostIdentityError('ERR_IDENTITY_INVALID', 'macOS Keychain Host identity encoding is invalid');
+  }
+  return new Uint8Array(Buffer.from(encoded, 'hex'));
 }
 
 function isKeychainMissing(result: KeychainCommandResult): boolean {
