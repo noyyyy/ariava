@@ -11,7 +11,7 @@
     },
     "apps/bridge": {
       "name": "@ariava/bridge",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "dependencies": {
         "@ariava/protocol": "workspace:*",
         "@ariava/shared-utils": "workspace:*",
@@ -19,7 +19,7 @@
     },
     "extensions/pi": {
       "name": "@ariava/pi-extension",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "dependencies": {
         "@ariava/protocol": "workspace:*",
       },
@@ -33,11 +33,11 @@
     },
     "packages/protocol": {
       "name": "@ariava/protocol",
-      "version": "0.1.4",
+      "version": "0.1.5",
     },
     "packages/shared-utils": {
       "name": "@ariava/shared-utils",
-      "version": "0.1.4",
+      "version": "0.1.5",
     },
   },
   "packages": {

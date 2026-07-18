@@ -13,7 +13,7 @@ Usage: ./scripts/publish-npm-safe.sh [options]
 Runs Ariava's safe npm release checklist:
   1. Check npm/bun/node and npm login
   2. Install dependencies with bun install
-  3. Run bun run verify:public
+  3. Run bun run verify
   4. Run npm pack --dry-run for the public ariava package
   5. Create a tarball with npm pack
   6. Install the tarball globally and smoke-test ariava help/status/doctor
@@ -24,7 +24,7 @@ Options:
   --publish       Actually run npm publish --access public after checks pass
   --otp <code>    Pass a 2FA OTP to npm publish
   --skip-install  Skip bun install
-  --skip-verify   Skip bun run verify:public
+  --skip-verify   Skip bun run verify
   -h, --help      Show this help
 
 Examples:
@@ -128,9 +128,9 @@ fi
 
 if [[ ${SKIP_VERIFY} -eq 0 ]]; then
   log "Running Public Core verification"
-  bun run verify:public
+  bun run verify
 else
-  log "Skipping bun run verify:public"
+  log "Skipping bun run verify"
 fi
 
 log "Building pi extension npm package bundle"

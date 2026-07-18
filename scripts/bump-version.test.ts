@@ -42,6 +42,12 @@ function readJson(path: string) {
   return JSON.parse(readFileSync(path, 'utf8'));
 }
 
+function readLockfileWorkspaceVersion(lockfile: string, workspacePath: string): string | undefined {
+  const escapedPath = workspacePath.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  const workspace = new RegExp(`"${escapedPath}"\\s*:\\s*\\{([\\s\\S]*?)\\n\\s*\\}(?:\\s*,)?`, 'u').exec(lockfile)?.[1];
+  return workspace ? /"version"\s*:\s*"([^"]+)"/u.exec(workspace)?.[1] : undefined;
+}
+
 describe('bump-version release preparation script', () => {
   test('bumps public publish-time versions without modifying the private Relay version', async () => {
     const root = makeFixture();
@@ -66,12 +72,11 @@ describe('bump-version release preparation script', () => {
       }
       expect(readJson(join(root, relayPackageFile)).version).toBe('0.1.4');
       const lockfileText = readFileSync(join(root, 'bun.lock'), 'utf8');
-      const lockfile = Bun.JSONC.parse(lockfileText);
-      expect(lockfile.workspaces['apps/bridge'].version).toBe('0.1.5');
-      expect(lockfile.workspaces['apps/relay'].version).toBe('0.1.4');
-      expect(lockfile.workspaces['extensions/pi'].version).toBe('0.1.5');
-      expect(lockfile.workspaces['packages/protocol'].version).toBe('0.1.5');
-      expect(lockfile.workspaces['packages/shared-utils'].version).toBe('0.1.5');
+      expect(readLockfileWorkspaceVersion(lockfileText, 'apps/bridge')).toBe('0.1.5');
+      expect(readLockfileWorkspaceVersion(lockfileText, 'apps/relay')).toBe('0.1.4');
+      expect(readLockfileWorkspaceVersion(lockfileText, 'extensions/pi')).toBe('0.1.5');
+      expect(readLockfileWorkspaceVersion(lockfileText, 'packages/protocol')).toBe('0.1.5');
+      expect(readLockfileWorkspaceVersion(lockfileText, 'packages/shared-utils')).toBe('0.1.5');
       expect(lockfileText).toContain('// Bun lockfiles are JSONC and retain trailing commas.');
       expect(lockfileText).toContain('"dependencies": {},\n    },');
       expect(lockfileText).toContain('"packages": {},\n}');
