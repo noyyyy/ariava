@@ -17,6 +17,16 @@
 > [!WARNING]
 > Ariava is early-stage. Breaking changes are expected.
 
+## Roadmap
+
+- [x] Human Attention and Intervention
+- [x] APN Notification
+- [ ] **In progress:** Smart Alert
+- [ ] **In progress:** Session Management
+- [ ] End-to-end encryption
+- [ ] Project management
+- [ ] Invoke a new Pi session
+
 ## Getting Started
 
 ### Requirements
