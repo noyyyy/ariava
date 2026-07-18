@@ -10,3 +10,4 @@ tmp/
 .env
 .env.*
 !.env.example
+ariava-*.tgz
