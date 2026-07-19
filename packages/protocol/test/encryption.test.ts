@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { createPrivateKey, verify } from 'node:crypto';
 import vectors from './fixtures/e2e-v1-vectors.json';
 import {
   COMMAND_TYPES,
@@ -7,6 +8,10 @@ import {
   base64UrlDecode,
   base64UrlEncode,
   buildEventContentAAD,
+  buildEncryptionBindingBytes,
+  buildProtectedEventContentBytes,
+  buildProtectedReplyContentBytes,
+  buildProtectedSessionContentBytes,
   buildLinkTranscriptBytes,
   buildReplyContentAAD,
   buildSafetyCodeInput,
@@ -52,6 +57,31 @@ describe('E2E protocol v1', () => {
     }))).toBe(fixed.event.wrapAAD);
   });
 
+  test('freezes and verifies canonical encryption binding signature bytes', () => {
+    const { canonicalBytes, bindingSignature, ...binding } = fixed.binding;
+    const bytes = buildEncryptionBindingBytes(binding);
+    expect(base64UrlEncode(bytes)).toBe(canonicalBytes);
+    const publicKey = createPrivateKey({
+      key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.from('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60', 'hex')]),
+      type: 'pkcs8', format: 'der',
+    });
+    expect(verify(null, bytes, publicKey, Buffer.from(bindingSignature, 'base64url'))).toBe(true);
+    expect(verify(null, buildEncryptionBindingBytes({ ...binding, sequence: 2 }), publicKey, Buffer.from(bindingSignature, 'base64url'))).toBe(false);
+  });
+
+  test('encodes protected plaintext with dedicated deterministic key order', () => {
+    expect(new TextDecoder().decode(buildProtectedEventContentBytes({
+      contextText: 'context', version: 1, assistantText: 'answer', userMessageText: 'question',
+      actionablePrompt: { type: 'question', promptId: 'prompt_1', label: 'Choose', options: ['A'], expiresAt: '2026-07-20T00:01:00.000Z' },
+    }))).toBe('{"version":1,"assistantText":"answer","userMessageText":"question","contextText":"context","actionablePrompt":{"promptId":"prompt_1","type":"question","label":"Choose","options":["A"],"expiresAt":"2026-07-20T00:01:00.000Z"}}');
+    expect(new TextDecoder().decode(buildProtectedSessionContentBytes({ latestActivityText: 'latest', version: 1, projectName: 'ariava', nameText: 'session' })))
+      .toBe('{"version":1,"projectName":"ariava","nameText":"session","latestActivityText":"latest"}');
+    expect(new TextDecoder().decode(buildProtectedReplyContentBytes({ text: 'continue', version: 1 })))
+      .toBe('{"version":1,"text":"continue"}');
+    expect(() => buildProtectedReplyContentBytes({ version: 1, text: 'continue', extra: true } as any)).toThrow();
+    expect(() => buildProtectedEventContentBytes({ version: 1, assistantText: 'answer', extra: true } as any)).toThrow();
+  });
+
   test('changes canonical bytes when generation, epoch, or direction changes', () => {
     const baseline = fixed.event.wrapAAD;
     const input = {
@@ -67,13 +97,17 @@ describe('E2E protocol v1', () => {
 
   test('strict validators reject padding, extra keys, wrong lengths, and oversize ciphertext', () => {
     const binding = {
-      version: 1, entityType: 'host', entityId: 'host_vector', identityKeyId: `key_${'A'.repeat(43)}`,
+      version: 1, entityType: 'host', entityId: `host_${'A'.repeat(43)}`, identityKeyId: `key_${'A'.repeat(43)}` ,
       encryptionKeyId: `ekey_${'A'.repeat(43)}`, suite: E2E_SUITE_V1, publicKey: fixed.keys.hostPublicKey,
       sequence: 1, createdAt: '2026-07-20T00:00:00.000Z', bindingSignature: base64UrlEncode(new Uint8Array(64)),
     } as const;
     expect(validateEncryptionKeyBindingV1(binding)).toBe(true);
     expect(validateEncryptionKeyBindingV1({ ...binding, publicKey: `${binding.publicKey}=` })).toBe(false);
     expect(validateEncryptionKeyBindingV1({ ...binding, extra: true })).toBe(false);
+    expect(validateEncryptionKeyBindingV1({ ...binding, entityId: 'host_vector' })).toBe(false);
+    expect(validateEncryptionKeyBindingV1({ ...binding, identityKeyId: 'key_vector' })).toBe(false);
+    expect(validateEncryptionKeyBindingV1({ ...binding, createdAt: '2026-07-20T00:00:00Z' })).toBe(false);
+    expect(() => buildEncryptionBindingBytes({ ...binding, entityId: 'host_vector' })).toThrow();
     const content = { version: 1, suite: E2E_SUITE_V1, contentId: fixed.event.contentId, payloadKind: 'event-content-v1', nonce: fixed.event.contentNonce, ciphertext: fixed.event.ciphertext } as const;
     expect(validateEncryptedContentV1(content)).toBe(true);
     expect(validateEncryptedContentV1({ ...content, nonce: base64UrlEncode(new Uint8Array(11)) })).toBe(false);

@@ -241,6 +241,14 @@ export interface WrapAADInput {
   payloadKind: ProtectedPayloadKind;
 }
 
+const CANONICAL_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+const ID_PATTERNS = {
+  host: /^host_[A-Za-z0-9_-]{43}$/u,
+  watch: /^watch_[A-Za-z0-9_-]{43}$/u,
+  identityKey: /^key_[A-Za-z0-9_-]{43}$/u,
+  encryptionKey: /^ekey_[A-Za-z0-9_-]{43}$/u,
+} as const;
+
 const encoder = new TextEncoder();
 
 export function encodeLengthPrefixedFields(fields: readonly string[]): Uint8Array {
@@ -256,10 +264,47 @@ export function encodeLengthPrefixedFields(fields: readonly string[]): Uint8Arra
 }
 
 export function buildEncryptionBindingBytes(binding: Omit<EncryptionKeyBindingV1, 'bindingSignature'>): Uint8Array {
+  assertValidEncryptionBinding(binding);
   return encodeLengthPrefixedFields([
     'ariava-e2e-binding-v1', binding.entityType, binding.entityId, binding.identityKeyId,
     binding.encryptionKeyId, binding.suite, String(binding.sequence), binding.createdAt, binding.publicKey,
   ]);
+}
+
+export function buildProtectedEventContentBytes(content: ProtectedEventContentV1): Uint8Array {
+  assertProtectedEventContent(content);
+  return encoder.encode(JSON.stringify({
+    version: 1,
+    assistantText: content.assistantText,
+    ...(content.userMessageText === undefined ? {} : { userMessageText: content.userMessageText }),
+    ...(content.contextText === undefined ? {} : { contextText: content.contextText }),
+    ...(content.actionablePrompt === undefined ? {} : { actionablePrompt: {
+      promptId: content.actionablePrompt.promptId,
+      type: 'question',
+      label: content.actionablePrompt.label,
+      ...(content.actionablePrompt.options === undefined ? {} : { options: content.actionablePrompt.options }),
+      ...(content.actionablePrompt.expiresAt === undefined ? {} : { expiresAt: content.actionablePrompt.expiresAt }),
+    } }),
+  }));
+}
+
+export function buildProtectedSessionContentBytes(content: ProtectedSessionContentV1): Uint8Array {
+  assertProtectedSessionContent(content);
+  return encoder.encode(JSON.stringify({
+    version: 1,
+    projectName: content.projectName,
+    nameText: content.nameText,
+    ...(content.openingText === undefined ? {} : { openingText: content.openingText }),
+    ...(content.latestActivityText === undefined ? {} : { latestActivityText: content.latestActivityText }),
+  }));
+}
+
+export function buildProtectedReplyContentBytes(content: ProtectedReplyContentV1): Uint8Array {
+  assertExactKeys(content, ['version', 'text'], 'protected reply content');
+  if (content.version !== 1 || typeof content.text !== 'string' || encoder.encode(content.text).byteLength > E2E_LIMITS.replyPlaintextBytes) {
+    throw new TypeError('protected reply content is invalid');
+  }
+  return encoder.encode(JSON.stringify({ version: 1, text: content.text }));
 }
 
 export function buildLinkTranscriptBytes(input: {
@@ -327,12 +372,13 @@ export function validateEncryptionKeyBindingV1(value: unknown): value is Encrypt
   if (!isExactRecord(value, ['version', 'entityType', 'entityId', 'identityKeyId', 'encryptionKeyId', 'suite', 'publicKey', 'sequence', 'createdAt', 'bindingSignature'])) return false;
   try {
     return value.version === 1 && (value.entityType === 'host' || value.entityType === 'watch')
-      && typeof value.entityId === 'string' && typeof value.identityKeyId === 'string'
-      && typeof value.encryptionKeyId === 'string' && /^ekey_[A-Za-z0-9_-]{43}$/u.test(value.encryptionKeyId)
+      && typeof value.entityId === 'string' && ID_PATTERNS[value.entityType].test(value.entityId)
+      && typeof value.identityKeyId === 'string' && ID_PATTERNS.identityKey.test(value.identityKeyId)
+      && typeof value.encryptionKeyId === 'string' && ID_PATTERNS.encryptionKey.test(value.encryptionKeyId)
       && value.suite === E2E_SUITE_V1 && decodeBase64Url(value.publicKey, 32)
       && Number.isSafeInteger(value.sequence) && (value.sequence as number) > 0
-      && typeof value.createdAt === 'string' && typeof value.bindingSignature === 'string'
-      && decodeBase64Url(value.bindingSignature, 64);
+      && typeof value.createdAt === 'string' && isCanonicalTimestamp(value.createdAt)
+      && typeof value.bindingSignature === 'string' && decodeBase64Url(value.bindingSignature, 64);
   } catch { return false; }
 }
 
@@ -355,6 +401,56 @@ export function validateRecipientKeyWrapV1(value: unknown): value is RecipientKe
     && typeof value.linkId === 'string' && isPositiveInteger(value.linkGeneration) && isPositiveInteger(value.epoch)
     && typeof value.senderEncryptionKeyId === 'string' && typeof value.recipientEncryptionKeyId === 'string'
     && decodeBase64Url(value.nonce, 12) && decodeBase64Url(value.ciphertext, 48);
+}
+
+function assertValidEncryptionBinding(binding: Omit<EncryptionKeyBindingV1, 'bindingSignature'>): void {
+  const candidate = { ...binding, bindingSignature: base64UrlZeros(64) };
+  if (!validateEncryptionKeyBindingV1(candidate)) throw new TypeError('encryption key binding is not canonical');
+}
+
+function assertProtectedEventContent(content: ProtectedEventContentV1): void {
+  assertExactKeys(content, ['version', 'assistantText', 'userMessageText', 'contextText', 'actionablePrompt'], 'protected event content');
+  if (content.version !== 1 || typeof content.assistantText !== 'string'
+    || (content.userMessageText !== undefined && typeof content.userMessageText !== 'string')
+    || (content.contextText !== undefined && typeof content.contextText !== 'string')
+    || encoder.encode(JSON.stringify(content)).byteLength > E2E_LIMITS.eventPlaintextBytes) {
+    throw new TypeError('protected event content is invalid');
+  }
+  const prompt = content.actionablePrompt;
+  if (prompt !== undefined) assertExactKeys(prompt, ['promptId', 'type', 'label', 'options', 'expiresAt'], 'protected actionable prompt');
+  if (prompt !== undefined && (typeof prompt.promptId !== 'string' || prompt.type !== 'question'
+    || typeof prompt.label !== 'string' || (prompt.options !== undefined
+      && (prompt.options.length > E2E_LIMITS.promptOptions || prompt.options.some((option) => typeof option !== 'string'
+        || encoder.encode(option).byteLength > E2E_LIMITS.promptOptionBytes)))
+    || (prompt.expiresAt !== undefined && !isCanonicalTimestamp(prompt.expiresAt)))) {
+    throw new TypeError('protected actionable prompt is invalid');
+  }
+}
+
+function assertProtectedSessionContent(content: ProtectedSessionContentV1): void {
+  assertExactKeys(content, ['version', 'projectName', 'nameText', 'openingText', 'latestActivityText'], 'protected session content');
+  if (content.version !== 1 || typeof content.projectName !== 'string' || typeof content.nameText !== 'string'
+    || (content.openingText !== undefined && typeof content.openingText !== 'string')
+    || (content.latestActivityText !== undefined && typeof content.latestActivityText !== 'string')
+    || encoder.encode(JSON.stringify(content)).byteLength > E2E_LIMITS.sessionPlaintextBytes) {
+    throw new TypeError('protected session content is invalid');
+  }
+}
+
+function assertExactKeys(value: object, allowed: readonly string[], label: string): void {
+  const supported = new Set(allowed);
+  if (Object.keys(value).some((key) => !supported.has(key))) throw new TypeError(`${label} contains unsupported fields`);
+}
+
+function isCanonicalTimestamp(value: string): boolean {
+  if (!CANONICAL_TIMESTAMP_RE.test(value)) return false;
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function base64UrlZeros(bytes: number): string {
+  const binary = String.fromCharCode(...new Uint8Array(bytes));
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '');
 }
 
 function decodeBase64Url(value: unknown, bytes: number): boolean {

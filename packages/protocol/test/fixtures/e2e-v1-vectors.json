@@ -16,6 +16,19 @@
     "watchPublicKey": "hSGEQYV0kVUu4p_cmCiI9X3i8Mmzy_N4D21zI6YX_CQ",
     "sharedSecret": "SS5z9puoIOB766bU0yej5z2FMwi1XFQbEJIsqZgFHwM"
   },
+  "binding": {
+    "version": 1,
+    "entityType": "host",
+    "entityId": "host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+    "identityKeyId": "key_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+    "encryptionKeyId": "ekey_CYl2qZ_WVBpJ3yUjhyJV39dm_YVsJJTDGInbKOGGz5M",
+    "suite": "x25519-hkdf-sha256-chachapoly-v1",
+    "publicKey": "Gal7qMoataJtQyEIuNwHo5NLutXDKjY_63Tf7ovq7TM",
+    "sequence": 1,
+    "createdAt": "2026-07-20T00:00:00.000Z",
+    "canonicalBytes": "MjE6YXJpYXZhLWUyZS1iaW5kaW5nLXYxCjQ6aG9zdAo0ODpob3N0X0lmNHgzNkZVb21GaWFfaFVCR19TSnh0NzdVdHF2a1dxV0lkLTlILVhJYmsKNDc6a2V5X0lmNHgzNkZVb21GaWFfaFVCR19TSnh0NzdVdHF2a1dxV0lkLTlILVhJYmsKNDg6ZWtleV9DWWwycVpfV1ZCcEozeVVqaHlKVjM5ZG1fWVZzSkpUREdJbmJLT0dHejVNCjMyOngyNTUxOS1oa2RmLXNoYTI1Ni1jaGFjaGFwb2x5LXYxCjE6MQoyNDoyMDI2LTA3LTIwVDAwOjAwOjAwLjAwMFoKNDM6R2FsN3FNb2F0YUp0UXlFSXVOd0hvNU5MdXRYREtqWV82M1RmN292cTdUTQo",
+    "bindingSignature": "ouGzskX-WjG9bfnCv25b2_szR2LB3E7lO9HO9bXjcedlOSznoDFiLu3k6XzcATGt23vvyz2LeFLWNmISUsP9CA"
+  },
   "transcript": {
     "hostBindingDigest": "A3FeVpPr6duSP2iOTU3rc_g_L8gNSlpI3NanGs__tko",
     "watchBindingDigest": "E8L2rjoyuFxUYT7GuX7G_Ygz8dzkTpiF-5fKsryZrt4",

@@ -9,6 +9,7 @@ const required = [
   'package.json', 'apps/bridge/dist/cli.js', 'apps/bridge/dist/public-cli.js',
   'apps/bridge/dist/ui/assets/ariava-success-wide.txt',
   'apps/bridge/dist/ui/assets/ariava-success-compact.txt',
+  'apps/bridge/dist/e2e/node-crypto.js', 'apps/bridge/dist/e2e/node-crypto-self-test.js',
   'packages/protocol/dist/index.js', 'packages/protocol/dist/index.d.ts',
   'packages/protocol/dist/events.js', 'packages/protocol/dist/events.d.ts',
   'packages/protocol/dist/encryption.js', 'packages/protocol/dist/encryption.d.ts',

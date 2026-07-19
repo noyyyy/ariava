@@ -221,6 +221,7 @@ describe('SystemdUserServiceManager', () => {
     current.manager.stop(installed);
     current.manager.restart(installed);
     current.runner.results.push(
+      { status: 0, stdout: 'v22.1.0\n', stderr: '' },
       { status: 0, stdout: 'enabled\n', stderr: '' },
       { status: 0, stdout: 'active\n', stderr: '' },
       { status: 0, stdout: 'loaded\n', stderr: '' },
@@ -426,9 +427,10 @@ describe('SystemdUserServiceManager', () => {
     const current = fixture();
     mkdirSync(dirname(current.definitionPath), { recursive: true });
     writeFileSync(current.definitionPath, 'unit');
-    current.runner.results.push({ status: 0, stdout: 'enabled\n', stderr: '' }, { status: 0, stdout: 'active\n', stderr: '' }, { status: 0, stdout: 'loaded\n', stderr: '' });
+    current.runner.results.push({ status: 0, stdout: 'v22.1.0\n', stderr: '' }, { status: 0, stdout: 'enabled\n', stderr: '' }, { status: 0, stdout: 'active\n', stderr: '' }, { status: 0, stdout: 'loaded\n', stderr: '' });
     expect(current.manager.status(record(current.definitionPath), '/usr/bin/node', '/usr/bin/ariava')).toMatchObject({ installed: true, enabled: true, loaded: true, processRunning: true, logBackend: 'journald' });
     expect(current.runner.calls).toEqual([
+      { command: '/usr/bin/node', args: ['--version'] },
       { command: 'systemctl', args: ['--user', 'is-enabled', 'ariava.service'] },
       { command: 'systemctl', args: ['--user', 'is-active', 'ariava.service'] },
       { command: 'systemctl', args: ['--user', 'show', 'ariava.service', '--property=LoadState', '--value'] },
@@ -437,8 +439,26 @@ describe('SystemdUserServiceManager', () => {
     const ordinary = fixture();
     mkdirSync(dirname(ordinary.definitionPath), { recursive: true });
     writeFileSync(ordinary.definitionPath, 'unit');
-    ordinary.runner.results.push({ status: 1, stdout: 'disabled\n', stderr: '' }, { status: 3, stdout: 'inactive\n', stderr: '' }, { status: 1, stdout: 'not-found\n', stderr: '' });
+    ordinary.runner.results.push({ status: 0, stdout: 'v22.1.0\n', stderr: '' }, { status: 1, stdout: 'disabled\n', stderr: '' }, { status: 3, stdout: 'inactive\n', stderr: '' }, { status: 1, stdout: 'not-found\n', stderr: '' });
     expect(ordinary.manager.status(record(ordinary.definitionPath), '/usr/bin/node', '/usr/bin/ariava')).toMatchObject({ enabled: false, loaded: false, processRunning: false });
+  });
+
+  test('probes the recorded runtime version and detects an in-place downgrade', () => {
+    const current = fixture();
+    mkdirSync(dirname(current.definitionPath), { recursive: true });
+    writeFileSync(current.definitionPath, 'unit');
+    const installed = { ...record(current.definitionPath), runtimeName: 'node' as const, runtimeVersion: 'v22.1.0' };
+    current.runner.results.push(
+      { status: 0, stdout: 'v21.9.0\n', stderr: '' },
+      { status: 0, stdout: 'enabled\n', stderr: '' },
+      { status: 0, stdout: 'active\n', stderr: '' },
+      { status: 0, stdout: 'loaded\n', stderr: '' },
+    );
+    expect(current.manager.status(installed, '/usr/bin/node', '/usr/bin/ariava')).toMatchObject({
+      runtimeVersion: 'v21.9.0', recordedRuntimeVersion: 'v22.1.0', runtimeVersionSupported: false,
+      runtimeVersionMatchesRecorded: false,
+    });
+    expect(current.runner.calls[0]).toEqual({ command: '/usr/bin/node', args: ['--version'] });
   });
 
   test('keeps a foreign backend safe while reinstall returns replacement metadata', () => {

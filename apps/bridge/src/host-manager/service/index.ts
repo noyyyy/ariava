@@ -4,5 +4,6 @@ export * from './launchd';
 export * from './migration';
 export * from './manager';
 export * from './platform';
+export * from './runtime-probe';
 export * from './systemd-user';
 export * from './types';

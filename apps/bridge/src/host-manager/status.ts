@@ -16,6 +16,7 @@ export interface HostServiceStatusInput {
   processRunning: boolean;
   runtimeNameIsNode?: boolean;
   runtimeVersionSupported?: boolean;
+  runtimeVersionMatchesRecorded?: boolean;
   runtimePathMatchesCurrent?: boolean;
   ariavaBinPathMatchesCurrent?: boolean;
   runtimeCryptoSelfTestPassed?: boolean;
@@ -38,6 +39,7 @@ export interface HostManagerStatus {
     processRunning: boolean;
     runtimeNameIsNode?: boolean;
     runtimeVersionSupported?: boolean;
+    runtimeVersionMatchesRecorded?: boolean;
     runtimePathMatchesCurrent?: boolean;
     ariavaBinPathMatchesCurrent?: boolean;
     runtimeCryptoSelfTestPassed?: boolean;
@@ -89,6 +91,7 @@ export function buildHostManagerStatus(args: {
       processRunning: serviceStatus.processRunning,
       ...(serviceStatus.runtimeNameIsNode === undefined ? {} : { runtimeNameIsNode: serviceStatus.runtimeNameIsNode }),
       ...(serviceStatus.runtimeVersionSupported === undefined ? {} : { runtimeVersionSupported: serviceStatus.runtimeVersionSupported }),
+      ...(serviceStatus.runtimeVersionMatchesRecorded === undefined ? {} : { runtimeVersionMatchesRecorded: serviceStatus.runtimeVersionMatchesRecorded }),
       ...(serviceStatus.runtimePathMatchesCurrent === undefined
         ? {}
         : { runtimePathMatchesCurrent: serviceStatus.runtimePathMatchesCurrent }),

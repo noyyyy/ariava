@@ -288,6 +288,7 @@ async function runStatus(deps: PublicCliDependencies, argv: string[], json: bool
   };
   const installMetadata = deps.loadInstallMetadata();
   const serviceStatus = currentServiceStatus(deps, manager, installMetadata);
+  serviceStatus.runtimeCryptoSelfTestPassed = deps.cryptoSelfTest();
   const piStatus = getPiExtensionStatus(RELEASE_PI_VERSION);
   const identityInspection = manager.support.platform === 'darwin' || manager.support.platform === 'linux'
     ? await inspectPublicIdentity(deps.createHostIdentityStore(resolved.identityPath, manager.support.platform))
@@ -321,6 +322,7 @@ async function runDoctor(deps: PublicCliDependencies, json: boolean): Promise<nu
     runtimePathMatchesCurrent: Boolean(serviceStatus.runtimePathMatchesCurrent ?? true),
     serviceRuntimeNameIsNode: serviceStatus.runtimeNameIsNode ?? null,
     serviceRuntimeVersionSupported: serviceStatus.runtimeVersionSupported ?? null,
+    serviceRuntimeVersionMatchesRecorded: serviceStatus.runtimeVersionMatchesRecorded ?? null,
     runtimeCryptoSelfTestPassed: deps.cryptoSelfTest(),
     piFound: deps.commandExists('pi'),
     configComplete: isConfigComplete(resolved),
@@ -329,6 +331,10 @@ async function runDoctor(deps: PublicCliDependencies, json: boolean): Promise<nu
     serviceLoaded: serviceStatus.loaded,
     serviceRunning: serviceStatus.processRunning,
     servicePathCurrent: Boolean(serviceStatus.runtimePathMatchesCurrent ?? true) && Boolean(serviceStatus.ariavaBinPathMatchesCurrent ?? true),
+    serviceRuntimeCurrent: Boolean(serviceStatus.runtimeNameIsNode ?? true)
+      && Boolean(serviceStatus.runtimeVersionSupported ?? true)
+      && Boolean(serviceStatus.runtimeVersionMatchesRecorded ?? true),
+    serviceReinstallRecommendation: serviceNeedsReinstall(serviceStatus) ? 'Run `ariava service reinstall`.' : undefined,
     serviceMetadataValid: metadataResult.diagnostics.serviceMetadataValid,
     installerMetadataValid: metadataResult.diagnostics.installerMetadataValid !== false,
     documentMetadataValid: metadataResult.diagnostics.documentMetadataValid !== false,
@@ -351,10 +357,9 @@ async function runDoctor(deps: PublicCliDependencies, json: boolean): Promise<nu
     identityWarning: identity.status === 'rotation-pending' ? 'Host key rotation is pending; recover it before normal operation.' : undefined,
   });
   const healthy = manager.support.supported && checks.nodeFound && checks.runtimeNameIsNode
-    && checks.runtimeVersionSupported && checks.runtimePathMatchesCurrent
-    && checks.serviceRuntimeNameIsNode !== false && checks.serviceRuntimeVersionSupported !== false
-    && checks.runtimeCryptoSelfTestPassed && checks.configComplete && checks.serviceMetadataValid
-    && checks.installerMetadataValid && checks.documentMetadataValid && identityReady;
+    && checks.runtimeVersionSupported && checks.runtimeCryptoSelfTestPassed && checks.configComplete
+    && checks.servicePathCurrent && checks.serviceRuntimeCurrent
+    && checks.serviceMetadataValid && checks.installerMetadataValid && checks.documentMetadataValid && identityReady;
   const envelope = {
     ok: healthy,
     code: healthy ? 'ok' : 'ERR_DOCTOR',
@@ -1163,6 +1168,15 @@ function currentServiceStatus(
     deps.realpath(deps.currentRuntimePath()),
     deps.realpath(deps.currentAriavaBinPath()),
   );
+}
+
+function serviceNeedsReinstall(status: ServiceStatus): boolean {
+  if (!status.runtimePath && !status.ariavaBinPath) return false;
+  return status.runtimePathMatchesCurrent === false
+    || status.ariavaBinPathMatchesCurrent === false
+    || status.runtimeNameIsNode === false
+    || status.runtimeVersionSupported === false
+    || status.runtimeVersionMatchesRecorded === false;
 }
 
 function stripFlag(argv: string[], flag: string): boolean {

@@ -15,3 +15,8 @@ and real-device evidence remain explicitly deferred to the watchOS phase.
 Binary values are canonical unpadded RFC 4648 base64url. ChaChaPoly ciphertext
 is `ciphertext || 16-byte tag`; nonce is a separate 12-byte field. The fixture's
 transcript and wrap AAD include `linkGeneration`.
+
+The initial reviewed fixture omitted binding canonical/signature bytes even though the
+frozen convergence contract requires them. The `binding` object was added during this
+pre-freeze review completion without changing any previously frozen value. Its Ed25519
+signature uses the existing public RFC 8032 test seed from the request-signing fixture.

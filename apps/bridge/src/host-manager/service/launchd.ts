@@ -10,6 +10,7 @@ import {
 } from '../paths';
 import { SpawnSyncCommandRunner } from './command-runner';
 import { AriavaCliError, commandFailureData, sanitizeCommandDetail } from './errors';
+import { probeRecordedServiceRuntime } from './runtime-probe';
 import type {
   AriavaServiceInstallRecord,
   CommandResult,
@@ -241,6 +242,7 @@ export class LaunchdServiceManager implements ServiceManager {
       };
     }
 
+    const runtimeProbe = probeRecordedServiceRuntime(this.runner, record);
     const definitionPath = record.definitionPath;
     const serviceId = record.serviceId;
     let plist: string;
@@ -257,8 +259,7 @@ export class LaunchdServiceManager implements ServiceManager {
         loaded: false,
         processRunning: false,
         runtimePath: record.runtimePath,
-        ...(record.runtimeName ? { runtimeName: record.runtimeName, runtimeNameIsNode: record.runtimeName === 'node' } : {}),
-        ...(record.runtimeVersion ? { runtimeVersion: record.runtimeVersion, runtimeVersionSupported: supportedNodeVersion(record.runtimeVersion) } : {}),
+        ...runtimeProbe,
         ariavaBinPath: record.ariavaBinPath,
         runtimePathMatchesCurrent: resolve(record.runtimePath) === resolve(currentRuntimePath),
         ariavaBinPathMatchesCurrent: resolve(record.ariavaBinPath) === resolve(currentAriavaBinPath),
@@ -287,8 +288,7 @@ export class LaunchdServiceManager implements ServiceManager {
       loaded,
       processRunning: loaded && /\bpid\s*=\s*\d+\b/.test(printResult.stdout),
       runtimePath: record.runtimePath,
-      ...(record.runtimeName ? { runtimeName: record.runtimeName, runtimeNameIsNode: record.runtimeName === 'node' } : {}),
-      ...(record.runtimeVersion ? { runtimeVersion: record.runtimeVersion, runtimeVersionSupported: supportedNodeVersion(record.runtimeVersion) } : {}),
+      ...runtimeProbe,
       ariavaBinPath: record.ariavaBinPath,
       runtimePathMatchesCurrent: resolve(record.runtimePath) === resolve(currentRuntimePath),
       ariavaBinPathMatchesCurrent: resolve(record.ariavaBinPath) === resolve(currentAriavaBinPath),
@@ -491,10 +491,6 @@ ${escapedArgs}
 `;
 }
 
-function supportedNodeVersion(version: string): boolean {
-  const major = /^v?(\d+)/u.exec(version)?.[1];
-  return major !== undefined && Number(major) >= 22;
-}
 
 function absoluteServicePath(path: string, field: string): string {
   if (!path.startsWith('/') || /[\u0000-\u001f\u007f-\u009f]/.test(path)) {

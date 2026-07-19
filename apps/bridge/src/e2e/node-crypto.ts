@@ -56,6 +56,7 @@ export function x25519SharedSecret(privateKeyPkcs8: Uint8Array, peerPublicKeyRaw
 }
 
 export function hkdfSha256(ikm: Uint8Array, salt: Uint8Array, info: Uint8Array): Uint8Array {
+  if (ikm.byteLength !== 32) throw new TypeError('HKDF IKM must contain exactly 32 bytes');
   if (salt.byteLength !== 32) throw new TypeError('HKDF salt must contain exactly 32 bytes');
   return new Uint8Array(hkdfSync('sha256', Buffer.from(ikm), Buffer.from(salt), Buffer.from(info), 32));
 }

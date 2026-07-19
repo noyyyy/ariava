@@ -227,7 +227,10 @@ describe('LaunchdServiceManager', () => {
     const { manager, runner, definitionPath, stdoutLogPath, stderrLogPath } = fixture();
     const record = manager.install({ runtimePath: '/usr/bin/node', ariavaBinPath: '/usr/bin/ariava' });
     runner.calls.length = 0;
-    runner.results.push({ status: 0, stdout: 'state = running\npid = 123\n', stderr: '' });
+    runner.results.push(
+      { status: 0, stdout: 'v22.1.0\n', stderr: '' },
+      { status: 0, stdout: 'state = running\npid = 123\n', stderr: '' },
+    );
 
     const status = manager.status(record, '/usr/bin/node', '/usr/bin/ariava');
 
@@ -241,6 +244,10 @@ describe('LaunchdServiceManager', () => {
       loaded: true,
       processRunning: true,
       runtimePath: '/usr/bin/node',
+      runtimeVersion: 'v22.1.0',
+      runtimeName: 'node',
+      runtimeNameIsNode: true,
+      runtimeVersionSupported: true,
       ariavaBinPath: '/usr/bin/ariava',
       runtimePathMatchesCurrent: true,
       ariavaBinPathMatchesCurrent: true,
@@ -249,10 +256,38 @@ describe('LaunchdServiceManager', () => {
       stderrLogPath,
     });
     expect(runner.calls).toEqual([
+      { command: '/usr/bin/node', args: ['--version'] },
       { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },
     ]);
     expect(status).not.toHaveProperty('launchdLoaded');
     expect(status).not.toHaveProperty('plistPath');
+  });
+
+  test('probes the recorded runtime and detects an in-place downgrade while legacy records remain readable', () => {
+    const current = fixture();
+    const installed = current.manager.install({
+      runtimePath: '/usr/bin/node', ariavaBinPath: '/usr/bin/ariava', runtimeName: 'node', runtimeVersion: 'v22.1.0',
+    });
+    current.runner.calls.length = 0;
+    current.runner.results.push(
+      { status: 0, stdout: 'v21.9.0\n', stderr: '' },
+      { status: 0, stdout: 'state = running\npid = 123\n', stderr: '' },
+    );
+    expect(current.manager.status(installed, '/usr/bin/node', '/usr/bin/ariava')).toMatchObject({
+      runtimeVersion: 'v21.9.0', recordedRuntimeVersion: 'v22.1.0', runtimeNameIsNode: true,
+      runtimeVersionSupported: false, runtimeVersionMatchesRecorded: false,
+    });
+    expect(current.runner.calls[0]).toEqual({ command: '/usr/bin/node', args: ['--version'] });
+
+    const legacy = { ...installed, runtimeName: undefined, runtimeVersion: undefined };
+    current.runner.results.push(
+      { status: 0, stdout: 'v22.2.0\n', stderr: '' },
+      { status: 0, stdout: 'state = running\npid = 123\n', stderr: '' },
+    );
+    expect(current.manager.status(legacy, '/usr/bin/node', '/usr/bin/ariava')).toMatchObject({
+      runtimeVersion: 'v22.2.0', runtimeNameIsNode: true, runtimeVersionSupported: true,
+    });
+    expect(current.manager.status).toBeFunction();
   });
 
   test('returns safe false status when the recorded plist cannot be read', () => {
@@ -281,7 +316,7 @@ describe('LaunchdServiceManager', () => {
     expect(status.detail).toContain('unable to read launchd definition');
     expect(status.detail?.length).toBeLessThanOrEqual(2_000);
     expect(status.detail).not.toContain('/secret/status.plist');
-    expect(current.runner.calls).toEqual([]);
+    expect(current.runner.calls).toEqual([{ command: '/usr/bin/node', args: ['--version'] }]);
   });
 
   test('does not treat an unrecorded stale default plist as installed or inspect launchctl', () => {

@@ -56,6 +56,8 @@ export interface ServiceStatus {
   runtimePath?: string;
   runtimeName?: 'node';
   runtimeVersion?: string;
+  recordedRuntimeVersion?: string;
+  runtimeVersionMatchesRecorded?: boolean;
   ariavaBinPath?: string;
   runtimeNameIsNode?: boolean;
   runtimeVersionSupported?: boolean;

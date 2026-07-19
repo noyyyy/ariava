@@ -29,7 +29,7 @@ class Ariava < Formula
   end
 
   service do
-    run [opt_bin/"ariava", "internal", "bridge-daemon", "--config", File.expand_path("~/.config/ariava/config.json")]
+    run [Formula["node"].opt_bin/"node", opt_libexec/"apps/bridge/dist/public-cli.js", "internal", "bridge-daemon", "--config", File.expand_path("~/.config/ariava/config.json")]
     keep_alive true
     log_path var/"log/ariava.log"
     error_log_path var/"log/ariava.log"

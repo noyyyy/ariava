@@ -95,6 +95,8 @@ const required = [
   'apps/bridge/dist/cli.js',
   'apps/bridge/dist/public-cli.js',
   ...reviewedBridgeAssets,
+  'apps/bridge/dist/e2e/node-crypto.js',
+  'apps/bridge/dist/e2e/node-crypto-self-test.js',
   'packages/protocol/dist/index.js',
   'packages/protocol/dist/index.d.ts',
   'packages/protocol/dist/events.js',
