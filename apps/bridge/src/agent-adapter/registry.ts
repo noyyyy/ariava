@@ -36,7 +36,7 @@ export interface RegisterSessionInput {
 export class AgentAdapterRegistry {
   private sessions = new Map<string, RegisteredSession>();
   private commandQueues = new Map<string, CommandEnvelope[]>();
-  private commandWaiters = new Map<string, Array<(command: CommandEnvelope) => void>>();
+  private commandWaiters = new Map<string, Array<(command: CommandEnvelope | null) => void>>();
   private results = new Map<string, CommandResult>();
   private resultWaiters = new Map<string, Array<(result: CommandResult) => void>>();
   private inFlightCommands = new Map<string, Set<string>>();
@@ -77,6 +77,12 @@ export class AgentAdapterRegistry {
     this.delayedTerminalEvents.delete(sessionId);
     this.stateStore.removeSessionDriver(sessionId);
     return this.sessions.delete(sessionId);
+  }
+
+  cancelCommandPolls(): void {
+    const waiters = [...this.commandWaiters.values()].flat();
+    this.commandWaiters.clear();
+    for (const waiter of waiters) waiter(null);
   }
 
   heartbeat(sessionId: string, status: SessionStatus, latestActivityText?: string): RegisteredSession | undefined {
@@ -228,7 +234,7 @@ export class AgentAdapterRegistry {
         resolve(null);
       }, timeoutMs);
 
-      const resolver = (command: CommandEnvelope) => {
+      const resolver = (command: CommandEnvelope | null) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -333,7 +339,7 @@ export class AgentAdapterRegistry {
     };
   }
 
-  private removeCommandWaiter(sessionId: string, resolver: (command: CommandEnvelope) => void): void {
+  private removeCommandWaiter(sessionId: string, resolver: (command: CommandEnvelope | null) => void): void {
     const waiters = this.commandWaiters.get(sessionId);
     if (!waiters) return;
 

@@ -17,6 +17,12 @@ export interface AgentAdapterClientOptions {
 
 const DEFAULT_CONFIG_PATH = `${homedir()}/.config/ariava/agent-adapter.json`;
 
+export function resolveAgentAdapterConfigPath(explicitConfigPath?: string): string {
+  if (explicitConfigPath !== undefined) return explicitConfigPath;
+  const environmentConfigPath = process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
+  if (environmentConfigPath?.trim()) return environmentConfigPath;
+  return DEFAULT_CONFIG_PATH;
+}
 
 export class AgentAdapterClient implements AgentAdapter {
   private readonly configPath: string;
@@ -24,7 +30,7 @@ export class AgentAdapterClient implements AgentAdapter {
   private readonly pinnedDiscovery: boolean;
 
   constructor(options: AgentAdapterClientOptions = {}) {
-    this.configPath = options.configPath ?? DEFAULT_CONFIG_PATH;
+    this.configPath = resolveAgentAdapterConfigPath(options.configPath);
     this.pinnedDiscovery = Boolean(options.baseUrl && options.secret);
     if (options.baseUrl && options.secret) {
       this.cachedDiscovery = { url: options.baseUrl, secret: options.secret };

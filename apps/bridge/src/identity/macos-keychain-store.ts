@@ -18,7 +18,12 @@ import type {
 
 export const MACOS_IDENTITY_KEYCHAIN_SERVICE = 'io.noyx.ariava.host-identity' as const;
 export const MACOS_SECURITY_PATH = '/usr/bin/security' as const;
-const KEYCHAIN_EVIDENCE_ACCOUNT = '__ariava_identity_index_v1';
+export type MacOSIdentityProfile = 'default' | 'dev';
+export const MACOS_IDENTITY_EVIDENCE_ACCOUNTS = {
+  default: '__ariava_identity_index_v1',
+  dev: '__ariava_identity_index_dev_v1',
+} as const satisfies Record<MacOSIdentityProfile, string>;
+type MacOSIdentityEvidenceAccount = (typeof MACOS_IDENTITY_EVIDENCE_ACCOUNTS)[MacOSIdentityProfile];
 const KEYCHAIN_EVIDENCE_VALUE = Buffer.from('ariava-host-identity-evidence-v1');
 const CREATION_SENTINEL_SCHEMA = 'ariava-macos-identity-creation-v1' as const;
 
@@ -52,6 +57,7 @@ export class SpawnKeychainCommandRunner implements KeychainCommandRunner {
 }
 
 interface MacIdentityMetadataFile {
+  evidenceAccount?: MacOSIdentityEvidenceAccount;
   current: HostIdentityMetadata;
   pending?: { operationId: string; issuedAt: string; identity: HostIdentityMetadata };
 }
@@ -73,14 +79,17 @@ export interface MacOSIdentityCreationHooks {
 
 export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
   readonly metadataPath: string;
+  readonly evidenceAccount: MacOSIdentityEvidenceAccount;
 
   constructor(
     metadataPath: string,
     private readonly runner: KeychainCommandRunner = new SpawnKeychainCommandRunner(),
     private readonly creationHooks: MacOSIdentityCreationHooks = {},
+    identityProfile: MacOSIdentityProfile = 'default',
   ) {
     if (!isAbsolute(metadataPath)) throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'macOS identity metadata path must be absolute');
     this.metadataPath = resolve(metadataPath);
+    this.evidenceAccount = MACOS_IDENTITY_EVIDENCE_ACCOUNTS[identityProfile];
   }
 
   async inspect(): Promise<HostIdentityInspection> {
@@ -173,10 +182,10 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
       this.creationHooks.afterKeyWrite?.();
       const verified = await this.loadItem(metadata, true);
       this.creationHooks.afterKeyVerification?.();
-      this.writeItem(KEYCHAIN_EVIDENCE_ACCOUNT, KEYCHAIN_EVIDENCE_VALUE, false);
+      this.writeItem(this.evidenceAccount, KEYCHAIN_EVIDENCE_VALUE, false);
       indexCreated = true;
       this.creationHooks.afterIndexWrite?.();
-      this.writeMetadata({ current: publicMetadata(verified) }, true);
+      this.writeProfileMetadata(publicMetadata(verified), { exclusive: true });
       metadataCreated = true;
       this.creationHooks.afterMetadataWrite?.();
       this.deleteCreationSentinel();
@@ -186,7 +195,7 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
         // Roll back only if every created Keychain item can be removed. Otherwise retain the
         // sentinel so restart can never mistake partial identity evidence for a fresh install.
         if (keyCreated) this.tryDeleteItem(metadata.hostId);
-        if (indexCreated) this.tryDeleteItem(KEYCHAIN_EVIDENCE_ACCOUNT);
+        if (indexCreated) this.tryDeleteItem(this.evidenceAccount);
         // Keep the durable marker: restart requires explicit reset rather than replacement.
       }
       // Once metadata is durable, retain the complete transaction. load() validates it and
@@ -215,7 +224,9 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     this.writeItem(pendingAccount, bytes, false);
     try {
       await this.loadItem(pending);
-      this.writeMetadata({ current: metadata.current, pending: { operationId: next.operationId, issuedAt: next.issuedAt, identity: publicMetadata(pending) } });
+      this.writeProfileMetadata(metadata.current, {
+        pending: { operationId: next.operationId, issuedAt: next.issuedAt, identity: publicMetadata(pending) },
+      });
     } catch (error) {
       this.tryDeleteItem(pendingAccount);
       throw error;
@@ -225,7 +236,7 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
   async abortRotation(operationId: string): Promise<void> {
     const metadata = this.readMetadata();
     if (!metadata.pending || metadata.pending.operationId !== operationId) throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Pending Host key rotation does not match operation ID');
-    this.writeMetadata({ current: metadata.current });
+    this.writeProfileMetadata(metadata.current);
     const storage = metadata.pending.identity.privateKeyStorage;
     if (storage.type !== 'macos-keychain') throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Pending Keychain storage reference is invalid');
     this.deleteItem(storage.account);
@@ -244,7 +255,7 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     this.writeItem(metadata.current.hostId, pendingKey, true);
     try {
       const promoted = await this.loadItem(promotedMetadata, true);
-      this.writeMetadata({ current: publicMetadata(promoted) });
+      this.writeProfileMetadata(publicMetadata(promoted));
       this.deleteItem(pendingStorage.account);
       return promoted;
     } catch (error) {
@@ -254,14 +265,15 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
   }
 
   async resetAfterExplicitConfirmation(): Promise<HostIdentity> {
-    const previous = this.metadataEvidence() ? this.readMetadata() : undefined;
+    const hasMetadata = this.metadataEvidence();
+    const previous = hasMetadata ? this.readMetadata() : undefined;
     const interrupted = this.readCreationSentinelIfPresent();
     const generated = await generateHostIdentity({ type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: 'pending-reset' });
     const metadata = withKeychainStorage(generated.identity, generated.identity.hostId);
     this.writeItem(metadata.hostId, generated.privateKeyPkcs8, true);
     const verified = await this.loadItem(metadata, true);
-    this.writeItem(KEYCHAIN_EVIDENCE_ACCOUNT, KEYCHAIN_EVIDENCE_VALUE, true);
-    this.writeMetadata({ current: publicMetadata(verified) }, !this.metadataEvidence());
+    this.writeItem(this.evidenceAccount, KEYCHAIN_EVIDENCE_VALUE, true);
+    this.writeProfileMetadata(publicMetadata(verified), { exclusive: !hasMetadata });
     if (previous && previous.current.hostId !== metadata.hostId) this.deleteItem(previous.current.hostId);
     if (previous?.pending && previous.pending.identity.privateKeyStorage.type === 'macos-keychain') this.deleteItem(previous.pending.identity.privateKeyStorage.account);
     if (interrupted && interrupted.hostId !== metadata.hostId) this.tryDeleteItem(interrupted.hostId);
@@ -296,7 +308,7 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     this.failKeychain('probe', result);
   }
 
-  private hasIndexEvidence(): boolean { return this.itemExists(KEYCHAIN_EVIDENCE_ACCOUNT); }
+  private hasIndexEvidence(): boolean { return this.itemExists(this.evidenceAccount); }
 
   private deleteItem(account: string): void {
     const result = this.runner.run(MACOS_SECURITY_PATH, ['delete-generic-password', '-s', MACOS_IDENTITY_KEYCHAIN_SERVICE, '-a', account]);
@@ -362,12 +374,29 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     try {
       const value = readSecureJson<MacIdentityMetadataFile>(this.metadataPath);
       if (!isMetadata(value)) throw new Error('invalid schema');
+      const profileMatches = value.evidenceAccount === this.evidenceAccount
+        || (value.evidenceAccount === undefined && this.evidenceAccount === MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default);
+      if (!profileMatches || !this.hasIndexEvidence()) {
+        throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'macOS identity metadata is not bound to the selected profile evidence');
+      }
       return value;
     } catch (error) {
       if (error instanceof HostIdentityError) throw error;
       const code = error instanceof SecureFileError ? 'ERR_IDENTITY_PERMISSIONS' : 'ERR_IDENTITY_INVALID';
       throw new HostIdentityError(code, 'macOS Host identity metadata is invalid', error);
     }
+  }
+
+  private writeProfileMetadata(
+    current: HostIdentityMetadata,
+    options: { pending?: MacIdentityMetadataFile['pending']; exclusive?: boolean } = {},
+  ): void {
+    const metadata: MacIdentityMetadataFile = {
+      evidenceAccount: this.evidenceAccount,
+      current,
+      ...(options.pending ? { pending: options.pending } : {}),
+    };
+    this.writeMetadata(metadata, options.exclusive);
   }
 
   private writeMetadata(metadata: MacIdentityMetadataFile, exclusive = false): void {
@@ -393,12 +422,16 @@ function publicMetadata(identity: HostIdentityMetadata): HostIdentityMetadata {
 }
 
 function isMetadata(value: MacIdentityMetadataFile): boolean {
-  if (!value || typeof value !== 'object' || !isPublicIdentityMetadata(value.current)) return false;
+  if (!value || typeof value !== 'object' || !isEvidenceAccount(value.evidenceAccount) || !isPublicIdentityMetadata(value.current)) return false;
   if (value.current.privateKeyStorage.account !== value.current.hostId) return false;
   if (!value.pending) return true;
   return typeof value.pending.operationId === 'string' && typeof value.pending.issuedAt === 'string'
     && isPublicIdentityMetadata(value.pending.identity) && value.pending.identity.hostId === value.current.hostId
     && value.pending.identity.privateKeyStorage.account === `${value.current.hostId}.pending`;
+}
+
+function isEvidenceAccount(value: unknown): value is MacOSIdentityEvidenceAccount | undefined {
+  return value === undefined || Object.values(MACOS_IDENTITY_EVIDENCE_ACCOUNTS).includes(value as MacOSIdentityEvidenceAccount);
 }
 
 function isPublicIdentityMetadata(value: HostIdentityMetadata): boolean {
@@ -411,7 +444,6 @@ function isPublicIdentityMetadata(value: HostIdentityMetadata): boolean {
 function samePending(left: MacIdentityMetadataFile['pending'], right: NonNullable<MacIdentityMetadataFile['pending']>): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
-
 function decodeSecurityPassword(stdout: Uint8Array): Uint8Array {
   const encoded = Buffer.from(stdout).toString('utf8').trimEnd();
   if (!/^(?:[0-9a-f]{2})+$/iu.test(encoded)) {

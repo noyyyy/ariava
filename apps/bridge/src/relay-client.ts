@@ -38,6 +38,8 @@ export interface RelayClientOptions {
   nonce?: () => string;
 }
 
+export type RelayRequestSignal = () => AbortSignal | undefined;
+
 export class RelayClientError extends Error {
   constructor(
     readonly status: number,
@@ -53,7 +55,7 @@ export class RelayClient {
   private readonly now: () => Date;
   private readonly nonce: () => string;
 
-  constructor(private readonly options: RelayClientOptions) {
+  constructor(private readonly options: RelayClientOptions, private readonly requestSignal?: RelayRequestSignal) {
     this.fetchImpl = options.fetch ?? fetch;
     this.now = options.now ?? (() => new Date());
     this.nonce = options.nonce ?? (() => base64UrlEncode(randomBytes(16)));
@@ -89,6 +91,7 @@ export class RelayClient {
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       },
       ...(body === undefined ? {} : { body: bodyBytes }),
+      signal: this.requestSignal?.(),
     });
     if (!response.ok) {
       const message = (await response.text()).trim() || response.statusText || 'Relay request failed.';

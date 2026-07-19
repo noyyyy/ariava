@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { chmodSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateHostRotationIdentity } from '../src/identity/host-identity';
+import { createRuntimeHostIdentityStore } from '../src/identity/runtime-store';
 import {
   MACOS_IDENTITY_KEYCHAIN_SERVICE,
+  MACOS_IDENTITY_EVIDENCE_ACCOUNTS,
   MACOS_SECURITY_PATH,
   MacOSKeychainHostIdentityStore,
   type KeychainCommandRunner,
@@ -98,6 +100,125 @@ describe('MacOSKeychainHostIdentityStore', () => {
     expect(runner.items.has(`${current.hostId}.pending`)).toBe(false);
   });
 
+  test('isolates default and dev evidence and key accounts in the same service', async () => {
+    const runner = new FakeKeychain();
+    const defaultPath = metadataPath();
+    const devPath = metadataPath();
+    const defaultStore = new MacOSKeychainHostIdentityStore(defaultPath, runner);
+    const devStore = new MacOSKeychainHostIdentityStore(devPath, runner, {}, 'dev');
+
+    const defaultIdentity = await defaultStore.createFirstRun();
+    const devIdentity = await devStore.createFirstRun();
+
+    expect(defaultStore.evidenceAccount).toBe(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default);
+    expect(devStore.evidenceAccount).toBe(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev);
+    expect(defaultIdentity.hostId).not.toBe(devIdentity.hostId);
+    expect(runner.items.has(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default)).toBe(true);
+    expect(runner.items.has(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev)).toBe(true);
+    expect(runner.items.has(defaultIdentity.hostId)).toBe(true);
+    expect(runner.items.has(devIdentity.hostId)).toBe(true);
+    expect(JSON.parse(readFileSync(defaultPath, 'utf8')).current.hostId).toBe(defaultIdentity.hostId);
+    expect(JSON.parse(readFileSync(devPath, 'utf8')).current.hostId).toBe(devIdentity.hostId);
+
+    const defaultEvidence = runner.items.get(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default);
+    const defaultKey = runner.items.get(defaultIdentity.hostId);
+    const pending = await generateHostRotationIdentity(devIdentity.hostId, {
+      type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: `${devIdentity.hostId}.pending`,
+    });
+    await devStore.stageRotation({ operationId: 'dev-rotation', issuedAt: new Date().toISOString(), identity: pending.identity });
+    expect(runner.items.has(`${devIdentity.hostId}.pending`)).toBe(true);
+    await devStore.abortRotation('dev-rotation');
+    expect(runner.items.has(`${devIdentity.hostId}.pending`)).toBe(false);
+    await devStore.resetAfterExplicitConfirmation();
+
+    expect(runner.items.get(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default)).toEqual(defaultEvidence);
+    expect(runner.items.get(defaultIdentity.hostId)).toEqual(defaultKey);
+    expect((await defaultStore.load())?.hostId).toBe(defaultIdentity.hostId);
+  });
+
+  test('runtime store factory preserves default selection and accepts the closed dev selection', () => {
+    const defaultStore = createRuntimeHostIdentityStore(metadataPath(), 'darwin');
+    const devStore = createRuntimeHostIdentityStore(metadataPath(), 'darwin', 'dev');
+
+    expect(defaultStore).toBeInstanceOf(MacOSKeychainHostIdentityStore);
+    expect(devStore).toBeInstanceOf(MacOSKeychainHostIdentityStore);
+    expect((defaultStore as MacOSKeychainHostIdentityStore).evidenceAccount).toBe(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default);
+    expect((devStore as MacOSKeychainHostIdentityStore).evidenceAccount).toBe(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev);
+  });
+
+  test('dev creation rollback never changes default evidence or key accounts', async () => {
+    const runner = new FakeKeychain();
+    const defaultStore = new MacOSKeychainHostIdentityStore(metadataPath(), runner);
+    const defaultIdentity = await defaultStore.createFirstRun();
+    const defaultEvidence = runner.items.get(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default);
+    const defaultKey = runner.items.get(defaultIdentity.hostId);
+    const devStore = new MacOSKeychainHostIdentityStore(metadataPath(), runner, {
+      afterIndexWrite() { throw new Error('injected dev rollback'); },
+    }, 'dev');
+
+    await expect(devStore.createFirstRun()).rejects.toThrow('injected dev rollback');
+
+    expect(runner.items.has(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev)).toBe(false);
+    expect(runner.items.get(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default)).toEqual(defaultEvidence);
+    expect(runner.items.get(defaultIdentity.hostId)).toEqual(defaultKey);
+    expect((await defaultStore.load())?.hostId).toBe(defaultIdentity.hostId);
+  });
+
+  test('dev fails closed on copied default metadata and preserves every default artifact', async () => {
+    const runner = new FakeKeychain();
+    const defaultPath = metadataPath();
+    const crossedDevPath = metadataPath();
+    const defaultStore = new MacOSKeychainHostIdentityStore(defaultPath, runner);
+    const defaultIdentity = await defaultStore.createFirstRun();
+    const pending = await generateHostRotationIdentity(defaultIdentity.hostId, {
+      type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: `${defaultIdentity.hostId}.pending`,
+    });
+    await defaultStore.stageRotation({ operationId: 'default-pending', issuedAt: new Date().toISOString(), identity: pending.identity });
+    copyFileSync(defaultPath, crossedDevPath);
+
+    const defaultMetadata = readFileSync(defaultPath);
+    const crossedMetadata = readFileSync(crossedDevPath);
+    const defaultEvidence = runner.items.get(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default);
+    const defaultCurrent = runner.items.get(defaultIdentity.hostId);
+    const defaultPending = runner.items.get(`${defaultIdentity.hostId}.pending`);
+    const crossedDevStore = new MacOSKeychainHostIdentityStore(crossedDevPath, runner, {}, 'dev');
+    const crossedNext = await generateHostRotationIdentity(defaultIdentity.hostId, {
+      type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: `${defaultIdentity.hostId}.pending`,
+    });
+
+    await expect(crossedDevStore.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    await expect(crossedDevStore.loadPending()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    await expect(crossedDevStore.stageRotation({ operationId: 'crossed', issuedAt: new Date().toISOString(), identity: crossedNext.identity }))
+      .rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    await expect(crossedDevStore.abortRotation('default-pending')).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    await expect(crossedDevStore.promoteRotation('default-pending')).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    await expect(crossedDevStore.resetAfterExplicitConfirmation()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+
+    expect(runner.items.has(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev)).toBe(false);
+    expect(runner.items.get(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default)).toEqual(defaultEvidence);
+    expect(runner.items.get(defaultIdentity.hostId)).toEqual(defaultCurrent);
+    expect(runner.items.get(`${defaultIdentity.hostId}.pending`)).toEqual(defaultPending);
+    expect(readFileSync(defaultPath)).toEqual(defaultMetadata);
+    expect(readFileSync(crossedDevPath)).toEqual(crossedMetadata);
+  });
+
+  test('missing selected evidence rejects metadata without changing it or its key', async () => {
+    const runner = new FakeKeychain();
+    const devPath = metadataPath();
+    const devStore = new MacOSKeychainHostIdentityStore(devPath, runner, {}, 'dev');
+    const identity = await devStore.createFirstRun();
+    const metadata = readFileSync(devPath);
+    const current = runner.items.get(identity.hostId);
+    runner.items.delete(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev);
+
+    await expect(devStore.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    await expect(devStore.resetAfterExplicitConfirmation()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+
+    expect(readFileSync(devPath)).toEqual(metadata);
+    expect(runner.items.get(identity.hostId)).toEqual(current);
+    expect(runner.items.has(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev)).toBe(false);
+  });
+
   test('requires an absolute secure metadata path before any Keychain write', async () => {
     const runner = new FakeKeychain();
     expect(() => new MacOSKeychainHostIdentityStore('relative.json', runner)).toThrow();
@@ -132,7 +253,7 @@ describe('MacOSKeychainHostIdentityStore', () => {
     const store = new MacOSKeychainHostIdentityStore(path, runner);
     await store.createFirstRun();
     runner.items.clear();
-    await expect(store.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_MISSING' });
+    await expect(store.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
   });
 
   for (const phase of ['afterSentinel', 'afterKeyWrite', 'afterKeyVerification', 'afterIndexWrite'] as const) {

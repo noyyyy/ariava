@@ -6,15 +6,22 @@ const DEFAULT_LOG_PATH = join(homedir(), '.config', 'ariava', 'pi-extension.log'
 
 const lastThrottledLogAt = new Map<string, number>();
 
-export function logExtensionError(label: string, error: unknown, logPath = DEFAULT_LOG_PATH): void {
+export function resolveExtensionLogPath(explicitLogPath?: string): string {
+  if (explicitLogPath !== undefined) return explicitLogPath;
+  const environmentLogPath = process.env.ARIAVA_PI_LOG_PATH;
+  return environmentLogPath?.trim() ? environmentLogPath : DEFAULT_LOG_PATH;
+}
+
+export function logExtensionError(label: string, error: unknown, logPath?: string): void {
+  const resolvedLogPath = resolveExtensionLogPath(logPath);
   const entry = JSON.stringify({
     timestamp: new Date().toISOString(),
     label,
     error: serializeError(error),
   });
 
-  void mkdir(dirname(logPath), { recursive: true })
-    .then(() => appendFile(logPath, `${entry}\n`, 'utf8'))
+  void mkdir(dirname(resolvedLogPath), { recursive: true })
+    .then(() => appendFile(resolvedLogPath, `${entry}\n`, 'utf8'))
     .catch(() => {
       // Logging must never affect pi interaction.
     });

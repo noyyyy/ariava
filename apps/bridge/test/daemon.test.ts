@@ -27,6 +27,29 @@ function decode(bytes: Uint8Array | ArrayBuffer | SharedArrayBuffer | null | und
   return decoder.decode(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)).trim();
 }
 
+async function createLongPollingDaemon(relayBaseUrl: string): Promise<BridgeDaemon> {
+  const root = join(tmpdir(), `bridge-daemon-stop-${Date.now()}-${roots.length}`);
+  roots.push(root);
+  mkdirSync(root, { mode: 0o700 });
+  const identityPath = join(root, 'identity.json');
+  const store = new LinuxJsonHostIdentityStore(identityPath);
+  const identity = await store.createFirstRun();
+  const config = loadBridgeConfig();
+  Object.assign(config, {
+    runtimePlatform: 'linux',
+    hostPlatform: 'linux',
+    hostId: identity.hostId,
+    identity: publicIdentityMetadata(identity),
+    relayBaseUrl,
+    pollIntervalMs: 60_000,
+    configPath: join(root, 'config.json'),
+    statePath: join(root, 'state.json'),
+    identityPath,
+    agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+  });
+  return new BridgeDaemon(config, [{ name: 'test', listSessions: async () => [] }], store);
+}
+
 describe('BridgeDaemon', () => {
   test('loads PaiDriver by default', () => {
     const config = loadBridgeConfig();
@@ -136,6 +159,30 @@ describe('BridgeDaemon', () => {
       if (previousSecret === undefined) delete process.env.ARIAVA_TEST_PRIVATE_KEY;
       else process.env.ARIAVA_TEST_PRIVATE_KEY = previousSecret;
     }
+  });
+
+  test('stop cancels the polling delay and runForever terminates', async () => {
+    const daemon = await createLongPollingDaemon('http://127.0.0.1:1');
+    await daemon.start();
+    const run = daemon.runForever();
+    await Bun.sleep(20);
+    daemon.stop();
+    await expect(Promise.race([run.then(() => 'stopped'), Bun.sleep(500).then(() => 'timeout')])).resolves.toBe('stopped');
+  });
+
+  test('stop aborts an in-flight Relay request and terminates the run loop', async () => {
+    let requestStarted!: () => void;
+    const started = new Promise<void>((resolveStarted) => { requestStarted = resolveStarted; });
+    const relay = Bun.serve({ port: 0, fetch: () => new Promise<Response>(() => {
+      requestStarted();
+    }) });
+    servers.push(relay);
+    const daemon = await createLongPollingDaemon(`http://127.0.0.1:${relay.port}`);
+    await daemon.start();
+    const run = daemon.runForever();
+    await started;
+    daemon.stop();
+    await expect(Promise.race([run.then(() => 'stopped'), Bun.sleep(500).then(() => 'timeout')])).resolves.toBe('stopped');
   });
 
   test('CLI help advertises identity-safe pair and no claim-code flow', () => {

@@ -1,3 +1,4 @@
+import { once } from 'node:events';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { CommandResult, SessionStatus } from '@ariava/protocol';
 import { SESSION_STATUSES } from '@ariava/protocol';
@@ -20,18 +21,25 @@ export class AgentAdapterServer {
     this.activePort = config.port;
   }
 
-  start(): void {
-    this.server = createServer((request, response) => {
+  async start(): Promise<void> {
+    if (this.server) return;
+    const server = createServer((request, response) => {
       void this.handle(request, response);
     });
-    this.server.listen(this.config.port, '127.0.0.1');
-    const address = this.server.address();
-    if (address && typeof address === 'object') {
-      this.activePort = address.port;
+    this.server = server;
+    server.listen(this.config.port, '127.0.0.1');
+    try {
+      await once(server, 'listening');
+    } catch (error) {
+      if (this.server === server) this.server = null;
+      throw error;
     }
+    const address = server.address();
+    if (address && typeof address === 'object') this.activePort = address.port;
   }
 
   stop(closeActiveConnections = false): void {
+    this.registry.cancelCommandPolls();
     if (!this.server) return;
     if (closeActiveConnections && 'closeAllConnections' in this.server) {
       this.server.closeAllConnections();

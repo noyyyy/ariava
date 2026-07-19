@@ -87,12 +87,11 @@ describe('ariavaPiExtension', () => {
     expect(registeredSessions).toHaveLength(1);
 
     await new Promise((resolve) => setTimeout(resolve, 5_100));
-    expect(notifications).toEqual([
-      {
-        message: 'Ariava bridge did not register this pi session within 5s. Watch integration may be unavailable; check the local bridge on 127.0.0.1:7272.',
-        level: 'warning',
-      },
-    ]);
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.level).toBe('warning');
+    expect(notifications[0]?.message).toBe(
+      'Ariava bridge did not register this pi session within 5s. Check that the selected local bridge profile is running and its Agent Adapter discovery file is available.',
+    );
 
     resolveRegistration({ sessionId: 'sess-1', registeredAt: '2026-07-08T00:00:00Z' });
   });

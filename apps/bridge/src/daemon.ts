@@ -84,9 +84,12 @@ export class BridgeDaemon {
     this.router = new CommandRouter(this.stateStore, new Map(this.drivers.map((driver) => [driver.name, driver])), config.hostId);
   }
 
+  private stopped = false;
+  private wakeRunLoop?: () => void;
+  private relayAbortController = new AbortController();
   async start(): Promise<void> {
     await this.validateStartup();
-    this.adapterServer.start();
+    await this.adapterServer.start();
     writeAgentAdapterConfig(this.config.agentAdapter.configPath, { url: this.adapterServer.url, secret: this.config.agentAdapter.secret });
   }
 
@@ -109,7 +112,10 @@ export class BridgeDaemon {
     if (!this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
       throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Configured identity metadata does not match the local Host identity');
     }
-    this.relayClient = new RelayClient({ baseUrl: this.config.relayBaseUrl, signer: identity.signer });
+    this.relayClient = new RelayClient(
+      { baseUrl: this.config.relayBaseUrl, signer: identity.signer },
+      () => this.relayAbortController.signal,
+    );
     this.startupValidated = true;
   }
 
@@ -126,7 +132,12 @@ export class BridgeDaemon {
     return this.relayClient;
   }
 
-  stop(): void { this.adapterServer.stop(); }
+  stop(): void {
+    this.stopped = true;
+    this.relayAbortController.abort();
+    this.adapterServer.stop(true);
+    this.wakeRunLoop?.();
+  }
   get adapterUrl(): string { return this.adapterServer.url; }
   get driverNames(): string[] { return this.drivers.map((driver) => driver.name); }
 
@@ -168,14 +179,25 @@ export class BridgeDaemon {
   }
 
   async runForever(): Promise<void> {
-    while (true) {
+    this.stopped = false;
+    if (this.relayAbortController.signal.aborted) this.relayAbortController = new AbortController();
+    while (!this.stopped) {
       try { await this.syncOnce(); }
       catch (error) {
+        if (this.stopped || isAbortError(error)) break;
         this.stateStore.queuePendingEvent(this.buildBridgeFailureEvent(error));
         await this.flushPendingEvents();
       }
-      await sleep(this.config.pollIntervalMs);
+      if (!this.stopped) await this.waitForNextPoll();
     }
+  }
+
+  private async waitForNextPoll(): Promise<void> {
+    await Promise.race([
+      sleep(this.config.pollIntervalMs),
+      new Promise<void>((resolveStop) => { this.wakeRunLoop = resolveStop; }),
+    ]);
+    this.wakeRunLoop = undefined;
   }
 
   private buildEnrollment(identity: HostIdentity): HostEnrollmentRequest {
@@ -275,6 +297,10 @@ export class BridgeDaemon {
         .map(([, value]) => value as string),
     ].filter((value): value is string => Boolean(value))));
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
 }
 
 function deriveEventTypeLabel(type: CanonicalEvent['type']): string {

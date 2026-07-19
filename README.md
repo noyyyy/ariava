@@ -26,6 +26,8 @@
 - [ ] End-to-end encryption
 - [ ] Project management
 - [ ] Invoke a new Pi session
+- [ ] Codex/Claude Code/Cursor integration
+- [ ] Summary and memory
 
 ## Getting Started
 

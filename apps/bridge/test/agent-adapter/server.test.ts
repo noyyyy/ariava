@@ -15,13 +15,13 @@ describe('AgentAdapterServer', () => {
   let server: AgentAdapterServer;
   let secret: string;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'bridge-server-'));
     store = new BridgeStateStore(join(dir, 'state.json'));
     registry = new AgentAdapterRegistry('host-1', store);
     secret = 'test-secret-token';
     server = new AgentAdapterServer({ port: 0, secret, hostId: 'host-1' }, registry);
-    server.start();
+    await server.start();
   });
 
   afterEach(() => {
@@ -187,4 +187,32 @@ describe('AgentAdapterServer', () => {
     const resolved = await registry.waitForResult('cmd-1', { timeoutMs: 50 });
     expect(resolved).toEqual(result);
   });
+  test('awaits bind readiness and reports an occupied port', async () => {
+    const occupied = new AgentAdapterServer({ port: 0, secret, hostId: 'host-1' }, registry);
+    await occupied.start();
+    const port = Number(new URL(occupied.url).port);
+    const conflicting = new AgentAdapterServer({ port, secret, hostId: 'host-1' }, registry);
+    try {
+      await expect(conflicting.start()).rejects.toMatchObject({ code: 'EADDRINUSE' });
+    } finally {
+      conflicting.stop();
+      occupied.stop();
+    }
+  });
+
+  test('stop completes an active command long poll without waiting for its timeout', async () => {
+    registry.register({ sessionId: 'sess-1', provider: 'pi', project: 'p', cwd: '/' });
+    const request = fetch(url('/v1/agent/sessions/sess-1/commands?timeout=120000'), {
+      method: 'GET',
+      headers: headers(),
+    });
+    await Bun.sleep(10);
+    server.stop();
+    const result = await Promise.race([
+      request.then((response) => response.status).catch(() => 0),
+      Bun.sleep(500).then(() => -1),
+    ]);
+    expect(result).not.toBe(-1);
+  });
+
 });

@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CommandEnvelope, CommandResult } from '@ariava/protocol';
 import type { AgentAdapterRegistry } from '../../../apps/bridge/src/agent-adapter/registry';
-import { AgentAdapterClient } from '../src/adapter';
+import { AgentAdapterClient, resolveAgentAdapterConfigPath } from '../src/adapter';
 import type { PiSessionInfo } from '../src/session';
 
 describe('AgentAdapterClient', () => {
@@ -13,8 +13,11 @@ describe('AgentAdapterClient', () => {
   let baseUrl: string;
   let client: AgentAdapterClient;
   let registry: AgentAdapterRegistry;
+  let stopServer: (() => void) | undefined;
 
+  const originalDiscoveryPath = process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
   beforeEach(async () => {
+    delete process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
     dir = mkdtempSync(join(tmpdir(), 'pi-adapter-'));
     secret = 'test-secret';
 
@@ -25,15 +28,22 @@ describe('AgentAdapterClient', () => {
     const store = new BridgeStateStore(join(dir, 'state.json'));
     registry = new Registry('host-1', store);
     const server = new AgentAdapterServer({ port: 0, secret, hostId: 'host-1' }, registry);
-    server.start();
+    await server.start();
+    stopServer = () => server.stop();
     baseUrl = server.url;
 
     client = new AgentAdapterClient({ baseUrl, secret });
+  });
 
-    afterEach(() => {
-      server.stop();
-      rmSync(dir, { recursive: true, force: true });
-    });
+  afterEach(() => {
+    stopServer?.();
+    stopServer = undefined;
+    rmSync(dir, { recursive: true, force: true });
+    if (originalDiscoveryPath === undefined) {
+      delete process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
+    } else {
+      process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = originalDiscoveryPath;
+    }
   });
 
   function makeSession(sessionId: string): PiSessionInfo {
@@ -145,6 +155,37 @@ describe('AgentAdapterClient', () => {
     expect(result.sessionId).toBe('sess-2');
   });
 
+  test('explicit discovery path takes precedence over environment selection', async () => {
+    const explicitConfigPath = join(dir, 'explicit-agent-adapter.json');
+    writeFileSync(explicitConfigPath, JSON.stringify({ url: baseUrl, secret }));
+    process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = join(dir, 'missing-environment-discovery.json');
+
+    const fileClient = new AgentAdapterClient({ configPath: explicitConfigPath });
+    const result = await fileClient.registerSession(makeSession('sess-explicit'));
+
+    expect(result.sessionId).toBe('sess-explicit');
+  });
+
+  test('reads discovery path selected from the process environment', async () => {
+    const environmentConfigPath = join(dir, 'environment-agent-adapter.json');
+    writeFileSync(environmentConfigPath, JSON.stringify({ url: baseUrl, secret }));
+    process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = environmentConfigPath;
+
+    const fileClient = new AgentAdapterClient();
+    const result = await fileClient.registerSession(makeSession('sess-environment'));
+
+    expect(result.sessionId).toBe('sess-environment');
+  });
+
+  test('uses the production discovery path when the environment selection is absent or empty', () => {
+    delete process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
+    const defaultPath = join(homedir(), '.config', 'ariava', 'agent-adapter.json');
+    expect(resolveAgentAdapterConfigPath()).toBe(defaultPath);
+
+    process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = '   ';
+    expect(resolveAgentAdapterConfigPath()).toBe(defaultPath);
+  });
+
   test('reloads discovery file after adapter auth is rejected', async () => {
     const configPath = join(dir, 'agent-adapter.json');
     writeFileSync(configPath, JSON.stringify({ url: baseUrl, secret: 'stale-secret' }));
@@ -154,6 +195,21 @@ describe('AgentAdapterClient', () => {
 
     await client.registerSession(makeSession('sess-1'));
     writeFileSync(configPath, JSON.stringify({ url: baseUrl, secret }));
+
+    await expect(fileClient.heartbeat('sess-1', 'working', 'Busy')).resolves.toBeUndefined();
+  });
+
+  test('reloads the same environment-selected discovery file after a 401', async () => {
+    const environmentConfigPath = join(dir, 'dev-agent-adapter.json');
+    writeFileSync(environmentConfigPath, JSON.stringify({ url: baseUrl, secret: 'stale-secret' }));
+    process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = environmentConfigPath;
+
+    const fileClient = new AgentAdapterClient();
+    await expect(fileClient.heartbeat('sess-1', 'working', 'Busy')).rejects.toThrow('Unauthorized');
+
+    await client.registerSession(makeSession('sess-1'));
+    writeFileSync(environmentConfigPath, JSON.stringify({ url: baseUrl, secret }));
+    process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = join(dir, 'production-agent-adapter.json');
 
     await expect(fileClient.heartbeat('sess-1', 'working', 'Busy')).resolves.toBeUndefined();
   });
