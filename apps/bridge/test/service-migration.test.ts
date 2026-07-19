@@ -154,6 +154,17 @@ describe('install metadata migration', () => {
     }
   });
 
+  test('adds runtime metadata for new records while preserving old records without fabricated versions', () => {
+    const path = installPath();
+    const oldService = normalizedLegacyService;
+    saveInstallMetadata({ service: oldService }, path);
+    expect(loadInstallMetadata(path).service).toEqual(oldService);
+
+    const currentService = { ...oldService, runtimeName: 'node' as const, runtimeVersion: 'v22.1.0' };
+    saveInstallMetadata({ service: currentService }, path);
+    expect(loadInstallMetadata(path).service).toEqual(currentService);
+  });
+
   test('round-trips v2 config path, public identity reference, and installer metadata without private material', () => {
     const path = installPath();
     const service = { ...normalizedLegacyService, ...v2Fields };

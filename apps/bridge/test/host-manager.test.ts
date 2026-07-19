@@ -26,7 +26,15 @@ import type { PiExtensionStatus } from '../src/host-manager/pi-extension';
 import type { HostServiceStatusInput } from '../src/host-manager/status';
 
 const roots: string[] = [];
-const homeOverride = join(tmpdir(), `ariava-test-home-${Date.now()}`);
+let homeOverride = '';
+
+beforeEach(() => {
+  homeOverride = join(tmpdir(), `ariava-test-home-${Date.now()}-${Math.random()}`);
+  process.env.HOME = homeOverride;
+  process.env.PI_CODING_AGENT_DIR = join(homeOverride, '.pi', 'agent');
+  mkdirSync(homeOverride, { recursive: true });
+  roots.push(homeOverride);
+});
 
 afterEach(() => {
   for (const root of roots.splice(0)) {

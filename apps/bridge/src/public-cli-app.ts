@@ -78,6 +78,8 @@ import {
 import { ARIAVA_CONFIG_ROOT } from './host-manager/paths';
 import { buildHostManagerStatus, isConfigComplete } from './host-manager/status';
 import { readAgentAdapterConfig } from './agent-adapter/config';
+import { inspectCurrentNodeRuntime, probeNodeRuntimePath } from './runtime/node-runtime';
+import { runNodeCryptoSelfTest } from './e2e/node-crypto-self-test';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const CLI_VERSION = readPackageVersion();
@@ -108,6 +110,9 @@ export interface PublicCliDependencies {
   spawn(command: string, args: string[], options?: Parameters<typeof spawnSync>[2]): ReturnType<typeof spawnSync>;
   spawnAsync(command: string, args: string[], options: { signal?: AbortSignal }): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }>;
   createHostIdentityStore(path: string, platform: NodeJS.Platform | string): HostIdentityStore;
+  inspectRuntime(): ReturnType<typeof inspectCurrentNodeRuntime>;
+  probeRuntimePath(path: string): ReturnType<typeof inspectCurrentNodeRuntime>;
+  cryptoSelfTest(): boolean;
 }
 
 export interface PublicCliOnboardingDependencies {
@@ -137,6 +142,9 @@ const defaultDependencies: PublicCliDependencies = {
   spawn: spawnSync,
   spawnAsync: spawnOnboardingChild,
   createHostIdentityStore: createRuntimeHostIdentityStore,
+  inspectRuntime: inspectCurrentNodeRuntime,
+  probeRuntimePath: probeNodeRuntimePath,
+  cryptoSelfTest: runNodeCryptoSelfTest,
 };
 
 export async function runPublicCli(
@@ -152,13 +160,21 @@ export async function runPublicCli(
     return runSetup(deps, args.slice(1), json, onboardingOverrides);
   }
   try {
+    if (command === 'internal') requireProductionRuntime(deps.inspectRuntime());
     if (command === 'internal') {
       await runInternal(args.slice(1), deps);
       return 0;
     }
     switch (command) {
       case '--help':
-      case 'help': print(deps, json, okEnvelope('ok', 'Ariava CLI', { commands: commandSummary() }), formatHelp()); break;
+      case 'help': print(deps, json, okEnvelope('ok', 'Ariava CLI', { commands: commandSummary(), runtime: deps.inspectRuntime() }), formatHelp()); break;
+      case 'version': print(deps, json, okEnvelope('ok', CLI_VERSION, { version: CLI_VERSION, runtime: deps.inspectRuntime() }), CLI_VERSION); break;
+      default: requireProductionRuntime(deps.inspectRuntime());
+    }
+    switch (command) {
+      case '--help':
+      case 'help':
+      case 'version': break;
       case 'init': await runInit(deps, json); break;
       case 'config': await runConfig(deps, args.slice(1), json); break;
       case 'status': await runStatus(deps, args.slice(1), json); break;
@@ -300,6 +316,12 @@ async function runDoctor(deps: PublicCliDependencies, json: boolean): Promise<nu
     serviceSupportReason: manager.support.reason,
     ...serviceSupportInstructions(manager),
     nodeFound: Boolean(deps.currentRuntimePath()),
+    runtimeNameIsNode: deps.inspectRuntime().runtimeNameIsNode,
+    runtimeVersionSupported: deps.inspectRuntime().runtimeVersionSupported,
+    runtimePathMatchesCurrent: Boolean(serviceStatus.runtimePathMatchesCurrent ?? true),
+    serviceRuntimeNameIsNode: serviceStatus.runtimeNameIsNode ?? null,
+    serviceRuntimeVersionSupported: serviceStatus.runtimeVersionSupported ?? null,
+    runtimeCryptoSelfTestPassed: deps.cryptoSelfTest(),
     piFound: deps.commandExists('pi'),
     configComplete: isConfigComplete(resolved),
     serviceInstalled: serviceStatus.installed,
@@ -328,8 +350,11 @@ async function runDoctor(deps: PublicCliDependencies, json: boolean): Promise<nu
     identityReady,
     identityWarning: identity.status === 'rotation-pending' ? 'Host key rotation is pending; recover it before normal operation.' : undefined,
   });
-  const healthy = manager.support.supported && checks.nodeFound && checks.configComplete
-    && checks.serviceMetadataValid && checks.installerMetadataValid && checks.documentMetadataValid && identityReady;
+  const healthy = manager.support.supported && checks.nodeFound && checks.runtimeNameIsNode
+    && checks.runtimeVersionSupported && checks.runtimePathMatchesCurrent
+    && checks.serviceRuntimeNameIsNode !== false && checks.serviceRuntimeVersionSupported !== false
+    && checks.runtimeCryptoSelfTestPassed && checks.configComplete && checks.serviceMetadataValid
+    && checks.installerMetadataValid && checks.documentMetadataValid && identityReady;
   const envelope = {
     ok: healthy,
     code: healthy ? 'ok' : 'ERR_DOCTOR',
@@ -786,8 +811,13 @@ async function runInternal(argv: string[], deps: Pick<PublicCliDependencies, 'st
 
 function serviceInstallInput(deps: PublicCliDependencies, resolved: ResolvedAriavaConfig) {
   if (!resolved.identity) throw new HostIdentityError('ERR_IDENTITY_NOT_INITIALIZED', 'Host identity is not initialized; run `ariava init`');
+  const runtimePath = deps.realpath(deps.currentRuntimePath());
+  const runtime = deps.probeRuntimePath(runtimePath);
+  requireProductionRuntime(runtime);
   return {
-    runtimePath: deps.realpath(deps.currentRuntimePath()),
+    runtimePath,
+    runtimeName: 'node' as const,
+    runtimeVersion: runtime.runtimeVersion,
     ariavaBinPath: deps.realpath(deps.currentAriavaBinPath()),
     configPath: resolved.configPath,
     identityReference: structuredClone(resolved.identity.privateKeyStorage),
@@ -802,6 +832,16 @@ function installerPatch(deps: PublicCliDependencies, metadata: AriavaInstallMeta
     ariavaBinRealPath: deps.realpath(deps.currentAriavaBinPath()),
     recordedAt: new Date().toISOString(),
   } };
+}
+
+function requireProductionRuntime(runtime: ReturnType<typeof inspectCurrentNodeRuntime>): void {
+  if (!runtime.runtimeNameIsNode || !runtime.runtimeVersionSupported) {
+    throw new AriavaCliError(
+      'ERR_NODE_RUNTIME_UNSUPPORTED',
+      `Ariava requires Node.js 22 or newer for its production Bridge runtime. Current runtime: ${runtime.runtimeName} ${runtime.runtimeVersion}`,
+      { runtimeName: runtime.runtimeName, runtimeVersion: runtime.runtimeVersion },
+    );
+  }
 }
 
 async function runSetup(
@@ -1160,6 +1200,7 @@ const IDENTITY_MANAGED_CONFIG_KEYS = new Set([
 function commandSummary(): string[] {
   return [
     'ariava setup [--extension pi ... | --no-extensions] [--resume] [--json] [--yes] [--relay-base-url <URL>]',
+    'ariava version',
     'ariava init',
     'ariava status [pi]',
     'ariava pair <PAIRING_CODE>',

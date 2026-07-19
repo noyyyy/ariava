@@ -36,6 +36,9 @@ class Ariava < Formula
   end
 
   test do
+    node_major = shell_output("#{Formula[\"node\"].opt_bin}/node --version").delete_prefix("v").split(".").first.to_i
+    assert_operator node_major, :>=, 22
     assert_match "Ariava CLI", shell_output("#{bin}/ariava help")
+    assert_match "true", shell_output("#{Formula[\"node\"].opt_bin}/node -e 'import(\"#{libexec}/apps/bridge/dist/e2e/node-crypto-self-test.js\").then(m => console.log(m.runNodeCryptoSelfTest()))'")
   end
 end

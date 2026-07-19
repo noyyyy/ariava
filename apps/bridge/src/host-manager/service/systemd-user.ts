@@ -131,6 +131,9 @@ export class SystemdUserServiceManager implements ServiceManager {
       backend: this.backend,
       installedAt: input.installedAt ?? this.now(),
       runtimePath,
+      ...(input.runtimeName && input.runtimeVersion
+        ? { runtimeName: input.runtimeName, runtimeVersion: input.runtimeVersion }
+        : {}),
       ariavaBinPath,
       ...(input.configPath && input.identityReference
         ? { configPath, identityReference: structuredClone(input.identityReference) }
@@ -236,6 +239,8 @@ export class SystemdUserServiceManager implements ServiceManager {
       definitionPath: this.definitionPath,
       serviceId: this.serviceId,
       runtimePath: record.runtimePath,
+      ...(record.runtimeName ? { runtimeName: record.runtimeName, runtimeNameIsNode: record.runtimeName === 'node' } : {}),
+      ...(record.runtimeVersion ? { runtimeVersion: record.runtimeVersion, runtimeVersionSupported: supportedNodeVersion(record.runtimeVersion) } : {}),
       ariavaBinPath: record.ariavaBinPath,
       runtimePathMatchesCurrent: resolve(record.runtimePath) === resolve(currentRuntimePath),
       ariavaBinPathMatchesCurrent: resolve(record.ariavaBinPath) === resolve(currentAriavaBinPath),
@@ -356,6 +361,11 @@ export function quoteSystemdArgument(value: string): string {
     .replaceAll('$', () => '$$')}"`;
 }
 
+
+function supportedNodeVersion(version: string): boolean {
+  const major = /^v?(\d+)/u.exec(version)?.[1];
+  return major !== undefined && Number(major) >= 22;
+}
 
 function absoluteServicePath(path: string, field: string): string {
   if (!isAbsolute(path) || /[\u0000-\u001f\u007f-\u009f]/.test(path)) {

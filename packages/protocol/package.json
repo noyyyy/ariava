@@ -18,6 +18,10 @@
       "types": "./dist/events.d.ts",
       "default": "./dist/events.js"
     },
+    "./encryption": {
+      "types": "./dist/encryption.d.ts",
+      "default": "./dist/encryption.js"
+    },
     "./hosts": {
       "types": "./dist/hosts.d.ts",
       "default": "./dist/hosts.js"
@@ -46,6 +50,7 @@
       "types": "./dist/validation.d.ts",
       "default": "./dist/validation.js"
     },
-    "./fixtures/ed25519-request-vectors": "./dist/fixtures/ed25519-request-vectors.json"
+    "./fixtures/ed25519-request-vectors": "./dist/fixtures/ed25519-request-vectors.json",
+    "./fixtures/e2e-v1-vectors": "./dist/fixtures/e2e-v1-vectors.json"
   }
 }

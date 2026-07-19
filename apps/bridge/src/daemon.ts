@@ -26,6 +26,8 @@ import { ensureAriavaSecureDirectories, pathHasFilesystemEvidence, readSecureJso
 import { HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostIdentity, type HostIdentityStore } from './identity';
 import { RelayClient, RelayClientError } from './relay-client';
 import { BridgeStateStore } from './state-store';
+import { assertProductionNodeRuntime } from './runtime/node-runtime';
+import { assertNodeCryptoSelfTest } from './e2e/node-crypto-self-test';
 import type { AgentDriver, BridgeConfig, BridgeSyncResult } from './types';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -129,6 +131,8 @@ export class BridgeDaemon {
 
   private async validateStartup(): Promise<void> {
     if (this.startupValidated) return;
+    assertProductionNodeRuntime();
+    assertNodeCryptoSelfTest();
     this.verifyFilesystem();
     const identity = await this.resolveIdentityStore().load();
     if (!identity) throw new HostIdentityError('ERR_IDENTITY_NOT_INITIALIZED', 'Host identity is not initialized; run `ariava init`');

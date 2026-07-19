@@ -1,3 +1,4 @@
+<!-- ARIAVA_PUBLIC_CORE_README: PUBLISHABLE -->
 <p align="center">
   <img src="https://raw.githubusercontent.com/noyyyy/ariava/main/ariava.png" alt="Ariava" width="160" height="160">
 </p>
@@ -32,8 +33,8 @@
 
 ### Requirements
 
-- Node.js and npm
-- macOS, or Linux/WSL with a reachable systemd user service manager
+- Node.js 22 or newer and npm (the shipped CLI and service run on Node; end users do not need Bun)
+- macOS, or Linux/WSL with a reachable systemd user service manager (see the [WSL installation guide](docs/install-guide.md#wsl))
 - [Pi](https://pi.dev/) when selecting the Pi adapter
 
 The shortest first-run path is:
@@ -75,7 +76,7 @@ The command surface is intentionally narrow. Ariava does not expose arbitrary sh
 
 ## Build from Source
 
-Requirements: [Bun](https://bun.sh/) and Node.js.
+Requirements: [Bun](https://bun.sh/) for workspace/build orchestration and Node.js 22+ for the production Bridge crypto/runtime gate.
 
 ```bash
 git clone https://github.com/noyyyy/ariava.git

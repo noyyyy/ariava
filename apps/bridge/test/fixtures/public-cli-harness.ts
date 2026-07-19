@@ -101,11 +101,12 @@ function createFakeManager(): ServiceManager {
     backend,
     support,
     install(input) {
-      recordCall({ operation: 'install', ...input });
+      const { runtimeName: _runtimeName, runtimeVersion: _runtimeVersion, ...legacyObservableInput } = input;
+      recordCall({ operation: 'install', ...legacyObservableInput });
       if (scenario === 'install-failure') {
         throw new AriavaCliError('ERR_SERVICE_INSTALL', 'fixture install failed', { command: 'fixture install' });
       }
-      return record;
+      return { ...record, runtimeName: input.runtimeName, runtimeVersion: input.runtimeVersion };
     },
     uninstall() {
       recordCall({ operation: 'uninstall' });
@@ -164,5 +165,14 @@ const exitCode = await runPublicCli(process.argv.slice(2), {
   stdout: process.stdout,
   stderr: process.stderr,
   commandExists: () => false,
+  inspectRuntime: () => ({
+    runtimeName: 'node', runtimeVersion: 'v22.0.0', runtimePath: '/fixture/node',
+    runtimeNameIsNode: true, runtimeVersionSupported: true,
+  }),
+  probeRuntimePath: (runtimePath) => ({
+    runtimeName: 'node', runtimeVersion: 'v22.0.0', runtimePath,
+    runtimeNameIsNode: true, runtimeVersionSupported: true,
+  }),
+  cryptoSelfTest: () => true,
 });
 process.exitCode = exitCode;

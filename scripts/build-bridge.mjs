@@ -18,6 +18,8 @@ const built = spawnSync('bun', [
   'build',
   resolve(bridgeRoot, 'src', 'cli.ts'),
   resolve(bridgeRoot, 'src', 'public-cli.ts'),
+  resolve(bridgeRoot, 'src', 'e2e', 'node-crypto.ts'),
+  resolve(bridgeRoot, 'src', 'e2e', 'node-crypto-self-test.ts'),
   '--outdir', outputDirectory,
   '--target', 'node',
   '--format', 'esm',

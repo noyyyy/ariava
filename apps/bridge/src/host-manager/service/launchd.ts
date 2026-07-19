@@ -149,6 +149,9 @@ export class LaunchdServiceManager implements ServiceManager {
       backend: 'launchd',
       installedAt: input.installedAt ?? this.now(),
       runtimePath,
+      ...(input.runtimeName && input.runtimeVersion
+        ? { runtimeName: input.runtimeName, runtimeVersion: input.runtimeVersion }
+        : {}),
       ariavaBinPath,
       ...(input.configPath && input.identityReference
         ? { configPath, identityReference: structuredClone(input.identityReference) }
@@ -254,6 +257,8 @@ export class LaunchdServiceManager implements ServiceManager {
         loaded: false,
         processRunning: false,
         runtimePath: record.runtimePath,
+        ...(record.runtimeName ? { runtimeName: record.runtimeName, runtimeNameIsNode: record.runtimeName === 'node' } : {}),
+        ...(record.runtimeVersion ? { runtimeVersion: record.runtimeVersion, runtimeVersionSupported: supportedNodeVersion(record.runtimeVersion) } : {}),
         ariavaBinPath: record.ariavaBinPath,
         runtimePathMatchesCurrent: resolve(record.runtimePath) === resolve(currentRuntimePath),
         ariavaBinPathMatchesCurrent: resolve(record.ariavaBinPath) === resolve(currentAriavaBinPath),
@@ -282,6 +287,8 @@ export class LaunchdServiceManager implements ServiceManager {
       loaded,
       processRunning: loaded && /\bpid\s*=\s*\d+\b/.test(printResult.stdout),
       runtimePath: record.runtimePath,
+      ...(record.runtimeName ? { runtimeName: record.runtimeName, runtimeNameIsNode: record.runtimeName === 'node' } : {}),
+      ...(record.runtimeVersion ? { runtimeVersion: record.runtimeVersion, runtimeVersionSupported: supportedNodeVersion(record.runtimeVersion) } : {}),
       ariavaBinPath: record.ariavaBinPath,
       runtimePathMatchesCurrent: resolve(record.runtimePath) === resolve(currentRuntimePath),
       ariavaBinPathMatchesCurrent: resolve(record.ariavaBinPath) === resolve(currentAriavaBinPath),
@@ -482,6 +489,11 @@ ${escapedArgs}
   </dict>
 </plist>
 `;
+}
+
+function supportedNodeVersion(version: string): boolean {
+  const major = /^v?(\d+)/u.exec(version)?.[1];
+  return major !== undefined && Number(major) >= 22;
 }
 
 function absoluteServicePath(path: string, field: string): string {

@@ -19,6 +19,13 @@ export interface CanonicalSessionState {
   snoozedUntil?: string;
 }
 
+/** Host-local plaintext model. It must never be used as a Relay persistence/read projection. */
+export type LocalCanonicalSessionPlaintext = CanonicalSessionState;
+
+export interface DecryptedWatchSession extends CanonicalSessionState {
+  revision: number;
+}
+
 /** A session in a Host-wide authoritative current-session replacement snapshot. */
 export interface ActiveSessionSnapshot extends CanonicalSessionState {
   presence: 'active';
