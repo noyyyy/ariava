@@ -34,8 +34,10 @@
 ### Requirements
 
 - Node.js and npm
-- macOS, or Linux/WSL with a reachable systemd user service manager
+- macOS, or Linux/WSL with a reachable systemd user service manager (see the [WSL installation guide](docs/install-guide.md#wsl))
 - [Pi](https://pi.dev/)
+
+For Ubuntu/Debian WSL, install `libpam-systemd` and `dbus-user-session`, enable systemd, and verify `systemctl --user` before installing Ariava. Follow the [WSL section of the installation guide](docs/install-guide.md#wsl).
 
 Install Ariava globally, initialize the Host, and install its user-scoped service:
 
