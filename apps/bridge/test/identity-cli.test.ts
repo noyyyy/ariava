@@ -59,7 +59,6 @@ describe('identity-safe public CLI', () => {
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       const path = new URL(request.url).pathname; paths.push(path);
-      if (path === '/v2/bridge/registration') return new Response('missing', { status: 404 });
       if (path === '/v2/bridge/enroll') return Response.json({ host: hostProjection(identity.hostId) });
       if (path === '/v2/bridge/watches') return Response.json({ watches: [] });
       if (path === '/v2/bridge/pair-watch') {
@@ -74,7 +73,23 @@ describe('identity-safe public CLI', () => {
     const output: string[] = []; const errors: string[] = [];
     const code = await runPublicCli([...argv, '--json'], cliDeps(root, identityPath, () => config, (next) => { config = next; }, output, errors));
     expect(code, errors.join('')).toBe(0);
-    expect(paths).toEqual(['/v2/bridge/registration', '/v2/bridge/enroll', finalPath]);
+    expect(paths).toEqual(['/v2/bridge/enroll', finalPath]);
+  });
+
+  test('rejects invalid pair codes before identity loading, enrollment, or Relay requests', async () => {
+    for (const pairingCode of ['ABCDEFGH', 'ABCD-EFGH', ' PEYX7K', 'PEYX7K ']) {
+      const root = mkdtempSync(join(tmpdir(), 'ariava-invalid-pair-cli-')); roots.push(root);
+      const output: string[] = []; const errors: string[] = [];
+      let storeCalls = 0; let fetchCalls = 0;
+      globalThis.fetch = (async () => { fetchCalls += 1; return Response.json({ ok: true }); }) as typeof fetch;
+      const deps = cliDeps(root, join(root, 'identity.json'), () => ({}), () => {}, output, errors);
+      deps.createHostIdentityStore = () => { storeCalls += 1; throw new Error('identity should not load'); };
+
+      expect(await runPublicCli(['pair', pairingCode, '--json'], deps)).toBe(1);
+      expect(JSON.parse(errors[0]!).message).toContain('exactly 6 Crockford symbols');
+      expect(storeCalls).toBe(0);
+      expect(fetchCalls).toBe(0);
+    }
   });
 
   test('rejects invalid pair codes before identity loading, enrollment, or Relay requests', async () => {

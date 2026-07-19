@@ -395,18 +395,13 @@ async function loadIdentityClient(deps: PublicCliDependencies): Promise<Identity
 }
 
 async function ensureHostEnrollment(context: IdentityClientContext): Promise<void> {
-  try {
-    await context.client.updateHost(context.metadata);
-  } catch (error) {
-    if (!(error instanceof RelayClientError) || error.status !== 404) throw error;
-    await context.client.enrollHost({
-      hostId: context.identity.hostId,
-      keyId: context.identity.keyId,
-      algorithm: context.identity.algorithm,
-      publicKey: context.identity.publicKey,
-      ...context.metadata,
-    });
-  }
+  await context.client.enrollHost({
+    hostId: context.identity.hostId,
+    keyId: context.identity.keyId,
+    algorithm: context.identity.algorithm,
+    publicKey: context.identity.publicKey,
+    ...context.metadata,
+  });
 }
 
 function hostMetadataContext(deps: PublicCliDependencies) {

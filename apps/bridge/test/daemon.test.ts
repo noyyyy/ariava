@@ -204,7 +204,6 @@ describe('BridgeDaemon', () => {
       expect(request.headers.get('x-ariava-key-id')).toBe(identity.keyId);
       expect(request.headers.has('x-host-auth')).toBe(false);
       expect(request.headers.has('authorization')).toBe(false);
-      if (url.pathname === '/v2/bridge/registration') return new Response('not enrolled', { status: 404 });
       if (url.pathname === '/v2/bridge/enroll') {
         const body = await request.json() as any;
         expect(body).toMatchObject({ hostId: identity.hostId, platform: 'linux' });
@@ -228,6 +227,6 @@ describe('BridgeDaemon', () => {
       configPath: join(root, 'config.json'), statePath: join(root, 'state.json'), agentAdapter: { ...config.agentAdapter, configPath: join(root, 'adapter.json') } });
     const result = await new BridgeDaemon(config).pairWatch('peyx7k');
     expect(result.watchDevice.watchDeviceId).toBe(`watch_${'C'.repeat(43)}`);
-    expect(paths).toEqual(['/v2/bridge/registration', '/v2/bridge/enroll', '/v2/bridge/pair-watch']);
+    expect(paths).toEqual(['/v2/bridge/enroll', '/v2/bridge/pair-watch']);
   });
 });

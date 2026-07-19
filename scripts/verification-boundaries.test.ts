@@ -69,9 +69,14 @@ describe('transition verification ownership', () => {
 
   test('safe npm publishing invokes only the Public Core gate and rejects the private README', () => {
     const publisher = readFileSync('scripts/publish-npm-safe.sh', 'utf8');
-    expect(publisher).toContain('bun run verify:public');
+    const publicVerifyCommand = `bun run ${publicEntry}`;
+    expect(publisher).toContain(publicVerifyCommand);
     expect(publisher).toContain('assert-publication-readme.mjs');
     expect(rootPackage.scripts.prepublishOnly).toContain('assert-publication-readme.mjs');
-    expect(publisher).not.toMatch(/bun run verify(?:\s|$)/u);
+    if (isPublicCandidate) {
+      expect(publisher).not.toContain('bun run verify:public');
+    } else {
+      expect(publisher).not.toMatch(/bun run verify(?:\s|$)/u);
+    }
   });
 });

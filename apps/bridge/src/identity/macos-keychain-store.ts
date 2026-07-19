@@ -452,6 +452,14 @@ function decodeSecurityPassword(stdout: Uint8Array): Uint8Array {
   return new Uint8Array(Buffer.from(encoded, 'hex'));
 }
 
+function decodeSecurityPassword(stdout: Uint8Array): Uint8Array {
+  const encoded = Buffer.from(stdout).toString('utf8').trimEnd();
+  if (!/^(?:[0-9a-f]{2})+$/iu.test(encoded)) {
+    throw new HostIdentityError('ERR_IDENTITY_INVALID', 'macOS Keychain Host identity encoding is invalid');
+  }
+  return new Uint8Array(Buffer.from(encoded, 'hex'));
+}
+
 function isKeychainMissing(result: KeychainCommandResult): boolean {
   return result.status === 44 || /could not be found/iu.test(result.stderr);
 }

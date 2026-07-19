@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 export interface IsolatedPublicCliEnvironment {
@@ -7,6 +7,8 @@ export interface IsolatedPublicCliEnvironment {
   launchctlLogPath: string;
   piLogPath: string;
 }
+
+const publicPackageVersion = (JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as { version: string }).version;
 
 export function createIsolatedPublicCliEnvironment(
   home: string,
@@ -36,7 +38,7 @@ export function createIsolatedPublicCliEnvironment(
       PATH: `${binDir}${delimiter}${process.env.PATH ?? '/usr/bin:/bin:/usr/sbin:/sbin'}`,
       ARIAVA_TEST_LAUNCHCTL_LOG: launchctlLogPath,
       ARIAVA_TEST_PI_LOG: piLogPath,
-      ARIAVA_TEST_PACKAGE_VERSION: '0.1.4',
+      ARIAVA_TEST_PACKAGE_VERSION: publicPackageVersion,
     },
     launchctlPath,
     launchctlLogPath,
