@@ -89,6 +89,12 @@ export function validateHostEnrollmentRequestSyntax(value: unknown): ValidationR
   requireNonEmptyString(object.hostName, 'hostName', issues);
   requireNonEmptyString(object.bridgeVersion, 'bridgeVersion', issues);
   if (!isHostPlatform(object.platform)) issues.push('platform must be macos or linux');
+  if (object.encryptionBinding !== undefined) {
+    const binding = object.encryptionBinding as { entityType?: unknown; entityId?: unknown; identityKeyId?: unknown };
+    if (!binding || binding.entityType !== 'host' || binding.entityId !== object.hostId || binding.identityKeyId !== object.keyId) {
+      issues.push('encryptionBinding does not match Host identity');
+    }
+  }
   return result(value as HostEnrollmentRequest, issues);
 }
 
@@ -150,7 +156,8 @@ async function validateEnrollmentIdentityBinding<T extends HostEnrollmentRequest
 function validateIdentityEnrollment(object: Record<string, unknown>, type: EntityType, issues: string[]): void {
   const entityField = 'hostId';
   const expectedKeys = [entityField, 'keyId', 'algorithm', 'publicKey', 'hostName', 'platform', 'bridgeVersion'];
-  requireExactKeys(object, expectedKeys, issues);
+  const acceptedKeys = object.encryptionBinding === undefined ? expectedKeys : [...expectedKeys, 'encryptionBinding'];
+  requireExactKeys(object, acceptedKeys, issues);
   const entityId = object[entityField];
   if (typeof entityId !== 'string' || !isEntityId(entityId, type)) issues.push(`${entityField} is invalid`);
   if (typeof object.keyId !== 'string' || !/^key_[A-Za-z0-9_-]{43}$/u.test(object.keyId)) issues.push('keyId is invalid');

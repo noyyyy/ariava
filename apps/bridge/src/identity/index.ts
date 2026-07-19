@@ -6,3 +6,6 @@ export * from './request-signer';
 export * from './types';
 export * from './manager';
 export * from './runtime-store';
+export * from './host-encryption-key';
+export * from './linux-encryption-key-store';
+export * from './macos-encryption-key-store';
