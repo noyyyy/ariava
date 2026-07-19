@@ -38,7 +38,7 @@ export function assertNodeCryptoSelfTest(): void {
 }
 
 function isProductionNodeRuntime(): boolean {
-  return process.release?.name === 'node' && process.execPath.toLowerCase().includes('node');
+  return process.release?.name === 'node' && !('bun' in process.versions);
 }
 
 function equal(left: Uint8Array, right: Uint8Array): boolean {

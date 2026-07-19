@@ -14,13 +14,16 @@ export interface NodeRuntimeInspection {
 }
 
 export function inspectCurrentNodeRuntime(): NodeRuntimeInspection {
-  const runtimeName = process.release?.name ?? 'unknown';
-  const runtimeVersion = process.version ?? 'unknown';
+  const bunRuntime = 'bun' in process.versions;
+  const sourceDevelopmentRuntime = bunRuntime && import.meta.url.endsWith('/src/runtime/node-runtime.ts');
+  const runtimeNameIsNode = (process.release?.name ?? 'unknown') === 'node' && (!bunRuntime || sourceDevelopmentRuntime);
+  const runtimeName = runtimeNameIsNode ? 'node' : bunRuntime ? 'bun' : process.release?.name ?? 'unknown';
+  const runtimeVersion = bunRuntime && !sourceDevelopmentRuntime ? String(process.versions.bun) : process.version ?? 'unknown';
   return {
     runtimeName,
     runtimeVersion,
     runtimePath: safeRealpath(process.execPath),
-    runtimeNameIsNode: runtimeName === 'node',
+    runtimeNameIsNode,
     runtimeVersionSupported: isSupportedNodeVersion(runtimeVersion),
   };
 }
