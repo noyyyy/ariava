@@ -36,6 +36,26 @@ export class LocalLinkKeyring implements EncryptedCommandKeyring {
   }
   listActive(): ActiveLinkPinV1[] { return this.pins.filter((pin) => pin.status === 'active').map((pin) => structuredClone(pin)); }
   listRetiring(): ActiveLinkPinV1[] { return this.pins.filter((pin) => pin.status === 'retiring').map((pin) => structuredClone(pin)); }
+  referencedHostEncryptionKeyIds(): Set<string> { return new Set(this.pins.filter((pin) => pin.status !== 'revoked').map(() => this.hostIdentity.encryptionKeyId)); }
+  pruneRetiring(input: { contentRetainedThrough?: Record<string, string>; commandRetainedThrough?: Record<string, string> }, now = new Date().toISOString()): ActiveLinkPinV1[] {
+    const removed: ActiveLinkPinV1[] = [];
+    this.pins = this.pins.filter((pin) => {
+      if (pin.status !== 'retiring') return true;
+      const key = pinKey(pin);
+      const retainUntil = maxTimestamp(input.contentRetainedThrough?.[key], input.commandRetainedThrough?.[key]);
+      if (!retainUntil || retainUntil > now) return true;
+      removed.push(pin); return false;
+    });
+    if (removed.length) this.persist();
+    return removed.map((pin) => structuredClone(pin));
+  }
+  revokeCompromisedEncryptionKey(encryptionKeyId: string): number {
+    if (encryptionKeyId !== this.hostIdentity.encryptionKeyId) return 0;
+    const before = this.pins.filter((pin) => pin.status !== 'revoked').length;
+    this.pins = this.pins.map((pin) => pin.status === 'revoked' ? pin : { ...pin, status: 'revoked' as const });
+    if (before) this.persist();
+    return before;
+  }
   getUsable(linkId: string, generation: number, epoch: number): ActiveLinkPinV1 | undefined {
     return this.pins.find((pin) => pin.status !== 'revoked' && pin.linkId === linkId && pin.linkGeneration === generation && pin.epoch === epoch);
   }
@@ -74,7 +94,7 @@ export class LocalLinkKeyring implements EncryptedCommandKeyring {
     return snapshot.recipients.map((recipient) => this.materialForRecipient(recipient));
   }
   revokeWatch(watchDeviceId: string, generation?: number): void {
-    this.pins = this.pins.map((pin) => pin.watchDeviceId === watchDeviceId && (generation === undefined || pin.linkGeneration !== generation)
+    this.pins = this.pins.map((pin) => pin.watchDeviceId === watchDeviceId && (generation === undefined || pin.linkGeneration === generation)
       ? { ...pin, status: 'revoked' as const } : pin); this.persist();
   }
   async authorize(command: EncryptedCommandEnvelopeV1): Promise<boolean> {
@@ -171,6 +191,11 @@ function deriveConfirmationKey(identity: HostEncryptionIdentity, peerPublicKey: 
 function hmac(key: Uint8Array, bytes: Uint8Array): string { return base64UrlEncode(createHmac('sha256', key).update(bytes).digest()); }
 function safeEncodedEqual(left: string, right: string): boolean { try { const a = base64UrlDecode(left); const b = base64UrlDecode(right); return a.length === b.length && timingSafeEqual(a, b); } catch { return false; } }
 function crockford30(bytes: Uint8Array): string { let value = ((bytes[0]! << 22) | (bytes[1]! << 14) | (bytes[2]! << 6) | (bytes[3]! >>> 2)) >>> 0; let result = ''; for (let i = 0; i < 6; i += 1) result += PAIRING_CODE_ALPHABET[(value >>> (25 - i * 5)) & 31]; return result; }
+function pinKey(pin: Pick<ActiveLinkPinV1, 'linkId' | 'linkGeneration' | 'epoch'>): string { return `${pin.linkId}:${pin.linkGeneration}:${pin.epoch}`; }
+function maxTimestamp(...values: Array<string | undefined>): string | undefined {
+  const defined = values.filter((value): value is string => value !== undefined);
+  return defined.length ? defined.reduce((latest, value) => value > latest ? value : latest) : undefined;
+}
 function sameBinding(left: EncryptionKeyBindingV1, right: EncryptionKeyBindingV1): boolean { return JSON.stringify(left) === JSON.stringify(right); }
 function validPin(value: ActiveLinkPinV1, hostId: string): boolean {
   return value?.version === 1 && ['active', 'retiring', 'revoked'].includes(value.status) && value.hostId === hostId

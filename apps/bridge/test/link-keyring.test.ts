@@ -33,6 +33,43 @@ describe('verified local E2E pins', () => {
       watchDeviceId: old.watchDeviceId, linkId: old.linkId, linkGeneration: old.linkGeneration, epoch: old.epoch })).toBe(false);
   });
 
+  test('retains a retiring pin through the maximum content/command reference and prunes only after both expire', () => {
+    const dir = join(tmpdir(), `ariava-retention-${crypto.randomUUID()}`); roots.push(dir); mkdirSync(dir, { mode: 0o700 });
+    const host = generateHostEncryptionIdentity(`host_${'H'.repeat(43)}`);
+    const keyring = new LocalLinkKeyring(join(dir, 'pins.json'), host);
+    const watchDeviceId = `watch_${'W'.repeat(43)}`;
+    const first = { version: 1 as const, status: 'active' as const, linkId: 'link-retained', hostId: host.hostId, watchDeviceId,
+      linkGeneration: 1, epoch: 1, transcriptDigest: base64UrlEncode(new Uint8Array(32)), watchBinding: fakeBinding(watchDeviceId, 1),
+      watchBindingDigest: base64UrlEncode(new Uint8Array(32)), peerProofDigest: base64UrlEncode(new Uint8Array(32)), activatedAt: '2026-07-20T00:00:00.000Z' };
+    keyring.persistActive(first);
+    keyring.persistActive({ ...first, linkId: 'link-current', epoch: 2, activatedAt: '2026-07-20T00:01:00.000Z' });
+    const referenceKey = 'link-retained:1:1';
+    expect(keyring.pruneRetiring({ contentRetainedThrough: { [referenceKey]: '2026-07-20T00:10:00.000Z' }, commandRetainedThrough: { [referenceKey]: '2026-07-20T00:20:00.000Z' } }, '2026-07-20T00:15:00.000Z')).toEqual([]);
+    expect(keyring.listRetiring()).toHaveLength(1);
+    expect(keyring.pruneRetiring({ contentRetainedThrough: { [referenceKey]: '2026-07-20T00:10:00.000Z' }, commandRetainedThrough: { [referenceKey]: '2026-07-20T00:20:00.000Z' } }, '2026-07-20T00:20:00.001Z')).toHaveLength(1);
+    expect(keyring.listRetiring()).toEqual([]);
+    expect(keyring.referencedHostEncryptionKeyIds()).toEqual(new Set([host.encryptionKeyId]));
+  });
+
+  test('scopes unlink revocation to the requested generation and compromise revokes every retained pin immediately', () => {
+    const dir = join(tmpdir(), `ariava-revoke-${crypto.randomUUID()}`); roots.push(dir); mkdirSync(dir, { mode: 0o700 });
+    const host = generateHostEncryptionIdentity(`host_${'H'.repeat(43)}`);
+    const keyring = new LocalLinkKeyring(join(dir, 'pins.json'), host);
+    const watchDeviceId = `watch_${'W'.repeat(43)}`;
+    const base = { version: 1 as const, status: 'active' as const, hostId: host.hostId, watchDeviceId, epoch: 1,
+      transcriptDigest: base64UrlEncode(new Uint8Array(32)), watchBinding: fakeBinding(watchDeviceId, 1),
+      watchBindingDigest: base64UrlEncode(new Uint8Array(32)), peerProofDigest: base64UrlEncode(new Uint8Array(32)), activatedAt: '2026-07-20T00:00:00.000Z' };
+    keyring.persistActive({ ...base, linkId: 'generation-1', linkGeneration: 1 });
+    keyring.persistActive({ ...base, linkId: 'generation-2', linkGeneration: 2 });
+    keyring.revokeWatch(watchDeviceId, 1);
+    expect(keyring.getUsable('generation-1', 1, 1)).toBeUndefined();
+    expect(keyring.getUsable('generation-2', 2, 1)).toBeDefined();
+    expect(keyring.revokeCompromisedEncryptionKey(host.encryptionKeyId)).toBe(1);
+    expect(keyring.listActive()).toEqual([]);
+    expect(keyring.listRetiring()).toEqual([]);
+    expect(keyring.referencedHostEncryptionKeyIds()).toEqual(new Set());
+  });
+
   test('binding verifier checks Ed25519 signature rather than Relay state', async () => {
     const pair = generateKeyPairSync('ed25519');
     const jwk = pair.publicKey.export({ format: 'jwk' });
