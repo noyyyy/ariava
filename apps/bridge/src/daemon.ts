@@ -29,6 +29,7 @@ import { BridgeStateStore } from './state-store';
 import { assertProductionNodeRuntime } from './runtime/node-runtime';
 import { assertNodeCryptoSelfTest } from './e2e/node-crypto-self-test';
 import type { AgentDriver, BridgeConfig, BridgeSyncResult } from './types';
+import { prepareCommandForExecution } from './e2e/command-execution';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const BRIDGE_VERSION = readPackageVersion();
@@ -372,11 +373,29 @@ export class BridgeDaemon {
     return flushed;
   }
 
+
   private async pullAndHandleCommands() {
     const response = await this.client().pullCommands(this.config.hostId);
     const handled = [];
     for (const command of response.commands) {
-      const outcome = await this.router.handle(command);
+      const prepared = await prepareCommandForExecution(command);
+      if (!prepared.ok) {
+        const result = {
+          commandId: command.commandId,
+          hostId: command.hostId,
+          sessionId: command.sessionId,
+          accepted: false,
+          status: 'failed' as const,
+          message: 'Encrypted reply execution is unavailable until the local E2E keyring is configured.',
+          correlationId: prepared.code,
+          updatedAt: isoNow(),
+        };
+        this.stateStore.rememberCommandResult(result);
+        handled.push(result);
+        await this.client().submitCommandResult(result);
+        continue;
+      }
+      const outcome = await this.router.handle(prepared.command);
       handled.push(outcome.result);
       await this.client().submitCommandResult(outcome.result);
     }

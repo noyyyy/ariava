@@ -5,6 +5,7 @@ import type {
   CanonicalSessionState,
   CommandEnvelope,
   CommandResult,
+  EncryptedCommandEnvelopeV1,
   HandleSessionRequest,
   HostEnrollmentRequest,
   HostEnrollmentResponse,
@@ -151,7 +152,7 @@ export class RelayClient {
     return this.request('POST', `/v2/bridge/sessions/${sessionId}/handle`, request);
   }
 
-  pullCommands(hostId: string, limit = 20): Promise<{ commands: CommandEnvelope[] }> {
+  pullCommands(hostId: string, limit = 20): Promise<{ commands: Array<CommandEnvelope | EncryptedCommandEnvelopeV1> }> {
     return this.request('POST', '/v2/bridge/commands/pull', { hostId, limit });
   }
 
