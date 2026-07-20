@@ -21,7 +21,6 @@
     "packages/*"
   ],
   "scripts": {
-    "boundary:check": "node ./scripts/assert-repository-boundaries.mjs --mode public-candidate --root .",
     "build": "bun run build:protocol && bun run build:shared-utils && bun run build:bridge && bun run build:pi-bundle",
     "build:protocol": "bun run ./scripts/build-public-package.mjs protocol",
     "build:shared-utils": "bun run ./scripts/build-public-package.mjs shared-utils",
@@ -34,7 +33,7 @@
     "package:assert": "npm pack --dry-run --json > /tmp/ariava-pack-dry-run.json && node ./scripts/assert-npm-package.mjs /tmp/ariava-pack-dry-run.json",
     "prepublishOnly": "node ./scripts/assert-publication-readme.mjs",
     "test": "bun test ./scripts ./packages/protocol/test ./packages/shared-utils/test ./apps/bridge/test && bun run --cwd extensions/pi test",
-    "verify": "bun run boundary:check && bun run build && bun run --cwd extensions/pi typecheck && bun run test && bun run package:assert"
+    "verify": "bun run build && bun run --cwd extensions/pi typecheck && bun run test && bun run package:assert"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

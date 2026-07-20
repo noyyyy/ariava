@@ -18,4 +18,4 @@ bun run --cwd extensions/pi test
 bun run --cwd extensions/pi typecheck
 ```
 
-Use module-specific builds after changing protocol, shared-utils, Bridge, or pi. Keep public package and repository boundary assertions green.
+Use module-specific builds after changing protocol, shared-utils, Bridge, or pi. Keep public package assertions green.

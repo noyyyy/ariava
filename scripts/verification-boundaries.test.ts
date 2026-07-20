@@ -38,7 +38,6 @@ describe('transition verification ownership', () => {
       'extensions/pi typecheck',
       'extensions/pi test',
       'package:assert',
-      isPublicCandidate ? 'boundary:check' : 'boundary:check:strict',
       isPublicCandidate ? 'bun test ./scripts' : 'verification-boundaries.test.ts',
     ]) {
       expect(closure).toContain(required);

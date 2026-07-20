@@ -85,6 +85,26 @@ bun install --frozen-lockfile
 bun run verify
 ```
 
+### Isolated source development profile
+
+Use the fixed `dev` profile when an installed Ariava Bridge is already running. It keeps source-development configuration, identity, state, discovery, and logs under `~/.config/ariava-dev`, and uses the loopback Agent Adapter on `127.0.0.1:7273`; the installed profile remains under `~/.config/ariava` on port `7272`.
+
+```bash
+# Create or reuse the isolated dev configuration and Host identity
+bun run dev:init
+
+# Run the source Bridge in the foreground
+bun run dev:bridge
+
+# In another terminal, run Pi with only the source Ariava extension
+bun run dev:pi -- <pi args...>
+
+# Inspect paths, Host ID, Relay URL, and Adapter status (secret redacted)
+bun run dev:status
+```
+
+`dev:pi` launches `pi --no-extensions -e <source-extension>`, so other automatically discovered Pi extensions are intentionally disabled in that process. These commands do not install or modify a launchd/systemd service, do not replace the globally installed Ariava Pi extension, and do not read or write the installed Ariava profile.
+
 ## Contributing
 
 Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and include the validation you performed.
