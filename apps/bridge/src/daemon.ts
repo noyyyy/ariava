@@ -30,6 +30,8 @@ import { assertProductionNodeRuntime } from './runtime/node-runtime';
 import { assertNodeCryptoSelfTest } from './e2e/node-crypto-self-test';
 import type { AgentDriver, BridgeConfig, BridgeSyncResult } from './types';
 import { prepareCommandForExecution } from './e2e/command-execution';
+import { LocalLinkKeyring } from './e2e/link-keyring';
+import { EncryptedUploadOrchestrator } from './e2e/upload-orchestrator';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const BRIDGE_VERSION = readPackageVersion();
@@ -85,6 +87,7 @@ export class BridgeDaemon {
   private readonly drivers: AgentDriver[];
   private readonly router: CommandRouter;
   private encryptionIdentity?: HostEncryptionIdentity;
+  private keyring?: LocalLinkKeyring;
   private filesystemVerified = false;
   private startupValidated = false;
   private syncFlight?: Promise<BridgeSyncResult>;
@@ -143,6 +146,13 @@ export class BridgeDaemon {
     }
     const encryptionStore = createRuntimeHostEncryptionIdentityStore(this.config.identityPath, this.config.runtimePlatform ?? process.platform);
     this.encryptionIdentity = encryptionStore.loadOrCreate(identity.hostId);
+    // Bun is retained only as a source-test runner and lacks production ChaChaPoly.
+    // Production Node startup migrates and enables the encrypted retry spool.
+    if (typeof (globalThis as { Bun?: unknown }).Bun === 'undefined') {
+      const recovery = this.stateStore.initializeEncryptedSpool(identity.hostId, this.config.identityPath, this.config.runtimePlatform ?? process.platform);
+      if (recovery.droppedUnreadableItems > 0) process.stderr.write(`Ariava dropped ${recovery.droppedUnreadableItems} unreadable encrypted spool item(s).\n`);
+    }
+    this.keyring = new LocalLinkKeyring(`${this.config.identityPath}.e2e-keyring.json`, this.encryptionIdentity);
     this.relayClient = new RelayClient(
       { baseUrl: this.config.relayBaseUrl, signer: identity.signer },
       () => this.relayAbortController.signal,
@@ -305,55 +315,41 @@ export class BridgeDaemon {
     this.stateStore.setHost(response.host);
   }
 
-  private async sendCurrentSessionsSnapshot(
-    pending: { request: ReplaceCurrentSessionsRequest; digest: string },
-  ): Promise<void> {
+  private async sendCurrentSessionsSnapshot(pending: { request: ReplaceCurrentSessionsRequest; digest: string }): Promise<void> {
     const response: ReplaceCurrentSessionsResponse = await this.client().replaceCurrentSessions(pending.request);
-    if (response.hostId !== pending.request.hostId || response.revision !== pending.request.revision) {
-      throw new Error('Relay returned a mismatched current session snapshot response');
-    }
+    if (response.hostId !== pending.request.hostId || response.revision !== pending.request.revision) throw new Error('Relay returned a mismatched current session snapshot response');
     this.stateStore.acceptCurrentSessionsSnapshot(pending.request.revision, pending.digest);
   }
 
   private async flushCurrentSessionsSnapshot(currentSessions: ActiveSessionSnapshot[]): Promise<void> {
     let pending = this.stateStore.getPendingCurrentSessionsSnapshot();
     if (!pending) return;
-    try {
-      await this.sendCurrentSessionsSnapshot(pending);
-    } catch (error) {
+    try { await this.sendCurrentSessionsSnapshot(pending); } catch (error) {
       const stale = snapshotError(error, 'session_snapshot_stale');
-      if (stale) {
-        this.stateStore.noteCurrentSessionsSnapshotRevisionLowerBound(stale.acceptedRevision);
-        this.stateStore.clearPendingCurrentSessionsSnapshot(pending.request.revision, pending.digest);
-        pending = await this.stateStore.stageCurrentSessionsSnapshot(
-          this.config.hostId, currentSessions, isoNow(), stale.acceptedRevision,
-        );
-        if (pending) await this.sendCurrentSessionsSnapshot(pending);
-        return;
-      }
-      throw error;
+      if (!stale) throw error;
+      this.stateStore.noteCurrentSessionsSnapshotRevisionLowerBound(stale.acceptedRevision);
+      this.stateStore.clearPendingCurrentSessionsSnapshot(pending.request.revision, pending.digest);
+      pending = await this.stateStore.stageCurrentSessionsSnapshot(this.config.hostId, currentSessions, isoNow(), stale.acceptedRevision);
+      if (pending) await this.sendCurrentSessionsSnapshot(pending);
     }
   }
 
+  async flushEncryptedUploadsForTest(): Promise<number> { await this.validateStartup(); return this.flushPendingEvents(); }
+  async publishRecipientSnapshotsForTest(): Promise<boolean> {
+    await this.validateStartup();
+    if (!this.encryptionIdentity || !this.keyring) return false;
+    const snapshot = await this.client().recipientSnapshot();
+    return this.uploadOrchestrator().publishRecipientChangeSnapshots(snapshot, this.keyring.reconcileRecipients(snapshot));
+  }
+
   private async flushPendingEvents(): Promise<number> {
-    let flushed = 0;
-    for (const event of this.stateStore.peekPendingEvents()) {
-      const session = this.stateStore.getSession(event.sessionId);
-      // Relay's event-ingest contract still requires a session envelope for diagnostic
-      // history. This synthetic envelope is transport-only: driver:/host: IDs are excluded
-      // from authoritative current-session snapshots above and by Relay defense in depth.
-      const syntheticSession = session ?? ({
-        sessionId: event.sessionId, hostId: event.hostId, provider: event.provider, projectName: 'system',
-        nameText: event.contextText ?? event.sessionId, openingText: undefined, latestActivityText: event.assistantText,
-        stateLabel: 'Unknown', status: event.status, updatedAt: event.createdAt,
-      } satisfies CanonicalSessionState);
-      try {
-        await this.client().publishEvent(event, syntheticSession);
-        this.stateStore.removePendingEvent(event.eventId);
-        flushed += 1;
-      } catch { break; }
-    }
-    return flushed;
+    if (!this.encryptionIdentity || !this.keyring) return 0;
+    return this.uploadOrchestrator().flushPendingEvents();
+  }
+
+  private uploadOrchestrator(): EncryptedUploadOrchestrator {
+    return new EncryptedUploadOrchestrator(this.stateStore, this.client(), this.encryptionIdentity!, this.keyring!);
+  }
   }
 
   private async flushPendingHandles(): Promise<number> {
@@ -378,7 +374,7 @@ export class BridgeDaemon {
     const response = await this.client().pullCommands(this.config.hostId);
     const handled = [];
     for (const command of response.commands) {
-      const prepared = await prepareCommandForExecution(command);
+      const prepared = await prepareCommandForExecution(command, this.keyring);
       if (!prepared.ok) {
         const result = {
           commandId: command.commandId,
@@ -401,6 +397,7 @@ export class BridgeDaemon {
     }
     return handled;
   }
+
 
   private buildDriverErrorEvent(driverName: string, error: unknown): CanonicalEvent {
     return { eventId: createId('evt'), hostId: this.config.hostId, sessionId: `driver:${driverName}`, provider: driverName,
@@ -428,6 +425,7 @@ export class BridgeDaemon {
     ].filter((value): value is string => Boolean(value))));
   }
 }
+
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';

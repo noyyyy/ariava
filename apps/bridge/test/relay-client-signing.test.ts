@@ -30,6 +30,10 @@ const session = { sessionId, hostId, provider: 'pi', projectName: 'p', nameText:
 const snapshot = { hostId, revision: 1, observedAt: '2026-07-15T00:00:00.000Z', sessions: [{ ...session, presence: 'active' }] } as any;
 const commandResult = { commandId: 'cmd_1', hostId, sessionId, type: 'interrupt', status: 'completed', completedAt: '2026-07-15T00:00:00.000Z' } as any;
 const rotation = { rotation: { operationId: 'op_12345678-1234-4123-8123-123456789abc', entityId: hostId, oldKeyId: `key_${'B'.repeat(43)}`, newKeyId: `key_${'E'.repeat(43)}`, newPublicKey: 'E'.repeat(43), issuedAt: '2026-07-15T00:00:00.000Z' }, oldKeyAuthorizationSignature: emptySignature, newKeyProofSignature: emptySignature } as any;
+const linkId = 'link_test';
+const confirmation = { linkId, linkGeneration: 1, epoch: 1, transcriptDigest: 'A'.repeat(43), confirmationProof: 'B'.repeat(43) };
+const activation = { linkId, linkGeneration: 1, epoch: 1, transcriptDigest: 'A'.repeat(43), peerRole: 'watch', peerProofDigest: 'C'.repeat(43), activatedAt: '2026-07-20T00:00:00.000Z' } as const;
+const encryptedUpload = { event: { encrypted: true }, session: { encrypted: true } } as any;
 
 const cases: Array<{ name: string; method: string; path: string; body?: unknown; invoke(client: RelayClient): Promise<unknown> }> = [
   { name: 'enroll', method: 'POST', path: '/v2/bridge/enroll', body: enrollment, invoke: (c) => c.enrollHost(enrollment) },
@@ -40,6 +44,13 @@ const cases: Array<{ name: string; method: string; path: string; body?: unknown;
   { name: 'remove watch', method: 'DELETE', path: `/v2/bridge/watches/${watchId}`, body: {}, invoke: (c) => c.removeWatch(watchId) },
   { name: 'event', method: 'POST', path: '/v2/bridge/events', body: { event, session }, invoke: (c) => c.publishEvent(event, session) },
   { name: 'current sessions', method: 'PUT', path: '/v2/bridge/sessions/current', body: snapshot, invoke: (c) => c.replaceCurrentSessions(snapshot) },
+  { name: 'recipient snapshot', method: 'GET', path: '/v2/bridge/e2e/recipients', invoke: (c) => c.recipientSnapshot() },
+  { name: 'encrypted event', method: 'POST', path: '/v2/bridge/e2e/events', body: encryptedUpload, invoke: (c) => c.publishEncryptedEvent(encryptedUpload.event, encryptedUpload.session) },
+  { name: 'E2E confirmation', method: 'POST', path: `/v2/bridge/e2e/links/${linkId}/confirm`, body: confirmation, invoke: (c) => c.confirmLink(linkId, confirmation) },
+  { name: 'E2E activation', method: 'POST', path: `/v2/bridge/e2e/links/${linkId}/activate`, body: activation, invoke: (c) => c.activateLink(linkId, activation) },
+  { name: 'encrypted session', method: 'POST', path: '/v2/bridge/e2e/sessions', body: { session: encryptedUpload.session }, invoke: (c) => c.publishEncryptedSession(encryptedUpload.session) },
+  { name: 'encrypted event reconcile', method: 'POST', path: '/v2/bridge/e2e/events/reconcile', body: encryptedUpload, invoke: (c) => c.reconcileEncryptedEvent(encryptedUpload.event, encryptedUpload.session) },
+  { name: 'encrypted session reconcile', method: 'POST', path: '/v2/bridge/e2e/sessions/reconcile', body: { session: encryptedUpload.session }, invoke: (c) => c.reconcileEncryptedSession(encryptedUpload.session) },
   { name: 'read', method: 'POST', path: `/v2/bridge/sessions/${sessionId}/read`, body: { latestReadEventId: 'evt_1', readAt: '2026-07-15T00:00:00.000Z', source: 'bridge_recovery' }, invoke: (c) => c.markSessionRead(sessionId, { latestReadEventId: 'evt_1', readAt: '2026-07-15T00:00:00.000Z', source: 'bridge_recovery' }) },
   { name: 'command pull', method: 'POST', path: '/v2/bridge/commands/pull', body: { hostId, limit: 20 }, invoke: (c) => c.pullCommands(hostId, 20) },
   { name: 'command result', method: 'POST', path: '/v2/bridge/commands/result', body: commandResult, invoke: (c) => c.submitCommandResult(commandResult) },
