@@ -43,6 +43,7 @@ export interface LinkedWatchProjection {
   watchDeviceId: string;
   pairedAt: string;
   lastSeenAt: string;
+  e2e?: E2EPendingLinkProjectionV1;
 }
 
 export function normalizePairingCode(value: string): string {
