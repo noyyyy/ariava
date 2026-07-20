@@ -23,7 +23,7 @@ import { PaiDriver } from './drivers/pi';
 import { probeHostPlatform } from './host-platform';
 import { loadUserConfig, resolveAriavaConfig, resolvePersistedAriavaConfig } from './host-manager';
 import { ensureAriavaSecureDirectories, pathHasFilesystemEvidence, readSecureJson, redactSensitive } from './host-manager/secure-files';
-import { HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostIdentity, type HostIdentityStore } from './identity';
+import { createHostEncryptionBinding, createRuntimeHostEncryptionIdentityStore, HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostEncryptionIdentity, type HostIdentity, type HostIdentityStore } from './identity';
 import { RelayClient, RelayClientError } from './relay-client';
 import { BridgeStateStore } from './state-store';
 import { assertProductionNodeRuntime } from './runtime/node-runtime';
@@ -83,6 +83,7 @@ export class BridgeDaemon {
   private readonly adapterServer: AgentAdapterServer;
   private readonly drivers: AgentDriver[];
   private readonly router: CommandRouter;
+  private encryptionIdentity?: HostEncryptionIdentity;
   private filesystemVerified = false;
   private startupValidated = false;
   private syncFlight?: Promise<BridgeSyncResult>;
@@ -139,6 +140,8 @@ export class BridgeDaemon {
     if (!this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
       throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Configured identity metadata does not match the local Host identity');
     }
+    const encryptionStore = createRuntimeHostEncryptionIdentityStore(this.config.identityPath, this.config.runtimePlatform ?? process.platform);
+    this.encryptionIdentity = encryptionStore.loadOrCreate(identity.hostId);
     this.relayClient = new RelayClient(
       { baseUrl: this.config.relayBaseUrl, signer: identity.signer },
       () => this.relayAbortController.signal,
@@ -279,9 +282,11 @@ export class BridgeDaemon {
     this.wakeRunLoop = undefined;
   }
 
-  private buildEnrollment(identity: HostIdentity): HostEnrollmentRequest {
+  private async buildEnrollment(identity: HostIdentity): Promise<HostEnrollmentRequest> {
+    if (!this.encryptionIdentity) throw new HostIdentityError('ERR_IDENTITY_MISSING', 'Host encryption identity is not loaded');
     return {
       hostId: identity.hostId, keyId: identity.keyId, algorithm: identity.algorithm, publicKey: identity.publicKey,
+      encryptionBinding: await createHostEncryptionBinding(identity, this.encryptionIdentity),
       ...this.buildHostMetadata(),
     };
   }
@@ -295,7 +300,7 @@ export class BridgeDaemon {
     if (!identity || !this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
       throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Host identity changed while daemon was running');
     }
-    const response = await this.client().enrollHost(this.buildEnrollment(identity));
+    const response = await this.client().enrollHost(await this.buildEnrollment(identity));
     this.stateStore.setHost(response.host);
   }
 

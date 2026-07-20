@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { BridgeDaemon, loadBridgeConfig } from './daemon';
 import {
   createRuntimeHostIdentityStore,
+  createRuntimeHostEncryptionIdentityStore,
+  createHostEncryptionBinding,
   enrollCurrentIdentity,
   HostIdentityError,
   inspectPublicIdentity,
@@ -224,9 +226,12 @@ async function runInit(deps: PublicCliDependencies, json: boolean): Promise<void
   });
   const resolved = deps.resolveAriavaConfig();
   if (!store) throw new Error('Host identity store was not initialized');
+  const hostId = initialized.config.identity?.hostId;
+  if (!hostId) throw new Error('Host identity was not initialized');
+  createRuntimeHostEncryptionIdentityStore(resolved.identityPath, manager.support.platform).loadOrCreate(hostId);
   print(deps, json, okEnvelope('ok', initialized.identityCreated ? 'Ariava identity initialized.' : 'Ariava identity already initialized.', {
     configPath: resolved.configPath, config: redactUserConfig(initialized.config), identity: await inspectPublicIdentity(store), created: initialized.identityCreated,
-  }), `${initialized.identityCreated ? 'Initialized' : 'Reused'} Host identity ${initialized.config.identity?.hostId}`);
+  }), `${initialized.identityCreated ? 'Initialized' : 'Reused'} Host identity ${hostId}`);
 }
 
 async function runConfig(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
@@ -426,8 +431,9 @@ async function runHost(deps: PublicCliDependencies, argv: string[], json: boolea
   if (action === 'reset') {
     if (!argv.includes('--confirm')) throw new AriavaCliError('ERR_CONFIRMATION_REQUIRED', 'Usage: ariava host reset --confirm');
     const result = await resetHostIdentity(store, resolved.relayBaseUrl);
+    const encryptionIdentity = createRuntimeHostEncryptionIdentityStore(resolved.identityPath, platform).replaceForReset(result.identity.hostId);
     deps.saveUserConfig({ ...buildInitializedConfig(deps.loadUserConfig()), identity: publicIdentityMetadata(result.identity) });
-    await enrollCurrentIdentity(resolved.relayBaseUrl, result.identity, hostMetadataContext(deps));
+    await enrollCurrentIdentity(resolved.relayBaseUrl, result.identity, hostMetadataContext(deps), encryptionIdentity);
     print(deps, json, okEnvelope('ok', 'Host identity reset.', {
       hostId: result.identity.hostId, keyId: result.identity.keyId, revokedOldIdentity: result.revokedOldIdentity, links: [],
       ...(result.warning ? { warning: result.warning } : {}),
@@ -440,6 +446,7 @@ async function runHost(deps: PublicCliDependencies, argv: string[], json: boolea
 interface IdentityClientContext {
   client: RelayClient;
   identity: HostIdentity;
+  encryptionIdentity: ReturnType<ReturnType<typeof createRuntimeHostEncryptionIdentityStore>['loadOrCreate']>;
   metadata: ReturnType<typeof hostMetadataContext>;
 }
 
@@ -451,6 +458,7 @@ async function loadIdentityClient(deps: PublicCliDependencies): Promise<Identity
   return {
     client: new RelayClient({ baseUrl: resolved.relayBaseUrl, signer: identity.signer }),
     identity,
+    encryptionIdentity: createRuntimeHostEncryptionIdentityStore(resolved.identityPath, platform).loadOrCreate(identity.hostId),
     metadata: hostMetadataContext(deps),
   };
 }
@@ -461,6 +469,7 @@ async function ensureHostEnrollment(context: IdentityClientContext): Promise<voi
     keyId: context.identity.keyId,
     algorithm: context.identity.algorithm,
     publicKey: context.identity.publicKey,
+    encryptionBinding: await createHostEncryptionBinding(context.identity, context.encryptionIdentity),
     ...context.metadata,
   });
 }

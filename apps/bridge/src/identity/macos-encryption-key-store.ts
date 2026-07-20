@@ -46,18 +46,30 @@ export class MacOSEncryptionKeyStore {
       return existing;
     }
     const identity = generateHostEncryptionIdentity(hostId);
-    this.writeItem(hostId, identity.privateKeyPkcs8, false);
+    const account = keychainAccount(identity);
+    this.writeItem(account, identity.privateKeyPkcs8, false);
     try { writeSecureJsonExclusive(this.metadataPath, metadata(identity)); }
-    catch (error) { this.deleteItem(hostId); throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'Could not persist macOS encryption metadata', error); }
+    catch (error) { this.deleteItem(account); throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'Could not persist macOS encryption metadata', error); }
     return this.loadRequired(hostId);
   }
 
   replaceForReset(hostId: string): HostEncryptionIdentity {
     const identity = generateHostEncryptionIdentity(hostId);
-    this.writeItem(hostId, identity.privateKeyPkcs8, true);
-    try { writeSecureJson(this.metadataPath, metadata(identity)); }
-    catch (error) { throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'Could not replace macOS encryption metadata', error); }
-    return this.loadRequired(hostId);
+    const account = keychainAccount(identity);
+    const previous = this.load();
+    this.writeItem(account, identity.privateKeyPkcs8, false);
+    try {
+      writeSecureJson(this.metadataPath, metadata(identity));
+      const loaded = this.loadRequired(hostId);
+      if (previous) this.deleteItem(keychainAccount(previous));
+      return loaded;
+    } catch (error) {
+      this.deleteItem(account);
+      if (previous) {
+        try { writeSecureJson(this.metadataPath, metadata(previous)); } catch { /* preserve the original failure */ }
+      }
+      throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'Could not replace macOS encryption metadata', error);
+    }
   }
 
   private loadRequired(hostId: string): HostEncryptionIdentity {
@@ -67,12 +79,14 @@ export class MacOSEncryptionKeyStore {
   }
 
   private writeItem(account: string, value: Uint8Array, update: boolean): void {
-    const command = `add-generic-password${update ? ' -U' : ''} -s \"${MACOS_ENCRYPTION_KEYCHAIN_SERVICE}\" -a \"${account}\" -X ${Buffer.from(value).toString('hex')}\n`;
-    const result = this.runner.run(MACOS_SECURITY_PATH, ['-i'], Buffer.from(command));
+    assertSafeKeychainIdentifier(account, 'account');
+    const args = ['add-generic-password', ...(update ? ['-U'] : []), '-s', MACOS_ENCRYPTION_KEYCHAIN_SERVICE, '-a', account, '-X', Buffer.from(value).toString('hex')];
+    const result = this.runner.run(MACOS_SECURITY_PATH, args);
     if (result.status !== 0 || result.error) throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'macOS encryption Keychain write failed');
   }
 
   private readItem(account: string): Uint8Array {
+    assertSafeKeychainIdentifier(account, 'account');
     const result = this.runner.run(MACOS_SECURITY_PATH, ['find-generic-password', '-s', MACOS_ENCRYPTION_KEYCHAIN_SERVICE, '-a', account, '-w']);
     if (result.status !== 0 || result.error) throw new HostIdentityError('ERR_IDENTITY_MISSING', 'macOS encryption Keychain item is missing');
     const encoded = Buffer.from(result.stdout).toString('utf8').trimEnd();
@@ -81,16 +95,21 @@ export class MacOSEncryptionKeyStore {
   }
 
   private deleteItem(account: string): void {
+    assertSafeKeychainIdentifier(account, 'account');
     this.runner.run(MACOS_SECURITY_PATH, ['delete-generic-password', '-s', MACOS_ENCRYPTION_KEYCHAIN_SERVICE, '-a', account]);
   }
 }
 
 function metadata(identity: HostEncryptionIdentity): MacEncryptionMetadata {
   const { privateKeyPkcs8: _private, ...publicFields } = identity;
-  return { ...publicFields, account: identity.hostId };
+  return { ...publicFields, account: keychainAccount(identity) };
 }
 function validMetadata(value: MacEncryptionMetadata): boolean {
-  return value?.version === 1 && typeof value.hostId === 'string' && value.account === value.hostId
+  return value?.version === 1 && typeof value.hostId === 'string' && value.account === `host-e2e:${value.encryptionKeyId}`
     && typeof value.encryptionKeyId === 'string' && typeof value.publicKey === 'string'
     && Number.isSafeInteger(value.sequence) && value.sequence > 0 && typeof value.createdAt === 'string';
+}
+function keychainAccount(identity: HostEncryptionIdentity): string { return `host-e2e:${identity.encryptionKeyId}`; }
+function assertSafeKeychainIdentifier(value: string, label: string): void {
+  if (!/^[A-Za-z0-9_.:-]{1,128}$/u.test(value)) throw new HostIdentityError('ERR_IDENTITY_INVALID', `Unsafe macOS Keychain ${label}`);
 }

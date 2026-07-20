@@ -1,4 +1,4 @@
-import { base64UrlDecode } from './request-signing.js';
+import { base64UrlDecode, contentSha256 } from './request-signing.js';
 import type { EventType, SessionStatus } from './events.js';
 
 export const E2E_SUITE_V1 = 'x25519-hkdf-sha256-chachapoly-v1' as const;
@@ -366,6 +366,18 @@ export function isEpochOperationAllowed(state: E2EEpochState, operation: E2EEpoc
   if (state === 'active') return true;
   if (state !== 'retiring') return false;
   return operation === 'read_historical_content' || operation === 'deliver_existing_command';
+}
+
+export async function deriveEncryptionKeyId(publicKey: string | Uint8Array): Promise<string> {
+  const raw = typeof publicKey === 'string'
+    ? base64UrlDecode(publicKey, E2E_LIMITS.publicKeyBytes, 'X25519 public key')
+    : publicKey;
+  if (raw.byteLength !== E2E_LIMITS.publicKeyBytes) throw new TypeError('X25519 public key must be 32 bytes');
+  return `ekey_${await contentSha256(raw)}`;
+}
+
+export async function encryptionKeyIdMatchesPublicKey(encryptionKeyId: string, publicKey: string): Promise<boolean> {
+  try { return encryptionKeyId === await deriveEncryptionKeyId(publicKey); } catch { return false; }
 }
 
 export function validateEncryptionKeyBindingV1(value: unknown): value is EncryptionKeyBindingV1 {

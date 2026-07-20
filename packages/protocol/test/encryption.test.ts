@@ -21,6 +21,8 @@ import {
   pairRootInfo,
   validateEncryptedContentV1,
   validateEncryptionKeyBindingV1,
+  deriveEncryptionKeyId,
+  encryptionKeyIdMatchesPublicKey,
   validateRecipientKeyWrapV1,
   type EncryptedCommandEnvelopeV1,
 } from '../src';
@@ -95,9 +97,16 @@ describe('E2E protocol v1', () => {
     expect(base64UrlEncode(buildWrapAAD({ ...input, direction: 'watch-to-bridge' }))).not.toBe(baseline);
   });
 
+  test('derives encryption key IDs from the raw X25519 public key', async () => {
+    const expected = await deriveEncryptionKeyId(fixed.keys.hostPublicKey);
+    expect(expected).toMatch(/^ekey_[A-Za-z0-9_-]{43}$/u);
+    expect(await encryptionKeyIdMatchesPublicKey(expected, fixed.keys.hostPublicKey)).toBe(true);
+    expect(await encryptionKeyIdMatchesPublicKey(`ekey_${'A'.repeat(43)}`, fixed.keys.hostPublicKey)).toBe(false);
+  });
+
   test('strict validators reject padding, extra keys, wrong lengths, and oversize ciphertext', () => {
     const binding = {
-      version: 1, entityType: 'host', entityId: `host_${'A'.repeat(43)}`, identityKeyId: `key_${'A'.repeat(43)}` ,
+      version: 1, entityType: 'host', entityId: `host_${'A'.repeat(43)}`, identityKeyId: `key_${'A'.repeat(43)}`,
       encryptionKeyId: `ekey_${'A'.repeat(43)}`, suite: E2E_SUITE_V1, publicKey: fixed.keys.hostPublicKey,
       sequence: 1, createdAt: '2026-07-20T00:00:00.000Z', bindingSignature: base64UrlEncode(new Uint8Array(64)),
     } as const;

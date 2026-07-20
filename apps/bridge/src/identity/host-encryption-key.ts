@@ -10,6 +10,7 @@ import {
   base64UrlDecode,
   base64UrlEncode,
   buildEncryptionBindingBytes,
+  deriveEncryptionKeyId,
   E2E_SUITE_V1,
   type EncryptionKeyBindingV1,
 } from '@ariava/protocol';
@@ -33,22 +34,34 @@ export function generateHostEncryptionIdentity(hostId: string, sequence = 1, cre
     throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Node did not produce a canonical X25519 public key');
   }
   const raw = base64UrlDecode(jwk.x, 32, 'X25519 public key');
-  const digest = new Uint8Array(createHash('sha256').update(raw).digest());
+  const publicKey = base64UrlEncode(raw);
   const privateKeyPkcs8 = new Uint8Array(pair.privateKey.export({ type: 'pkcs8', format: 'der' }));
   return {
     version: 1,
     hostId,
-    encryptionKeyId: `ekey_${base64UrlEncode(digest)}`,
-    publicKey: base64UrlEncode(raw),
+    encryptionKeyId: `ekey_${base64UrlEncode(new Uint8Array(createHash('sha256').update(raw).digest()))}`,
+    publicKey,
     privateKeyPkcs8,
     sequence,
     createdAt,
   };
 }
 
+export async function finalizeHostEncryptionIdentity(identity: HostEncryptionIdentity): Promise<HostEncryptionIdentity> {
+  return { ...identity, encryptionKeyId: await deriveEncryptionKeyId(identity.publicKey) };
+}
+
+export function deriveHostEncryptionKeyId(publicKey: string): string {
+  const raw = base64UrlDecode(publicKey, 32, 'X25519 public key');
+  return `ekey_${base64UrlEncode(new Uint8Array(createHash('sha256').update(raw).digest()))}`;
+}
+
 export function importHostEncryptionPrivateKey(identity: HostEncryptionIdentity): KeyObject {
   if (identity.version !== 1 || identity.sequence < 1 || !Number.isSafeInteger(identity.sequence)) {
     throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Host encryption identity metadata is invalid');
+  }
+  if (identity.encryptionKeyId !== deriveHostEncryptionKeyId(identity.publicKey)) {
+    throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Host encryption key ID does not match its public key');
   }
   const key = createPrivateKey({ key: Buffer.from(identity.privateKeyPkcs8), format: 'der', type: 'pkcs8' });
   if (key.asymmetricKeyType !== 'x25519') throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Host encryption private key is not X25519');
@@ -78,6 +91,9 @@ export async function createHostEncryptionBinding(
 ): Promise<EncryptionKeyBindingV1> {
   if (encryptionIdentity.hostId !== identity.hostId) {
     throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Encryption identity belongs to another Host');
+  }
+  if (encryptionIdentity.encryptionKeyId !== await deriveEncryptionKeyId(encryptionIdentity.publicKey)) {
+    throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Encryption key ID does not match its X25519 public key');
   }
   const unsigned = {
     version: 1 as const,

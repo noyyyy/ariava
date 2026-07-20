@@ -1,3 +1,4 @@
+import type { E2EPendingLinkProjectionV1 } from './encryption.js';
 import type { HostProjection } from './hosts.js';
 
 export const PAIRING_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ' as const;
@@ -36,6 +37,7 @@ export interface BridgePairWatchResponse {
   watchDevice: BridgePairWatchDeviceProjection;
   link: HostWatchLink;
   alreadyPaired: boolean;
+  e2e?: E2EPendingLinkProjectionV1;
 }
 export interface LinkedWatchProjection {
   watchDeviceId: string;
