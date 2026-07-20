@@ -57,7 +57,9 @@ export interface E2EPendingLinkProjectionV1 {
   linkGeneration: number;
   epoch: number;
   hostBinding: EncryptionKeyBindingV1;
+  hostIdentityPublicKey: string;
   watchBinding: EncryptionKeyBindingV1;
+  watchIdentityPublicKey: string;
   transcriptDigest: string;
   confirmationExpiresAt: string;
   state: Extract<E2EEpochState, 'pending_confirmation' | 'confirmations_complete' | 'host_activated' | 'watch_activated'>;

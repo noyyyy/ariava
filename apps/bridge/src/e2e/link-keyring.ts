@@ -2,7 +2,7 @@ import { createHmac, createPublicKey, timingSafeEqual, verify } from 'node:crypt
 import {
   PAIRING_CODE_ALPHABET, base64UrlDecode, base64UrlEncode, buildConfirmationProofBytes,
   buildEncryptionBindingBytes, buildLinkTranscriptBytes, buildSafetyCodeInput, contentSha256,
-  encryptionKeyIdMatchesPublicKey, validateEncryptionKeyBindingV1,
+  deriveEntityIdentity, encryptionKeyIdMatchesPublicKey, validateEncryptionKeyBindingV1,
   type E2EActivationAckV1, type E2EConfirmationSubmissionV1, type E2EPendingLinkProjectionV1,
   type E2ERecipientSnapshotV1, type EncryptionKeyBindingV1, type EncryptedCommandEnvelopeV1,
 } from '@ariava/protocol';
@@ -24,7 +24,6 @@ export interface ActiveLinkPinV1 {
 export interface PendingActivationV1 { version: 1; linkId: string; linkGeneration: number; epoch: number;
   peerProofDigest: string; activatedAt: string; pin: ActiveLinkPinV1 }
 interface PersistedKeyringV1 { version: 1; pins: ActiveLinkPinV1[]; pendingActivations?: PendingActivationV1[] }
-export interface PeerBindingVerifier { verify(binding: EncryptionKeyBindingV1): Promise<boolean>; }
 export interface HostActivationTransport {
   confirmLink(linkId: string, request: E2EConfirmationSubmissionV1): Promise<{ state: string; peerConfirmationProof?: E2EConfirmationSubmissionV1 }>;
   activateLink(linkId: string, request: E2EActivationAckV1): Promise<{ state: string }>;
@@ -113,11 +112,11 @@ export class LocalLinkKeyring implements EncryptedCommandKeyring {
 }
 
 export async function prepareHostActivation(input: { projection: E2EPendingLinkProjectionV1; hostIdentity: HostEncryptionIdentity;
-  hostBinding: EncryptionKeyBindingV1; peerBindingVerifier: PeerBindingVerifier; keyring: LocalLinkKeyring;
+  hostBinding: EncryptionKeyBindingV1; keyring: LocalLinkKeyring;
   now?: () => string }): Promise<{ safetyCode: string; confirm: E2EConfirmationSubmissionV1; complete(transport: HostActivationTransport): Promise<ActiveLinkPinV1> }> {
   const { projection, hostIdentity, hostBinding } = input;
   if (projection.hostId !== hostIdentity.hostId || projection.hostBinding.encryptionKeyId !== hostIdentity.encryptionKeyId || !sameBinding(projection.hostBinding, hostBinding)) throw new TypeError('Host binding projection mismatch');
-  if (!await validatePeerBinding(projection.watchBinding, projection.watchDeviceId, input.peerBindingVerifier)) throw new TypeError('Watch encryption binding verification failed');
+  if (!await validatePeerBinding(projection.watchBinding, projection.watchDeviceId, projection.watchIdentityPublicKey)) throw new TypeError('Watch encryption binding verification failed');
   const hostDigest = await bindingDigest(projection.hostBinding); const watchDigest = await bindingDigest(projection.watchBinding);
   const expectedTranscript = await contentSha256(buildLinkTranscriptBytes({ linkId: projection.linkId, hostId: projection.hostId,
     watchDeviceId: projection.watchDeviceId, linkGeneration: projection.linkGeneration, epoch: projection.epoch,
@@ -157,9 +156,12 @@ export function verifyBindingWithIdentityPublicKey(binding: EncryptionKeyBinding
     const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI_PREFIX, Buffer.from(raw)]), format: 'der', type: 'spki' });
     return verify(null, buildEncryptionBindingBytes(unsigned), key, base64UrlDecode(bindingSignature, 64, 'binding signature')); } catch { return false; }
 }
-async function validatePeerBinding(binding: EncryptionKeyBindingV1, watchDeviceId: string, verifier: PeerBindingVerifier): Promise<boolean> {
-  return validateEncryptionKeyBindingV1(binding) && binding.entityType === 'watch' && binding.entityId === watchDeviceId
-    && await encryptionKeyIdMatchesPublicKey(binding.encryptionKeyId, binding.publicKey) && await verifier.verify(binding);
+async function validatePeerBinding(binding: EncryptionKeyBindingV1, watchDeviceId: string, identityPublicKey: string): Promise<boolean> {
+  if (!validateEncryptionKeyBindingV1(binding) || binding.entityType !== 'watch' || binding.entityId !== watchDeviceId
+    || !await encryptionKeyIdMatchesPublicKey(binding.encryptionKeyId, binding.publicKey)) return false;
+  const derived = await deriveEntityIdentity('watch', identityPublicKey);
+  return derived.entityId === watchDeviceId && derived.keyId === binding.identityKeyId
+    && verifyBindingWithIdentityPublicKey(binding, identityPublicKey);
 }
 async function bindingDigest(binding: EncryptionKeyBindingV1): Promise<string> { const { bindingSignature: _, ...unsigned } = binding; return contentSha256(buildEncryptionBindingBytes(unsigned)); }
 function deriveConfirmationKey(identity: HostEncryptionIdentity, peerPublicKey: string, transcriptDigest: string): Uint8Array {

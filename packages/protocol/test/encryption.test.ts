@@ -24,6 +24,7 @@ import {
   deriveEncryptionKeyId,
   encryptionKeyIdMatchesPublicKey,
   validateRecipientKeyWrapV1,
+  type E2EPendingLinkProjectionV1,
   type EncryptedCommandEnvelopeV1,
 } from '../src';
 
@@ -125,6 +126,18 @@ describe('E2E protocol v1', () => {
     expect(validateRecipientKeyWrapV1(wrap)).toBe(true);
     expect(validateRecipientKeyWrapV1({ ...wrap, ciphertext: base64UrlEncode(new Uint8Array(47)) })).toBe(false);
     expect(() => base64UrlDecode(`${fixed.keys.hostPublicKey}=`)).toThrow();
+  });
+
+  test('pending link projection carries both exact identity verification keys', () => {
+    const projection = {
+      linkId: fixed.link.linkId, hostId: fixed.link.hostId, watchDeviceId: fixed.link.watchDeviceId,
+      linkGeneration: fixed.link.linkGeneration, epoch: fixed.link.epoch, hostBinding: {} as never,
+      hostIdentityPublicKey: fixed.keys.hostPublicKey, watchBinding: {} as never,
+      watchIdentityPublicKey: fixed.keys.watchPublicKey, transcriptDigest: fixed.transcript.digest,
+      confirmationExpiresAt: '2026-07-20T00:05:00.000Z', state: 'pending_confirmation',
+    } satisfies E2EPendingLinkProjectionV1;
+    expect(projection.hostIdentityPublicKey).toBe(fixed.keys.hostPublicKey);
+    expect(projection.watchIdentityPublicKey).toBe(fixed.keys.watchPublicKey);
   });
 
   test('enforces explicit active/retiring operation permissions', () => {
