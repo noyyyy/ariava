@@ -16,18 +16,39 @@ const encryptedReply = (): EncryptedCommandEnvelopeV1 => ({
 });
 
 describe('encrypted command execution boundary', () => {
-  test('fails closed without passing ciphertext as reply text', async () => {
-    const result = await prepareCommandForExecution(encryptedReply());
-    expect(result).toEqual({ ok: false, code: 'e2e_key_unavailable' });
-    expect(JSON.stringify(result)).not.toContain((encryptedReply() as Extract<EncryptedCommandEnvelopeV1, { type: 'reply' }>).payload.content.ciphertext);
+  const localReply = (command: Extract<EncryptedCommandEnvelopeV1, { type: 'reply' }>) => ({
+    commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId, type: 'reply' as const,
+    payload: { text: 'continue' }, targetAlertEventId: command.targetAlertEventId, issuedAt: command.issuedAt,
+    expiresAt: command.expiresAt, nonce: command.nonce, watchDeviceId: command.watchDeviceId,
   });
 
-  test('accepts a decoder interface only when it produces a non-empty local reply', async () => {
-    const result = await prepareCommandForExecution(encryptedReply(), { decodeReply: async (command) => ({
-      commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId, type: 'reply', payload: { text: 'continue' },
-      targetAlertEventId: command.targetAlertEventId, issuedAt: command.issuedAt, expiresAt: command.expiresAt, nonce: command.nonce,
-      watchDeviceId: command.watchDeviceId,
-    }) });
+  test('fails closed without a keyring for both encrypted reply and interrupt', async () => {
+    const reply = encryptedReply();
+    const interrupt = { ...reply, type: 'interrupt' as const, payload: {} };
+    delete (interrupt as Partial<typeof interrupt>).targetAlertEventId;
+    expect(await prepareCommandForExecution(reply)).toEqual({ ok: false, code: 'e2e_key_unavailable' });
+    expect(await prepareCommandForExecution(interrupt)).toEqual({ ok: false, code: 'e2e_key_unavailable' });
+    expect(JSON.stringify(await prepareCommandForExecution(reply))).not.toContain(reply.payload.content.ciphertext);
+  });
+
+  test('checks the local active pin before reply decryption or interrupt execution', async () => {
+    const reply = encryptedReply();
+    const interrupt = { ...reply, type: 'interrupt' as const, payload: {} };
+    delete (interrupt as Partial<typeof interrupt>).targetAlertEventId;
+    let decodeCalls = 0;
+    const stalePin = { authorize: async () => false, decodeReply: async (command: Extract<EncryptedCommandEnvelopeV1, { type: 'reply' }>) => {
+      decodeCalls += 1; return localReply(command);
+    } };
+    expect(await prepareCommandForExecution(reply, stalePin)).toEqual({ ok: false, code: 'e2e_epoch_unauthorized' });
+    expect(await prepareCommandForExecution(interrupt, stalePin)).toEqual({ ok: false, code: 'e2e_epoch_unauthorized' });
+    expect(decodeCalls).toBe(0);
+  });
+
+  test('accepts only a locally authorized current epoch and a non-empty decrypted reply', async () => {
+    const result = await prepareCommandForExecution(encryptedReply(), {
+      authorize: async (command) => command.linkId === 'link-1' && command.linkGeneration === 1 && command.epoch === 1,
+      decodeReply: async (command) => localReply(command),
+    });
     expect(result).toMatchObject({ ok: true, command: { type: 'reply', payload: { text: 'continue' } } });
   });
 });

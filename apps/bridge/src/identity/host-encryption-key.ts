@@ -108,4 +108,3 @@ export async function createHostEncryptionBinding(
   };
   return { ...unsigned, bindingSignature: await identity.signer.sign(buildEncryptionBindingBytes(unsigned)) };
 }
-
