@@ -686,6 +686,8 @@ describe('ariavaPiExtension', () => {
       private?: boolean;
       files?: string[];
       keywords?: string[];
+      homepage?: string;
+      repository?: { type?: string; url?: string };
       pi?: { extensions?: string[] };
     };
 
@@ -694,5 +696,10 @@ describe('ariavaPiExtension', () => {
     expect(manifest.keywords).toContain('pi-package');
     expect(manifest.files).toContain('index.js');
     expect(manifest.pi?.extensions).toEqual(['./index.js']);
+    expect(manifest.homepage).toBe('https://github.com/noyyyy/ariava');
+    expect(manifest.repository).toEqual({
+      type: 'git',
+      url: 'git+https://github.com/noyyyy/ariava.git',
+    });
   });
 });

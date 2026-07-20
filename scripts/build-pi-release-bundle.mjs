@@ -30,8 +30,8 @@ writeFileSync(
       main: './index.js',
       files: ['index.js', '.ariava-release-bundle.json'],
       keywords: ['pi-package', 'pi-extension', 'ariava', 'apple-watch', 'coding-agent'],
-      homepage: 'https://github.com/noyx/ariava',
-      repository: { type: 'git', url: 'git+https://github.com/noyx/ariava.git' },
+      homepage: 'https://github.com/noyyyy/ariava',
+      repository: { type: 'git', url: 'git+https://github.com/noyyyy/ariava.git' },
       pi: {
         extensions: ['./index.js'],
       },
