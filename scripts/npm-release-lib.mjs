@@ -7,6 +7,10 @@ export const OFFICIAL_REGISTRY = 'https://registry.npmjs.org/';
 export const RELEASE_SCHEMA_VERSION = 1;
 export const TRUSTED_NPM_MINIMUM = '11.5.1';
 export const RELEASE_PACKAGES = Object.freeze(['ariava', '@ariava/pi-extension']);
+/** Post-publish registry visibility checks: enough room for npm eventual consistency. */
+export const REGISTRY_VERIFY_ATTEMPTS = 10;
+export const REGISTRY_VERIFY_BASE_DELAY_MS = 1_000;
+export const REGISTRY_VERIFY_MAX_DELAY_MS = 30_000;
 export const SOURCE_VERSION_FILES = Object.freeze([
   'package.json',
   'apps/bridge/package.json',
@@ -32,6 +36,30 @@ const SENSITIVE_FLAG = /^--[^=]*(?:otp|token|auth|password|passwd|secret|private
 const SENSITIVE_ENV_NAME = /(?:TOKEN|AUTH|PASSWORD|PASSWD|OTP|SECRET|PRIVATE_KEY)/iu;
 const TRUSTED_NPM_CONFIG_ALLOWLIST = new Set(['NPM_CONFIG_USER_AGENT']);
 const ORIGIN_TRACKING_PREFIX = 'refs/remotes/origin/';
+
+/**
+ * Delay before the next final-registry verification attempt after `attempt` failed.
+ * Uses exponential backoff: base * 2^(attempt-1), capped at maxDelayMs.
+ * attempt is 1-based (first failed try sleeps base, then 2x, 4x, ...).
+ * A zero base keeps tests instantaneous; negative/NaN values fail closed.
+ */
+export function registryVerifyBackoffMs(attempt, options = {}) {
+  if (!Number.isInteger(attempt) || attempt < 1) {
+    throw new Error(`registry verify attempt must be a positive integer, got ${attempt}`);
+  }
+  const baseDelayMs = options.baseDelayMs ?? REGISTRY_VERIFY_BASE_DELAY_MS;
+  const maxDelayMs = options.maxDelayMs ?? REGISTRY_VERIFY_MAX_DELAY_MS;
+  if (!Number.isFinite(baseDelayMs) || baseDelayMs < 0) {
+    throw new Error(`registry verify baseDelayMs must be a non-negative finite number, got ${baseDelayMs}`);
+  }
+  if (!Number.isFinite(maxDelayMs) || maxDelayMs < 0) {
+    throw new Error(`registry verify maxDelayMs must be a non-negative finite number, got ${maxDelayMs}`);
+  }
+  if (baseDelayMs === 0) return 0;
+  // Cap the exponent so 2^n stays well within Number range for pathological attempt counts.
+  const exponent = Math.min(attempt - 1, 30);
+  return Math.min(baseDelayMs * (2 ** exponent), maxDelayMs);
+}
 
 export function parseStableTag(tag) {
   const match = STABLE_TAG.exec(tag ?? '');
@@ -528,7 +556,9 @@ export async function publishPrepared(options, dependencies) {
       actions.push('published');
     }
 
-    const attempts = options.verifyAttempts ?? 5;
+    const attempts = options.verifyAttempts ?? REGISTRY_VERIFY_ATTEMPTS;
+    const baseDelayMs = options.retryDelayMs ?? REGISTRY_VERIFY_BASE_DELAY_MS;
+    const maxDelayMs = options.retryMaxDelayMs ?? REGISTRY_VERIFY_MAX_DELAY_MS;
     let finalStates;
     let latest;
     let lastError;
@@ -544,7 +574,9 @@ export async function publishPrepared(options, dependencies) {
         break;
       } catch (error) {
         lastError = error;
-        if (attempt < attempts) await dependencies.sleep(options.retryDelayMs ?? 1_000);
+        if (attempt < attempts) {
+          await dependencies.sleep(registryVerifyBackoffMs(attempt, { baseDelayMs, maxDelayMs }));
+        }
       }
     }
     if (lastError) throw new Error(`final registry verification failed after ${attempts} attempts: ${lastError.message}`);

@@ -52,6 +52,10 @@ export interface LaunchdServiceManagerDependencies {
   stderrLogPath: string;
   fileSystem: LaunchdFileSystem;
   now?: () => string;
+  sleep?: (milliseconds: number) => void;
+  unloadTimeoutMs?: number;
+  bootstrapRetryLimit?: number;
+  bootstrapRetryDelayMs?: number;
 }
 
 const defaultSupport: ServiceSupport = {
@@ -71,6 +75,10 @@ const defaultFileSystem: LaunchdFileSystem = {
   rmSync,
   writeFileSync,
 };
+
+const DEFAULT_UNLOAD_TIMEOUT_MS = 5_000;
+const DEFAULT_BOOTSTRAP_RETRY_LIMIT = 8;
+const DEFAULT_BOOTSTRAP_RETRY_DELAY_MS = 50;
 
 export function createDefaultLaunchdServiceManager(): LaunchdServiceManager {
   return new LaunchdServiceManager({
@@ -97,6 +105,10 @@ export class LaunchdServiceManager implements ServiceManager {
   private readonly stderrLogPath: string;
   private readonly fileSystem: LaunchdFileSystem;
   private readonly now: () => string;
+  private readonly sleep: (milliseconds: number) => void;
+  private readonly unloadTimeoutMs: number;
+  private readonly bootstrapRetryLimit: number;
+  private readonly bootstrapRetryDelayMs: number;
 
   constructor(dependencies: LaunchdServiceManagerDependencies) {
     this.support = dependencies.support;
@@ -108,6 +120,10 @@ export class LaunchdServiceManager implements ServiceManager {
     this.stderrLogPath = dependencies.stderrLogPath;
     this.fileSystem = dependencies.fileSystem;
     this.now = dependencies.now ?? isoNow;
+    this.sleep = dependencies.sleep ?? sleepSync;
+    this.unloadTimeoutMs = dependencies.unloadTimeoutMs ?? DEFAULT_UNLOAD_TIMEOUT_MS;
+    this.bootstrapRetryLimit = dependencies.bootstrapRetryLimit ?? DEFAULT_BOOTSTRAP_RETRY_LIMIT;
+    this.bootstrapRetryDelayMs = dependencies.bootstrapRetryDelayMs ?? DEFAULT_BOOTSTRAP_RETRY_DELAY_MS;
   }
 
   install(input: ServiceInstallInput): AriavaServiceInstallRecord {
@@ -132,18 +148,8 @@ export class LaunchdServiceManager implements ServiceManager {
     }
 
     const secrets = [runtimePath, ariavaBinPath, configPath];
-    this.runLaunchctl(
-      ['bootout', this.serviceTarget(this.serviceId)],
-      false,
-      'ERR_SERVICE_INSTALL',
-      secrets,
-    );
-    this.runLaunchctl(
-      ['bootstrap', this.domainTarget(), this.definitionPath],
-      true,
-      'ERR_SERVICE_INSTALL',
-      secrets,
-    );
+    this.unloadService(this.serviceId, 'ERR_SERVICE_INSTALL', secrets);
+    this.bootstrapDefinition(this.serviceId, this.definitionPath, 'ERR_SERVICE_INSTALL', secrets);
 
     return {
       backend: 'launchd',
@@ -186,12 +192,13 @@ export class LaunchdServiceManager implements ServiceManager {
 
   start(record?: AriavaServiceInstallRecord): void {
     if (record && record.backend !== this.backend) return;
-    this.runLaunchctl(
-      ['bootstrap', this.domainTarget(), record?.definitionPath ?? this.definitionPath],
-      true,
-      'ERR_SERVICE_COMMAND',
-      record ? [record.runtimePath, record.ariavaBinPath] : [],
-    );
+    const secrets = record ? [record.runtimePath, record.ariavaBinPath] : [];
+    const definitionPath = record?.definitionPath ?? this.definitionPath;
+    const serviceId = record?.serviceId ?? this.serviceId;
+    // start must tolerate a half-unloaded or still-loaded agent: unload first,
+    // wait for launchd to drop the job, then bootstrap with transient retries.
+    this.unloadService(serviceId, 'ERR_SERVICE_COMMAND', secrets);
+    this.bootstrapDefinition(serviceId, definitionPath, 'ERR_SERVICE_COMMAND', secrets);
   }
 
   stop(record?: AriavaServiceInstallRecord): void {
@@ -341,6 +348,51 @@ export class LaunchdServiceManager implements ServiceManager {
     secrets: readonly string[] = [],
   ): CommandResult {
     return runLaunchctlCommand(this.runner, args, strict, code, secrets);
+  }
+
+  private unloadService(
+    serviceId: string,
+    code: 'ERR_SERVICE_INSTALL' | 'ERR_SERVICE_COMMAND',
+    secrets: readonly string[],
+  ): void {
+    this.runLaunchctl(['bootout', this.serviceTarget(serviceId)], false, code, secrets);
+    this.waitUntilServiceAbsent(serviceId);
+  }
+
+  private waitUntilServiceAbsent(serviceId: string): void {
+    const deadline = Date.now() + this.unloadTimeoutMs;
+    while (this.isServicePresent(serviceId)) {
+      if (Date.now() >= deadline) return;
+      this.sleep(this.bootstrapRetryDelayMs);
+    }
+  }
+
+  private isServicePresent(serviceId: string): boolean {
+    const result = this.runner.run('launchctl', ['print', this.serviceTarget(serviceId)]);
+    return result.status === 0;
+  }
+
+  private bootstrapDefinition(
+    serviceId: string,
+    definitionPath: string,
+    code: 'ERR_SERVICE_INSTALL' | 'ERR_SERVICE_COMMAND',
+    secrets: readonly string[],
+  ): void {
+    const args = ['bootstrap', this.domainTarget(), definitionPath];
+    let lastResult: CommandResult | undefined;
+    for (let attempt = 1; attempt <= this.bootstrapRetryLimit; attempt += 1) {
+      lastResult = this.runner.run('launchctl', args);
+      if (lastResult.status === 0) return;
+      if (!isTransientBootstrapFailure(lastResult) || attempt === this.bootstrapRetryLimit) {
+        throw launchctlFailure(code, args, lastResult, secrets);
+      }
+      // launchd can still be removing the previous job, or the domain can still
+      // be in bootstrap mode. Force another unload and back off before retrying.
+      this.runLaunchctl(['bootout', this.serviceTarget(serviceId)], false, code, secrets);
+      this.waitUntilServiceAbsent(serviceId);
+      this.sleep(this.bootstrapRetryDelayMs * attempt);
+    }
+    throw launchctlFailure(code, args, lastResult ?? { status: 1, stdout: '', stderr: '' }, secrets);
   }
 
 }
@@ -508,6 +560,20 @@ function isNotLoadedFailure(result: CommandResult): boolean {
   const detail = `${result.stdout}\n${result.stderr}`.trim().toLowerCase();
   if (/permission|not permitted|denied|policy|unauthorized|failed|error/.test(detail)) return false;
   return /^(could not find service|no such process|service not found)[.!\s]*$/.test(detail);
+}
+
+export function isTransientBootstrapFailure(result: CommandResult): boolean {
+  // macOS launchd returns EIO (5) while a previous bootout is still tearing down
+  // the job, and EINPROGRESS (37) while the gui domain is already bootstrapping.
+  if (result.status === 5 || result.status === 37) return true;
+  const detail = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return /input\/output error|operation already in progress|bootstrap failed:\s*(5|37)\b/.test(detail);
+}
+
+function sleepSync(milliseconds: number): void {
+  if (milliseconds <= 0) return;
+  const shared = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(shared, 0, 0, milliseconds);
 }
 
 function escapeXml(value: string): string {

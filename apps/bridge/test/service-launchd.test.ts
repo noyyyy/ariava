@@ -50,6 +50,10 @@ function fixture(fileSystemOverrides: Partial<LaunchdFileSystem> = {}) {
     stderrLogPath,
     fileSystem: { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, ...fileSystemOverrides },
     now: () => '2026-07-15T12:00:00.000Z',
+    sleep: () => {},
+    unloadTimeoutMs: 0,
+    bootstrapRetryLimit: 3,
+    bootstrapRetryDelayMs: 0,
   });
   return { root, definitionPath, stdoutLogPath, stderrLogPath, runner, manager };
 }
@@ -112,8 +116,10 @@ describe('LaunchdServiceManager', () => {
     expect(reinstalledRecord).toEqual(record);
     expect(runner.calls).toEqual([
       { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },
+      { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },
       { command: 'launchctl', args: ['bootstrap', 'gui/501', definitionPath] },
       { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },
+      { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },
       { command: 'launchctl', args: ['bootstrap', 'gui/501', definitionPath] },
     ]);
     const plist = readFileSync(definitionPath, 'utf8');
@@ -151,6 +157,8 @@ describe('LaunchdServiceManager', () => {
     manager.uninstall(record);
 
     expect(runner.calls).toEqual([
+      { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },
+      { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },
       { command: 'launchctl', args: ['bootstrap', 'gui/501', definitionPath] },
       { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },
       { command: 'launchctl', args: ['kickstart', '-k', 'gui/501/io.test.ariava'] },
@@ -332,7 +340,8 @@ describe('LaunchdServiceManager', () => {
     const runtimePath = '/secret/runtime-token/node';
     const ariavaBinPath = '/secret/bin-token/ariava';
     install.runner.results.push(
-      { status: 0, stdout: '', stderr: '' },
+      { status: 0, stdout: '', stderr: '' }, // bootout
+      { status: 113, stdout: '', stderr: 'Could not find service' }, // print absent
       {
         status: 1,
         stdout: '',
@@ -384,6 +393,64 @@ describe('LaunchdServiceManager', () => {
     expect(String(typedLifecycleError.data.stderr).length).toBe(2_000);
     expect(JSON.stringify(typedLifecycleError.data)).not.toContain(runtimePath);
     expect(JSON.stringify(typedLifecycleError.data)).not.toContain(ariavaBinPath);
+  });
+
+  test('retries transient bootstrap EIO after waiting for unload', () => {
+    const { manager, runner, definitionPath } = fixture();
+    runner.results.push(
+      { status: 0, stdout: '', stderr: '' }, // bootout
+      { status: 113, stdout: '', stderr: 'Could not find service' }, // print absent
+      {
+        status: 5,
+        stdout: '',
+        stderr: 'Bootstrap failed: 5: Input/output error\nTry re-running the command as root for richer errors.\n',
+      },
+      { status: 0, stdout: '', stderr: '' }, // retry bootout
+      { status: 113, stdout: '', stderr: 'Could not find service' }, // print absent
+      { status: 0, stdout: '', stderr: '' }, // bootstrap success
+    );
+
+    const record = manager.install({ runtimePath: '/usr/bin/node', ariavaBinPath: '/usr/bin/ariava' });
+    expect(record.serviceId).toBe('io.test.ariava');
+    expect(runner.calls).toEqual([
+      { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },
+      { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },
+      { command: 'launchctl', args: ['bootstrap', 'gui/501', definitionPath] },
+      { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },
+      { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },
+      { command: 'launchctl', args: ['bootstrap', 'gui/501', definitionPath] },
+    ]);
+  });
+
+  test('surfaces permanent bootstrap failures after exhausting transient retries', () => {
+    const { manager, runner } = fixture();
+    const eio = {
+      status: 5,
+      stdout: '',
+      stderr: 'Bootstrap failed: 5: Input/output error\nTry re-running the command as root for richer errors.\n',
+    };
+    runner.results.push(
+      { status: 0, stdout: '', stderr: '' }, // bootout
+      { status: 113, stdout: '', stderr: 'Could not find service' }, // print absent
+      eio, // bootstrap 1
+      { status: 0, stdout: '', stderr: '' }, // retry bootout
+      { status: 113, stdout: '', stderr: 'Could not find service' },
+      eio, // bootstrap 2
+      { status: 0, stdout: '', stderr: '' },
+      { status: 113, stdout: '', stderr: 'Could not find service' },
+      eio, // bootstrap 3 final
+    );
+
+    let error: unknown;
+    try {
+      manager.install({ runtimePath: '/usr/bin/node', ariavaBinPath: '/usr/bin/ariava' });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(AriavaCliError);
+    expect((error as AriavaCliError).code).toBe('ERR_SERVICE_INSTALL');
+    expect((error as AriavaCliError).message).toContain('Input/output error');
+    expect(runner.calls.filter((call) => call.args[0] === 'bootstrap')).toHaveLength(3);
   });
 
   test('reports file log availability without reading log contents', () => {

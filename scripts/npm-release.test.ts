@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   OFFICIAL_REGISTRY,
+  REGISTRY_VERIFY_ATTEMPTS,
+  REGISTRY_VERIFY_BASE_DELAY_MS,
+  REGISTRY_VERIFY_MAX_DELAY_MS,
   RELEASE_PACKAGES,
   classifyRegistryResult,
   createControlledNpmConfigs,
@@ -13,6 +16,7 @@ import {
   parseStableNpmVersion,
   prepareRelease,
   publishPrepared,
+  registryVerifyBackoffMs,
   validateCommonVersions,
   validateGitRelease,
   validateReleaseManifest,
@@ -137,11 +141,32 @@ function publishOptions(root: string, directory: string, mode: 'trusted' | 'manu
   return { root, directory, mode, tag: TAG, defaultBranchRef: DEFAULT_REF, env: trustedEnv(), verifyAttempts: 2, retryDelayMs: 0 };
 }
 
-const deps = (run: any, log: Invocation[]) => ({
+const deps = (run: any, log: Invocation[], sleeps: number[] = []) => ({
   run,
-  sleep: async () => undefined,
+  sleep: async (ms: number) => { sleeps.push(ms); },
   makeTempDir: (prefix: string) => mkdtempSync(join(tmpdir(), prefix)),
   inspectTarball: async (path: string) => ({ name: path.includes('pi-extension') ? '@ariava/pi-extension' : 'ariava', version: VERSION }),
+});
+
+describe('registry verify backoff', () => {
+  test('uses exponential delays capped at the max, and zero base stays instantaneous', () => {
+    expect(registryVerifyBackoffMs(1)).toBe(REGISTRY_VERIFY_BASE_DELAY_MS);
+    expect(registryVerifyBackoffMs(2)).toBe(REGISTRY_VERIFY_BASE_DELAY_MS * 2);
+    expect(registryVerifyBackoffMs(3)).toBe(REGISTRY_VERIFY_BASE_DELAY_MS * 4);
+    expect(registryVerifyBackoffMs(5)).toBe(REGISTRY_VERIFY_BASE_DELAY_MS * 16);
+    expect(registryVerifyBackoffMs(6)).toBe(REGISTRY_VERIFY_MAX_DELAY_MS);
+    expect(registryVerifyBackoffMs(10)).toBe(REGISTRY_VERIFY_MAX_DELAY_MS);
+    expect(registryVerifyBackoffMs(1, { baseDelayMs: 0 })).toBe(0);
+    expect(registryVerifyBackoffMs(5, { baseDelayMs: 500, maxDelayMs: 2_000 })).toBe(2_000);
+    expect(REGISTRY_VERIFY_ATTEMPTS).toBe(10);
+  });
+
+  test('rejects invalid attempt or delay configuration', () => {
+    expect(() => registryVerifyBackoffMs(0)).toThrow('positive integer');
+    expect(() => registryVerifyBackoffMs(1.5)).toThrow('positive integer');
+    expect(() => registryVerifyBackoffMs(1, { baseDelayMs: -1 })).toThrow('baseDelayMs');
+    expect(() => registryVerifyBackoffMs(1, { maxDelayMs: Number.NaN })).toThrow('maxDelayMs');
+  });
 });
 
 describe('release contract', () => {
@@ -444,6 +469,32 @@ describe('prepared publication and partial-success recovery', () => {
     };
     try { await expect(publishPrepared(publishOptions(root, directory), deps(run, fake.log))).rejects.toThrow('after 2 attempts'); }
     finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('final registry verification uses exponential backoff between attempts', async () => {
+    const root = fixture(); const { directory } = prepared(root); const fake = fakeRun({ states: ['matching', 'matching'] });
+    const sleeps: number[] = [];
+    let packageViews = 0;
+    const run = async (command: string, args: string[], options: any) => {
+      if (command === 'npm' && args[0] === 'view' && args[2] !== 'dist-tags') {
+        packageViews += 1;
+        // Initial preflight = 2 matching views. Fail the next two full final rounds (4 views),
+        // then allow the third final attempt to succeed.
+        if (packageViews > 2 && packageViews <= 6) {
+          return { code: 1, stdout: '', stderr: 'npm error code E404\nnpm error 404 Not Found' };
+        }
+      }
+      return fake.run(command, args, options);
+    };
+    try {
+      const summary = await publishPrepared(
+        { ...publishOptions(root, directory), verifyAttempts: 4, retryDelayMs: 100, retryMaxDelayMs: 1_000 },
+        deps(run, fake.log, sleeps),
+      );
+      expect(summary.packages.every((item: any) => item.final === 'present-and-matching')).toBe(true);
+      // Sleeps after failed final attempts 1 and 2: 100, 200 (not after the successful 3rd).
+      expect(sleeps).toEqual([100, 200]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test('OTP stdin/FD input is validated and argv alias remains deprecated compatibility only', () => {
