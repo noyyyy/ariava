@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 export interface IsolatedPublicCliEnvironment {
@@ -8,7 +8,6 @@ export interface IsolatedPublicCliEnvironment {
   piLogPath: string;
 }
 
-const publicPackageVersion = (JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as { version: string }).version;
 
 export function createIsolatedPublicCliEnvironment(
   home: string,
@@ -27,7 +26,35 @@ export function createIsolatedPublicCliEnvironment(
   chmodSync(launchctlPath, 0o755);
   writeFileSync(
     piPath,
-    `#!/bin/sh\nset -eu\nprintf '%s\\n' "$*" >> "$ARIAVA_TEST_PI_LOG"\nagent_dir="\${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"\nsettings="$agent_dir/settings.json"\npkg="$agent_dir/npm/node_modules/@ariava/pi-extension"\ncase "$1" in\n  install)\n    mkdir -p "$pkg"\n    printf '{"name":"@ariava/pi-extension","version":"%s"}\\n' "$ARIAVA_TEST_PACKAGE_VERSION" > "$pkg/package.json"\n    mkdir -p "$agent_dir"\n    printf '{"packages":["npm:@ariava/pi-extension"]}\\n' > "$settings"\n    ;;\n  update)\n    mkdir -p "$pkg"\n    printf '{"name":"@ariava/pi-extension","version":"%s"}\\n' "$ARIAVA_TEST_PACKAGE_VERSION" > "$pkg/package.json"\n    ;;\n  remove)\n    rm -rf "$pkg"\n    printf '{"packages":[]}\\n' > "$settings"\n    ;;\nesac\n`,
+    `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "$ARIAVA_TEST_PI_LOG"
+agent_dir="\${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+settings="$agent_dir/settings.json"
+pkg="$agent_dir/npm/node_modules/@ariava/pi-extension"
+case "$1" in
+  install)
+    source="$2"
+    version="\${source##*@}"
+    mkdir -p "$pkg" "$agent_dir"
+    printf '{"name":"@ariava/pi-extension","version":"%s"}\\n' "$version" > "$pkg/package.json"
+    ARIAVA_TEST_PI_SOURCE="$source" SETTINGS_PATH="$settings" bun -e '
+      import { existsSync, readFileSync, writeFileSync } from "node:fs";
+      const path = process.env.SETTINGS_PATH;
+      const settings = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
+      const packages = Array.isArray(settings.packages) ? settings.packages : [];
+      settings.packages = [...packages.filter((entry) => {
+        const source = typeof entry === "string" ? entry : entry?.source;
+        return source !== "npm:@ariava/pi-extension" && !source?.startsWith("npm:@ariava/pi-extension@");
+      }), process.env.ARIAVA_TEST_PI_SOURCE];
+      writeFileSync(path, JSON.stringify(settings) + "\\n");
+    '
+    ;;
+  remove)
+    rm -rf "$pkg"
+    ;;
+esac
+`,
   );
   chmodSync(piPath, 0o755);
   return {
@@ -35,10 +62,10 @@ export function createIsolatedPublicCliEnvironment(
       ...process.env,
       ...overrides,
       HOME: home,
+      PI_CODING_AGENT_DIR: join(home, '.pi', 'agent'),
       PATH: `${binDir}${delimiter}${process.env.PATH ?? '/usr/bin:/bin:/usr/sbin:/sbin'}`,
       ARIAVA_TEST_LAUNCHCTL_LOG: launchctlLogPath,
       ARIAVA_TEST_PI_LOG: piLogPath,
-      ARIAVA_TEST_PACKAGE_VERSION: publicPackageVersion,
     },
     launchctlPath,
     launchctlLogPath,

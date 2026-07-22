@@ -7,6 +7,8 @@ import { spawnSync } from 'node:child_process';
 const helper = join(process.cwd(), 'scripts', 'assert-npm-package.mjs');
 const required = [
   'package.json', 'apps/bridge/dist/cli.js', 'apps/bridge/dist/public-cli.js',
+  'apps/bridge/dist/ui/assets/ariava-success-wide.txt',
+  'apps/bridge/dist/ui/assets/ariava-success-compact.txt',
   'packages/protocol/dist/index.js', 'packages/protocol/dist/index.d.ts',
   'packages/protocol/dist/events.js', 'packages/protocol/dist/events.d.ts',
   'packages/protocol/dist/fixtures/ed25519-request-vectors.json',
@@ -46,8 +48,8 @@ describe('npm package artifact assertion', () => {
     expect(result.stdout.toString()).toContain(`${required.length} required artifacts`);
   });
 
-  test('rejects missing, private, source, and otherwise unexpected artifacts', () => {
-    expect(run(required.slice(1)).exitCode).toBe(1);
+  test('rejects a missing reviewed asset and private, source, image, or otherwise unexpected artifacts', () => {
+    expect(run(required.filter((path) => path !== 'apps/bridge/dist/ui/assets/ariava-success-wide.txt')).exitCode).toBe(1);
     for (const forbidden of [
       'helpers/Identity.swift',
       'apps/relay/dist/worker.js',
@@ -57,6 +59,8 @@ describe('npm package artifact assertion', () => {
       'scripts/private-deploy.sh',
       'packages/protocol/src/index.ts',
       'packages/protocol/dist/index.js.map',
+      'apps/bridge/dist/ui/assets/ariava.png',
+      'apps/bridge/dist/ui/assets/unreviewed.txt',
       'Users/example/private.txt',
       'ariava-private/README.md',
     ]) {

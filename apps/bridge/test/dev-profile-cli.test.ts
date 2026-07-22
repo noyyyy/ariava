@@ -60,6 +60,9 @@ describe('source dev profile commands', () => {
     const original = '{"production":true}\n';
     writeFileSync(defaultConfig, original, { mode: 0o600 });
 
+    let saves = 0;
+    const save = harness.deps.saveUserConfig;
+    harness.deps.saveUserConfig = (config, path) => { saves += 1; save(config, path); };
     expect(await runDevProfileCommand(['init'], harness.deps)).toBe(0);
     const first = JSON.parse(readFileSync(harness.deps.paths.configPath, 'utf8'));
     expect(first).toMatchObject({
@@ -73,11 +76,59 @@ describe('source dev profile commands', () => {
     });
     expect(first.identity.hostId).toBeString();
     expect(readFileSync(defaultConfig, 'utf8')).toBe(original);
+    const firstBytes = readFileSync(harness.deps.paths.configPath, 'utf8');
+    expect(saves).toBe(1);
 
     expect(await runDevProfileCommand(['init'], harness.deps)).toBe(0);
-    const second = JSON.parse(readFileSync(harness.deps.paths.configPath, 'utf8'));
+    const secondBytes = readFileSync(harness.deps.paths.configPath, 'utf8');
+    const second = JSON.parse(secondBytes);
     expect(second.identity.hostId).toBe(first.identity.hostId);
+    expect(secondBytes).toBe(firstBytes);
+    expect(saves).toBe(1);
     expect(readFileSync(defaultConfig, 'utf8')).toBe(original);
+  });
+
+  test('setup initializes the isolated profile, prepares Pi, and leaves Pi startup to the user', async () => {
+    const harness = createHarness();
+    const defaultRoot = join(harness.root, '.config', 'ariava');
+    mkdirSync(defaultRoot, { recursive: true, mode: 0o700 });
+    const defaultConfig = join(defaultRoot, 'config.json');
+    writeFileSync(defaultConfig, '{"production":true}\n', { mode: 0o600 });
+    const extensionPath = join(harness.root, 'index.ts');
+    writeFileSync(extensionPath, 'export default {}', { mode: 0o600 });
+    harness.deps.sourcePiExtensionPath = extensionPath;
+    harness.deps.interactive = false;
+
+    let bridgeStopped = false;
+    let finishBridge!: () => void;
+    harness.deps.createBridge = (config) => ({
+      start: async () => {
+        writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
+          url: `http://127.0.0.1:${config.agentAdapter.port}`, secret: 'dev-secret',
+        });
+      },
+      runForever: () => new Promise<void>((resolveRun) => { finishBridge = resolveRun; }),
+      stop: () => { bridgeStopped = true; finishBridge(); },
+    });
+    let piSpawns = 0;
+    harness.deps.spawn = () => { piSpawns += 1; return { status: 0 }; };
+    harness.deps.waitForShutdown = async () => {};
+
+    expect(await runDevProfileCommand(['setup', '--extension', 'pi'], harness.deps)).toBe(0);
+    expect(piSpawns).toBe(0);
+    expect(harness.output()).toContain('bun run --cwd open-source/ariava dev:pi');
+    expect(bridgeStopped).toBe(true);
+    expect(readFileSync(defaultConfig, 'utf8')).toBe('{"production":true}\n');
+    expect(JSON.parse(readFileSync(harness.deps.paths.configPath, 'utf8'))).toMatchObject({
+      relayBaseUrl: 'http://127.0.0.1:8787', agentAdapterPort: 7273,
+    });
+  });
+
+  test('setup requires an explicit adapter when noninteractive', async () => {
+    const harness = createHarness();
+    harness.deps.interactive = false;
+    await expect(runDevProfileCommand(['setup'], harness.deps)).rejects.toThrow('requires --extension pi or --no-extensions');
+    expect(harness.deps.pathExists(harness.deps.paths.configPath)).toBe(false);
   });
 
   test('bridge uses persisted config despite stale environment and explicitly selects dev identity', async () => {

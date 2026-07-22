@@ -45,6 +45,15 @@ describe('AgentAdapterServer', () => {
     expect(response.status).toBe(401);
   });
 
+  test('health is authenticated and returns only minimal Host evidence', async () => {
+    const unauthenticated = await fetch(url('/v1/health'));
+    expect(unauthenticated.status).toBe(401);
+
+    const response = await fetch(url('/v1/health'), { headers: headers() });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, hostId: 'host-1' });
+  });
+
   test('registers a session', async () => {
     const response = await fetch(url('/v1/agent/sessions'), {
       method: 'POST',

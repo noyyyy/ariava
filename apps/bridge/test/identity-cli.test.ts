@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runPublicCli } from '../src/public-cli-app';
@@ -24,11 +24,11 @@ describe('identity-safe public CLI', () => {
   test('init creates once, reuses identity, and rejects managed config fields', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ariava-identity-cli-')); roots.push(root);
     const configPath = join(root, 'config.json'); const identityPath = join(root, 'identity.json');
-    let config: any = {}; const out: string[] = []; const err: string[] = [];
+    let config: any = { identityPath }; const out: string[] = []; const err: string[] = [];
     const deps = {
       createServiceManager: manager, stdout: { write: (x: string) => { out.push(x); return true; } } as any,
       stderr: { write: (x: string) => { err.push(x); return true; } } as any,
-      loadUserConfig: () => config, saveUserConfig: (next: any) => { config = next; mkdirSync(root, { recursive: true }); Bun.write(configPath, JSON.stringify(next)); },
+      loadUserConfig: () => config, saveUserConfig: (next: any) => { config = next; mkdirSync(root, { recursive: true }); writeFileSync(configPath, JSON.stringify(next)); },
       resolveAriavaConfig: () => ({ ...config, relayBaseUrl: 'https://relay.test', hostName: 'Linux', agentAdapterPort: 7272,
         agentAdapterConfigPath: join(root, 'adapter.json'), statePath: join(root, 'state.json'), identityPath, configPath,
         installPath: join(root, 'install.json'), logDir: root, stdoutLogPath: '', stderrLogPath: '', tmpDir: root, environmentOverrides: [] }),
@@ -37,7 +37,7 @@ describe('identity-safe public CLI', () => {
       removePath: () => {}, loadInstallMetadata: () => ({}), loadInstallMetadataDetailed: () => ({ metadata: {}, diagnostics: { serviceMetadataValid: true } }),
       mergeInstallMetadata: () => ({}), saveInstallMetadata: () => {},
     } as any;
-    expect(await runPublicCli(['init', '--json'], deps)).toBe(0);
+    expect(await runPublicCli(['init', '--json'], deps), err.join('')).toBe(0);
     const first = config.identity.hostId;
     expect(await runPublicCli(['init', '--json'], deps)).toBe(0);
     expect(config.identity.hostId).toBe(first);

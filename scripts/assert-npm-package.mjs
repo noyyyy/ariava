@@ -26,10 +26,15 @@ if (inputPath.endsWith('.tgz')) {
   filePaths = (payload?.[0]?.files ?? []).map((entry) => entry.path);
 }
 const files = new Set(filePaths);
+const reviewedBridgeAssets = [
+  'apps/bridge/dist/ui/assets/ariava-success-wide.txt',
+  'apps/bridge/dist/ui/assets/ariava-success-compact.txt',
+];
 const required = [
   'package.json',
   'apps/bridge/dist/cli.js',
   'apps/bridge/dist/public-cli.js',
+  ...reviewedBridgeAssets,
   'packages/protocol/dist/index.js',
   'packages/protocol/dist/index.d.ts',
   'packages/protocol/dist/events.js',
@@ -46,6 +51,7 @@ const allowedPrefixes = [
   'packages/shared-utils/dist/',
   'extensions/pi/bundle/',
 ];
+const reviewedBridgeAssetSet = new Set(reviewedBridgeAssets);
 const allowedExactFiles = new Set([
   'package.json',
   'README.md',
@@ -69,6 +75,8 @@ const forbiddenPatterns = [
   /\.swift$/iu,
   /\.map$/iu,
   /macos-helper/iu,
+  /runtime-image/iu,
+  /\.(?:png|jpe?g|gif|webp|heic|svg)$/iu,
  ];
 const missing = required.filter((path) => !files.has(path));
 if (missing.length > 0) {
@@ -77,6 +85,7 @@ if (missing.length > 0) {
 }
 const unexpected = [...files].filter((path) => {
   if (allowedExactFiles.has(path)) return false;
+  if (path.startsWith('apps/bridge/dist/ui/assets/') && !reviewedBridgeAssetSet.has(path)) return true;
   if (!allowedPrefixes.some((prefix) => path.startsWith(prefix))) return true;
   return forbiddenPatterns.some((pattern) => pattern.test(path));
 });

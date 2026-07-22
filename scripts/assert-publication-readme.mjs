@@ -26,4 +26,21 @@ if (!readme.includes(PUBLIC_README_MARKER)) {
   console.error(`publication README check failed: expected generated Public Core marker ${PUBLIC_README_MARKER}`);
   process.exit(1);
 }
-console.log('publication README check passed: generated Public Core README marker present');
+
+export const REQUIRED_PUBLICATION_TEXT = [
+  { label: 'recommended npx onboarding command', text: 'npx --yes ariava@latest setup' },
+  { label: 'canonical production Relay', text: 'https://ariava-relay.noyx.io' },
+  { label: 'Pi reload instruction', text: '/reload' },
+  { label: 'explicit Watch pairing command', text: 'ariava pair <PAIRING_CODE>' },
+  { label: 'retained manual init command', text: 'ariava init' },
+  { label: 'retained manual service command', text: 'ariava service install' },
+  { label: 'retained manual Pi install command', text: 'ariava install pi' },
+  { label: 'retained doctor command', text: 'ariava doctor' },
+];
+
+const missing = REQUIRED_PUBLICATION_TEXT.filter(({ text }) => !readme.includes(text));
+if (missing.length > 0) {
+  console.error(`publication README check failed: missing ${missing.map(({ label, text }) => `${label} (${text})`).join(', ')}`);
+  process.exit(1);
+}
+console.log('publication README check passed: marker and required onboarding/manual text present');

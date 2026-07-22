@@ -34,33 +34,33 @@
 ### Requirements
 
 - Node.js and npm
-- macOS, or Linux/WSL with a reachable systemd user service manager (see the [WSL installation guide](docs/install-guide.md#wsl))
-- [Pi](https://pi.dev/)
+- macOS, or Linux/WSL with a reachable systemd user service manager
+- [Pi](https://pi.dev/) when selecting the Pi adapter
 
-For Ubuntu/Debian WSL, install `libpam-systemd` and `dbus-user-session`, enable systemd, and verify `systemctl --user` before installing Ariava. Follow the [WSL section of the installation guide](docs/install-guide.md#wsl).
+The shortest first-run path is:
 
-Install Ariava globally, initialize the Host, and install its user-scoped service:
+```bash
+npx --yes ariava@latest setup
+```
+
+Fresh production setup uses `https://ariava-relay.noyx.io`. Follow the prompts to set up the Bridge and optionally install the Pi extension; run `/reload` in an open Pi session after installation.
+
+Pair your Watch separately:
+
+```bash
+ariava pair <PAIRING_CODE>
+```
+
+For manual setup:
 
 ```bash
 npm install --global ariava
 ariava init
 ariava service install
 ariava service status
-```
-
-Set your Relay URL, then restart the service:
-
-```bash
-ariava config set relayBaseUrl https://your-relay.example.com
-ariava service restart
-```
-
-Install the Pi extension, then run `/reload` in an open Pi session or restart Pi:
-
-```bash
 ariava install pi
+ariava doctor
 ```
-
 ## Usage
 
 Check the Host, pair with a valid pairing code, inspect linked devices, or view service logs:

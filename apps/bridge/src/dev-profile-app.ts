@@ -21,6 +21,7 @@ import {
   type HostIdentityStore,
 } from './identity';
 import type { BridgeConfig } from './types';
+import { createReadlineOnboardingPrompt, promptForOnboardingSelection } from './ui/onboarding-renderer';
 
 const PUBLIC_CORE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const SOURCE_PI_EXTENSION_PATH = resolve(PUBLIC_CORE_ROOT, 'extensions', 'pi', 'index.ts');
@@ -52,6 +53,8 @@ export interface DevProfileDependencies {
   createBridge(config: BridgeConfig, identityStore: HostIdentityStore): DevBridgeDaemon;
   spawn(command: string, args: string[], options: SpawnSyncOptions): SpawnResult;
   waitForShutdown(): Promise<void>;
+  selectAdapter(): Promise<'pi' | 'bridge-only'>;
+  interactive: boolean;
   environment: NodeJS.ProcessEnv;
   hostName(): string;
   generateSecret(): string;
@@ -71,6 +74,8 @@ export function createDefaultDevProfileDependencies(): DevProfileDependencies {
     createBridge: (config, identityStore) => new BridgeDaemon(config, undefined, identityStore),
     spawn: (command, args, options) => spawnSync(command, args, options),
     waitForShutdown: waitForShutdownSignal,
+    selectAdapter: selectDevAdapter,
+    interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
     environment: process.env,
     hostName: hostname,
     generateSecret: () => randomBytes(32).toString('hex'),
@@ -83,6 +88,8 @@ export async function runDevProfileCommand(
 ): Promise<number> {
   const command = argv[0];
   switch (command) {
+    case 'setup':
+      return runDevSetup(argv.slice(1), dependencies);
     case 'init':
       return initDevProfile(dependencies);
     case 'bridge':
@@ -92,8 +99,54 @@ export async function runDevProfileCommand(
     case 'status':
       return showDevStatus(dependencies);
     default:
-      throw new Error('Usage: dev-profile-cli <init|bridge|pi|status>');
+      throw new Error('Usage: dev-profile-cli <setup|init|bridge|pi|status>');
   }
+}
+
+async function runDevSetup(args: string[], deps: DevProfileDependencies): Promise<number> {
+  const usePi = await selectDevSetupPi(args, deps);
+  await initDevProfile(deps);
+  const { daemon, runPromise } = await startDevBridge(deps);
+  try {
+    if (usePi) {
+      requireSourcePiExtension(deps);
+      deps.stdout.write('Pi source adapter ready. Start Pi in another terminal with:\n');
+      deps.stdout.write('  bun run --cwd open-source/ariava dev:pi\n');
+    } else {
+      deps.stdout.write('Dev profile ready without agent extensions.\n');
+    }
+    deps.stdout.write('Press Ctrl-C to stop the source Bridge.\n');
+    const outcome = await Promise.race([
+      runPromise.then(() => 'bridge' as const),
+      deps.waitForShutdown().then(() => 'shutdown' as const),
+    ]);
+    if (outcome === 'bridge') throw new Error('Ariava source Bridge stopped unexpectedly');
+    return 0;
+  } finally {
+    daemon.stop();
+    await waitForBridgeShutdown(runPromise);
+  }
+}
+
+async function selectDevSetupPi(args: string[], deps: DevProfileDependencies): Promise<boolean> {
+  let piSelected = false;
+  let noExtensions = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (value === '--extension') {
+      if (args[++index] !== 'pi') throw new Error('dev:setup supports only --extension pi');
+      piSelected = true;
+    } else if (value === '--no-extensions') {
+      noExtensions = true;
+    } else {
+      throw new Error(`Unknown dev:setup option: ${value}`);
+    }
+  }
+  if (piSelected && noExtensions) throw new Error('Choose either --extension or --no-extensions');
+  if (piSelected) return true;
+  if (noExtensions) return false;
+  if (!deps.interactive) throw new Error('Noninteractive dev:setup requires --extension pi or --no-extensions');
+  return await deps.selectAdapter() === 'pi';
 }
 
 async function initDevProfile(deps: DevProfileDependencies): Promise<number> {
@@ -108,22 +161,16 @@ async function initDevProfile(deps: DevProfileDependencies): Promise<number> {
     identityPath: deps.paths.identityPath,
     ...(existing.pollIntervalMs === undefined ? {} : { pollIntervalMs: existing.pollIntervalMs }),
   };
-  deps.saveUserConfig(base, deps.paths.configPath);
   const store = deps.createIdentityStore(deps.paths.identityPath, deps.platform, 'dev');
   const ensured = await ensureFirstRunIdentity(store);
-  deps.saveUserConfig({ ...base, identity: publicIdentityMetadata(ensured.identity) }, deps.paths.configPath);
+  const config = { ...base, identity: publicIdentityMetadata(ensured.identity) };
+  if (JSON.stringify(existing) !== JSON.stringify(config)) deps.saveUserConfig(config, deps.paths.configPath);
   deps.stdout.write(`${ensured.created ? 'Initialized' : 'Reused'} dev Host identity ${ensured.identity.hostId}\n`);
   return 0;
 }
 
 async function runDevBridge(deps: DevProfileDependencies): Promise<number> {
-  requireInitializedConfig(deps);
-  const config = loadBridgeConfig(deps.paths.configPath);
-  const identityStore = deps.createIdentityStore(deps.paths.identityPath, deps.platform, 'dev');
-  const daemon = deps.createBridge(config, identityStore);
-  await daemon.start();
-  deps.stdout.write(`Ariava source Bridge listening on ${config.agentAdapter.port} using ${deps.paths.configPath}\n`);
-  const runPromise = daemon.runForever();
+  const { daemon, runPromise } = await startDevBridge(deps);
   try {
     await Promise.race([runPromise, deps.waitForShutdown()]);
   } finally {
@@ -131,6 +178,16 @@ async function runDevBridge(deps: DevProfileDependencies): Promise<number> {
     await waitForBridgeShutdown(runPromise);
   }
   return 0;
+}
+
+async function startDevBridge(deps: DevProfileDependencies): Promise<{ daemon: DevBridgeDaemon; runPromise: Promise<void> }> {
+  requireInitializedConfig(deps);
+  const config = loadBridgeConfig(deps.paths.configPath);
+  const identityStore = deps.createIdentityStore(deps.paths.identityPath, deps.platform, 'dev');
+  const daemon = deps.createBridge(config, identityStore);
+  await daemon.start();
+  deps.stdout.write(`Ariava source Bridge listening on ${config.agentAdapter.port} using ${deps.paths.configPath}\n`);
+  return { daemon, runPromise: daemon.runForever() };
 }
 
 async function waitForBridgeShutdown(runPromise: Promise<void>): Promise<void> {
@@ -149,19 +206,31 @@ async function waitForBridgeShutdown(runPromise: Promise<void>): Promise<void> {
 }
 
 function runDevPi(args: string[], deps: DevProfileDependencies): number {
-  if (!deps.pathExists(deps.paths.agentAdapterConfigPath)) {
-    throw new Error(`Dev Agent Adapter discovery is missing at ${deps.paths.agentAdapterConfigPath}; start dev:bridge first`);
-  }
-  if (!deps.pathExists(deps.sourcePiExtensionPath)) {
-    throw new Error(`Source pi extension is missing at ${deps.sourcePiExtensionPath}`);
-  }
+  requireDevPiFiles(deps);
   const environment = sanitizeAriavaEnvironment(deps.environment);
   environment.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = deps.paths.agentAdapterConfigPath;
   environment.ARIAVA_PI_LOG_PATH = deps.paths.piExtensionLogPath;
-  const result = deps.spawn('pi', ['--no-extensions', '-e', deps.sourcePiExtensionPath, ...args], {
-    env: environment,
-    stdio: 'inherit',
-  });
+  return exitCode(deps.spawn(
+    'pi',
+    ['--no-extensions', '-e', deps.sourcePiExtensionPath, ...args],
+    { env: environment, stdio: 'inherit' },
+  ));
+}
+
+function requireDevPiFiles(deps: DevProfileDependencies): void {
+  if (!deps.pathExists(deps.paths.agentAdapterConfigPath)) {
+    throw new Error(`Dev Agent Adapter discovery is missing at ${deps.paths.agentAdapterConfigPath}; start dev:bridge first`);
+  }
+  requireSourcePiExtension(deps);
+}
+
+function requireSourcePiExtension(deps: DevProfileDependencies): void {
+  if (!deps.pathExists(deps.sourcePiExtensionPath)) {
+    throw new Error(`Source pi extension is missing at ${deps.sourcePiExtensionPath}`);
+  }
+}
+
+function exitCode(result: SpawnResult): number {
   if (result.error) throw result.error;
   if (result.signal) throw new Error(`pi exited from signal ${result.signal}`);
   return result.status ?? 1;
@@ -216,6 +285,16 @@ function assertFixedDevConfig(
 
 function sanitizeAriavaEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(environment).filter(([name]) => !name.startsWith('ARIAVA_')));
+}
+
+async function selectDevAdapter(): Promise<'pi' | 'bridge-only'> {
+  const prompt = createReadlineOnboardingPrompt(process.stdin, process.stdout);
+  try {
+    const selection = await promptForOnboardingSelection({ pi: { present: true } }, prompt, false);
+    return selection.extensions.includes('pi') ? 'pi' : 'bridge-only';
+  } finally {
+    prompt.close?.();
+  }
 }
 
 function waitForShutdownSignal(): Promise<void> {

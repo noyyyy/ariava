@@ -80,14 +80,14 @@ describe('host-manager helpers', () => {
     expect(() => loadInstallMetadata(installPath)).toThrow();
   });
 
-  test('uses the local relay when no override is configured', () => {
+  test('uses the canonical production relay when no override is configured', () => {
     const root = join(tmpdir(), `ariava-host-manager-${Date.now()}`);
     roots.push(root);
     const configPath = join(root, 'config.json');
 
     const resolved = resolveAriavaConfig({}, configPath);
 
-    expect(resolved.relayBaseUrl).toBe('http://127.0.0.1:8787');
+    expect(resolved.relayBaseUrl).toBe('https://ariava-relay.noyx.io');
   });
 
   test('resolves persisted and environment agent adapter secrets', () => {
@@ -217,18 +217,24 @@ describe('host-manager helpers', () => {
     await Bun.write(join(nested, 'index.ts'), 'export default {}');
     await Bun.write(join(source, 'package.json'), JSON.stringify({ name: '@ariava/pi-extension', version: '0.1.2' }));
 
+    const installPath = join(root, 'isolated-pi', 'extensions', 'ariava-pi');
     const record = installPiExtension({
       sourcePath: source,
       sourceKind: 'release-bundle',
       version: '0.1.2',
       force: true,
       installDependencies: false,
+      installPath,
     });
-    const status = getPiExtensionStatus('0.1.2');
+    const status = getPiExtensionStatus('0.1.2', {
+      settingsPath: join(root, 'isolated-pi', 'settings.json'),
+      packagePath: installPath,
+    });
 
     expect(record.version).toBe('0.1.2');
+    expect(record.managedPath).toBe(installPath);
+    expect(JSON.parse(readFileSync(join(installPath, '.ariava-managed.json'), 'utf8')).version).toBe('0.1.2');
     expect(status.managed).toBe(true);
-    expect(status.installedVersion).toBe('0.1.2');
   });
 
   test('resolves default dev pi source to the built bundle', () => {

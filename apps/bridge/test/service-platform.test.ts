@@ -87,7 +87,7 @@ describe('neutral service command boundary', () => {
 });
 
 describe('stable Ariava CLI errors', () => {
-  test('exposes all eight stable service error codes', () => {
+  test('exposes stable service and onboarding error codes', () => {
     expect(ARIAVA_CLI_ERROR_CODES).toEqual([
       'ERR_UNSUPPORTED_PLATFORM',
       'ERR_SYSTEMCTL_NOT_FOUND',
@@ -97,6 +97,21 @@ describe('stable Ariava CLI errors', () => {
       'ERR_SERVICE_COMMAND',
       'ERR_SERVICE_METADATA',
       'ERR_LOGS_UNAVAILABLE',
+      'ERR_ONBOARDING_LOCKED',
+      'ERR_STABLE_CLI_INSTALL',
+      'ERR_STABLE_CLI_PATH',
+      'ERR_RELAY_CONFIG_REQUIRED',
+      'ERR_RELAY_UNREACHABLE',
+      'ERR_RELAY_AUTH_FAILED',
+      'ERR_ADAPTER_UNKNOWN',
+      'ERR_ADAPTER_UNAVAILABLE',
+      'ERR_AGENT_RUNTIME_NOT_FOUND',
+      'ERR_EXTENSION_INSTALL',
+      'ERR_EXTENSION_VERSION_MISMATCH',
+      'ERR_EXTENSION_UNMANAGED',
+      'ERR_AGENT_ADAPTER_DISCOVERY',
+      'ERR_AGENT_ADAPTER_NOT_LOOPBACK',
+      'ERR_ONBOARDING_NOT_READY',
     ]);
   });
 

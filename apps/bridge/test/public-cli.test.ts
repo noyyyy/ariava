@@ -2,11 +2,14 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { AriavaCliError, type OnboardingDetection, type OnboardingResult } from '../src/host-manager';
+import { runPublicCli } from '../src/public-cli-app';
 import { createIsolatedPublicCliEnvironment } from './fixtures/isolated-public-cli-env';
 
+const publicCoreRoot = join(import.meta.dir, '..', '..', '..');
 const roots: string[] = [];
 const bunPath = process.execPath;
-const cliPath = join(process.cwd(), 'apps', 'bridge', 'src', 'public-cli.ts');
+const cliPath = join(publicCoreRoot, 'apps', 'bridge', 'src', 'public-cli.ts');
 
 function isolatedEnv(home: string, overrides: Record<string, string | undefined> = {}) {
   return createIsolatedPublicCliEnvironment(home, overrides).env;
@@ -30,6 +33,41 @@ afterEach(() => {
 });
 
 describe('public ariava CLI', () => {
+  test('renders structured top-level help while preserving the JSON command catalog', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'ariava-cli-help-'));
+    roots.push(home);
+    const run = async (...args: string[]) => {
+      const proc = Bun.spawn({
+        cmd: [bunPath, 'run', cliPath, ...args],
+        cwd: process.cwd(),
+        env: isolatedEnv(home),
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      expect(exitCode, stderr).toBe(0);
+      return stdout;
+    };
+
+    const human = await run('help');
+    expect(human).toContain('Ariava — Apple Watch-first collaboration for coding agents');
+    expect(human).toContain('Usage:\n  ariava <command> [options]');
+    expect(human).toContain('Get started:');
+    expect(human).toContain('Status and diagnostics:');
+    expect(human).toContain('Watch pairing:');
+    expect(human).toContain('Global options:');
+    expect(human).toContain('npx --yes ariava@latest setup');
+
+    const json = JSON.parse(await run('--help', '--json'));
+    expect(json).toMatchObject({ ok: true, code: 'ok', message: 'Ariava CLI' });
+    expect(json.data.commands).toContain('ariava watches remove <WATCH_DEVICE_ID>');
+    expect(json.data.commands).toContain('ariava upgrade [pi]');
+  });
+
   test('isolates launchctl when the uninstall subprocess purges its temporary home', async () => {
     const parent = mkdtempSync(join(tmpdir(), 'ariava-cli-parent-'));
     const home = join(parent, 'home-$UNDEFINED');
@@ -52,7 +90,7 @@ describe('public ariava CLI', () => {
   test('reports the package version in status and upgrade output', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     roots.push(home);
-    const expectedVersion = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')).version;
+    const expectedVersion = JSON.parse(readFileSync(join(publicCoreRoot, 'package.json'), 'utf8')).version;
 
     const run = async (...args: string[]) => {
       const proc = Bun.spawn({
@@ -168,7 +206,7 @@ describe('public ariava CLI', () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     const workdir = mkdtempSync(join(tmpdir(), 'ariava-random-cwd-'));
     roots.push(home, workdir);
-    const isolated = createIsolatedPublicCliEnvironment(home, { ARIAVA_TEST_PACKAGE_VERSION: '0.1.4' });
+    const isolated = createIsolatedPublicCliEnvironment(home);
 
     const proc = Bun.spawn({
       cmd: [bunPath, 'run', cliPath, 'install', 'pi', '--json'],
@@ -183,9 +221,11 @@ describe('public ariava CLI', () => {
     const body = JSON.parse(stdout);
     expect(body.ok).toBe(true);
     expect(body.data.managedPath).toBe(join(home, '.pi', 'agent', 'npm', 'node_modules', '@ariava', 'pi-extension'));
-    expect(body.data.source).toMatchObject({ kind: 'npm-package', package: 'npm:@ariava/pi-extension' });
-    expect(readFileSync(isolated.piLogPath, 'utf8')).toContain('install npm:@ariava/pi-extension');
-    expect(JSON.parse(readFileSync(join(home, '.pi', 'agent', 'settings.json'), 'utf8')).packages).toContain('npm:@ariava/pi-extension');
+    const expectedVersion = JSON.parse(readFileSync(join(publicCoreRoot, 'package.json'), 'utf8')).version;
+    const exactSource = `npm:@ariava/pi-extension@${expectedVersion}`;
+    expect(body.data.source).toMatchObject({ kind: 'npm-package', package: exactSource });
+    expect(readFileSync(isolated.piLogPath, 'utf8')).toContain(`install ${exactSource}`);
+    expect(JSON.parse(readFileSync(join(home, '.pi', 'agent', 'settings.json'), 'utf8')).packages).toContain(exactSource);
   });
 
   test('service status shows relay base url and log paths in text output', async () => {
@@ -255,7 +295,7 @@ describe('public ariava CLI', () => {
     roots.push(home);
     const configRoot = join(home, '.config', 'ariava');
     secureJsonFixture(join(configRoot, 'config.json'), {});
-    const harnessPath = join(process.cwd(), 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
+    const harnessPath = join(publicCoreRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
     const proc = Bun.spawn({
       cmd: [bunPath, 'run', harnessPath, 'uninstall', '--purge', '--json'],
       cwd: process.cwd(),
@@ -275,11 +315,11 @@ describe('public ariava CLI', () => {
     expect(existsSync(configRoot)).toBe(false);
   });
 
-  test('init persists a stable agent adapter secret without printing it', async () => {
+  test('init persists the canonical production relay and stable agent adapter secret without printing it', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     roots.push(home);
 
-    const harnessPath = join(process.cwd(), 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
+    const harnessPath = join(publicCoreRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
     const proc = Bun.spawn({
       cmd: [bunPath, 'run', harnessPath, 'init', '--json'],
       cwd: process.cwd(),
@@ -296,7 +336,7 @@ describe('public ariava CLI', () => {
 
     const config = JSON.parse(readFileSync(join(home, '.config', 'ariava', 'config.json'), 'utf8'));
     expect(config.agentAdapterSecret).toMatch(/^[0-9a-f]{64}$/);
-    expect(config.relayBaseUrl).toBe('http://127.0.0.1:8787');
+    expect(config.relayBaseUrl).toBe('https://ariava-relay.noyx.io');
     expect(stdout).not.toContain(config.agentAdapterSecret);
   });
 
@@ -427,8 +467,137 @@ describe('public ariava CLI', () => {
     expect(JSON.parse(readFileSync(installPath, 'utf8')).service).toEqual(foreignService);
   });
 
+  describe('guided onboarding CLI integration', () => {
+    function captureStream() {
+      let output = '';
+      return {
+        stream: { write(chunk: unknown) { output += String(chunk); return true; } } as NodeJS.WritableStream,
+        read: () => output,
+      };
+    }
+
+    function detection(piPresent = true): OnboardingDetection {
+      return {
+        platform: 'linux', architecture: 'arm64', nodeVersion: '22.0.0', npm: { present: true }, pi: { present: piPresent },
+        serviceSupport: { platform: 'linux', backend: 'systemd-user', supported: true, isWsl: false, reason: 'supported' },
+        interactive: false, machineOutput: true, configPath: '/isolated/config.json', config: {}, installMetadata: {},
+        currentCli: { executablePath: '/isolated/bin/ariava' },
+      };
+    }
+
+    function result(target: 'host-ready' | 'adapter-installed', readiness: OnboardingResult['readiness'], nextActions: OnboardingResult['nextActions'] = []): OnboardingResult {
+      const adapterSelected = target === 'adapter-installed';
+      const failed = readiness === 'failed';
+      let readinessStatus: OnboardingResult['steps'][number]['status'] = 'ready';
+      if (readiness === 'reload-pending') readinessStatus = 'reload-pending';
+      else if (failed) readinessStatus = 'failed';
+      return {
+        target, readiness, nextActions,
+        steps: [
+          { id: 'preflight', status: 'ready' },
+          { id: 'stable-cli', status: 'reused' },
+          { id: 'relay-config', status: 'ready' },
+          { id: 'host-init', status: 'ready' },
+          { id: 'bridge-service', status: 'ready' },
+          { id: 'adapter-detect', status: adapterSelected ? 'ready' : 'skipped' },
+          { id: 'adapter-install', status: adapterSelected ? 'installed' : 'skipped' },
+          { id: 'strict-readiness', status: readinessStatus },
+          { id: 'completion', status: failed ? 'failed' : 'ready' },
+        ],
+      };
+    }
+
+    test('non-TTY Bridge-only onboarding returns JSON success without host mutations', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      let received: Parameters<NonNullable<Parameters<typeof runPublicCli>[2]['run']>>[0] | undefined;
+      const exitCode = await runPublicCli(['setup', '--no-extensions', '--json'], { stdout: stdout.stream, stderr: stderr.stream }, {
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+        detect: () => detection(),
+        run: async (input) => { received = input; return result('host-ready', 'host-ready'); },
+      });
+      expect(exitCode).toBe(0);
+      expect(received).toMatchObject({ target: 'host-ready', publicArgs: ['--no-extensions'], resumed: false });
+      expect(JSON.parse(stdout.read())).toMatchObject({ ok: true, code: 'ok', data: { target: 'host-ready', readiness: 'host-ready' } });
+      expect(stderr.read()).toBe('');
+    });
+
+    test('Pi onboarding returns reload-pending JSON and required next actions', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const nextActions = [
+        { id: 'reload-pi', command: '/reload' },
+        { id: 'pair-watch', command: 'ariava pair <PAIRING_CODE>' },
+      ];
+      const exitCode = await runPublicCli(['setup', '--extension', 'pi', '--json'], { stdout: stdout.stream, stderr: stderr.stream }, {
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+        detect: () => detection(),
+        run: async (input) => {
+          expect(input.target).toBe('adapter-installed');
+          return result('adapter-installed', 'reload-pending', nextActions);
+        },
+      });
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout.read())).toMatchObject({ ok: true, data: { readiness: 'reload-pending', nextActions } });
+      expect(stderr.read()).toBe('');
+    });
+
+    test('public --resume is accepted without internal bootstrap markers', async () => {
+      const stdout = captureStream();
+      let received: Parameters<NonNullable<Parameters<typeof runPublicCli>[2]['run']>>[0] | undefined;
+      const exitCode = await runPublicCli(['setup', '--no-extensions', '--resume', '--json'], { stdout: stdout.stream }, {
+        terminal: { stdout: stdout.stream, stderr: captureStream().stream, interactive: false, color: false },
+        detect: () => detection(),
+        run: async (input) => { received = input; return result('host-ready', 'host-ready'); },
+      });
+      expect(exitCode).toBe(0);
+      expect(received).toMatchObject({ resumed: true, bootstrapVersion: undefined, publicArgs: ['--no-extensions'] });
+    });
+
+    test('SIGINT abort produces failed JSON, nonzero exit, and closes the onboarding prompt', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      let closeCalls = 0;
+      const exitCodePromise = runPublicCli(['setup', '--no-extensions', '--json'], { stdout: stdout.stream, stderr: stderr.stream }, {
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+        prompt: { choose: async () => 'bridge-only', close: () => { closeCalls += 1; } },
+        detect: () => detection(),
+        run: (input) => new Promise((resolve) => {
+          input.signal?.addEventListener('abort', () => resolve(result('host-ready', 'failed', [{ id: 'retry-onboarding', command: 'ariava setup --resume' }])), { once: true });
+          queueMicrotask(() => process.emit('SIGINT'));
+        }),
+      });
+      const exitCode = await exitCodePromise;
+      expect(exitCode).toBe(1);
+      expect(closeCalls).toBeGreaterThan(0);
+      expect(JSON.parse(stdout.read())).toMatchObject({ ok: false, data: { readiness: 'failed', nextActions: [{ id: 'retry-onboarding', command: 'ariava setup --resume' }] } });
+      expect(stderr.read()).toBe('');
+    });
+
+    test('onboarding errors preserve structured remediation in JSON', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const exitCode = await runPublicCli(['setup', '--no-extensions', '--json'], { stdout: stdout.stream, stderr: stderr.stream }, {
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+        detect: () => detection(),
+        run: async () => {
+          throw new AriavaCliError('ERR_STABLE_CLI_INSTALL', 'npm global prefix is not writable.', {
+            step: 'stable-cli', retryable: true,
+            remediation: { message: 'Configure a user-writable npm prefix.', command: 'npm config set prefix ~/.local' },
+          });
+        },
+      });
+      expect(exitCode).toBe(1);
+      expect(stdout.read()).toBe('');
+      expect(JSON.parse(stderr.read())).toEqual({
+        ok: false, code: 'ERR_STABLE_CLI_INSTALL', message: 'npm global prefix is not writable.',
+        data: { step: 'stable-cli', retryable: true, remediation: { message: 'Configure a user-writable npm prefix.', command: 'npm config set prefix ~/.local' } },
+      });
+    });
+  });
+
   describe('injectable cross-platform service commands', () => {
-    const harnessPath = join(process.cwd(), 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
+    const harnessPath = join(publicCoreRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
 
     async function runHarness(home: string, scenario: string, ...args: string[]) {
       return runHarnessWithEnv(home, scenario, {}, ...args);

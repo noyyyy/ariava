@@ -24,6 +24,8 @@ import {
   ARIAVA_TMP_DIR,
 } from './paths';
 
+export const ARIAVA_PRODUCTION_RELAY_BASE_URL = 'https://ariava-relay.noyx.io';
+
 export interface AriavaUserConfig {
   relayBaseUrl?: string;
   hostName?: string;
@@ -146,7 +148,7 @@ export function resolveAriavaConfig(
   const environmentOverrides: string[] = [];
   const env = (name: string): string | undefined => useEnvironment ? readEnv(name, environmentOverrides) : undefined;
 
-  const relayBaseUrl = env('ARIAVA_RELAY_BASE_URL') ?? overrides.relayBaseUrl ?? fileConfig.relayBaseUrl ?? 'http://127.0.0.1:8787';
+  const relayBaseUrl = env('ARIAVA_RELAY_BASE_URL') ?? overrides.relayBaseUrl ?? fileConfig.relayBaseUrl ?? ARIAVA_PRODUCTION_RELAY_BASE_URL;
   const hostName = env('ARIAVA_HOST_NAME') ?? overrides.hostName ?? fileConfig.hostName ?? '';
   const agentAdapterPort = Number.parseInt(
     env('ARIAVA_AGENT_ADAPTER_PORT') ?? String(overrides.agentAdapterPort ?? fileConfig.agentAdapterPort ?? 7272),

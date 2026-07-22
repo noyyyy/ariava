@@ -65,6 +65,11 @@ export class AgentAdapterServer {
     const method = request.method ?? 'GET';
 
     try {
+      if (pathname === '/v1/health' && method === 'GET') {
+        this.writeJson(response, 200, { ok: true, hostId: this.config.hostId });
+        return;
+      }
+
       if (pathname === '/v1/agent/sessions' && method === 'POST') {
         const input = parseRegisterInput(await this.readJson(request));
         const session = this.registry.register(input);

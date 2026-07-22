@@ -1,14 +1,13 @@
 import { normalizePairingCode } from '@ariava/protocol';
-import { existsSync, lstatSync, readFileSync, realpathSync, rmSync } from 'node:fs';
-import { hostname } from 'node:os';
-import { dirname, isAbsolute, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { hostname } from 'node:os';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { spawn as spawnChild, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { BridgeDaemon, loadBridgeConfig } from './daemon';
 import {
   createRuntimeHostIdentityStore,
-  ensureFirstRunIdentity,
   enrollCurrentIdentity,
   HostIdentityError,
   inspectPublicIdentity,
@@ -21,10 +20,21 @@ import {
 import { RelayClient, RelayClientError } from './relay-client';
 import { probeHostPlatform } from './host-platform';
 import {
+  createReadlineOnboardingPrompt,
+  promptForOnboardingSelection,
+  renderOnboardingProgress,
+  renderOnboardingResult,
+  restoreOnboardingTerminal,
+  type OnboardingPrompt,
+  type OnboardingTerminal,
+} from './ui/onboarding-renderer';
+import {
   AriavaCliError,
+  buildInitializedConfig,
   createServiceManager,
   getPiExtensionStatus,
   installPiExtension,
+  initializeHost,
   installPiPackage,
   loadInstallMetadata,
   loadInstallMetadataDetailed,
@@ -41,6 +51,21 @@ import {
   saveUserConfig,
   supportError,
   sanitizeCommandDetail,
+  acquireOnboardingLock,
+  ephemeralBootstrapLockPath,
+  bootstrapStableCli,
+  checkStrictOnboardingReadiness,
+  pollForDiscoveryAndHealth,
+  detectOnboardingEnvironment,
+  ensureExactPiPackage,
+  resolveAriavaDevProfilePaths,
+  runOnboardingOrchestrator,
+  validateOnboardingSelection,
+  ARIAVA_ONBOARDING_LOCK_PATH,
+  SpawnSyncCommandRunner,
+  type OnboardingDetection,
+  type OnboardingOrchestratorDependencies,
+  type OnboardingResult,
   type AriavaAssetSource,
   type AriavaInstallMetadata,
   type AriavaUserConfig,
@@ -50,10 +75,9 @@ import {
   type ServiceManager,
   type ServiceStatus,
 } from './host-manager';
-import {
-  ARIAVA_AGENT_ADAPTER_CONFIG_PATH, ARIAVA_CONFIG_ROOT, ARIAVA_HOST_IDENTITY_PATH, ARIAVA_STATE_PATH,
-} from './host-manager/paths';
+import { ARIAVA_CONFIG_ROOT } from './host-manager/paths';
 import { buildHostManagerStatus, isConfigComplete } from './host-manager/status';
+import { readAgentAdapterConfig } from './agent-adapter/config';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const CLI_VERSION = readPackageVersion();
@@ -82,7 +106,15 @@ export interface PublicCliDependencies {
   removePath(path: string): void;
   realpath(path: string): string;
   spawn(command: string, args: string[], options?: Parameters<typeof spawnSync>[2]): ReturnType<typeof spawnSync>;
+  spawnAsync(command: string, args: string[], options: { signal?: AbortSignal }): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }>;
   createHostIdentityStore(path: string, platform: NodeJS.Platform | string): HostIdentityStore;
+}
+
+export interface PublicCliOnboardingDependencies {
+  detect(machineOutput: boolean, interactive: boolean): OnboardingDetection;
+  run(input: { target: 'host-ready' | 'adapter-installed'; publicArgs: readonly string[]; resumed: boolean; bootstrapVersion?: string; relayBaseUrl?: string; signal?: AbortSignal }): Promise<OnboardingResult>;
+  prompt: OnboardingPrompt;
+  terminal: OnboardingTerminal;
 }
 
 const defaultDependencies: PublicCliDependencies = {
@@ -103,24 +135,30 @@ const defaultDependencies: PublicCliDependencies = {
   removePath: (path) => rmSync(path, { recursive: true, force: true }),
   realpath: realpathSync,
   spawn: spawnSync,
+  spawnAsync: spawnOnboardingChild,
   createHostIdentityStore: createRuntimeHostIdentityStore,
 };
 
 export async function runPublicCli(
   argv: string[],
   overrides: Partial<PublicCliDependencies> = {},
+  onboardingOverrides: Partial<PublicCliOnboardingDependencies> = {},
 ): Promise<number> {
   const deps = { ...defaultDependencies, ...overrides };
   const args = [...argv];
   const json = stripFlag(args, '--json');
+  const command = args[0] ?? 'help';
+  if (command === 'setup') {
+    return runSetup(deps, args.slice(1), json, onboardingOverrides);
+  }
   try {
-    const command = args[0] ?? 'help';
     if (command === 'internal') {
-      await runInternal(args.slice(1));
+      await runInternal(args.slice(1), deps);
       return 0;
     }
     switch (command) {
-      case 'help': print(deps, json, okEnvelope('ok', 'Ariava CLI', { commands: commandSummary() }), commandSummary().join('\n')); break;
+      case '--help':
+      case 'help': print(deps, json, okEnvelope('ok', 'Ariava CLI', { commands: commandSummary() }), formatHelp()); break;
       case 'init': await runInit(deps, json); break;
       case 'config': await runConfig(deps, args.slice(1), json); break;
       case 'status': await runStatus(deps, args.slice(1), json); break;
@@ -156,30 +194,23 @@ export async function runPublicCli(
 async function runInit(deps: PublicCliDependencies, json: boolean): Promise<void> {
   const manager = deps.createServiceManager();
   requireServiceSupport(manager);
-  const existing = deps.loadUserConfig();
-  const base = buildInitializedConfig(existing);
-  deps.saveUserConfig(base);
+  let store: HostIdentityStore | undefined;
+  const initialized = await initializeHost({}, {
+    loadUserConfig: deps.loadUserConfig,
+    saveUserConfig: deps.saveUserConfig,
+    createIdentityStore(identityPath) {
+      store = deps.createHostIdentityStore(identityPath, manager.support.platform);
+      return store;
+    },
+    hostName: hostname,
+    generateSecret: generateAgentAdapterSecret,
+    environment: process.env,
+  });
   const resolved = deps.resolveAriavaConfig();
-  const store = deps.createHostIdentityStore(resolved.identityPath, manager.support.platform);
-  const ensured = await ensureFirstRunIdentity(store);
-  const next = { ...base, identity: publicIdentityMetadata(ensured.identity) };
-  deps.saveUserConfig(next);
-  print(deps, json, okEnvelope('ok', ensured.created ? 'Ariava identity initialized.' : 'Ariava identity already initialized.', {
-    configPath: resolved.configPath, config: redactUserConfig(next), identity: await inspectPublicIdentity(store), created: ensured.created,
-  }), `${ensured.created ? 'Initialized' : 'Reused'} Host identity ${ensured.identity.hostId}`);
-}
-
-function buildInitializedConfig(existing: AriavaUserConfig): AriavaUserConfig {
-  return {
-    ...(existing.identity ? { identity: existing.identity } : {}),
-    relayBaseUrl: existing.relayBaseUrl ?? process.env.ARIAVA_RELAY_BASE_URL ?? 'http://127.0.0.1:8787',
-    hostName: existing.hostName ?? process.env.ARIAVA_HOST_NAME ?? hostname(),
-    agentAdapterPort: existing.agentAdapterPort ?? 7272,
-    agentAdapterSecret: existing.agentAdapterSecret ?? generateAgentAdapterSecret(),
-    identityPath: existing.identityPath ?? resolve(process.env.ARIAVA_HOST_IDENTITY_PATH ?? ARIAVA_HOST_IDENTITY_PATH),
-    agentAdapterConfigPath: resolve(existing.agentAdapterConfigPath ?? ARIAVA_AGENT_ADAPTER_CONFIG_PATH),
-    statePath: resolve(existing.statePath ?? ARIAVA_STATE_PATH),
-  };
+  if (!store) throw new Error('Host identity store was not initialized');
+  print(deps, json, okEnvelope('ok', initialized.identityCreated ? 'Ariava identity initialized.' : 'Ariava identity already initialized.', {
+    configPath: resolved.configPath, config: redactUserConfig(initialized.config), identity: await inspectPublicIdentity(store), created: initialized.identityCreated,
+  }), `${initialized.identityCreated ? 'Initialized' : 'Reused'} Host identity ${initialized.config.identity?.hostId}`);
 }
 
 async function runConfig(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
@@ -474,7 +505,7 @@ async function runService(deps: PublicCliDependencies, argv: string[], json: boo
 
 async function runInstall(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
   if (argv[0] !== 'pi') throw new Error('Usage: ariava install pi');
-  const record = installPiPackage();
+  const record = installPiPackage(RELEASE_PI_VERSION);
   mergeInstallMetadata({ piExtension: record, piSource: record.source });
   print(deps, json, okEnvelope('ok', 'Installed Ariava pi package.', record), `Installed ${record.source.package} through pi at ${record.managedPath}. Reload pi or run /reload.`);
 }
@@ -528,7 +559,7 @@ function reconcileUserConfig(deps: PublicCliDependencies): { updated: boolean; c
 }
 
 function upgradePiExtension() {
-  const record = upgradePiPackage();
+  const record = upgradePiPackage(RELEASE_PI_VERSION);
   mergeInstallMetadata({ piExtension: record, piSource: record.source });
   return record;
 }
@@ -718,8 +749,25 @@ async function runUninstall(deps: PublicCliDependencies, argv: string[], json: b
   print(deps, json, okEnvelope('ok', 'Ariava uninstall completed.', data), purge ? 'Ariava config, service, and managed assets removed.' : backendMismatch ? 'Current service backend is not installed. Foreign service metadata retained.' : 'Ariava service removed. Config retained.');
 }
 
-async function runInternal(argv: string[]): Promise<void> {
+async function runInternal(argv: string[], deps: Pick<PublicCliDependencies, 'stdout'>): Promise<void> {
   const subcommand = argv[0];
+  if (subcommand === 'render-onboarding-success') {
+    if (argv.length !== 5 || argv[1] !== '--target' || argv[3] !== '--columns') throw new Error('internal render-onboarding-success accepts only --target and --columns');
+    const target = argv[2];
+    if (target !== 'host-ready' && target !== 'adapter-installed') throw new Error('internal render-onboarding-success requires --target <host-ready|adapter-installed>');
+    const columns = Number.parseInt(argv[4] ?? '', 10);
+    if (!Number.isSafeInteger(columns) || String(columns) !== argv[4] || columns < 1) throw new Error('internal render-onboarding-success requires --columns <positive-integer>');
+    const result: OnboardingResult = {
+      target,
+      readiness: target === 'host-ready' ? 'host-ready' : 'reload-pending',
+      steps: [{ id: 'completion', status: 'ready' }],
+      nextActions: target === 'host-ready' ? [] : [{ id: 'reload-pi', command: '/reload' }],
+    };
+    deps.stdout.write(`${renderOnboardingResult(result, {
+      terminal: { stdout: deps.stdout, stderr: deps.stdout, interactive: true, color: false, columns },
+    })}\n`);
+    return;
+  }
   if (subcommand !== 'bridge-daemon') throw new Error(`Unknown internal command: ${subcommand}`);
   const configPath = readOption(argv, '--config');
   if (!configPath || !configPath.startsWith('/')) throw new Error('internal bridge-daemon requires --config <absolute-config-path>');
@@ -756,6 +804,282 @@ function installerPatch(deps: PublicCliDependencies, metadata: AriavaInstallMeta
   } };
 }
 
+async function runSetup(
+  deps: PublicCliDependencies,
+  argv: string[],
+  json: boolean,
+  overrides: Partial<PublicCliOnboardingDependencies>,
+): Promise<number> {
+  const terminal = overrides.terminal ?? onboardingTerminal(deps, json);
+  let prompt = overrides.prompt;
+  const cancellation = new AbortController();
+  const signalHandler = () => {
+    cancellation.abort();
+    prompt?.close?.();
+    restoreOnboardingTerminal(terminal);
+  };
+  process.once('SIGINT', signalHandler);
+  process.once('SIGTERM', signalHandler);
+  try {
+    const options = parseOnboardingArguments(argv);
+    const detectEnvironment = overrides.detect ?? ((machineOutput: boolean, interactive: boolean) => createOnboardingDetection(deps, machineOutput, interactive));
+    const detection = detectEnvironment(json || !terminal.interactive, terminal.interactive);
+    let selection;
+    if (options.extensions || options.noExtensions || !terminal.interactive || options.yes) {
+      selection = validateOnboardingSelection({
+        extensions: options.extensions, noExtensions: options.noExtensions, yes: options.yes, interactive: terminal.interactive,
+      });
+    } else {
+      prompt ??= createReadlineOnboardingPrompt(process.stdin, deps.stdout);
+      selection = await promptForOnboardingSelection(detection, prompt, options.yes);
+    }
+    if (selection.extensions.includes('pi') && !detection.pi.present) {
+      throw new AriavaCliError('ERR_AGENT_RUNTIME_NOT_FOUND', 'Pi is not installed. Install Pi, then rerun `ariava setup --extension pi`.', {
+        step: 'adapter-detect', retryable: true, remediation: { command: 'ariava setup --extension pi' },
+      });
+    }
+    renderOnboardingProgress('Setting up Ariava…', terminal);
+    const runOnboarding = overrides.run ?? ((input: Parameters<PublicCliOnboardingDependencies['run']>[0]) => runDefaultOnboarding(deps, input));
+    const result = await runOnboarding({
+      target: selection.target, publicArgs: options.publicArgs, resumed: options.resumed,
+      bootstrapVersion: options.bootstrapVersion, relayBaseUrl: options.relayBaseUrl, signal: cancellation.signal,
+    });
+    restoreOnboardingTerminal(terminal);
+    const failed = result.readiness === 'failed';
+    if (json) {
+      printJson({
+        ok: !failed,
+        code: failed ? onboardingFailureCode(result) : 'ok',
+        message: failed ? 'Ariava onboarding is incomplete.' : 'Ariava onboarding completed.',
+        data: result,
+      }, deps.stdout);
+    } else {
+      deps.stdout.write(`${renderOnboardingResult(result, { terminal })}\n`);
+    }
+    return failed ? 1 : 0;
+  } catch (error) {
+    const normalized = normalizeOnboardingError(error);
+    if (json) printJson(normalized, deps.stderr);
+    else {
+      deps.stderr.write(`Onboarding stopped: ${normalized.message}\n`);
+      const remediation = normalized.data.remediation as { message?: string; command?: string } | undefined;
+      if (remediation?.message) deps.stderr.write(`${remediation.message}\n`);
+      if (remediation?.command) deps.stderr.write(`Next: ${remediation.command}\n`);
+    }
+    return 1;
+  } finally {
+    prompt?.close?.();
+    process.off('SIGINT', signalHandler);
+    process.off('SIGTERM', signalHandler);
+  }
+}
+
+interface ParsedOnboardingArguments {
+  extensions?: string[];
+  noExtensions: boolean;
+  resumed: boolean;
+  yes: boolean;
+  relayBaseUrl?: string;
+  bootstrapVersion?: string;
+  publicArgs: string[];
+}
+
+function parseOnboardingArguments(argv: string[]): ParsedOnboardingArguments {
+  const result: ParsedOnboardingArguments = { noExtensions: false, resumed: false, yes: false, publicArgs: [] };
+  let bootstrapOnce = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    const value = argv[index]!;
+    if (value === '--extension' || value === '--relay-base-url' || value === '--bootstrap-version') {
+      const option = argv[++index];
+      if (!option || option.startsWith('--')) throw new AriavaCliError('ERR_ONBOARDING_NOT_READY', `${value} requires a value.`, { step: 'preflight', retryable: false });
+      if (value === '--extension') (result.extensions ??= []).push(option);
+      else if (value === '--relay-base-url') result.relayBaseUrl = validateRelayUrl(option);
+      else result.bootstrapVersion = option;
+      if (value !== '--bootstrap-version') result.publicArgs.push(value, option);
+      continue;
+    }
+    if (value === '--no-extensions') { result.noExtensions = true; result.publicArgs.push(value); continue; }
+    if (value === '--resume') { result.resumed = true; continue; }
+    if (value === '--yes') { result.yes = true; result.publicArgs.push(value); continue; }
+    if (value === '--bootstrap-once') { bootstrapOnce = true; continue; }
+    throw new AriavaCliError('ERR_ONBOARDING_NOT_READY', `Unknown onboarding option: ${value}`, { step: 'preflight', retryable: false });
+  }
+  const internalPresent = result.bootstrapVersion !== undefined || bootstrapOnce;
+  if (internalPresent && (!result.resumed || !bootstrapOnce || result.bootstrapVersion !== CLI_VERSION)) {
+    throw new AriavaCliError('ERR_STABLE_CLI_PATH', 'Internal onboarding re-entry markers are incomplete or mismatched.', { step: 'stable-cli', retryable: false });
+  }
+  return result;
+}
+
+function validateRelayUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('invalid');
+    return url.origin;
+  } catch {
+    throw new AriavaCliError('ERR_RELAY_CONFIG_REQUIRED', 'Relay base URL must be an HTTP(S) origin without credentials, path, query, or fragment.', { step: 'relay-config', retryable: false });
+  }
+}
+
+function onboardingTerminal(deps: PublicCliDependencies, json: boolean): OnboardingTerminal {
+  const stdout = deps.stdout as NodeJS.WritableStream & { isTTY?: boolean; columns?: number };
+  const interactive = !json && stdout.isTTY === true && process.stdin.isTTY === true && process.env.CI === undefined && process.env.TERM !== 'dumb';
+  return { stdout: deps.stdout, stderr: deps.stderr, columns: stdout.columns, interactive, color: interactive && process.env.NO_COLOR === undefined };
+}
+
+function createOnboardingDetection(deps: PublicCliDependencies, machineOutput: boolean, interactive: boolean): OnboardingDetection {
+  const runner = new SpawnSyncCommandRunner();
+  const manager = deps.createServiceManager();
+  const binPath = deps.realpath(deps.currentAriavaBinPath());
+  const prefix = resolveNpmPrefix(runner);
+  return detectOnboardingEnvironment({
+    platform: manager.support.platform as NodeJS.Platform, architecture: process.arch, nodeVersion: process.version, runner,
+    detectServiceSupport: () => manager.support, isTty: interactive, machineOutput, configPath: deps.resolveAriavaConfig().configPath,
+    devConfigPath: resolveAriavaDevProfilePaths().configPath, pathExists: deps.pathExists, loadConfig: deps.loadUserConfig,
+    loadInstallMetadata: deps.loadInstallMetadata, currentCli: {
+      executablePath: binPath, packageRoot: PACKAGE_ROOT, packageVersion: CLI_VERSION, npmPrefix: prefix, npmBinPath: prefix ? join(prefix, 'bin') : undefined,
+    },
+  });
+}
+
+function spawnOnboardingChild(command: string, args: string[], options: { signal?: AbortSignal }): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }> {
+  return new Promise((resolve) => {
+    const child = spawnChild(command, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let error: Error | undefined;
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+    child.once('error', (cause) => { error = cause; });
+    const abort = () => child.kill('SIGTERM');
+    if (options.signal?.aborted) abort();
+    else options.signal?.addEventListener('abort', abort, { once: true });
+    child.once('close', (status) => {
+      options.signal?.removeEventListener('abort', abort);
+      resolve({ status, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8'), ...(error ? { error } : {}) });
+    });
+  });
+}
+
+async function runDefaultOnboarding(deps: PublicCliDependencies, input: Parameters<PublicCliOnboardingDependencies['run']>[0]): Promise<OnboardingResult> {
+  const manager = deps.createServiceManager();
+  const runner = new SpawnSyncCommandRunner();
+  const detectMachineEnvironment = () => createOnboardingDetection(deps, true, false);
+  const orchestratorDeps: OnboardingOrchestratorDependencies = {
+    detect: detectMachineEnvironment,
+    bootstrap: (bootstrapInput) => bootstrapStableCli(bootstrapInput, {
+      runner, realpath: deps.realpath, readPackageVersion: readVersionAtRoot, assertPrefixWritable: (path) => accessSync(path, constants.W_OK | constants.X_OK),
+      resolveGlobalPrefix: () => resolveNpmPrefix(runner), resolveStableExecutable: (prefix) => {
+        const path = join(prefix, 'bin', 'ariava');
+        return deps.pathExists(path) ? deps.realpath(path) : undefined;
+      }, currentCli: detectMachineEnvironment().currentCli,
+    }),
+    reenter: async (command, args) => {
+      throwIfOnboardingAborted(input.signal);
+      const child = await deps.spawnAsync(command, [...args, '--json'], { signal: input.signal });
+      const envelope = parseStableChildEnvelope(child.stdout, child.stderr);
+      if ((child.status ?? 1) !== 0) {
+        if (envelope?.data && isOnboardingResult(envelope.data)) return envelope.data;
+        if (envelope && typeof envelope.code === 'string') {
+          throw new AriavaCliError(envelope.code as AriavaCliError['code'], typeof envelope.message === 'string' ? envelope.message : 'Stable Ariava CLI re-entry failed.',
+            envelope.data && typeof envelope.data === 'object' ? envelope.data as Record<string, unknown> : { step: 'stable-cli', retryable: true });
+        }
+        throw new AriavaCliError('ERR_STABLE_CLI_PATH', child.error?.message ?? 'Stable Ariava CLI re-entry failed before returning a structured error.', { step: 'stable-cli', retryable: true });
+      }
+      if (!envelope?.data || !isOnboardingResult(envelope.data)) {
+        throw new AriavaCliError('ERR_STABLE_CLI_PATH', 'Stable Ariava CLI re-entry returned malformed output.', { step: 'stable-cli', retryable: true });
+      }
+      throwIfOnboardingAborted(input.signal);
+      return envelope.data;
+    },
+    acquireBootstrapLock: () => acquireOnboardingLock(ephemeralBootstrapLockPath(CLI_VERSION)),
+    acquireLock: () => acquireOnboardingLock(ARIAVA_ONBOARDING_LOCK_PATH),
+    loadUserConfig: deps.loadUserConfig, saveUserConfig: deps.saveUserConfig,
+    initializeHost: (relayBaseUrl) => initializeOnboardingHost(deps, manager, relayBaseUrl),
+    loadHostState: () => loadOnboardingHostState(deps, manager),
+    loadInstallMetadata: deps.loadInstallMetadata, saveInstallMetadata: deps.saveInstallMetadata, serviceManager: manager,
+    adapterProbe: () => detectMachineEnvironment().pi,
+    proveBridgeHealth: async (state) => { await pollForDiscoveryAndHealth({ config: state.config, identity: state.identity, signal: input.signal }); },
+    installPi: (version) => ensureExactPiPackage(version),
+    checkReadiness: ({ target, stableCli, state, installMetadata, service, pi }) => checkStrictOnboardingReadiness({ ...buildReadinessInput(deps, manager, state, target, stableCli, installMetadata, service, pi), signal: input.signal }, { serviceStatus: () => currentServiceStatus(deps, manager, deps.loadInstallMetadata()) }),
+    cancellation: { throwIfCancelled: () => throwIfOnboardingAborted(input.signal) },
+  };
+  return runOnboardingOrchestrator({ ...input, cliVersion: CLI_VERSION, runtimePath: deps.realpath(deps.currentRuntimePath()) }, orchestratorDeps);
+}
+
+async function initializeOnboardingHost(deps: PublicCliDependencies, manager: ServiceManager, relayBaseUrl: string) {
+  return initializeHost({ relayBaseUrl }, { loadUserConfig: deps.loadUserConfig, saveUserConfig: deps.saveUserConfig, createIdentityStore: (path) => deps.createHostIdentityStore(path, manager.support.platform), hostName: hostname, generateSecret: generateAgentAdapterSecret, environment: process.env });
+}
+
+async function loadOnboardingHostState(deps: PublicCliDependencies, manager: ServiceManager) {
+  const config = deps.resolveAriavaConfig();
+  const store = deps.createHostIdentityStore(config.identityPath, manager.support.platform);
+  const [identityInspection, identity] = await Promise.all([store.inspect(), store.load()]);
+  return identity ? { config, identityInspection, identity } : undefined;
+}
+
+function buildReadinessInput(
+  deps: PublicCliDependencies, manager: ServiceManager, state: NonNullable<Awaited<ReturnType<typeof loadOnboardingHostState>>>, target: 'host-ready' | 'adapter-installed',
+  stableCli: { executablePath: string; packageRoot?: string; packageVersion?: string; npmPrefix?: string; npmBinPath?: string },
+  installMetadata: AriavaInstallMetadata, service: AriavaInstallMetadata['service'], pi: ReturnType<typeof getPiExtensionStatus>,
+) {
+  return {
+    target, cliVersion: CLI_VERSION, stableCli, installMetadata, config: state.config, identityInspection: state.identityInspection, identity: state.identity,
+    serviceRecord: service, expectedRuntimePath: deps.realpath(deps.currentRuntimePath()), expectedAriavaBinPath: stableCli.executablePath,
+    hostMetadata: { hostName: state.config.hostName, platform: probeHostPlatform(manager.support.platform), bridgeVersion: CLI_VERSION }, piStatus: pi,
+  };
+}
+
+function resolveNpmPrefix(runner: SpawnSyncCommandRunner): string | undefined {
+  const result = runner.run('npm', ['prefix', '--global']);
+  const value = result.status === 0 ? result.stdout.trim() : '';
+  return value && isAbsolute(value) ? resolve(value) : undefined;
+}
+
+function readVersionAtRoot(root: string): string | undefined {
+  try { return (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { version?: string }).version; } catch { return undefined; }
+}
+
+function throwIfOnboardingAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw new AriavaCliError('ERR_ONBOARDING_NOT_READY', 'Ariava onboarding was cancelled.', {
+    step: 'preflight', retryable: true, remediation: { command: 'ariava setup --resume' },
+  });
+}
+
+function parseStableChildEnvelope(stdout: unknown, stderr: unknown): Record<string, unknown> | undefined {
+  for (const raw of [stdout, stderr]) {
+    const text = String(raw ?? '').trim();
+    if (!text) continue;
+    try {
+      const value = JSON.parse(text) as unknown;
+      if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
+    } catch {
+      // Stable children are required to return one JSON envelope; try the other stream.
+    }
+  }
+  return undefined;
+}
+
+function isOnboardingResult(value: unknown): value is OnboardingResult {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const result = value as Partial<OnboardingResult>;
+  return (result.target === 'host-ready' || result.target === 'adapter-installed')
+    && typeof result.readiness === 'string' && Array.isArray(result.steps) && Array.isArray(result.nextActions);
+}
+
+function normalizeOnboardingError(error: unknown): { ok: false; code: string; message: string; data: Record<string, unknown> } {
+  if (error instanceof AriavaCliError) return { ok: false, code: error.code, message: error.message, data: error.data };
+  if (error instanceof HostIdentityError) return { ok: false, code: error.code, message: error.message, data: { step: 'host-init', retryable: false } };
+  return { ok: false, code: 'ERR_ONBOARDING_NOT_READY', message: error instanceof Error ? error.message : String(error), data: { step: 'preflight', retryable: true } };
+}
+
+function onboardingFailureCode(result: OnboardingResult): string {
+  const failed = result.steps.find((step) => step.status === 'failed');
+  return typeof failed?.detail?.code === 'string' ? failed.detail.code : 'ERR_ONBOARDING_NOT_READY';
+}
+
+
 function requireServiceSupport(manager: ServiceManager): void {
   if (!manager.support.supported) throw supportError(manager.support);
 }
@@ -778,8 +1102,8 @@ function currentServiceStatus(
  ): ServiceStatus {
   return manager.status(
     installMetadata.service,
-    deps.currentRuntimePath(),
-    deps.currentAriavaBinPath(),
+    deps.realpath(deps.currentRuntimePath()),
+    deps.realpath(deps.currentAriavaBinPath()),
   );
 }
 
@@ -817,28 +1141,106 @@ const IDENTITY_MANAGED_CONFIG_KEYS = new Set([
 
 function commandSummary(): string[] {
   return [
+    'ariava setup [--extension pi ... | --no-extensions] [--resume] [--json] [--yes] [--relay-base-url <URL>]',
     'ariava init',
-    'ariava status',
+    'ariava status [pi]',
     'ariava pair <PAIRING_CODE>',
-    'ariava watches list|remove <WATCH_DEVICE_ID>',
+    'ariava watches list',
+    'ariava watches remove <WATCH_DEVICE_ID>',
     'ariava identity status',
     'ariava host rotate-key',
     'ariava host reset --confirm',
     'ariava doctor',
     'ariava logs',
+    'ariava upgrade [pi]',
     'ariava uninstall [--purge] [--remove-pi]',
     'ariava config path|show|get|set',
     'ariava config agent-secret ensure|rotate',
     'ariava service install|reinstall|status|start|stop|restart|uninstall',
     'ariava install pi',
-    'ariava upgrade pi',
-    'ariava status pi',
     'ariava remove pi',
     'ariava dev install pi [--from <path>]',
     'ariava dev upgrade pi [--from <path>]',
     'ariava dev bridge use [--from <path>]',
     'ariava dev status',
   ];
+}
+
+function formatHelp(): string {
+  return [
+    'Ariava — Apple Watch-first collaboration for coding agents',
+    '',
+    'Usage:',
+    '  ariava <command> [options]',
+    '',
+    'Get started:',
+    '  setup [options]                 Set up the Host, Bridge, and selected agent extensions',
+    '    --extension pi                 Install an agent extension; repeat for multiple extensions',
+    '    --no-extensions                Set up the Host and Bridge without agent extensions',
+    '    --resume                      Resume an interrupted setup',
+    '    --relay-base-url <URL>        Use a specific Relay URL',
+    '    --yes                         Accept setup prompts where possible',
+    '  init                            Initialize Host configuration and identity manually',
+    '',
+    'Status and diagnostics:',
+    '  status                          Show Host, service, identity, and pi status',
+    '  status pi                       Show pi extension status',
+    '  doctor                          Run configuration and installation checks',
+    '  logs                            Show Bridge service logs',
+    '',
+    'Watch pairing:',
+    '  pair <PAIRING_CODE>             Pair this Host with a Watch',
+    '  watches list                    List Watches linked to this Host',
+    '  watches remove <WATCH_DEVICE_ID>',
+    '                                  Remove one Watch link',
+    '',
+    'Host identity:',
+    '  identity status                 Inspect the Host identity',
+    '  host rotate-key                 Rotate the Host signing key',
+    '  host reset --confirm            Replace the Host identity and remove all links',
+    '',
+    'Service management:',
+    '  service install                 Install and start the user service',
+    '  service reinstall               Reinstall and start the user service',
+    '  service status                  Show service state',
+    '  service start|stop|restart       Control the service',
+    '  service uninstall               Remove the user service',
+    '',
+    'pi integration:',
+    '  install pi                      Install the Ariava pi extension',
+    '  upgrade pi                      Upgrade the Ariava pi extension',
+    '  remove pi                       Remove the Ariava pi extension',
+    '',
+    'Configuration:',
+    '  config path                     Print the active configuration path',
+    '  config show                     Show configuration with secrets redacted',
+    '  config get <KEY>                Read a configuration value',
+    '  config set <KEY> <VALUE>        Set a configuration value',
+    '  config agent-secret ensure      Create the Agent Adapter secret if absent',
+    '  config agent-secret rotate      Replace the Agent Adapter secret',
+    '',
+    'Maintenance:',
+    '  upgrade                         Upgrade Ariava, its service, and pi extension',
+    '  uninstall [--purge] [--remove-pi]',
+    '                                  Remove Ariava components and optional local data',
+    '',
+    'Development:',
+    '  dev install pi [--from <PATH>]  Install a pi extension from source',
+    '  dev upgrade pi [--from <PATH>]  Upgrade a source-installed pi extension',
+    '  dev bridge use [--from <PATH>]  Point the service at a development Bridge build',
+    '  dev status                      Show active development sources',
+    '',
+    'Global options:',
+    '  --json                          Emit machine-readable JSON',
+    '  --help                          Show this help',
+    '',
+    'Examples:',
+    '  npx --yes ariava@latest setup',
+    '  ariava pair ABCD-1234',
+    '  ariava doctor --json',
+    '',
+    'Run `ariava <command> --help` is not yet supported; use this command reference.',
+  ].join('\n');
 }
 
 async function runAgentSecretConfig(deps: PublicCliDependencies, argv: string[], json: boolean, fileConfig: AriavaUserConfig): Promise<void> {

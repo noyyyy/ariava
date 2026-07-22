@@ -12,7 +12,7 @@ function run(command: string, args: string[], cwd: string) {
 }
 
 describe('published root tarball', () => {
-  test('installs cleanly with npm and exposes a working CLI', () => {
+  test('installs cleanly and loads packaged onboarding assets from an unrelated cwd', () => {
     const root = mkdtempSync(join(tmpdir(), 'ariava-root-tarball-'));
     const packDirectory = join(root, 'pack');
     const installDirectory = join(root, 'install');
@@ -36,9 +36,21 @@ describe('published root tarball', () => {
       const installed = run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', join(packDirectory, tarballName!)], installDirectory);
       expect(installed.status, installed.stderr).toBe(0);
 
-      const cli = run(process.execPath, [join(installDirectory, 'node_modules', 'ariava', 'apps', 'bridge', 'dist', 'public-cli.js'), 'help'], installDirectory);
+      const unrelatedCwd = join(root, 'unrelated-cwd');
+      mkdirSync(unrelatedCwd);
+      const cliPath = join(installDirectory, 'node_modules', 'ariava', 'apps', 'bridge', 'dist', 'public-cli.js');
+      const cli = run(process.execPath, [cliPath, 'help'], unrelatedCwd);
       expect(cli.status, cli.stderr).toBe(0);
-      expect(cli.stdout).toContain('ariava init');
+      expect(cli.stdout).toContain('setup [options]');
+      expect(cli.stdout).toContain('init                            Initialize Host');
+
+      // Internal package-smoke seam: rendering is read-only and loads the same
+      // packaged asset path used after successful onboarding without preflight writes.
+      const rendered = run(process.execPath, [cliPath, 'internal', 'render-onboarding-success', '--target', 'adapter-installed', '--columns', '80'], unrelatedCwd);
+      expect(rendered.status, rendered.stderr).toBe(0);
+      expect(rendered.stdout).toContain('Ariava ready');
+      expect(rendered.stdout).toContain('Reload Pi: run /reload in an existing session');
+      expect(rendered.stdout).toMatch(/[+#]/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

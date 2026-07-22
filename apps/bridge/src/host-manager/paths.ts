@@ -5,6 +5,7 @@ const configuredRoot = process.env.XDG_CONFIG_HOME?.trim();
 export const ARIAVA_CONFIG_ROOT = resolve(configuredRoot && isAbsolute(configuredRoot) ? configuredRoot : join(homedir(), '.config'), 'ariava');
 export const ARIAVA_CONFIG_PATH = join(ARIAVA_CONFIG_ROOT, 'config.json');
 export const ARIAVA_INSTALL_PATH = join(ARIAVA_CONFIG_ROOT, 'install.json');
+export const ARIAVA_ONBOARDING_LOCK_PATH = join(ARIAVA_CONFIG_ROOT, 'onboarding.lock');
 export const ARIAVA_AGENT_ADAPTER_CONFIG_PATH = join(ARIAVA_CONFIG_ROOT, 'agent-adapter.json');
 export const ARIAVA_HOST_IDENTITY_PATH = join(ARIAVA_CONFIG_ROOT, 'host-identity.json');
 export const ARIAVA_STATE_DIR = join(ARIAVA_CONFIG_ROOT, 'state');
