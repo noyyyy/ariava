@@ -38,7 +38,7 @@ describe('public ariava CLI', () => {
     roots.push(home);
     const run = async (...args: string[]) => {
       const proc = Bun.spawn({
-        cmd: [bunPath, 'run', cliPath, ...args],
+        cmd: [bunPath, cliPath, ...args],
         cwd: process.cwd(),
         env: isolatedEnv(home),
         stdout: 'pipe',
@@ -75,7 +75,7 @@ describe('public ariava CLI', () => {
     const isolated = createIsolatedPublicCliEnvironment(home);
 
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', cliPath, 'uninstall', '--purge', '--json'],
+      cmd: [bunPath, cliPath, 'uninstall', '--purge', '--json'],
       cwd: process.cwd(),
       env: isolated.env,
       stdout: 'pipe',
@@ -94,7 +94,7 @@ describe('public ariava CLI', () => {
 
     const run = async (...args: string[]) => {
       const proc = Bun.spawn({
-        cmd: [bunPath, 'run', cliPath, ...args, '--json'],
+        cmd: [bunPath, cliPath, ...args, '--json'],
         cwd: process.cwd(),
         env: isolatedEnv(home, { ARIAVA_UPGRADE_SELF_DONE: '1', ARIAVA_UPGRADE_SKIP_LAUNCHCTL: '1' }),
         stdout: 'pipe',
@@ -143,7 +143,7 @@ describe('public ariava CLI', () => {
     });
 
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', cliPath, 'status'],
+      cmd: [bunPath, cliPath, 'status'],
       cwd: process.cwd(),
       env: { ...process.env, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ''}` },
       stdout: 'pipe',
@@ -165,7 +165,7 @@ describe('public ariava CLI', () => {
     roots.push(home);
 
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', cliPath, 'config', 'path', '--json'],
+      cmd: [bunPath, cliPath, 'config', 'path', '--json'],
       cwd: process.cwd(),
       env: isolatedEnv(home),
       stdout: 'pipe',
@@ -187,7 +187,7 @@ describe('public ariava CLI', () => {
     roots.push(home);
 
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', cliPath, 'status', 'pi', '--json'],
+      cmd: [bunPath, cliPath, 'status', 'pi', '--json'],
       cwd: process.cwd(),
       env: isolatedEnv(home),
       stdout: 'pipe',
@@ -209,7 +209,7 @@ describe('public ariava CLI', () => {
     const isolated = createIsolatedPublicCliEnvironment(home);
 
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', cliPath, 'install', 'pi', '--json'],
+      cmd: [bunPath, cliPath, 'install', 'pi', '--json'],
       cwd: workdir,
       env: isolated.env,
       stdout: 'pipe',
@@ -233,7 +233,7 @@ describe('public ariava CLI', () => {
     roots.push(home);
 
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', cliPath, 'service', 'status'],
+      cmd: [bunPath, cliPath, 'service', 'status'],
       cwd: process.cwd(),
       env: isolatedEnv(home, { ARIAVA_RELAY_BASE_URL: 'https://relay.example.test' }),
       stdout: 'pipe',
@@ -253,7 +253,7 @@ describe('public ariava CLI', () => {
     roots.push(home);
 
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', cliPath, 'service', 'status', '--json'],
+      cmd: [bunPath, cliPath, 'service', 'status', '--json'],
       cwd: process.cwd(),
       env: isolatedEnv(home, { ARIAVA_RELAY_BASE_URL: 'https://relay.example.test' }),
       stdout: 'pipe',
@@ -275,7 +275,7 @@ describe('public ariava CLI', () => {
     roots.push(home);
 
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', cliPath, 'dev', 'status', '--json'],
+      cmd: [bunPath, cliPath, 'dev', 'status', '--json'],
       cwd: process.cwd(),
       env: isolatedEnv(home),
       stdout: 'pipe',
@@ -297,7 +297,7 @@ describe('public ariava CLI', () => {
     secureJsonFixture(join(configRoot, 'config.json'), {});
     const harnessPath = join(publicCoreRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', harnessPath, 'uninstall', '--purge', '--json'],
+      cmd: [bunPath, harnessPath, 'uninstall', '--purge', '--json'],
       cwd: process.cwd(),
       env: isolatedEnv(home, { ARIAVA_TEST_SCENARIO: 'linux-supported' }),
       stdout: 'pipe',
@@ -321,7 +321,7 @@ describe('public ariava CLI', () => {
 
     const harnessPath = join(publicCoreRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', harnessPath, 'init', '--json'],
+      cmd: [bunPath, harnessPath, 'init', '--json'],
       cwd: process.cwd(),
       env: isolatedEnv(home, { ARIAVA_TEST_SCENARIO: 'linux-supported' }),
       stdout: 'pipe',
@@ -346,7 +346,7 @@ describe('public ariava CLI', () => {
 
     const run = async (...args: string[]) => {
       const proc = Bun.spawn({
-        cmd: [bunPath, 'run', cliPath, ...args, '--json'],
+        cmd: [bunPath, cliPath, ...args, '--json'],
         cwd: process.cwd(),
         env: isolatedEnv(home),
         stdout: 'pipe',
@@ -383,7 +383,7 @@ describe('public ariava CLI', () => {
     roots.push(home);
 
     const proc = Bun.spawn({
-      cmd: [bunPath, 'run', cliPath, 'upgrade', '--json'],
+      cmd: [bunPath, cliPath, 'upgrade', '--json'],
       cwd: process.cwd(),
       env: isolatedEnv(home, { ARIAVA_UPGRADE_SELF_DONE: '1', ARIAVA_UPGRADE_SKIP_LAUNCHCTL: '1' }),
       stdout: 'pipe',
@@ -427,7 +427,7 @@ describe('public ariava CLI', () => {
 
     const run = async (...args: string[]) => {
       const proc = Bun.spawn({
-        cmd: [bunPath, 'run', cliPath, ...args, '--json'],
+        cmd: [bunPath, cliPath, ...args, '--json'],
         cwd: process.cwd(),
         env: isolatedEnv(home, { ARIAVA_UPGRADE_SELF_DONE: '1', ARIAVA_UPGRADE_SKIP_LAUNCHCTL: '1' }),
         stdout: 'pipe',
@@ -626,7 +626,7 @@ describe('public ariava CLI', () => {
       }
       Object.assign(env, environment);
       const proc = Bun.spawn({
-        cmd: [bunPath, 'run', harnessPath, ...args, '--json'],
+        cmd: [bunPath, harnessPath, ...args, '--json'],
         cwd: process.cwd(),
         env,
         stdout: 'pipe',
