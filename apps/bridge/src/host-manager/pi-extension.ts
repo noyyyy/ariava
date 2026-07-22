@@ -23,6 +23,11 @@ export interface PiPackageLifecycleDependencies {
   now(): string;
 }
 
+export interface PiExtensionStatusOverrides extends Partial<PiPackageLifecycleDependencies> {
+  legacyInstallPath?: string;
+  legacyMetadataPath?: string;
+}
+
 export interface PiExtensionInstallOptions {
   sourcePath: string;
   sourceKind: AriavaAssetSource['kind'];
@@ -161,13 +166,13 @@ export function readManagedPiMetadata(metadataPath = ARIAVA_PI_MANAGED_METADATA_
 
 export function getPiExtensionStatus(
   bundledVersion: string,
-  overrides: Partial<PiPackageLifecycleDependencies> = {},
+  overrides: PiExtensionStatusOverrides = {},
 ): PiExtensionStatus {
   const packageStatus = inspectPiPackage(bundledVersion, overrides);
   if (packageStatus.registeredSource !== undefined || packageStatus.installed || packageStatus.sourceOwnership !== 'absent') return packageStatus;
 
-  const legacyMetadataPath = ARIAVA_PI_MANAGED_METADATA_PATH;
-  const legacyInstallPath = ARIAVA_PI_EXTENSION_DIR;
+  const legacyMetadataPath = overrides.legacyMetadataPath ?? ARIAVA_PI_MANAGED_METADATA_PATH;
+  const legacyInstallPath = overrides.legacyInstallPath ?? ARIAVA_PI_EXTENSION_DIR;
   const legacy = readManagedPiMetadata(legacyMetadataPath);
   return {
     ...packageStatus,

@@ -69,9 +69,16 @@ function oldRecord(overrides: Partial<OnboardingLockRecord> = {}): OnboardingLoc
 
 describe('onboarding locks', () => {
   test('uses an ephemeral uid/version lock outside the product config tree', () => {
-    const path = ephemeralBootstrapLockPath('0.1.6-next/unsafe', 501);
-    expect(path).toContain('ariava-501/onboard-0.1.6-next_unsafe.lock');
-    expect(path).not.toContain('/.config/ariava/');
+    const previousRuntimeDir = process.env.XDG_RUNTIME_DIR;
+    delete process.env.XDG_RUNTIME_DIR;
+    try {
+      const path = ephemeralBootstrapLockPath('0.1.6-next/unsafe', 501);
+      expect(path).toContain('ariava-501/onboard-0.1.6-next_unsafe.lock');
+      expect(path).not.toContain('/.config/ariava/');
+    } finally {
+      if (previousRuntimeDir === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = previousRuntimeDir;
+    }
   });
 
   test('allows one owner and rejects a simultaneous contender', () => {

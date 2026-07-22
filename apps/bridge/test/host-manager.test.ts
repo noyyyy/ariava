@@ -28,12 +28,6 @@ import type { HostServiceStatusInput } from '../src/host-manager/status';
 const roots: string[] = [];
 const homeOverride = join(tmpdir(), `ariava-test-home-${Date.now()}`);
 
-beforeEach(() => {
-  process.env.HOME = homeOverride;
-  mkdirSync(homeOverride, { recursive: true });
-  roots.push(homeOverride);
-});
-
 afterEach(() => {
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -229,6 +223,8 @@ describe('host-manager helpers', () => {
     const status = getPiExtensionStatus('0.1.2', {
       settingsPath: join(root, 'isolated-pi', 'settings.json'),
       packagePath: installPath,
+      legacyInstallPath: installPath,
+      legacyMetadataPath: join(installPath, '.ariava-managed.json'),
     });
 
     expect(record.version).toBe('0.1.2');
