@@ -1,12 +1,12 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { AgentAdapterClient } from './adapter';
 import type { AgentAdapter } from './adapter-interface';
 import { executeCommand } from './commands';
 import { buildBlockedEvent, buildDoneEvent, buildQuestionEvent, buildWorkingEvent } from './events';
 import { startHeartbeat, stopHeartbeat, type HeartbeatContext } from './heartbeat';
 import {
-  classifyAgentEnd,
-  extractBlockedReason,
+  classifyStoredAssistantText,
   markFingerprintEmitted,
   resetEmittedFingerprints,
 } from './question-detector';
@@ -23,30 +23,20 @@ import {
   withSessionStatus,
 } from './session';
 
-function previewInputText(value: string, maxLength = 120): string {
-  const normalized = value.replace(/\s+/g, ' ').trim();
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…`;
-}
-
-function deriveAgentEndActivityText(ctx: ExtensionContext, messages: unknown[] | undefined): string | undefined {
-  const latestError = Array.isArray(messages)
-    ? [...messages].reverse().find((message): message is { errorMessage: string } =>
-      typeof message === 'object' &&
-      message !== null &&
-      typeof (message as { errorMessage?: unknown }).errorMessage === 'string' &&
-      (message as { errorMessage: string }).errorMessage.trim().length > 0,
-    )?.errorMessage.trim()
-    : undefined;
-  return latestError ?? deriveLatestActivityText(ctx, { eventMessages: messages as import('@earendil-works/pi-agent-core').AgentMessage[] | undefined });
-}
-
-const DEFAULT_RECOVERY_HOLD_MS = 60_000;
 const REGISTRATION_WARNING_MS = 5_000;
 const REGISTRATION_WARNING_MESSAGE =
   'Ariava bridge did not register this pi session within 5s. Check that the selected local bridge profile is running and its Agent Adapter discovery file is available.';
 const REGISTRATION_RETRY_MS = 1_000;
 const TERMINAL_ALERT_QUIET_WINDOW_MS = 1_500;
+const UNKNOWN_STOP_REASON_MAX_LENGTH = 80;
+const ERROR_PREVIEW_MAX_LENGTH = 240;
+
+type LatestAgentEndResult = {
+  assistantFound: boolean;
+  stopReason?: string;
+  assistantText?: string;
+  errorText?: string;
+};
 
 type PendingTerminalAlert = {
   type: 'done' | 'blocked' | 'question_requested';
@@ -54,17 +44,7 @@ type PendingTerminalAlert = {
   fingerprint?: string;
   userMessageText?: string;
   createdAt: string;
-};
-
-type RecoveryHoldReason = 'agent_error' | 'length' | 'context_overflow' | 'system_abort' | 'auto_compact';
-
-type RecoveryHold = {
-  reason: RecoveryHoldReason;
-  assistantText: string;
-  userMessageText?: string;
-  startedAt: number;
-  expiresAt: number;
-  timer: ReturnType<typeof setTimeout>;
+  flowRevision: number;
 };
 
 type PendingHandleCandidate = {
@@ -80,15 +60,12 @@ type PiReducerState = {
   rootSessionActive: boolean;
   loopRunning: boolean;
   terminalEmittedForCurrentLoop: boolean;
-  retryHoldUntil: number | null;
-  retryHoldAssistantText?: string;
-  blockedReason?: string;
+  flowRevision: number;
+  latestAgentEndResult?: LatestAgentEndResult;
   latestPendingAlert?: PendingTerminalAlert;
   pendingHandleCandidate?: PendingHandleCandidate;
   quietTimer?: ReturnType<typeof setTimeout>;
-  recoveryHold?: RecoveryHold;
   lastInputAt?: number;
-  lastAgentLoopEndedAt?: number;
   activeLeafId?: string;
   lastTreeSwitchAt?: number;
 };
@@ -145,24 +122,28 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     runAdapterTask('push working event', () => adapter.pushEvent(buildWorkingEvent(session!, latestActivityText)));
   }
 
-  function runtimeHasPendingMessages(ctx: ExtensionContext): boolean {
-    const runtime = ctx as ExtensionContext & { isIdle?: () => boolean; hasPendingMessages?: () => boolean };
-    return runtime.isIdle?.() === false || runtime.hasPendingMessages?.() === true;
+  function runtimeHasNewWork(ctx: ExtensionContext): boolean {
+    return ctx.isIdle() === false || ctx.hasPendingMessages() === true;
   }
 
-
-  function extractLatestAssistantEnd(event: { messages?: import('@earendil-works/pi-agent-core').AgentMessage[] }): { stopReason?: string; assistantText?: string; errorText?: string } {
-    const messages = event.messages ?? [];
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index] as { role?: string; stopReason?: unknown; content?: unknown; errorMessage?: unknown; error?: unknown } | undefined;
+  function extractLatestAssistantEnd(messages: AgentMessage[] | undefined): LatestAgentEndResult {
+    for (let index = (messages?.length ?? 0) - 1; index >= 0; index -= 1) {
+      const message = messages?.[index] as {
+        role?: string;
+        stopReason?: unknown;
+        content?: unknown;
+        errorMessage?: unknown;
+        error?: unknown;
+      } | undefined;
       if (message?.role !== 'assistant') continue;
       return {
+        assistantFound: true,
         stopReason: typeof message.stopReason === 'string' ? message.stopReason : undefined,
         assistantText: extractTextContent(message.content),
         errorText: stringifyErrorLike(message.errorMessage) ?? stringifyErrorLike(message.error),
       };
     }
-    return {};
+    return { assistantFound: false };
   }
 
   function extractTextContent(content: unknown): string | undefined {
@@ -191,13 +172,26 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       .join(': ') || undefined;
   }
 
-  function getRecoveryHoldMs(): number {
-    const configured = Number(process.env.ARIAVA_PI_RECOVERY_HOLD_MS);
-    return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_RECOVERY_HOLD_MS;
+  function sanitizeDisplayText(value: string | undefined, maxLength: number): string | undefined {
+    const normalized = value
+      ?.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ')
+      .replace(/\p{Cf}/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!normalized) return undefined;
+    if (normalized.length <= maxLength) return normalized;
+    return `${normalized.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…`;
+  }
+
+  function unsupportedReasonPreview(reason: string): string {
+    const sanitized = sanitizeDisplayText(reason, UNKNOWN_STOP_REASON_MAX_LENGTH);
+    return sanitized
+      ? `Pi stopped for an unsupported reason: ${sanitized}.`
+      : 'Pi stopped for an unsupported reason.';
   }
 
   async function emitTerminalAlert(alert: PendingTerminalAlert) {
-    if (!session || !state?.rootSessionActive) return;
+    if (!session || !state?.rootSessionActive || state.flowRevision !== alert.flowRevision) return;
 
     const normalizedAssistant = normalizeAssistantTextForEvent(alert.type, session, alert.assistantText);
     const sessionStatus = alert.type === 'done' ? 'done' : 'blocked';
@@ -218,9 +212,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
 
     state.terminalEmittedForCurrentLoop = true;
     state.latestPendingAlert = undefined;
-    if (alert.fingerprint) {
-      markFingerprintEmitted(alert.fingerprint);
-    }
+    if (alert.fingerprint) markFingerprintEmitted(alert.fingerprint);
 
     runAdapterTask(`push ${alert.type} event`, async () => {
       const pushed = await adapter.pushEvent(event);
@@ -236,26 +228,41 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   }
 
   function clearQuietTimer(loopState: PiReducerState | null = state) {
-    if (loopState?.quietTimer) {
-      clearTimeout(loopState.quietTimer);
-      loopState.quietTimer = undefined;
-    }
+    if (!loopState?.quietTimer) return;
+    clearTimeout(loopState.quietTimer);
+    loopState.quietTimer = undefined;
+  }
+
+  function invalidatePendingTerminal(loopState: PiReducerState): void {
+    clearQuietTimer(loopState);
+    loopState.latestPendingAlert = undefined;
   }
 
   function schedulePendingTerminal(ctx: ExtensionContext) {
     if (!state) return;
     clearQuietTimer(state);
     const scheduledSessionId = state.sessionId;
+    const scheduledFlowRevision = state.flowRevision;
     state.quietTimer = setTimeout(() => {
-      void flushPendingTerminalIfStable(ctx, scheduledSessionId);
+      void flushPendingTerminalIfStable(ctx, scheduledSessionId, scheduledFlowRevision);
     }, TERMINAL_ALERT_QUIET_WINDOW_MS);
     state.quietTimer.unref?.();
   }
 
-  async function flushPendingTerminalIfStable(ctx: ExtensionContext, scheduledSessionId: string) {
-    if (!state || state.sessionId !== scheduledSessionId || !state.latestPendingAlert || state.loopRunning) return;
-    if (runtimeHasPendingMessages(ctx)) {
-      schedulePendingTerminal(ctx);
+  async function flushPendingTerminalIfStable(
+    ctx: ExtensionContext,
+    scheduledSessionId: string,
+    scheduledFlowRevision: number,
+  ) {
+    if (
+      !state ||
+      state.sessionId !== scheduledSessionId ||
+      state.flowRevision !== scheduledFlowRevision ||
+      !state.latestPendingAlert ||
+      state.loopRunning
+    ) return;
+    if (runtimeHasNewWork(ctx)) {
+      invalidatePendingTerminal(state);
       return;
     }
     const alert = state.latestPendingAlert;
@@ -263,75 +270,22 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     await emitTerminalAlert(alert);
   }
 
-  async function pushTerminal(type: 'done' | 'blocked' | 'question_requested', ctx: ExtensionContext, assistantText?: string, fingerprint?: string) {
-    if (!session || !state?.rootSessionActive || state.terminalEmittedForCurrentLoop) return;
-
-    const normalizedAssistant = normalizeAssistantTextForEvent(type, session, assistantText ?? deriveLatestActivityText(ctx));
-    const sessionStatus = type === 'done' ? 'done' : 'blocked';
-    session = withSessionStatus(session, sessionStatus, normalizedAssistant);
-    heartbeatContext.status = sessionStatus;
-    heartbeatContext.latestActivityText = session.latestActivityText;
+  function submitTerminalCandidate(
+    type: 'done' | 'blocked' | 'question_requested',
+    ctx: ExtensionContext,
+    assistantText: string,
+    fingerprint?: string,
+  ) {
+    if (!session || !state?.rootSessionActive || state.terminalEmittedForCurrentLoop || state.latestPendingAlert) return;
     state.latestPendingAlert = {
       type,
-      assistantText: normalizedAssistant,
+      assistantText: normalizeAssistantTextForEvent(type, session, assistantText),
       userMessageText: deriveMessageTexts(ctx).latestUserText,
       fingerprint,
       createdAt: new Date().toISOString(),
+      flowRevision: state.flowRevision,
     };
-    state.lastAgentLoopEndedAt = Date.now();
     schedulePendingTerminal(ctx);
-  }
-
-  async function emitBlockedAlertNow(assistantText: string, userMessageText?: string): Promise<void> {
-    if (!session || !state?.rootSessionActive || state.terminalEmittedForCurrentLoop) return;
-    await emitTerminalAlert({
-      type: 'blocked',
-      assistantText,
-      userMessageText,
-      createdAt: new Date().toISOString(),
-    });
-  }
-
-  function clearRecoveryHold(loopState: PiReducerState | null = state): void {
-    if (loopState?.recoveryHold?.timer) {
-      clearTimeout(loopState.recoveryHold.timer);
-    }
-    if (loopState) {
-      loopState.recoveryHold = undefined;
-    }
-  }
-
-  function enterRecoveryHold(reason: RecoveryHoldReason, ctx: ExtensionContext, assistantText: string): void {
-    if (!state || !session || !state.rootSessionActive) return;
-    clearRecoveryHold(state);
-    clearQuietTimer(state);
-    state.latestPendingAlert = undefined;
-    const startedAt = Date.now();
-    const holdMs = getRecoveryHoldMs();
-    const scheduledSessionId = state.sessionId;
-    const userMessageText = deriveMessageTexts(ctx).latestUserText;
-    const normalizedAssistant = normalizeAssistantTextForEvent('working', session, assistantText);
-    const timer = setTimeout(() => {
-      void emitRecoveryHoldBlockedIfCurrent(scheduledSessionId, startedAt);
-    }, holdMs);
-    timer.unref?.();
-    state.recoveryHold = {
-      reason,
-      assistantText: normalizedAssistant,
-      userMessageText,
-      startedAt,
-      expiresAt: startedAt + holdMs,
-      timer,
-    };
-    void pushWorking(ctx, normalizedAssistant);
-  }
-
-  async function emitRecoveryHoldBlockedIfCurrent(scheduledSessionId: string, startedAt: number): Promise<void> {
-    if (!state || state.sessionId !== scheduledSessionId || state.loopRunning || !state.recoveryHold) return;
-    if (state.recoveryHold.startedAt !== startedAt) return;
-    const { assistantText, userMessageText } = state.recoveryHold;
-    clearRecoveryHold(state);
-    await emitBlockedAlertNow(assistantText, userMessageText);
   }
 
   function resetLoopState(nextSessionId: string, activeLeafId?: string): PiReducerState {
@@ -340,38 +294,28 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       rootSessionActive: true,
       loopRunning: false,
       terminalEmittedForCurrentLoop: false,
-      retryHoldUntil: null,
-      retryHoldAssistantText: undefined,
-      blockedReason: undefined,
-      latestPendingAlert: undefined,
-      quietTimer: undefined,
+      flowRevision: 0,
       activeLeafId,
-      recoveryHold: undefined,
-      pendingHandleCandidate: undefined,
     };
     return state;
   }
 
   function ensureLoopState(nextSessionId: string, activeLeafId?: string): PiReducerState {
-    if (!state || state.sessionId !== nextSessionId) {
-      return resetLoopState(nextSessionId, activeLeafId);
-    }
+    if (!state || state.sessionId !== nextSessionId) return resetLoopState(nextSessionId, activeLeafId);
     state.activeLeafId = activeLeafId ?? state.activeLeafId;
     return state;
   }
 
   function clearRegistrationWarningTimer() {
-    if (registrationWarningTimer) {
-      clearTimeout(registrationWarningTimer);
-      registrationWarningTimer = null;
-    }
+    if (!registrationWarningTimer) return;
+    clearTimeout(registrationWarningTimer);
+    registrationWarningTimer = null;
   }
 
   function clearRegistrationRetryTimer() {
-    if (registrationRetryTimer) {
-      clearTimeout(registrationRetryTimer);
-      registrationRetryTimer = null;
-    }
+    if (!registrationRetryTimer) return;
+    clearTimeout(registrationRetryTimer);
+    registrationRetryTimer = null;
   }
 
   function registerSessionInBackground(ctx: ExtensionContext, sessionInfo: NonNullable<typeof session>) {
@@ -401,27 +345,22 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
           registrationRetryTimer.unref?.();
         });
     };
-
     attemptRegistration();
   }
 
   function clearBranchSensitiveState(loopState: PiReducerState) {
-    clearQuietTimer(loopState);
+    invalidatePendingTerminal(loopState);
+    loopState.latestAgentEndResult = undefined;
     loopState.terminalEmittedForCurrentLoop = false;
-    loopState.latestPendingAlert = undefined;
     loopState.pendingHandleCandidate = undefined;
-    loopState.retryHoldUntil = null;
-    loopState.retryHoldAssistantText = undefined;
-    loopState.blockedReason = undefined;
-    clearRecoveryHold(loopState);
+    loopState.flowRevision += 1;
   }
 
-  function refreshActiveLeaf(ctx: ExtensionContext): string | undefined {
-    const activeLeafId = deriveActiveLeafId(ctx);
-    if (state) {
-      state.activeLeafId = activeLeafId ?? state.activeLeafId;
-    }
-    return state?.activeLeafId ?? activeLeafId;
+  function beginNewLowLevelRun(loopState: PiReducerState) {
+    invalidatePendingTerminal(loopState);
+    loopState.latestAgentEndResult = undefined;
+    loopState.terminalEmittedForCurrentLoop = false;
+    loopState.flowRevision += 1;
   }
 
   pi.on('session_start', async (_event, ctx) => {
@@ -453,17 +392,13 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     commandPoller?.stop();
     commandPoller = null;
     clearQuietTimer(state);
-    clearRecoveryHold(state);
 
     if (session && state?.rootSessionActive) {
       const assistantText = clampAssistantText(deriveLatestActivityText(ctx) ?? 'pi session ended');
       session = withSessionStatus(session, session.status, assistantText);
       heartbeatContext.latestActivityText = session.latestActivityText;
     }
-
-    if (sessionId) {
-      runAdapterTask('unregister session', () => adapter.unregisterSession(sessionId));
-    }
+    if (sessionId) runAdapterTask('unregister session', () => adapter.unregisterSession(sessionId));
 
     heartbeatContext.sessionId = '';
     heartbeatContext.status = 'unknown';
@@ -476,97 +411,80 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   pi.on('input', async (_event, _ctx) => {
     if (!state) return;
     state.lastInputAt = Date.now();
-    clearQuietTimer(state);
+    invalidatePendingTerminal(state);
+    state.latestAgentEndResult = undefined;
+    state.flowRevision += 1;
     reportPendingHandleAfterLocalInput(state);
   });
 
   pi.on('agent_start', async (_event, ctx) => {
+    const eventSessionId = deriveSessionId(ctx);
+    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId) return;
     session = deriveSession(ctx);
     const loopState = ensureLoopState(session.sessionId, deriveActiveLeafId(ctx));
+    beginNewLowLevelRun(loopState);
     loopState.loopRunning = true;
-    clearBranchSensitiveState(loopState);
     await pushWorking(ctx, deriveLatestActivityText(ctx));
   });
 
   pi.on('agent_end', async (event, ctx) => {
     const eventSessionId = deriveSessionId(ctx);
-    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId) {
-      return;
-    }
+    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId) return;
 
-    const agentEndEvent = event as { messages?: import('@earendil-works/pi-agent-core').AgentMessage[] };
     session = deriveSession(ctx);
     const loopState = ensureLoopState(session.sessionId, deriveActiveLeafId(ctx));
-
     loopState.loopRunning = false;
-    const activeLeafId = refreshActiveLeaf(ctx);
-    const latestActivityText = deriveAgentEndActivityText(ctx, agentEndEvent.messages);
-    const latestAssistant = extractLatestAssistantEnd(agentEndEvent);
-    const stopReason = latestAssistant.stopReason;
-    const stopReasonText = latestAssistant.errorText ?? latestActivityText ?? latestAssistant.assistantText;
+    loopState.latestAgentEndResult = extractLatestAssistantEnd(event.messages);
+    await pushWorking(ctx, loopState.latestAgentEndResult.errorText ?? loopState.latestAgentEndResult.assistantText);
+  });
+
+  pi.on('agent_settled', async (_event, ctx) => {
+    const eventSessionId = deriveSessionId(ctx);
+    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId || !state) return;
+    const loopState = state;
+    if (loopState.sessionId !== eventSessionId || loopState.loopRunning || loopState.latestPendingAlert) return;
+
+    const result = loopState.latestAgentEndResult;
+    loopState.latestAgentEndResult = undefined;
+    if (!result?.assistantFound || loopState.terminalEmittedForCurrentLoop) return;
+
+    const stopReason = result.stopReason;
+    if (stopReason === 'aborted') return;
 
     if (stopReason === 'error') {
-      enterRecoveryHold('agent_error', ctx, stopReasonText ?? 'Agent error needs attention');
+      submitTerminalCandidate(
+        'blocked',
+        ctx,
+        sanitizeDisplayText(result.errorText, ERROR_PREVIEW_MAX_LENGTH) ?? 'Pi stopped after an unrecovered error.',
+      );
       return;
     }
-
     if (stopReason === 'length') {
-      enterRecoveryHold('length', ctx, stopReasonText ?? 'Agent output was truncated');
+      submitTerminalCandidate('blocked', ctx, 'Pi stopped after reaching the response length limit.');
       return;
     }
-
     if (stopReason === 'toolUse') {
-      clearRecoveryHold(loopState);
-      await pushTerminal('blocked', ctx, stopReasonText ?? 'Agent stopped while waiting to use a tool');
+      submitTerminalCandidate('blocked', ctx, 'Pi stopped while waiting to use a tool.');
+      return;
+    }
+    if (stopReason !== undefined && stopReason !== 'stop') {
+      submitTerminalCandidate('blocked', ctx, unsupportedReasonPreview(stopReason));
       return;
     }
 
-    if (stopReason === 'aborted') {
-      clearRecoveryHold(loopState);
-      return;
-    }
-
-    const classification = classifyAgentEnd(ctx, {
-      sessionId: session.sessionId,
-      activeLeafId,
-      messages: agentEndEvent.messages,
+    const classification = classifyStoredAssistantText(result.assistantText, {
+      sessionId: loopState.sessionId,
+      activeLeafId: loopState.activeLeafId,
     });
-
-    if (classification.type === 'suppress_duplicate') {
-      return;
-    }
-
-    clearRecoveryHold(loopState);
-
-    if (classification.type === 'question_requested') {
-      loopState.retryHoldUntil = null;
-      loopState.retryHoldAssistantText = undefined;
-      loopState.blockedReason = undefined;
-      await pushTerminal('question_requested', ctx, classification.assistantText, classification.fingerprint);
-      return;
-    }
-
-    const explicitBlockedReason = classification.type === 'blocked'
-      ? classification.blockedReason
-      : extractBlockedReason(latestActivityText ?? '');
-    if (explicitBlockedReason) {
-      loopState.retryHoldUntil = null;
-      loopState.retryHoldAssistantText = undefined;
-      loopState.blockedReason = explicitBlockedReason;
-      await pushTerminal('blocked', ctx, explicitBlockedReason, classification.fingerprint);
-      return;
-    }
-
-    loopState.retryHoldUntil = null;
-    loopState.retryHoldAssistantText = undefined;
-    loopState.blockedReason = undefined;
-    await pushTerminal('done', ctx, classification.assistantText || latestActivityText || 'Task complete', classification.fingerprint);
+    if (classification.type === 'suppress_duplicate') return;
+    submitTerminalCandidate(classification.type, ctx, classification.assistantText, classification.fingerprint);
   });
 
   pi.on('session_tree', async (event, ctx) => {
+    const eventSessionId = deriveSessionId(ctx);
+    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId || !state) return;
     const treeEvent = event as { newLeafId?: string };
-    const sessionId = session?.sessionId ?? deriveSessionId(ctx);
-    const loopState = ensureLoopState(sessionId, treeEvent.newLeafId ?? deriveActiveLeafId(ctx));
+    const loopState = state;
     loopState.activeLeafId = treeEvent.newLeafId ?? deriveActiveLeafId(ctx) ?? loopState.activeLeafId;
     loopState.lastTreeSwitchAt = Date.now();
     clearBranchSensitiveState(loopState);

@@ -1,18 +1,14 @@
-import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
-import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { createHash } from 'node:crypto';
-import { deriveLatestActivityText } from './session';
 
-export type AgentEndClassification =
+export type StoredAssistantClassification =
   | { type: 'question_requested'; assistantText: string; fingerprint: string }
   | { type: 'blocked'; assistantText: string; fingerprint: string; blockedReason: string }
   | { type: 'done'; assistantText: string; fingerprint: string }
   | { type: 'suppress_duplicate'; fingerprint: string; assistantText?: string; blockedReason?: string };
 
-export interface ClassifyAgentEndInput {
+export interface ClassifyStoredAssistantInput {
   sessionId: string;
   activeLeafId?: string;
-  messages?: AgentMessage[];
 }
 
 const QUESTION_PATTERNS: RegExp[] = [
@@ -39,42 +35,27 @@ const BLOCKED_PATTERNS: RegExp[] = [
   /\bmanual step\b/i,
 ];
 
-const RETRYABLE_ERROR_PATTERNS: RegExp[] = [
-  /\boverloaded\b/i,
-  /\brate limit\b/i,
-  /\btoo many requests\b/i,
-  /\btimeout\b/i,
-  /\btemporar(?:y|ily) unavailable\b/i,
-  /\bupstream\b/i,
-  /\bnetwork\b/i,
-  /\b5\d\d\b/i,
-  /\bwebsocket closed\b/i,
-  /\bstream[_ -]?read[_ -]?error\b/i,
-];
-
 const emittedFingerprints = new Set<string>();
 
-export function classifyAgentEnd(ctx: ExtensionContext, input: ClassifyAgentEndInput | string): AgentEndClassification {
-  const normalizedInput = typeof input === 'string' ? { sessionId: input } : input;
-  const text = deriveLatestActivityText(ctx, { eventMessages: normalizedInput.messages }) ?? '';
-  const fingerprint = buildFingerprint(normalizedInput.sessionId, normalizedInput.activeLeafId, text);
+export function classifyStoredAssistantText(
+  text: string | undefined,
+  input: ClassifyStoredAssistantInput,
+): StoredAssistantClassification {
+  const normalizedText = text?.trim() ?? '';
+  const fingerprint = buildFingerprint(input.sessionId, input.activeLeafId, normalizedText);
 
-  if (emittedFingerprints.has(fingerprint)) {
-    return { type: 'suppress_duplicate', fingerprint };
+  if (emittedFingerprints.has(fingerprint)) return { type: 'suppress_duplicate', fingerprint };
+
+  if (looksLikeQuestion(normalizedText)) {
+    return { type: 'question_requested', assistantText: normalizedText, fingerprint };
   }
 
-  if (looksLikeQuestion(text)) {
-    return { type: 'question_requested', assistantText: text, fingerprint };
-  }
-
-  const blockedReason = extractBlockedReason(text);
-  if (blockedReason) {
-    return { type: 'blocked', assistantText: blockedReason, fingerprint, blockedReason };
-  }
+  const blockedReason = extractBlockedReason(normalizedText);
+  if (blockedReason) return { type: 'blocked', assistantText: blockedReason, fingerprint, blockedReason };
 
   return {
     type: 'done',
-    assistantText: text || 'Task complete',
+    assistantText: normalizedText || 'Task complete',
     fingerprint,
   };
 }
@@ -85,10 +66,6 @@ export function markFingerprintEmitted(fingerprint: string): void {
 
 export function resetEmittedFingerprints(): void {
   emittedFingerprints.clear();
-}
-
-export function looksRetryableError(text: string): boolean {
-  return RETRYABLE_ERROR_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 export function looksLikeQuestion(text: string): boolean {
@@ -108,9 +85,8 @@ export function extractBlockedReason(text: string): string | undefined {
 }
 
 function buildFingerprint(sessionId: string, activeLeafId: string | undefined, text: string): string {
-  const hash = createHash('sha256')
+  return createHash('sha256')
     .update(`${sessionId}:${activeLeafId ?? 'no-leaf'}:${text}`)
     .digest('hex')
     .slice(0, 16);
-  return hash;
 }
