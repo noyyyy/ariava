@@ -68,7 +68,7 @@ describe('public ariava CLI', () => {
     expect(json.data.commands).toContain('ariava upgrade [pi]');
   });
 
-  test('isolates launchctl when the uninstall subprocess purges its temporary home', async () => {
+  test.skipIf(process.platform !== 'darwin')('isolates launchctl when the uninstall subprocess purges its temporary home', async () => {
     const parent = mkdtempSync(join(tmpdir(), 'ariava-cli-parent-'));
     const home = join(parent, 'home-$UNDEFINED');
     roots.push(parent);
@@ -113,7 +113,7 @@ describe('public ariava CLI', () => {
     expect(upgrade.data.piExtension.record.version).toBe(expectedVersion);
   });
 
-  test('renders top-level human status with neutral loaded wording and state', async () => {
+  test.skipIf(process.platform !== 'darwin')('renders top-level human status with neutral loaded wording and state', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-status-'));
     roots.push(home);
     const configRoot = join(home, '.config', 'ariava');
@@ -228,7 +228,7 @@ describe('public ariava CLI', () => {
     expect(JSON.parse(readFileSync(join(home, '.pi', 'agent', 'settings.json'), 'utf8')).packages).toContain(exactSource);
   });
 
-  test('service status shows relay base url and log paths in text output', async () => {
+  test.skipIf(process.platform !== 'darwin')('service status shows relay base url and log paths in text output', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     roots.push(home);
 
@@ -248,7 +248,7 @@ describe('public ariava CLI', () => {
     expect(stdout).toContain(`Stderr log: ${join(home, '.config', 'ariava', 'logs', 'bridge.stderr.log')}`);
   });
 
-  test('service status returns relay base url and log paths in json output', async () => {
+  test.skipIf(process.platform !== 'darwin')('service status returns relay base url and log paths in json output', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     roots.push(home);
 
@@ -407,7 +407,7 @@ describe('public ariava CLI', () => {
     expect(body.data.piExtension.record.managedPath).toBe(join(home, '.pi', 'agent', 'npm', 'node_modules', '@ariava', 'pi-extension'));
   });
 
-  test('macOS CLI preserves foreign systemd metadata and reports mismatch safely', async () => {
+  test.skipIf(process.platform !== 'darwin')('macOS CLI preserves foreign systemd metadata and reports mismatch safely', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-foreign-service-'));
     roots.push(home);
     const configRoot = join(home, '.config', 'ariava');
