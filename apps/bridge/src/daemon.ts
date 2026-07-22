@@ -350,7 +350,6 @@ export class BridgeDaemon {
   private uploadOrchestrator(): EncryptedUploadOrchestrator {
     return new EncryptedUploadOrchestrator(this.stateStore, this.client(), this.encryptionIdentity!, this.keyring!);
   }
-  }
 
   private async flushPendingHandles(): Promise<number> {
     let flushed = 0;

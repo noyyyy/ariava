@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { createHmac, createPrivateKey, createPublicKey, verify } from 'node:crypto';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   chachaPolyOpen, chachaPolySeal, exportX25519PublicKeyRaw, generateX25519KeyMaterial,
   hkdfSha256, importX25519PrivateKey, importX25519PublicKeyRaw, x25519SharedSecret,
@@ -12,7 +13,8 @@ import {
   buildConfirmationProofBytes, buildEncryptionBindingBytes, buildWrapAAD,
 } from '../../../packages/protocol/dist/index.js';
 
-const vectors = JSON.parse(readFileSync(resolve('packages/protocol/test/fixtures/e2e-v1-vectors.json'), 'utf8'));
+const publicCoreRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+const vectors = JSON.parse(readFileSync(resolve(publicCoreRoot, 'packages/protocol/test/fixtures/e2e-v1-vectors.json'), 'utf8'));
 const decode = (value) => new Uint8Array(Buffer.from(value, 'base64url'));
 
 test('Node 22 production crypto matches the frozen X25519/HKDF/ChaChaPoly vector', () => {

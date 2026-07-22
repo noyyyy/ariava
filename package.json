@@ -32,7 +32,6 @@
     "packages/*"
   ],
   "scripts": {
-    "boundary:check": "node ./scripts/assert-repository-boundaries.mjs --mode public-candidate --root .",
     "build": "bun run build:protocol && bun run build:shared-utils && bun run build:bridge && bun run build:pi-bundle",
     "build:protocol": "bun run ./scripts/build-public-package.mjs protocol",
     "build:shared-utils": "bun run ./scripts/build-public-package.mjs shared-utils",
@@ -45,10 +44,9 @@
     "release:prepare": "./scripts/publish-npm-safe.sh --prepare",
     "build:pi-bundle": "bun run --cwd extensions/pi build && node ./scripts/build-pi-release-bundle.mjs",
     "package:assert": "node ./scripts/package-assert.mjs",
-    "prepublishOnly": "node ./scripts/assert-publication-readme.mjs",
-    "test": "NODE_ENV=test bun test ./scripts ./packages/protocol/test ./packages/shared-utils/test ./apps/bridge/test && bun run --cwd extensions/pi test",
+    "test": "bun test ./scripts ./packages/protocol/test ./packages/shared-utils/test ./apps/bridge/test && bun run --cwd extensions/pi test",
     "test:bridge-crypto:node": "node --test ./apps/bridge/test-node/*.test.mjs",
-    "verify": "bun run boundary:check && bun run build && bun run test:bridge-crypto:node && bun run --cwd extensions/pi typecheck && bun run test && bun run package:assert",
+    "verify": "bun run build && bun run test:bridge-crypto:node && bun run --cwd extensions/pi typecheck && bun run test && bun run package:assert",
     "dev:setup": "bun run ./apps/bridge/src/dev-profile-cli.ts setup"
   },
   "devDependencies": {

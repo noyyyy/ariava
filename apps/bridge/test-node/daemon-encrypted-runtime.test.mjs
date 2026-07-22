@@ -24,7 +24,12 @@ function event(hostId, id = 'event-1', sessionId = 'session-1') {
 }
 function responseError(reason) { return new Response(JSON.stringify({ reason }), { status: 409, headers: { 'content-type': 'application/json' } }); }
 async function unwrap(response) {
-  if (!response.ok) throw new RelayClientError(response.status, await response.text());
+  if (!response.ok) {
+    const text = await response.text();
+    let body;
+    try { body = JSON.parse(text); } catch { body = undefined; }
+    throw new RelayClientError(response.status, body?.reason ?? body?.error ?? text, body);
+  }
   return response.status === 204 ? undefined : response.json();
 }
 

@@ -55,6 +55,9 @@ function relay(handler: (request: Request) => Response | Promise<Response>) {
       const body = await request.json() as { hostId: string };
       return Response.json({ host: { hostId: body.hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
     }
+    if (path === '/v2/bridge/e2e/recipients') {
+      return Response.json({ version: 1, hostId: 'test', recipientSetVersion: 1, recipients: [] });
+    }
     if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] });
     return handler(request);
   };

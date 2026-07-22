@@ -46,7 +46,7 @@ describe('published root tarball', () => {
 
       // Internal package-smoke seam: rendering is read-only and loads the same
       // packaged asset path used after successful onboarding without preflight writes.
-      const rendered = run(process.execPath, [cliPath, 'internal', 'render-onboarding-success', '--target', 'adapter-installed', '--columns', '80'], unrelatedCwd);
+      const rendered = run('node', [cliPath, 'internal', 'render-onboarding-success', '--target', 'adapter-installed', '--columns', '80'], unrelatedCwd);
       expect(rendered.status, rendered.stderr).toBe(0);
       expect(rendered.stdout).toContain('Ariava ready');
       expect(rendered.stdout).toContain('Reload Pi: run /reload in an existing session');

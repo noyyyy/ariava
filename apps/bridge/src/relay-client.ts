@@ -184,7 +184,6 @@ export class RelayClient {
     assertRestrictedDynamicValue(linkId, 'link ID');
     return this.request('POST', `/v2/bridge/e2e/links/${linkId}/activate`, request);
   }
-  }
 
   markSessionRead(sessionId: string, request: MarkSessionReadRequest): Promise<MarkSessionReadResponse> {
     assertRestrictedDynamicValue(sessionId, 'session ID');
