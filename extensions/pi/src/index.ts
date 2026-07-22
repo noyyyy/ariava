@@ -68,6 +68,7 @@ type PiReducerState = {
   lastInputAt?: number;
   activeLeafId?: string;
   lastTreeSwitchAt?: number;
+  agentEndConsumedForCurrentRun: boolean;
 };
 
 export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentAdapter) {
@@ -81,8 +82,9 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   const heartbeatContext: HeartbeatContext = {
     sessionId: '',
     client: adapter,
-    status: 'unknown',
+    status: 'idle',
     latestActivityText: undefined,
+    getSession: () => session,
   };
 
   function runAdapterTask(label: string, task: () => Promise<unknown>): void {
@@ -296,6 +298,8 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       terminalEmittedForCurrentLoop: false,
       flowRevision: 0,
       activeLeafId,
+      pendingHandleCandidate: undefined,
+      agentEndConsumedForCurrentRun: false,
     };
     return state;
   }
@@ -372,7 +376,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     const sessionId = deriveSessionId(ctx);
     heartbeatContext.sessionId = sessionId;
     heartbeatContext.latestActivityText = session.latestActivityText;
-    heartbeatContext.status = 'unknown';
+    heartbeatContext.status = session.status;
     resetLoopState(sessionId, deriveActiveLeafId(ctx));
 
     startHeartbeat(heartbeatContext);
@@ -380,6 +384,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       sessionId,
       client: adapter,
       onCommand: (command) => handleCommand(pi, ctx, command, adapter),
+      getSession: () => session,
     });
     registerSessionInBackground(ctx, session);
   });
@@ -401,7 +406,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     if (sessionId) runAdapterTask('unregister session', () => adapter.unregisterSession(sessionId));
 
     heartbeatContext.sessionId = '';
-    heartbeatContext.status = 'unknown';
+    heartbeatContext.status = 'idle';
     heartbeatContext.latestActivityText = undefined;
     session = null;
     state = null;
@@ -423,16 +428,22 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     session = deriveSession(ctx);
     const loopState = ensureLoopState(session.sessionId, deriveActiveLeafId(ctx));
     beginNewLowLevelRun(loopState);
+    loopState.agentEndConsumedForCurrentRun = false;
     loopState.loopRunning = true;
     await pushWorking(ctx, deriveLatestActivityText(ctx));
   });
 
+  // Pi exposes no low-level loop identity. Consume at most one agent_end per
+  // observed agent_start, but defer all terminal classification to agent_settled.
   pi.on('agent_end', async (event, ctx) => {
     const eventSessionId = deriveSessionId(ctx);
     if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId) return;
 
     session = deriveSession(ctx);
     const loopState = ensureLoopState(session.sessionId, deriveActiveLeafId(ctx));
+    if (loopState.agentEndConsumedForCurrentRun) return;
+
+    loopState.agentEndConsumedForCurrentRun = true;
     loopState.loopRunning = false;
     loopState.latestAgentEndResult = extractLatestAssistantEnd(event.messages);
     await pushWorking(ctx, loopState.latestAgentEndResult.errorText ?? loopState.latestAgentEndResult.assistantText);
@@ -440,7 +451,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
 
   pi.on('agent_settled', async (_event, ctx) => {
     const eventSessionId = deriveSessionId(ctx);
-    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId || !state) return;
+    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId || !state || !session) return;
     const loopState = state;
     if (loopState.sessionId !== eventSessionId || loopState.loopRunning || loopState.latestPendingAlert) return;
 
@@ -449,7 +460,18 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     if (!result?.assistantFound || loopState.terminalEmittedForCurrentLoop) return;
 
     const stopReason = result.stopReason;
-    if (stopReason === 'aborted') return;
+    if (stopReason === 'aborted') {
+      loopState.terminalEmittedForCurrentLoop = true;
+      session = withSessionStatus(
+        session,
+        'idle',
+        session.latestActivityText ?? deriveLatestActivityText(ctx),
+      );
+      heartbeatContext.status = 'idle';
+      heartbeatContext.latestActivityText = session.latestActivityText;
+      await adapter.heartbeat(session.sessionId, 'idle', session.latestActivityText ?? null, session);
+      return;
+    }
 
     if (stopReason === 'error') {
       submitTerminalCandidate(
@@ -488,6 +510,16 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     loopState.activeLeafId = treeEvent.newLeafId ?? deriveActiveLeafId(ctx) ?? loopState.activeLeafId;
     loopState.lastTreeSwitchAt = Date.now();
     clearBranchSensitiveState(loopState);
+    const currentSession = withSessionStatus(
+      deriveSession(ctx), heartbeatContext.status, deriveLatestActivityText(ctx),
+    );
+    session = currentSession;
+    heartbeatContext.latestActivityText = currentSession.latestActivityText;
+    runAdapterTask('refresh active branch session', () =>
+      adapter.heartbeat(
+        currentSession.sessionId, currentSession.status, currentSession.latestActivityText ?? null, currentSession,
+      ),
+    );
   });
 }
 

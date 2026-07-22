@@ -8,6 +8,10 @@ export class AgentAdapterClient {
     return this.registry.listSessions();
   }
 
+  isAuthoritativeSetReady(persistedSessions: CanonicalSessionState[]): boolean {
+    return this.registry.isAuthoritativeSetReady(persistedSessions);
+  }
+
   enqueueCommand(command: CommandEnvelope): void {
     this.registry.enqueueCommand(command);
   }

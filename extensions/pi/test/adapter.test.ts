@@ -55,8 +55,8 @@ describe('AgentAdapterClient', () => {
       nameText: 'Demo session',
       openingText: 'Start task',
       latestActivityText: 'Working',
-      stateLabel: 'Unknown',
-      status: 'unknown',
+      stateLabel: 'Ready',
+      status: 'idle',
       pid: 1234,
     };
   }
@@ -96,10 +96,52 @@ describe('AgentAdapterClient', () => {
     expect(result).toMatchObject({ ok: true, hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-1' });
   });
 
-  test('heartbeat', async () => {
+  test('heartbeat updates an idle session to working', async () => {
     const session = makeSession('sess-1');
     await client.registerSession(session);
+    expect(registry.listSessions()[0]?.status).toBe('idle');
+
     await expect(client.heartbeat(session.sessionId, 'working', 'Busy')).resolves.toBeUndefined();
+    expect(registry.listSessions()[0]).toMatchObject({ status: 'working', latestActivityText: 'Busy' });
+  });
+
+  test('heartbeat full semantic snapshot explicitly clears optional branch text', async () => {
+    const session = makeSession('sess-clear');
+    await client.registerSession(session);
+    await client.heartbeat(session.sessionId, 'idle', null, {
+      ...session,
+      openingText: undefined,
+      latestActivityText: undefined,
+    });
+
+    expect(registry.listSessions()[0]).toMatchObject({ status: 'idle' });
+    expect(registry.listSessions()[0]?.openingText).toBeUndefined();
+    expect(registry.listSessions()[0]?.latestActivityText).toBeUndefined();
+  });
+
+  test('heartbeat re-registers and retries semantic update after a Bridge registry restart', async () => {
+    const session = makeSession('sess-restart');
+    await client.registerSession(session);
+    registry.unregister(session.sessionId);
+
+    await expect(client.heartbeat(session.sessionId, 'working', 'Recovered activity', {
+      ...session,
+      status: 'working',
+      latestActivityText: 'Recovered activity',
+    })).resolves.toBeUndefined();
+
+    expect(registry.listSessions()[0]).toMatchObject({
+      sessionId: session.sessionId, status: 'working', latestActivityText: 'Recovered activity',
+    });
+  });
+
+  test('command polling re-registers after a Bridge registry restart', async () => {
+    const session = makeSession('sess-poll-restart');
+    await client.registerSession(session);
+    registry.unregister(session.sessionId);
+
+    await expect(client.pollCommands(session.sessionId, 0, session)).resolves.toBeNull();
+    expect(registry.listSessions()[0]).toMatchObject({ sessionId: session.sessionId, status: 'idle' });
   });
 
   test('pollCommands returns enqueued command', async () => {

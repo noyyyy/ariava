@@ -161,6 +161,33 @@ describe('BridgeStateStore', () => {
     store.replaceDriverSessions('pi', []);
     expect(store.listSessions()).toHaveLength(0);
   });
+  test('initializes snapshot state without discarding a complete legacy state file', () => {
+    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json');
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const legacy = {
+      host: null,
+      sessions: { 'sess-1': { sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'p', nameText: 'n', stateLabel: 'Ready', status: 'idle', updatedAt: '2026-07-20T00:00:00.000Z' } },
+      sessionDrivers: { 'sess-1': 'pi' },
+      recentEvents: [{ eventId: 'evt-recent', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'done', typeLabel: 'Done', createdAt: '2026-07-20T00:00:01.000Z' }],
+      pendingEvents: [{ eventId: 'evt-pending', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'working', status: 'working', typeLabel: 'Working', createdAt: '2026-07-20T00:00:02.000Z' }],
+      pendingHandles: { 'host-1:sess-1': { hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-recent', handledAt: '2026-07-20T00:00:03.000Z', action: 'pi_input', updatedAt: '2026-07-20T00:00:03.000Z' } },
+      commandResults: { 'cmd-1': { commandId: 'cmd-1', hostId: 'host-1', sessionId: 'sess-1', accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-07-20T00:00:04.000Z' } },
+      seenCommands: { 'cmd-1': '2026-07-20T00:00:04.000Z' },
+    };
+    writeFileSync(statePath, JSON.stringify(legacy)); chmodSync(statePath, 0o600);
+    const store = new BridgeStateStore(statePath);
+    expect(store.listSessions()).toEqual(Object.values(legacy.sessions));
+    expect(store.peekPendingEvents()).toEqual(legacy.pendingEvents);
+    expect(store.peekPendingSessionHandles()).toEqual(Object.values(legacy.pendingHandles));
+    expect(store.getCommandResult('cmd-1')).toEqual(legacy.commandResults['cmd-1']);
+    expect(store.hasSeenCommand('cmd-1')).toBe(true);
+    expect(store.getCurrentSessionsSnapshotState()).toEqual({ version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0 });
+    const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(persisted.recentEvents).toEqual(legacy.recentEvents);
+    expect(persisted.currentSessionsSnapshot).toEqual({ version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0 });
+  });
+
   test('persists pending handles monotonically and migrates legacy pending reads', () => {
     const root = join(tmpdir(), `bridge-store-${Date.now()}`);
     paths.push(root);

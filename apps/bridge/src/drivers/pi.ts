@@ -15,6 +15,10 @@ export class PaiDriver implements AgentDriver {
     return this.adapter.listSessions();
   }
 
+  isAuthoritativeSetReady(persistedSessions: CanonicalSessionState[]): boolean {
+    return this.adapter.isAuthoritativeSetReady(persistedSessions);
+  }
+
   async executeCommand(ctx: DriverCommandContext): Promise<CommandResult> {
     this.adapter.enqueueCommand(ctx.command);
     const result = await this.adapter.waitForResult(ctx.command.commandId, { timeoutMs: 30_000 });

@@ -134,6 +134,24 @@ describe('AgentAdapterServer', () => {
     expect(session?.latestActivityText).toBe('Still running');
   });
 
+  test('heartbeat JSON null explicitly clears optional semantic text', async () => {
+    registry.register({
+      sessionId: 'sess-clear', provider: 'pi', project: 'p', cwd: '/',
+      openingText: 'Old task', latestActivityText: 'Old activity',
+    });
+
+    const response = await fetch(url('/v1/agent/sessions/sess-clear/heartbeat'), {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ status: 'idle', openingText: null, latestActivityText: null }),
+    });
+
+    expect(response.status).toBe(200);
+    const session = registry.listSessions()[0];
+    expect(session?.openingText).toBeUndefined();
+    expect(session?.latestActivityText).toBeUndefined();
+  });
+
   test('returns enqueued command during short poll', async () => {
     registry.register({ sessionId: 'sess-1', provider: 'pi', project: 'p', cwd: '/' });
 

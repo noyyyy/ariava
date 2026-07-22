@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const packageName = process.argv[2];
 const entries = packageName === 'protocol'
-  ? ['index', 'commands', 'events', 'hosts', 'identity', 'pairing', 'request-signing', 'sessions', 'validation']
+  ? ['index', 'commands', 'events', 'hosts', 'identity', 'pairing', 'request-signing', 'session-snapshots', 'sessions', 'validation']
   : packageName === 'shared-utils'
     ? ['index']
     : undefined;

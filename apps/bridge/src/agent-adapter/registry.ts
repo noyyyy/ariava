@@ -16,6 +16,7 @@ export interface RegisteredSession {
   registeredAt: string;
   lastHeartbeatAt: string;
   status: SessionStatus;
+  semanticUpdatedAt: string;
 }
 
 export interface RegisterSessionInput {
@@ -30,10 +31,16 @@ export interface RegisterSessionInput {
   latestActivityText?: string;
   summary?: string;
   pid?: number;
+  status?: SessionStatus;
 }
 
+const SESSION_TTL_MS = 45_000;
+
+export type RegistryMutationReason = 'register' | 'semantic' | 'unregister' | 'ttl';
+export type RegistryMutationCallback = (reason: RegistryMutationReason) => void;
 
 export class AgentAdapterRegistry {
+  private readonly recoveryDeadlineMs: number;
   private sessions = new Map<string, RegisteredSession>();
   private commandQueues = new Map<string, CommandEnvelope[]>();
   private commandWaiters = new Map<string, Array<(command: CommandEnvelope | null) => void>>();
@@ -45,10 +52,15 @@ export class AgentAdapterRegistry {
   constructor(
     private readonly hostId: string,
     private readonly stateStore: BridgeStateStore,
-  ) {}
+    private readonly onMutation: RegistryMutationCallback = () => {},
+    private readonly now: () => Date = () => new Date(),
+  ) {
+    this.recoveryDeadlineMs = this.now().getTime() + SESSION_TTL_MS;
+  }
 
   register(input: RegisterSessionInput): RegisteredSession {
-    const now = isoNow();
+    const now = this.nowIso();
+    const previous = this.sessions.get(input.sessionId);
     const projectName = input.projectName ?? input.project ?? 'unknown';
     const nameText = input.nameText ?? input.title ?? projectName;
     const session: RegisteredSession = {
@@ -61,22 +73,43 @@ export class AgentAdapterRegistry {
       latestActivityText: input.latestActivityText ?? input.summary,
       pid: input.pid,
       hostId: this.hostId,
-      registeredAt: now,
+      registeredAt: previous?.registeredAt ?? now,
       lastHeartbeatAt: now,
-      status: 'unknown',
+      status: input.status ?? 'idle',
+      semanticUpdatedAt: previous?.semanticUpdatedAt ?? now,
     };
+    const changed = !previous || semanticFingerprint(previous) !== semanticFingerprint(session);
+    if (changed && previous) session.semanticUpdatedAt = now;
     this.sessions.set(input.sessionId, session);
     this.stateStore.setSessionDriver(input.sessionId, input.provider);
+    if (changed) this.onMutation('register');
     return session;
   }
 
-  unregister(sessionId: string): boolean {
+  unregister(sessionId: string, reason: 'unregister' | 'ttl' = 'unregister'): boolean {
+    const session = this.sessions.get(sessionId);
     this.commandQueues.delete(sessionId);
     this.commandWaiters.delete(sessionId);
     this.inFlightCommands.delete(sessionId);
     this.delayedTerminalEvents.delete(sessionId);
-    this.stateStore.removeSessionDriver(sessionId);
-    return this.sessions.delete(sessionId);
+    const removed = this.sessions.delete(sessionId);
+    if (removed && session) {
+      // Preserve the owner until after registry removal so a stale unregister cannot
+      // delete a session that has already been reassigned to another driver.
+      this.stateStore.removeSession(sessionId, session.provider);
+      this.onMutation(reason);
+      return true;
+    }
+
+    // A Pi shutdown can race a Bridge restart before the session re-registers. The
+    // authenticated unregister remains authoritative for that persisted session.
+    const removedPersisted = this.stateStore.removeSession(sessionId);
+    if (removedPersisted) this.onMutation(reason);
+    return removedPersisted;
+  }
+
+  hasSession(sessionId: string): boolean {
+    return this.sessions.has(sessionId);
   }
 
   cancelCommandPolls(): void {
@@ -85,27 +118,38 @@ export class AgentAdapterRegistry {
     for (const waiter of waiters) waiter(null);
   }
 
-  heartbeat(sessionId: string, status: SessionStatus, latestActivityText?: string): RegisteredSession | undefined {
+  heartbeat(
+    sessionId: string,
+    status: SessionStatus,
+    latestActivityText?: string | null,
+    metadata: { openingText?: string | null; projectName?: string; nameText?: string } = {},
+  ): RegisteredSession | undefined {
     const session = this.sessions.get(sessionId);
     if (!session) return undefined;
 
-    session.lastHeartbeatAt = isoNow();
+    const before = semanticFingerprint(session);
+    const now = this.nowIso();
+    session.lastHeartbeatAt = now;
     session.status = status;
-    if (latestActivityText !== undefined) {
-      session.latestActivityText = latestActivityText;
+    if (latestActivityText !== undefined) session.latestActivityText = latestActivityText ?? undefined;
+    if (metadata.openingText !== undefined) session.openingText = metadata.openingText ?? undefined;
+    if (metadata.projectName !== undefined) session.projectName = metadata.projectName;
+    if (metadata.nameText !== undefined) session.nameText = metadata.nameText;
+    if (semanticFingerprint(session) !== before) {
+      session.semanticUpdatedAt = now;
+      this.onMutation('semantic');
     }
     return session;
   }
 
   listSessions(): CanonicalSessionState[] {
-    const now = Date.now();
-    const ttlMs = 45_000;
+    const now = this.now().getTime();
     const active: CanonicalSessionState[] = [];
 
     for (const session of this.sessions.values()) {
       const lastHeartbeat = new Date(session.lastHeartbeatAt).getTime();
-      if (now - lastHeartbeat > ttlMs) {
-        this.unregister(session.sessionId);
+      if (now - lastHeartbeat > SESSION_TTL_MS) {
+        this.unregister(session.sessionId, 'ttl');
         continue;
       }
 
@@ -113,6 +157,17 @@ export class AgentAdapterRegistry {
     }
 
     return active.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  /**
+   * A freshly restarted in-memory registry cannot authoritatively declare the Pi set
+   * empty until every persisted Pi session has either re-registered or exceeded the
+   * normal heartbeat TTL. This bounded recovery window prevents a restart race while
+   * still allowing shutdown/unregister and TTL expiry to end sessions.
+   */
+  isAuthoritativeSetReady(persistedSessions: CanonicalSessionState[]): boolean {
+    if (persistedSessions.length === 0 || this.now().getTime() > this.recoveryDeadlineMs) return true;
+    return persistedSessions.every((persisted) => this.sessions.has(persisted.sessionId));
   }
 
   pushEvent(sessionId: string, event: Partial<CanonicalEvent>): string {
@@ -139,6 +194,14 @@ export class AgentAdapterRegistry {
       createdAt: event.createdAt ?? now,
     };
 
+    const before = semanticFingerprint(session);
+    if (event.status !== undefined) session.status = event.status;
+    const activity = event.assistantText?.trim();
+    if (activity) session.latestActivityText = event.assistantText;
+    if (semanticFingerprint(session) !== before) {
+      session.semanticUpdatedAt = now;
+      this.onMutation('semantic');
+    }
     if (isTerminalEvent(canonicalEvent) && this.hasPendingCommandWork(sessionId)) {
       this.delayedTerminalEvents.set(sessionId, canonicalEvent);
     } else {
@@ -324,7 +387,7 @@ export class AgentAdapterRegistry {
   }
 
   private toCanonicalSession(session: RegisteredSession): CanonicalSessionState {
-    const updatedAt = session.lastHeartbeatAt;
+    const updatedAt = session.semanticUpdatedAt;
     return {
       sessionId: session.sessionId,
       hostId: session.hostId,
@@ -337,6 +400,10 @@ export class AgentAdapterRegistry {
       status: session.status,
       updatedAt,
     };
+  }
+
+  private nowIso(): string {
+    return this.now().toISOString();
   }
 
   private removeCommandWaiter(sessionId: string, resolver: (command: CommandEnvelope | null) => void): void {
@@ -416,4 +483,12 @@ function normalizeHandledAt(value: string | undefined, fallback: string): string
   if (!value) return fallback;
   const time = new Date(value).getTime();
   return Number.isFinite(time) ? value : fallback;
+}
+
+function semanticFingerprint(session: RegisteredSession): string {
+  return JSON.stringify({
+    sessionId: session.sessionId, provider: session.provider, projectName: session.projectName,
+    cwd: session.cwd, nameText: session.nameText, openingText: session.openingText,
+    latestActivityText: session.latestActivityText, pid: session.pid, hostId: session.hostId, status: session.status,
+  });
 }

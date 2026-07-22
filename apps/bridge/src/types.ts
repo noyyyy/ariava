@@ -5,6 +5,7 @@ import type {
   CommandResult,
   HostProjection,
   HostPlatform,
+  ReplaceCurrentSessionsRequest,
 } from '@ariava/protocol';
 import type { HostIdentityMetadata } from './identity/types';
 
@@ -16,6 +17,7 @@ export interface DriverCommandContext {
 export interface AgentDriver {
   readonly name: string;
   listSessions(hostId: string): Promise<CanonicalSessionState[]>;
+  isAuthoritativeSetReady?(persistedSessions: CanonicalSessionState[]): boolean;
   executeCommand(context: DriverCommandContext): Promise<CommandResult>;
 }
 
@@ -65,13 +67,31 @@ export interface PendingSessionHandle {
   updatedAt: string;
 }
 
+export interface PendingCurrentSessionsSnapshot {
+  digest: string;
+  contentDigest: string;
+  request: ReplaceCurrentSessionsRequest;
+}
+
+/** Host-wide active-set revisions; never reuse these as per-session content revisions. */
+export interface PersistedCurrentSessionsSnapshotState {
+  version: 1;
+  lastAllocatedRevision: number;
+  lastAcceptedRevision: number;
+  lastAcceptedDigest?: string;
+  lastAcceptedContentDigest?: string;
+  pending?: PendingCurrentSessionsSnapshot;
+}
+
 export interface PersistedBridgeState {
   host: HostProjection | null;
   sessions: Record<string, CanonicalSessionState>;
   sessionDrivers: Record<string, string>;
+  reconciledDrivers: Record<string, true>;
   recentEvents: CanonicalEvent[];
   pendingEvents: CanonicalEvent[];
   pendingHandles: Record<string, PendingSessionHandle>;
   commandResults: Record<string, CommandResult>;
   seenCommands: Record<string, string>;
+  currentSessionsSnapshot: PersistedCurrentSessionsSnapshotState;
 }

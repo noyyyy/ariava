@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   COMMAND_TYPES,
   SESSION_HANDLE_ACTIONS,
+  SESSION_STATUSES,
   HOST_PLATFORMS,
   LINK_REVOKE_REASONS,
   formatPairingCode,
@@ -10,6 +11,7 @@ import {
   isUserVisibleActionableAlert,
   normalizeMarkSessionReadRequest,
   normalizePairingCode,
+  statusToStateLabel,
   validateCommandType,
   type CanonicalEvent,
   type MarkSessionReadRequest,
@@ -53,6 +55,16 @@ describe('protocol helpers', () => {
     expect(isUserVisibleActionableAlert({ ...baseEvent, type: 'driver_error' })).toBe(false);
   });
 
+  test('keeps idle additive and maps every status to its compatibility label', () => {
+    expect(SESSION_STATUSES).toEqual(['idle', 'working', 'blocked', 'done', 'unknown']);
+    expect(SESSION_STATUSES.map((status) => [status, statusToStateLabel(status)])).toEqual([
+      ['idle', 'Ready'],
+      ['working', 'In progress'],
+      ['blocked', 'Needs attention'],
+      ['done', 'Done'],
+      ['unknown', 'Status unavailable'],
+    ]);
+  });
 
   test('normalizes current and transitional session read fields', () => {
     const request: MarkSessionReadRequest = { latestReadEventId: 'evt-2', readAt: '2026-07-13T10:00:00.000Z', source: 'pi_local_interaction' };

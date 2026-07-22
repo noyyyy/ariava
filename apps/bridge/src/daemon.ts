@@ -5,8 +5,11 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
   BridgePairWatchResponse,
+  ActiveSessionSnapshot,
   CanonicalEvent,
   CanonicalSessionState,
+  ReplaceCurrentSessionsRequest,
+  ReplaceCurrentSessionsResponse,
   HostEnrollmentRequest,
   HostProjection,
 } from '@ariava/protocol';
@@ -21,7 +24,7 @@ import { probeHostPlatform } from './host-platform';
 import { loadUserConfig, resolveAriavaConfig, resolvePersistedAriavaConfig } from './host-manager';
 import { ensureAriavaSecureDirectories, pathHasFilesystemEvidence, readSecureJson, redactSensitive } from './host-manager/secure-files';
 import { HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostIdentity, type HostIdentityStore } from './identity';
-import { RelayClient } from './relay-client';
+import { RelayClient, RelayClientError } from './relay-client';
 import { BridgeStateStore } from './state-store';
 import type { AgentDriver, BridgeConfig, BridgeSyncResult } from './types';
 
@@ -60,6 +63,16 @@ function generateAgentAdapterSecret(): string {
   return randomBytes(32).toString('hex');
 }
 
+export interface ReconciliationScheduler {
+  schedule(callback: () => void, delayMs: number): unknown;
+  cancel(handle: unknown): void;
+}
+
+const DEFAULT_RECONCILIATION_SCHEDULER: ReconciliationScheduler = {
+  schedule: (callback, delayMs) => setTimeout(callback, delayMs),
+  cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
 export class BridgeDaemon {
   private relayClient?: RelayClient;
   private readonly stateStore: BridgeStateStore;
@@ -70,10 +83,21 @@ export class BridgeDaemon {
   private readonly router: CommandRouter;
   private filesystemVerified = false;
   private startupValidated = false;
+  private syncFlight?: Promise<BridgeSyncResult>;
+  private reconciliationTimer?: unknown;
+  private reconciliationRequested = true;
 
-  constructor(private readonly config: BridgeConfig, drivers?: AgentDriver[], private readonly identityStore?: HostIdentityStore) {
+  constructor(
+    private readonly config: BridgeConfig,
+    drivers?: AgentDriver[],
+    private readonly identityStore?: HostIdentityStore,
+    registryNow?: () => Date,
+    private readonly reconciliationScheduler: ReconciliationScheduler = DEFAULT_RECONCILIATION_SCHEDULER,
+  ) {
     this.stateStore = new BridgeStateStore(config.statePath);
-    this.adapterRegistry = new AgentAdapterRegistry(config.hostId, this.stateStore);
+    this.adapterRegistry = new AgentAdapterRegistry(
+      config.hostId, this.stateStore, () => this.scheduleRegistryReconciliation(), registryNow,
+    );
     this.adapterClient = new AgentAdapterClient(this.adapterRegistry);
     this.adapterServer = new AgentAdapterServer(
       { port: config.agentAdapter.port, secret: config.agentAdapter.secret, hostId: config.hostId },
@@ -131,8 +155,21 @@ export class BridgeDaemon {
     return this.relayClient;
   }
 
+  private scheduleRegistryReconciliation(): void {
+    this.reconciliationRequested = true;
+    if (this.stopped || this.reconciliationTimer) return;
+    this.reconciliationTimer = this.reconciliationScheduler.schedule(() => {
+      this.reconciliationTimer = undefined;
+      this.wakeRunLoop?.();
+    }, 300);
+  }
+
   stop(): void {
     this.stopped = true;
+    if (this.reconciliationTimer !== undefined) {
+      this.reconciliationScheduler.cancel(this.reconciliationTimer);
+      this.reconciliationTimer = undefined;
+    }
     this.relayAbortController.abort();
     this.adapterServer.stop(true);
     this.wakeRunLoop?.();
@@ -140,8 +177,20 @@ export class BridgeDaemon {
   get adapterUrl(): string { return this.adapterServer.url; }
   get driverNames(): string[] { return this.drivers.map((driver) => driver.name); }
 
-  async syncOnce(): Promise<BridgeSyncResult> {
+  syncOnce(): Promise<BridgeSyncResult> {
+    if (this.syncFlight) {
+      this.reconciliationRequested = true;
+      return this.syncFlight;
+    }
+    const flight = this.performSyncOnce();
+    this.syncFlight = flight;
+    void flight.finally(() => { if (this.syncFlight === flight) this.syncFlight = undefined; }).catch(() => {});
+    return flight;
+  }
+
+  private async performSyncOnce(): Promise<BridgeSyncResult> {
     await this.validateStartup();
+    this.reconciliationRequested = false;
     let offline = false;
     try {
       await this.registerHostPresence();
@@ -151,17 +200,43 @@ export class BridgeDaemon {
       offline = true;
     }
 
-    const nextSessions: CanonicalSessionState[] = [];
     const newEvents: CanonicalEvent[] = [];
+    let authoritativeSetComplete = true;
     for (const driver of this.drivers) {
       try {
+        const persistedDriverSessions = this.stateStore.listSessions()
+          .filter((session) => this.stateStore.getDriverNameForSession(session.sessionId) === driver.name);
         const sessions = await driver.listSessions(this.config.hostId);
-        nextSessions.push(...sessions);
+        if (driver.isAuthoritativeSetReady?.(persistedDriverSessions) === false) {
+          authoritativeSetComplete = false;
+          continue;
+        }
         this.stateStore.replaceDriverSessions(driver.name, sessions);
       } catch (error) {
+        if (!this.stateStore.hasReconciledDriver(driver.name)) authoritativeSetComplete = false;
         const event = this.buildDriverErrorEvent(driver.name, error);
         this.stateStore.queuePendingEvent(event);
         newEvents.push(event);
+      }
+    }
+    // A driver failure must never turn a partial list into an authoritative replacement.
+    // Successful drivers have been reconciled above, while failed drivers retain their last
+    // complete persisted set. Build the Host snapshot only from that reconciled store.
+    const nextSessions = this.stateStore.listSessions();
+    const activeSessions = nextSessions
+      .filter((session) => !isDiagnosticSession(session))
+      .map((session): ActiveSessionSnapshot => ({ ...session, presence: 'active' }));
+    if (authoritativeSetComplete) {
+      const pending = await this.stateStore.stageCurrentSessionsSnapshot(this.config.hostId, activeSessions, isoNow());
+      if (!offline && (pending || this.stateStore.getPendingCurrentSessionsSnapshot())) {
+        try {
+          await this.flushCurrentSessionsSnapshot(activeSessions);
+        } catch (error) {
+          if (snapshotError(error, 'session_snapshot_conflict')) {
+            throw new Error('Relay rejected the persisted current session snapshot revision as conflicting', { cause: error });
+          }
+          offline = true;
+        }
       }
     }
     const flushedEvents = offline ? 0 : await this.flushPendingEvents();
@@ -178,6 +253,7 @@ export class BridgeDaemon {
 
   async runForever(): Promise<void> {
     this.stopped = false;
+    this.reconciliationRequested = true;
     if (this.relayAbortController.signal.aborted) this.relayAbortController = new AbortController();
     while (!this.stopped) {
       try { await this.syncOnce(); }
@@ -186,6 +262,7 @@ export class BridgeDaemon {
         this.stateStore.queuePendingEvent(this.buildBridgeFailureEvent(error));
         await this.flushPendingEvents();
       }
+      if (this.reconciliationRequested) continue;
       if (!this.stopped) await this.waitForNextPoll();
     }
   }
@@ -218,10 +295,43 @@ export class BridgeDaemon {
     this.stateStore.setHost(response.host);
   }
 
+  private async sendCurrentSessionsSnapshot(
+    pending: { request: ReplaceCurrentSessionsRequest; digest: string },
+  ): Promise<void> {
+    const response: ReplaceCurrentSessionsResponse = await this.client().replaceCurrentSessions(pending.request);
+    if (response.hostId !== pending.request.hostId || response.revision !== pending.request.revision) {
+      throw new Error('Relay returned a mismatched current session snapshot response');
+    }
+    this.stateStore.acceptCurrentSessionsSnapshot(pending.request.revision, pending.digest);
+  }
+
+  private async flushCurrentSessionsSnapshot(currentSessions: ActiveSessionSnapshot[]): Promise<void> {
+    let pending = this.stateStore.getPendingCurrentSessionsSnapshot();
+    if (!pending) return;
+    try {
+      await this.sendCurrentSessionsSnapshot(pending);
+    } catch (error) {
+      const stale = snapshotError(error, 'session_snapshot_stale');
+      if (stale) {
+        this.stateStore.noteCurrentSessionsSnapshotRevisionLowerBound(stale.acceptedRevision);
+        this.stateStore.clearPendingCurrentSessionsSnapshot(pending.request.revision, pending.digest);
+        pending = await this.stateStore.stageCurrentSessionsSnapshot(
+          this.config.hostId, currentSessions, isoNow(), stale.acceptedRevision,
+        );
+        if (pending) await this.sendCurrentSessionsSnapshot(pending);
+        return;
+      }
+      throw error;
+    }
+  }
+
   private async flushPendingEvents(): Promise<number> {
     let flushed = 0;
     for (const event of this.stateStore.peekPendingEvents()) {
       const session = this.stateStore.getSession(event.sessionId);
+      // Relay's event-ingest contract still requires a session envelope for diagnostic
+      // history. This synthetic envelope is transport-only: driver:/host: IDs are excluded
+      // from authoritative current-session snapshots above and by Relay defense in depth.
       const syntheticSession = session ?? ({
         sessionId: event.sessionId, hostId: event.hostId, provider: event.provider, projectName: 'system',
         nameText: event.contextText ?? event.sessionId, openingText: undefined, latestActivityText: event.assistantText,
@@ -325,4 +435,18 @@ function samePersistedIdentity(
     && configured.algorithm === actual.algorithm
     && configured.createdAt === actual.createdAt
     && storageMatches;
+}
+
+function isDiagnosticSession(session: CanonicalSessionState): boolean {
+  return session.sessionId.startsWith('driver:') || session.sessionId.startsWith('host:');
+}
+
+function snapshotError(
+  error: unknown,
+  code: 'session_snapshot_stale' | 'session_snapshot_conflict',
+): { acceptedRevision: number } | undefined {
+  if (!(error instanceof RelayClientError) || error.status !== 409 || !error.body || typeof error.body !== 'object') return undefined;
+  const body = error.body as Record<string, unknown>;
+  if (body.code !== code || typeof body.acceptedRevision !== 'number' || !Number.isSafeInteger(body.acceptedRevision)) return undefined;
+  return { acceptedRevision: body.acceptedRevision };
 }

@@ -34,6 +34,10 @@
       "types": "./dist/request-signing.d.ts",
       "default": "./dist/request-signing.js"
     },
+    "./session-snapshots": {
+      "types": "./dist/session-snapshots.d.ts",
+      "default": "./dist/session-snapshots.js"
+    },
     "./sessions": {
       "types": "./dist/sessions.d.ts",
       "default": "./dist/sessions.js"

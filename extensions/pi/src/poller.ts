@@ -1,5 +1,6 @@
 import type { CommandEnvelope } from '@ariava/protocol';
 import type { AgentAdapter } from './adapter-interface';
+import type { PiSessionInfo } from './session';
 import { logExtensionErrorThrottled } from './logger';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
@@ -10,6 +11,7 @@ export interface CommandPollerContext {
   sessionId: string;
   client: AgentAdapter;
   onCommand: (command: CommandEnvelope) => Promise<void>;
+  getSession?: () => PiSessionInfo | null;
 }
 
 export interface CommandPollerHandle {
@@ -26,7 +28,7 @@ export function startCommandPoller(
   const run = async () => {
     while (!stopped && !abort.signal.aborted) {
       try {
-        const command = await ctx.client.pollCommands(ctx.sessionId, IMMEDIATE_POLL_TIMEOUT_MS);
+        const command = await ctx.client.pollCommands(ctx.sessionId, IMMEDIATE_POLL_TIMEOUT_MS, ctx.getSession?.() ?? undefined);
         if (command) {
           await ctx.onCommand(command);
           continue;

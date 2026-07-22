@@ -16,6 +16,8 @@ const INTENDED_RUNTIME_EXPORTS = [
   'REQUEST_SIGNATURE_DOMAIN',
   'RequestCanonicalizationError',
   'SESSION_HANDLE_ACTIONS',
+  'SESSION_PRESENCES',
+  'SESSION_SNAPSHOT_ERROR_CODES',
   'SESSION_STATUSES',
   'SIGNED_REQUEST_HEADER_NAMES',
   'SIGNED_REQUEST_LIMITS',
@@ -54,6 +56,7 @@ const INTENDED_RUNTIME_EXPORTS = [
   'validateHostMetadataUpdateRequest',
   'validateIdentityRevokeRequest',
   'validateSignedRequestHeaders',
+  'validateReplaceCurrentSessionsRequest',
 ] as const;
 
 describe('public protocol barrel', () => {

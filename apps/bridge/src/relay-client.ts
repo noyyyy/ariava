@@ -17,6 +17,8 @@ import type {
   MarkSessionReadResponse,
   QueryPair,
   QuerySchema,
+  ReplaceCurrentSessionsRequest,
+  ReplaceCurrentSessionsResponse,
 } from '@ariava/protocol';
 import {
   assertRestrictedDynamicValue,
@@ -44,6 +46,7 @@ export class RelayClientError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly body?: unknown,
   ) {
     super(message);
     this.name = 'RelayClientError';
@@ -94,8 +97,11 @@ export class RelayClient {
       signal: this.requestSignal?.(),
     });
     if (!response.ok) {
-      const message = (await response.text()).trim() || response.statusText || 'Relay request failed.';
-      throw new RelayClientError(response.status, message);
+      const text = (await response.text()).trim();
+      let errorBody: unknown;
+      try { errorBody = text ? JSON.parse(text) : undefined; } catch { errorBody = undefined; }
+      const message = errorMessage(errorBody) ?? (text || response.statusText || 'Relay request failed.');
+      throw new RelayClientError(response.status, message, errorBody);
     }
     if (response.status === 204) return undefined as T;
     return (await response.json()) as T;
@@ -131,6 +137,10 @@ export class RelayClient {
     return this.request('POST', '/v2/bridge/events', { event, session });
   }
 
+  replaceCurrentSessions(request: ReplaceCurrentSessionsRequest): Promise<ReplaceCurrentSessionsResponse> {
+    return this.request('PUT', '/v2/bridge/sessions/current', request);
+  }
+
   markSessionRead(sessionId: string, request: MarkSessionReadRequest): Promise<MarkSessionReadResponse> {
     assertRestrictedDynamicValue(sessionId, 'session ID');
     return this.request('POST', `/v2/bridge/sessions/${sessionId}/read`, request);
@@ -161,4 +171,13 @@ export class RelayClient {
   revokeIdentity(): Promise<IdentityRevokeResponse> {
     return this.request('POST', '/v2/bridge/revoke', {});
   }
+}
+
+function errorMessage(body: unknown): string | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const record = body as Record<string, unknown>;
+  if (typeof record.message === 'string' && record.message.trim()) return record.message;
+  if (typeof record.error === 'string' && record.error.trim()) return record.error;
+  if (typeof record.code === 'string' && record.code.trim()) return record.code;
+  return undefined;
 }

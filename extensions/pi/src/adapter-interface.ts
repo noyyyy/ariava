@@ -6,7 +6,7 @@ export interface AgentAdapter {
   unregisterSession(sessionId: string): Promise<void>;
   pushEvent(event: Partial<CanonicalEvent>): Promise<{ eventId: string }> ;
   handleSession(sessionId: string, request: HandleSessionRequest): Promise<{ ok: true; hostId: string; sessionId: string; handledThroughEventId: string }>;
-  heartbeat(sessionId: string, status: SessionStatus, latestActivityText?: string): Promise<void>;
-  pollCommands(sessionId: string, timeoutMs: number): Promise<CommandEnvelope | null>;
+  heartbeat(sessionId: string, status: SessionStatus, latestActivityText?: string | null, session?: PiSessionInfo): Promise<void>;
+  pollCommands(sessionId: string, timeoutMs: number, session?: PiSessionInfo): Promise<CommandEnvelope | null>;
   submitResult(commandId: string, result: CommandResult): Promise<void>;
 }

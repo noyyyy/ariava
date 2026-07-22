@@ -1,4 +1,4 @@
-export const SESSION_STATUSES = ['working', 'blocked', 'done', 'unknown'] as const;
+export const SESSION_STATUSES = ['idle', 'working', 'blocked', 'done', 'unknown'] as const;
 export type SessionStatus = (typeof SESSION_STATUSES)[number];
 
 export const EVENT_TYPES = [
@@ -103,6 +103,8 @@ export function isUserVisibleActionableAlert(event: Pick<CanonicalEvent, 'type'>
 
 export function statusToStateLabel(status: SessionStatus): string {
   switch (status) {
+    case 'idle':
+      return 'Ready';
     case 'working':
       return 'In progress';
     case 'blocked':
@@ -110,6 +112,6 @@ export function statusToStateLabel(status: SessionStatus): string {
     case 'done':
       return 'Done';
     case 'unknown':
-      return 'Unknown';
+      return 'Status unavailable';
   }
 }

@@ -50,7 +50,7 @@ describe('AgentAdapterRegistry', () => {
       expect(sessions[0]?.provider).toBe('pi');
       expect(sessions[0]?.projectName).toBe('deploy-tools');
       expect(sessions[0]?.nameText).toBe('Fix deploy');
-      expect(sessions[0]?.status).toBe('unknown');
+      expect(sessions[0]?.status).toBe('idle');
     } finally {
       cleanup();
     }
@@ -66,6 +66,95 @@ describe('AgentAdapterRegistry', () => {
       const session = registry.listSessions()[0];
       expect(session?.status).toBe('working');
       expect(session?.latestActivityText).toBe('Running tests');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('heartbeat distinguishes omitted semantic text from explicit null clear', () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const registry = new AgentAdapterRegistry('host-1', store);
+      registry.register({
+        sessionId: 'sess-1', provider: 'pi', projectName: 'p', cwd: '/',
+        openingText: 'Original task', latestActivityText: 'Original activity',
+      });
+
+      registry.heartbeat('sess-1', 'idle');
+      expect(registry.listSessions()[0]).toMatchObject({
+        openingText: 'Original task', latestActivityText: 'Original activity',
+      });
+
+      registry.heartbeat('sess-1', 'idle', null, { openingText: null });
+      expect(registry.listSessions()[0]?.openingText).toBeUndefined();
+      expect(registry.listSessions()[0]?.latestActivityText).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('notifies only for semantic changes and TTL/unregister live-set removals', () => {
+    const { store, cleanup } = makeStore();
+    try {
+      let now = new Date('2026-07-20T00:00:00.000Z');
+      const reasons: string[] = [];
+      const registry = new AgentAdapterRegistry('host-1', store, (reason) => reasons.push(reason), () => now);
+      registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', cwd: '/' });
+      expect(reasons).toEqual(['register']);
+      const firstUpdatedAt = registry.listSessions()[0]?.updatedAt;
+      now = new Date('2026-07-20T00:00:10.000Z');
+      registry.heartbeat('sess-1', 'idle');
+      expect(reasons).toEqual(['register']);
+      expect(registry.listSessions()[0]?.updatedAt).toBe(firstUpdatedAt);
+      registry.heartbeat('sess-1', 'working', 'Running');
+      expect(reasons).toEqual(['register', 'semantic']);
+      registry.unregister('sess-1');
+      expect(reasons).toEqual(['register', 'semantic', 'unregister']);
+
+      registry.register({ sessionId: 'sess-ttl', provider: 'pi', projectName: 'p', cwd: '/' });
+      now = new Date('2026-07-20T00:01:00.001Z');
+      expect(registry.listSessions()).toHaveLength(0);
+      expect(reasons.at(-1)).toBe('ttl');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('restart authority waits for persisted Pi sessions to re-register but expires at normal TTL', () => {
+    const { store, cleanup } = makeStore();
+    try {
+      let now = new Date('2026-07-20T00:00:00.000Z');
+      const registry = new AgentAdapterRegistry('host-1', store, () => {}, () => now);
+      const persisted = [{
+        sessionId: 'sess-live', hostId: 'host-1', provider: 'pi', projectName: 'p', nameText: 'live',
+        stateLabel: 'In progress', status: 'working' as const, updatedAt: now.toISOString(),
+      }];
+      expect(registry.isAuthoritativeSetReady(persisted)).toBe(false);
+      registry.register({ sessionId: 'sess-live', provider: 'pi', projectName: 'p', cwd: '/', status: 'working' });
+      expect(registry.isAuthoritativeSetReady(persisted)).toBe(true);
+
+      const anotherRestart = new AgentAdapterRegistry('host-1', store, () => {}, () => now);
+      now = new Date('2026-07-20T00:00:45.001Z');
+      expect(anotherRestart.isAuthoritativeSetReady(persisted)).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('pushEvent updates status and meaningful latest activity in the same semantic mutation', () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const registry = new AgentAdapterRegistry('host-1', store);
+      registry.register({
+        sessionId: 'sess-activity', provider: 'pi', projectName: 'p', cwd: '/',
+        status: 'idle', latestActivityText: 'Old activity',
+      });
+      registry.pushEvent('sess-activity', {
+        type: 'working', status: 'working', assistantText: 'Running the integration suite',
+      });
+      expect(registry.listSessions()[0]).toMatchObject({
+        status: 'working', latestActivityText: 'Running the integration suite',
+      });
     } finally {
       cleanup();
     }

@@ -107,8 +107,8 @@ export class AgentAdapterServer {
 
       const heartbeatMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/heartbeat$/);
       if (heartbeatMatch && method === 'POST') {
-        const { status, latestActivityText } = parseHeartbeatInput(await this.readJson(request));
-        const session = this.registry.heartbeat(heartbeatMatch[1], status, latestActivityText);
+        const { status, latestActivityText, openingText, projectName, nameText } = parseHeartbeatInput(await this.readJson(request));
+        const session = this.registry.heartbeat(heartbeatMatch[1], status, latestActivityText, { openingText, projectName, nameText });
         if (!session) {
           this.writeJson(response, 404, { error: 'Session not found' });
           return;
@@ -119,6 +119,10 @@ export class AgentAdapterServer {
 
       const commandMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/commands$/);
       if (commandMatch && method === 'GET') {
+        if (!this.registry.hasSession(commandMatch[1])) {
+          this.writeJson(response, 404, { error: 'Session not found' });
+          return;
+        }
         const timeout = Math.min(Math.max(parseInt(url.searchParams.get('timeout') ?? '30000', 10), 0), 120_000);
         const command = await this.registry.dequeueCommand(commandMatch[1], timeout);
         if (!command) {
@@ -181,10 +185,17 @@ function parseRegisterInput(value: unknown): RegisterSessionInput {
     openingText: optionalString(obj, 'openingText'),
     latestActivityText: optionalString(obj, 'latestActivityText') ?? optionalString(obj, 'summary'),
     pid: optionalNumber(obj, 'pid'),
+    status: optionalStatus(obj, 'status'),
   };
 }
 
-function parseHeartbeatInput(value: unknown): { status: SessionStatus; latestActivityText?: string } {
+function parseHeartbeatInput(value: unknown): {
+  status: SessionStatus;
+  latestActivityText?: string | null;
+  openingText?: string | null;
+  projectName?: string;
+  nameText?: string;
+} {
   if (typeof value !== 'object' || value === null) {
     throw new Error('Request body must be an object');
   }
@@ -197,8 +208,20 @@ function parseHeartbeatInput(value: unknown): { status: SessionStatus; latestAct
 
   return {
     status: statusValue as SessionStatus,
-    latestActivityText: optionalString(obj, 'latestActivityText') ?? optionalString(obj, 'summary'),
+    latestActivityText: hasOwn(obj, 'latestActivityText')
+      ? optionalNullableString(obj, 'latestActivityText')
+      : optionalNullableString(obj, 'summary'),
+    openingText: optionalNullableString(obj, 'openingText'),
+    projectName: optionalString(obj, 'projectName'),
+    nameText: optionalString(obj, 'nameText'),
   };
+}
+
+function optionalStatus(obj: Record<string, unknown>, key: string): SessionStatus | undefined {
+  const value = optionalString(obj, key);
+  if (value === undefined) return undefined;
+  if (!SESSION_STATUSES.includes(value as SessionStatus)) throw new Error(`Invalid status: ${value}`);
+  return value as SessionStatus;
 }
 
 function parseResultInput(value: unknown, expectedCommandId: string): CommandResult {
@@ -228,6 +251,19 @@ function requireString(obj: Record<string, unknown>, key: string): string {
   const value = obj[key];
   if (typeof value !== 'string') {
     throw new Error(`Missing or invalid field: ${key}`);
+  }
+  return value;
+}
+
+function hasOwn(obj: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function optionalNullableString(obj: Record<string, unknown>, key: string): string | null | undefined {
+  const value = obj[key];
+  if (value === undefined || value === null) return value;
+  if (typeof value !== 'string') {
+    throw new Error(`Invalid field: ${key}`);
   }
   return value;
 }

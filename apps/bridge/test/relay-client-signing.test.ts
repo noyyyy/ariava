@@ -27,6 +27,7 @@ const enrollment = { hostId, keyId: `key_${'B'.repeat(43)}`, algorithm: 'Ed25519
 const metadata = { hostName: 'Host', platform: 'linux', bridgeVersion: '1.0.0' } as const;
 const event = { eventId: 'evt_1', hostId, sessionId, provider: 'pi', type: 'working', status: 'working', typeLabel: 'Working', createdAt: '2026-07-15T00:00:00.000Z' } as any;
 const session = { sessionId, hostId, provider: 'pi', projectName: 'p', nameText: 'n', stateLabel: 'Working', status: 'working', updatedAt: '2026-07-15T00:00:00.000Z' } as any;
+const snapshot = { hostId, revision: 1, observedAt: '2026-07-15T00:00:00.000Z', sessions: [{ ...session, presence: 'active' }] } as any;
 const commandResult = { commandId: 'cmd_1', hostId, sessionId, type: 'interrupt', status: 'completed', completedAt: '2026-07-15T00:00:00.000Z' } as any;
 const rotation = { rotation: { operationId: 'op_12345678-1234-4123-8123-123456789abc', entityId: hostId, oldKeyId: `key_${'B'.repeat(43)}`, newKeyId: `key_${'E'.repeat(43)}`, newPublicKey: 'E'.repeat(43), issuedAt: '2026-07-15T00:00:00.000Z' }, oldKeyAuthorizationSignature: emptySignature, newKeyProofSignature: emptySignature } as any;
 
@@ -38,6 +39,7 @@ const cases: Array<{ name: string; method: string; path: string; body?: unknown;
   { name: 'list watches', method: 'GET', path: '/v2/bridge/watches', invoke: (c) => c.listWatches() },
   { name: 'remove watch', method: 'DELETE', path: `/v2/bridge/watches/${watchId}`, body: {}, invoke: (c) => c.removeWatch(watchId) },
   { name: 'event', method: 'POST', path: '/v2/bridge/events', body: { event, session }, invoke: (c) => c.publishEvent(event, session) },
+  { name: 'current sessions', method: 'PUT', path: '/v2/bridge/sessions/current', body: snapshot, invoke: (c) => c.replaceCurrentSessions(snapshot) },
   { name: 'read', method: 'POST', path: `/v2/bridge/sessions/${sessionId}/read`, body: { latestReadEventId: 'evt_1', readAt: '2026-07-15T00:00:00.000Z', source: 'bridge_recovery' }, invoke: (c) => c.markSessionRead(sessionId, { latestReadEventId: 'evt_1', readAt: '2026-07-15T00:00:00.000Z', source: 'bridge_recovery' }) },
   { name: 'command pull', method: 'POST', path: '/v2/bridge/commands/pull', body: { hostId, limit: 20 }, invoke: (c) => c.pullCommands(hostId, 20) },
   { name: 'command result', method: 'POST', path: '/v2/bridge/commands/result', body: commandResult, invoke: (c) => c.submitCommandResult(commandResult) },

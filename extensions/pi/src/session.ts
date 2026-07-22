@@ -176,8 +176,8 @@ export function deriveSession(ctx: ExtensionContext): PiSessionInfo {
     nameText: deriveNameText(rawSessionName, projectName),
     openingText: clampAssistantText(firstUserText),
     latestActivityText: deriveLatestActivityText(ctx),
-    stateLabel: statusToStateLabel('unknown'),
-    status: 'unknown',
+    stateLabel: statusToStateLabel('idle'),
+    status: 'idle',
     pid: process.pid,
   };
 }

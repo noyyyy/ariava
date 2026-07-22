@@ -60,20 +60,33 @@ export class AgentAdapterClient implements AgentAdapter {
     return (await response.json()) as { ok: true; hostId: string; sessionId: string; handledThroughEventId: string };
   }
 
-  async heartbeat(sessionId: string, status: SessionStatus, latestActivityText?: string): Promise<void> {
-    await this.fetch('POST', `/v1/agent/sessions/${encodeURIComponent(sessionId)}/heartbeat`, {
-      status,
-      latestActivityText,
-    });
+  async heartbeat(sessionId: string, status: SessionStatus, latestActivityText?: string | null, session?: PiSessionInfo): Promise<void> {
+    const currentSession = session ? { ...session, status, latestActivityText: latestActivityText ?? undefined } : undefined;
+    const body: Record<string, unknown> = { status };
+    if (latestActivityText !== undefined) body.latestActivityText = latestActivityText;
+    if (currentSession) {
+      body.openingText = currentSession.openingText ?? null;
+      body.projectName = currentSession.projectName;
+      body.nameText = currentSession.nameText;
+    }
+    const path = `/v1/agent/sessions/${encodeURIComponent(sessionId)}/heartbeat`;
+    const response = await this.fetchResponse('POST', path, body);
+    if (response.status === 404 && currentSession) {
+      await this.registerSession(currentSession);
+      await this.fetch('POST', path, body);
+      return;
+    }
+    await this.requireOk(response, 'POST', path);
   }
 
-  async pollCommands(sessionId: string, timeoutMs: number): Promise<CommandEnvelope | null> {
-    const response = await this.fetch(
-      'GET',
-      `/v1/agent/sessions/${encodeURIComponent(sessionId)}/commands?timeout=${timeoutMs}`,
-      undefined,
-      { expectEmpty: true },
-    );
+  async pollCommands(sessionId: string, timeoutMs: number, session?: PiSessionInfo): Promise<CommandEnvelope | null> {
+    const path = `/v1/agent/sessions/${encodeURIComponent(sessionId)}/commands?timeout=${timeoutMs}`;
+    let response = await this.fetchResponse('GET', path, undefined);
+    if (response.status === 404 && session) {
+      await this.registerSession(session);
+      response = await this.fetchResponse('GET', path, undefined);
+    }
+    await this.requireOk(response, 'GET', path);
     if (response.status === 204) return null;
     const body = (await response.json()) as { command: CommandEnvelope };
     return body.command;
@@ -92,27 +105,31 @@ export class AgentAdapterClient implements AgentAdapter {
     method: 'GET' | 'POST' | 'DELETE',
     path: string,
     body: unknown,
-    options: { expectEmpty?: boolean } = {},
+  ): Promise<Response> {
+    const response = await this.fetchResponse(method, path, body);
+    await this.requireOk(response, method, path);
+    return response;
+  }
+
+  private async fetchResponse(
+    method: 'GET' | 'POST' | 'DELETE',
+    path: string,
+    body: unknown,
   ): Promise<Response> {
     let discovery = await this.getDiscovery();
     let response = await this.requestWithDiscovery(discovery, method, path, body);
-
     if (response.status === 401 && !this.pinnedDiscovery) {
       this.cachedDiscovery = null;
       discovery = await this.getDiscovery();
       response = await this.requestWithDiscovery(discovery, method, path, body);
     }
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Agent Adapter ${method} ${path} failed: ${response.status} ${text}`);
-    }
-
-    if (response.status === 204 && options.expectEmpty) {
-      return response;
-    }
-
     return response;
+  }
+
+  private async requireOk(response: Response, method: string, path: string): Promise<void> {
+    if (response.ok) return;
+    const text = await response.text();
+    throw new Error(`Agent Adapter ${method} ${path} failed: ${response.status} ${text}`);
   }
 
   private async requestWithDiscovery(

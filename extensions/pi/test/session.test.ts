@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { ExtensionContext, SessionMessageEntry } from '@earendil-works/pi-coding-agent';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { AssistantMessage, UserMessage } from '@earendil-works/pi-ai';
-import { deriveLatestActivityText, deriveMessageTexts, getActiveMessages, normalizeAssistantTextForEvent, withSessionStatus } from '../src/session';
+import { deriveLatestActivityText, deriveMessageTexts, deriveSession, getActiveMessages, normalizeAssistantTextForEvent, withSessionStatus } from '../src/session';
 
 function textAssistantMessage(text: string): AssistantMessage {
   return {
@@ -56,6 +56,15 @@ function makeContext(options: {
 }
 
 describe('active preview extraction', () => {
+  test('derives a normal session as idle/Ready without unknown', () => {
+    const session = deriveSession(makeContext({ contextMessages: [userMessage('  Start here  ')] }));
+
+    expect(session.status).toBe('idle');
+    expect(session.stateLabel).toBe('Ready');
+    expect(session.openingText).toBe('Start here');
+    expect(JSON.stringify(session)).not.toContain('unknown');
+  });
+
   test('prefers agent_end event messages over getEntries', () => {
     const ctx = makeContext({ entries: [textAssistantMessage('old branch text')] });
     expect(deriveLatestActivityText(ctx, { eventMessages: [textAssistantMessage('event loop text')] })).toBe('event loop text');
