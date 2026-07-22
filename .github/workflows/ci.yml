@@ -1,0 +1,47 @@
+name: Public Core CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v4.2.2
+      - name: Check out Public Core
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      # actions/setup-node v4.4.0
+      - name: Set up Node.js 24.18.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+
+      # oven-sh/setup-bun v2.0.2
+      - name: Set up Bun 1.3.14
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76
+        with:
+          bun-version: 1.3.14
+
+      - name: Use reviewed npm CLI
+        run: npm install --global npm@11.18.0 --registry https://registry.npmjs.org/
+
+      - name: Log toolchain versions
+        run: |
+          node --version
+          npm --version
+          bun --version
+
+      - name: Install frozen dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify Public Core
+        run: bun run verify

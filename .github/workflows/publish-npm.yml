@@ -1,0 +1,180 @@
+name: Publish npm packages
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: npm-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 24.18.0
+  NPM_VERSION: 11.18.0
+  BUN_VERSION: 1.3.14
+
+jobs:
+  prepare:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.context.outputs.release_tag }}
+      release_commit: ${{ steps.context.outputs.release_commit }}
+      default_branch_ref: ${{ steps.context.outputs.default_branch_ref }}
+      source_date_epoch: ${{ steps.context.outputs.source_date_epoch }}
+    steps:
+      # actions/checkout v4.2.2
+      - name: Check out the exact tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # actions/setup-node v4.4.0; registry-url is intentionally omitted so no token config is injected.
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # oven-sh/setup-bun v2.0.2
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install reviewed npm CLI
+        run: npm install --global "npm@${NPM_VERSION}" --registry https://registry.npmjs.org/
+
+      - name: Create controlled npm configuration
+        run: |
+          install -d -m 700 "${RUNNER_TEMP}/ariava-npm-config"
+          printf 'registry=https://registry.npmjs.org/\n' > "${RUNNER_TEMP}/ariava-npm-config/user.npmrc"
+          : > "${RUNNER_TEMP}/ariava-npm-config/global.npmrc"
+          chmod 600 "${RUNNER_TEMP}/ariava-npm-config/"*.npmrc
+
+      - name: Resolve release context and fetch default branch
+        id: context
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test -n "${DEFAULT_BRANCH}"
+          git fetch --no-tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          release_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          test "${release_commit}" = "${GITHUB_SHA}"
+          default_branch_ref="refs/remotes/origin/${DEFAULT_BRANCH}"
+          source_date_epoch="$(git show -s --format=%ct "${release_commit}")"
+          {
+            echo "release_tag=${GITHUB_REF_NAME}"
+            echo "release_commit=${release_commit}"
+            echo "default_branch_ref=${default_branch_ref}"
+            echo "source_date_epoch=${source_date_epoch}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Log toolchain versions
+        run: |
+          node --version
+          npm --version
+          bun --version
+
+      - name: Prepare exact release artifacts
+        env:
+          ARIAVA_DEFAULT_BRANCH_REF: ${{ steps.context.outputs.default_branch_ref }}
+          SOURCE_DATE_EPOCH: ${{ steps.context.outputs.source_date_epoch }}
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/ariava-npm-config/user.npmrc
+          NPM_CONFIG_GLOBALCONFIG: ${{ runner.temp }}/ariava-npm-config/global.npmrc
+        run: ./scripts/publish-npm-safe.sh --prepare --output-dir "${RUNNER_TEMP}/npm-release"
+
+      # actions/upload-artifact v4.6.2
+      - name: Upload prepared artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: npm-release-${{ steps.context.outputs.release_commit }}
+          path: |
+            ${{ runner.temp }}/npm-release/*.tgz
+            ${{ runner.temp }}/npm-release/release-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: prepare
+    environment: npm-production
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v4.2.2
+      - name: Check out the exact tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # actions/setup-node v4.4.0; registry-url is intentionally omitted for OIDC Trusted Publishing.
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install reviewed npm CLI
+        run: npm install --global "npm@${NPM_VERSION}" --registry https://registry.npmjs.org/
+
+
+      - name: Fetch the reviewed default branch ref
+        env:
+          DEFAULT_BRANCH_REF: ${{ needs.prepare.outputs.default_branch_ref }}
+        run: |
+          default_branch="${DEFAULT_BRANCH_REF#refs/remotes/origin/}"
+          git fetch --no-tags origin "+refs/heads/${default_branch}:${DEFAULT_BRANCH_REF}"
+
+      # actions/download-artifact v4.3.0
+      - name: Download prepared artifacts from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: npm-release-${{ needs.prepare.outputs.release_commit }}
+          path: ${{ runner.temp }}/npm-release
+
+      - name: Log publishing toolchain versions
+        run: |
+          node --version
+          npm --version
+
+      - name: Publish prepared artifacts with OIDC
+        env:
+          ARIAVA_DEFAULT_BRANCH_REF: ${{ needs.prepare.outputs.default_branch_ref }}
+        run: |
+          ./scripts/publish-npm-safe.sh \
+            --publish-prepared "${RUNNER_TEMP}/npm-release" \
+            --trusted-publishing \
+            --summary-file "${RUNNER_TEMP}/release-summary.json"
+
+      - name: Write sanitized release summary
+        if: always()
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
+        run: |
+          {
+            echo '## Public Core npm release'
+            echo
+            echo "- Tag: \`${RELEASE_TAG}\`"
+            echo "- Commit: \`${RELEASE_COMMIT}\`"
+            if test -f "${RUNNER_TEMP}/release-summary.json"; then
+              node - "${RUNNER_TEMP}/release-summary.json" <<'NODE'
+          const fs = require('node:fs');
+          const value = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+          for (const item of value.summary?.packages ?? []) {
+            console.log(`- ${item.name}: ${item.action}; sha256 \`${item.sha256}\`; registry ${item.registryVersion}; latest ${item.latest}`);
+          }
+          NODE
+            else
+              echo '- Publication did not produce a release summary; inspect the failed step without exposing credentials.'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

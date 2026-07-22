@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 
@@ -108,7 +108,6 @@ describe("optional Linux systemd integration-test orchestrator", () => {
     expect(result.stdout.toString()).toContain("--tarball");
     expect(result.stdout.toString()).toContain("--keep-vm");
     expect(result.stdout.toString()).toContain("--output-dir");
-    expect(result.stdout.toString()).not.toContain("--with-relay");
     expect(result.stdout.toString()).toContain("--real-self-upgrade");
   });
 
@@ -139,10 +138,8 @@ describe("optional Linux systemd integration-test orchestrator", () => {
     expect(calls).toContain("orbctl restart");
     expect(calls).toContain("linux-systemd-after-restart-test.sh");
     expect(calls).toContain("linux-systemd-unavailable-test.sh");
-    expect(calls).not.toContain("linux-systemd-with-relay-test.sh");
     expect(calls).toContain("linux-systemd-real-upgrade-test.sh");
     expect(calls).toContain(String.raw`systemd\ --version`);
-    expect(calls).not.toMatch(/orbctl run -m [^\n]+ \/home\/ariava-test\/linux-systemd-with-relay-test\.sh\n/);
     expect(calls).not.toMatch(/orbctl run -m [^\n]+ \/home\/ariava-test\/linux-systemd-real-upgrade-test\.sh\n/);
     expect(calls).toContain("orbctl delete -f");
     expect(calls).not.toContain("bun run build:bridge");
@@ -153,28 +150,8 @@ describe("optional Linux systemd integration-test orchestrator", () => {
     expect(summary).toContain("scope=optional-linux-systemd-integration-test");
     expect(summary).toContain("wsl_tested=false");
     expect(summary).toContain("tarball_sha256=");
-    expect(summary).not.toContain("with_relay=");
     expect(summary).toContain("real_self_upgrade=0");
     expect(summary).toContain("reconciliation_phase=reconciliation-only");
-  });
-
-
-  test("rejects the private Relay option but retains the public real-upgrade phase", () => {
-    const current = fixture();
-    const tarball = join(current.root, "ariava.tgz");
-    writeFileSync(tarball, "artifact");
-    const relay = run(["--tarball", tarball, "--output-dir", current.outputDir, "--with-relay"], current.env);
-    expect(relay.exitCode).toBe(2);
-    expect(relay.stderr.toString()).toContain("Unknown option: --with-relay");
-
-    const result = run(["--tarball", tarball, "--output-dir", current.outputDir, "--real-self-upgrade"], current.env);
-    expect(result.exitCode, result.stderr.toString()).toBe(0);
-    const calls = readFileSync(current.commandLog, "utf8");
-    expect(calls).not.toContain("ariava-relay-smoke-source.tgz");
-    expect(calls).not.toContain("linux-systemd-with-relay-test.sh");
-    expect(calls).toContain("/home/ariava-test/linux-systemd-real-upgrade-test.sh");
-    const summary = readFileSync(join(current.outputDir, "summary.txt"), "utf8");
-    expect(summary).toContain("real_self_upgrade=1");
   });
 
   test("builds a tarball from the checkout when one is not supplied", () => {
@@ -291,19 +268,11 @@ describe("Linux systemd guest phases", () => {
 });
 
 
-describe("opt-in public Linux guest phase", () => {
+describe("opt-in real npm upgrade phase", () => {
   test("labels the real npm upgrade evidence separately", () => {
     const upgrade = readFileSync(join(repoRoot, "scripts", "fixtures", "linux-systemd-real-upgrade-test.sh"), "utf8");
     expect(upgrade).toContain("REAL_NPM_SELF_UPGRADE_PHASE=PASS");
     expect(upgrade).toContain("env -u ARIAVA_UPGRADE_SELF_DONE ARIAVA_UPGRADE_PACKAGE_MANAGER=npm ariava upgrade --json");
     expect(upgrade).not.toContain("export ARIAVA_UPGRADE_SELF_DONE=1");
-  });
-
-  test("has no dependency on private Relay files", () => {
-    const source = readFileSync(scriptPath, "utf8");
-    for (const token of ["apps/relay", "with-relay", "smoke-pi-plugin", "smoke-send-command", "scripts/private"]) {
-      expect(source).not.toContain(token);
-    }
-    expect(existsSync(join(repoRoot, "scripts", "fixtures", "linux-systemd-with-relay-test.sh"))).toBe(false);
   });
 });

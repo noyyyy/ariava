@@ -16,7 +16,8 @@ const LOCKFILE = 'bun.lock';
 function usage() {
   return `Usage: node scripts/bump-version.mjs <patch|minor|major|x.y.z> [--dry-run] [--root <path>]
 
-Prepares Ariava package versions before running scripts/publish-npm-safe.sh.
+Prepares a reviewed Ariava release PR. Normal publication happens after merge
+from an annotated stable Public Core tag; see docs/release.md.
 
 Examples:
   node scripts/bump-version.mjs patch
@@ -245,5 +246,9 @@ if (!dryRun) {
 const prefix = dryRun ? 'Dry run: Ariava version would change' : 'Bumped Ariava version:';
 console.log(`${prefix} ${current} -> ${next}`);
 console.log('Next steps:');
-console.log('  bun run verify:public');
-console.log('  ./scripts/publish-npm-safe.sh --publish --otp <6-digit-code>');
+console.log('  bun install --frozen-lockfile');
+console.log('  bun run verify');
+console.log('  Review and merge the Public Core release change to the default branch.');
+console.log(`  Create and push annotated tag v${next} on that merged commit.`);
+console.log('  Observe and, if configured, approve publish-npm.yml in npm-production.');
+console.log('  Break-glass/manual instructions: docs/release.md');

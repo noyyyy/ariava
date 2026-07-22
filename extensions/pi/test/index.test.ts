@@ -547,14 +547,15 @@ describe('unchanged extension integration behavior', () => {
     expect(manifest.pi?.extensions).toEqual(['./index.ts']);
   });
 
-  test('safe npm publish script always includes the generated pi extension package', () => {
-    const script = readFileSync(new URL('../../../scripts/publish-npm-safe.sh', import.meta.url), 'utf8');
+  test('shared npm release orchestrator always includes the generated pi extension package', () => {
+    const shell = readFileSync(new URL('../../../scripts/publish-npm-safe.sh', import.meta.url), 'utf8');
+    const release = readFileSync(new URL('../../../scripts/npm-release-lib.mjs', import.meta.url), 'utf8');
 
-    expect(script).not.toContain('--include-pi-extension');
-    expect(script).toContain('Pack/publish the generated @ariava/pi-extension package');
-    expect(script).toContain('bun run build:pi-bundle');
-    expect(script).toContain('PI_EXTENSION_PACKAGE_NAME="@ariava/pi-extension"');
-    expect(script).toContain('npm publish --access public');
+    expect(shell).toContain('npm-release.mjs');
+    expect(shell).not.toContain('--include-pi-extension');
+    expect(release).toContain("'@ariava/pi-extension'");
+    expect(release).toContain("join(root, 'extensions/pi/bundle')");
+    expect(release).toContain("['publish', join(resolve(options.directory), artifact.filename)");
   });
 
   test('release bundle manifest is publishable as an npm pi package', () => {
