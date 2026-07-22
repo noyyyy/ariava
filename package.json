@@ -3,6 +3,14 @@
   "version": "0.1.7",
   "description": "Live Your Life. Your Agents Stay Close.",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/noyyyy/ariava",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/noyyyy/ariava.git"
+  },
+  "bugs": {
+    "url": "https://github.com/noyyyy/ariava/issues"
+  },
   "type": "module",
   "bin": {
     "ariava": "apps/bridge/dist/public-cli.js"
