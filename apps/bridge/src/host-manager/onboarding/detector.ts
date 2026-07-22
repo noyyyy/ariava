@@ -32,7 +32,10 @@ export function detectOnboardingEnvironment(deps: OnboardingDetectorDependencies
 
 export function validateOnboardingSelection(input: OnboardingSelectionInput): OnboardingSelection {
   if (input.extensions?.length && input.noExtensions) {
-    throw selectionError('Conflicting extension selection: use either --extension or --no-extensions.');
+    throw selectionError(
+      'ERR_ONBOARDING_NOT_READY',
+      'Conflicting extension selection: use either --extension or --no-extensions.',
+    );
   }
   if (input.extensions) {
     const extensions = [...new Set(input.extensions.map((id) => getProductionAdapter(id).id))];
@@ -40,9 +43,12 @@ export function validateOnboardingSelection(input: OnboardingSelectionInput): On
   }
   if (input.noExtensions) return selectionFromExtensions([]);
   if (!input.interactive || input.yes) {
-    throw selectionError('Non-interactive onboarding requires --extension pi or --no-extensions.');
+    throw selectionError(
+      'ERR_ONBOARDING_NOT_READY',
+      'Non-interactive onboarding requires --extension pi or --no-extensions.',
+    );
   }
-  throw selectionError('Select the agent extensions to install.');
+  throw selectionError('ERR_ONBOARDING_NOT_READY', 'Select the agent extensions to install.');
 }
 
 function selectionFromExtensions(extensions: OnboardingSelection['extensions']): OnboardingSelection {
@@ -74,8 +80,8 @@ function assertProductionEvidence(
   });
 }
 
-function selectionError(message: string): AriavaCliError {
-  return new AriavaCliError('ERR_ADAPTER_UNKNOWN', message, {
+function selectionError(code: AriavaCliError['code'], message: string): AriavaCliError {
+  return new AriavaCliError(code, message, {
     step: 'adapter-detect',
     retryable: false,
     remediation: { message: 'Pass --extension pi or --no-extensions.' },

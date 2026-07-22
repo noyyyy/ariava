@@ -138,8 +138,23 @@ describe('onboarding detector', () => {
     expect(validateOnboardingSelection({ extensions: ['pi'], interactive: false })).toEqual({ target: 'adapter-installed', extensions: ['pi'], adapter: 'pi' });
     expect(validateOnboardingSelection({ noExtensions: true, interactive: false })).toEqual({ target: 'host-ready', extensions: [] });
     expect(() => validateOnboardingSelection({ extensions: ['pi'], noExtensions: true, interactive: true })).toThrow();
-    expect(() => validateOnboardingSelection({ interactive: false })).toThrow();
-    expect(() => validateOnboardingSelection({ interactive: true, yes: true })).toThrow();
-    expect(() => validateOnboardingSelection({ extensions: ['cursor'], interactive: true })).toThrow();
+    try {
+      validateOnboardingSelection({ interactive: false });
+      throw new Error('expected non-interactive selection failure');
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'ERR_ONBOARDING_NOT_READY' });
+    }
+    try {
+      validateOnboardingSelection({ interactive: true, yes: true });
+      throw new Error('expected --yes selection failure');
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'ERR_ONBOARDING_NOT_READY' });
+    }
+    try {
+      validateOnboardingSelection({ extensions: ['cursor'], interactive: true });
+      throw new Error('expected unknown adapter failure');
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'ERR_ADAPTER_UNKNOWN' });
+    }
   });
 });

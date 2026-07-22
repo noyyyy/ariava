@@ -184,9 +184,13 @@ export async function runOnboardingOrchestrator(
       });
       cancellation.throwIfCancelled();
       if (!readiness.ready) {
-        steps.push(step('strict-readiness', 'failed', { checks: readiness.checks }));
+        const failedCode = firstFailedCheckCode(readiness.checks);
+        steps.push(step('strict-readiness', 'failed', {
+          checks: readiness.checks,
+          ...(failedCode ? { code: failedCode } : {}),
+        }));
         steps.push(step('completion', 'skipped'));
-        return failureResult(input.target, steps, 'strict-readiness', true);
+        return failureResult(input.target, steps, 'strict-readiness', true, failedCode);
       }
       steps.push(step('strict-readiness', readiness.readiness === 'reload-pending' ? 'reload-pending' : 'ready', {
         checks: readiness.checks,
@@ -440,6 +444,13 @@ function completionActions(target: OnboardingTarget): OnboardingResult['nextActi
 
 function step(id: OnboardingStepId, status: OnboardingStepResult['status'], detail?: Record<string, unknown>): OnboardingStepResult {
   return { id, status, ...(detail && Object.keys(detail).length > 0 ? { detail } : {}) };
+}
+
+function firstFailedCheckCode(checks: StrictReadinessResult['checks']): string | undefined {
+  for (const check of checks) {
+    if (!check.ready && typeof check.code === 'string' && check.code.length > 0) return check.code;
+  }
+  return undefined;
 }
 
 function onboardingError(

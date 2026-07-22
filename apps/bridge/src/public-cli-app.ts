@@ -839,9 +839,12 @@ async function runSetup(
       });
     }
     renderOnboardingProgress('Setting up Ariava…', terminal);
+    // Interactive selections are not present on argv. Persist them into publicArgs so
+    // stable-CLI re-entry (which forces --json / non-interactive) keeps the same target.
+    const publicArgs = selectionPublicArgs(selection, options.publicArgs);
     const runOnboarding = overrides.run ?? ((input: Parameters<PublicCliOnboardingDependencies['run']>[0]) => runDefaultOnboarding(deps, input));
     const result = await runOnboarding({
-      target: selection.target, publicArgs: options.publicArgs, resumed: options.resumed,
+      target: selection.target, publicArgs, resumed: options.resumed,
       bootstrapVersion: options.bootstrapVersion, relayBaseUrl: options.relayBaseUrl, signal: cancellation.signal,
     });
     restoreOnboardingTerminal(terminal);
@@ -1076,7 +1079,22 @@ function normalizeOnboardingError(error: unknown): { ok: false; code: string; me
 
 function onboardingFailureCode(result: OnboardingResult): string {
   const failed = result.steps.find((step) => step.status === 'failed');
-  return typeof failed?.detail?.code === 'string' ? failed.detail.code : 'ERR_ONBOARDING_NOT_READY';
+  if (typeof failed?.detail?.code === 'string') return failed.detail.code;
+  const checks = failed?.detail?.checks;
+  if (Array.isArray(checks)) {
+    for (const check of checks) {
+      if (!check || typeof check !== 'object' || Array.isArray(check)) continue;
+      const entry = check as { ready?: unknown; code?: unknown };
+      if (entry.ready === false && typeof entry.code === 'string') return entry.code;
+    }
+  }
+  return 'ERR_ONBOARDING_NOT_READY';
+}
+
+function selectionPublicArgs(selection: { extensions: readonly string[] }, publicArgs: readonly string[]): string[] {
+  if (publicArgs.includes('--extension') || publicArgs.includes('--no-extensions')) return [...publicArgs];
+  if (selection.extensions.includes('pi')) return ['--extension', 'pi', ...publicArgs];
+  return ['--no-extensions', ...publicArgs];
 }
 
 

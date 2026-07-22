@@ -147,6 +147,50 @@ describe('strict onboarding readiness', () => {
     expect({ hostId: identity.hostId, keyId: identity.keyId, publicKey: identity.publicKey }).toEqual(before);
   });
 
+  test('default readiness nonce is canonical 16-byte base64url and enrollment-only failures keep health ready', async () => {
+    const { base64UrlDecode } = await import('@ariava/protocol');
+    let capturedNonce: string | undefined;
+    const { input } = fixture();
+    // Omit nonce so defaultDependencies.nonce (base64url of 16 random bytes) is used.
+    const depsWithoutNonce: Partial<StrictReadinessDependencies> = {
+      clock: clock(),
+      readDiscovery: () => ({ url: 'http://127.0.0.1:7272', secret: 'secret-value' }),
+      serviceStatus: () => ({
+        backend: 'systemd-user',
+        support: { platform: 'linux', backend: 'systemd-user', supported: true, isWsl: false, reason: 'supported' },
+        installed: true, enabled: true, loaded: true, processRunning: true,
+        runtimePath: '/usr/bin/node', ariavaBinPath: '/prefix/bin/ariava',
+        runtimePathMatchesCurrent: true, ariavaBinPathMatchesCurrent: true, logBackend: 'journald',
+      }),
+      fetch: async (request) => {
+        const url = String(request);
+        return Response.json(url.endsWith('/health') && url.includes('127.0.0.1') ? { ok: true, hostId: 'host-1' } : { ok: true });
+      },
+      createRelayClient: (options) => {
+        capturedNonce = options.nonce?.();
+        return { enrollHost: async () => enrollment() };
+      },
+    };
+    await expect(checkRelay(input, depsWithoutNonce)).resolves.toBeUndefined();
+    expect(typeof capturedNonce).toBe('string');
+    expect(base64UrlDecode(capturedNonce!).byteLength).toBe(16);
+
+    const failedEnrollment = fixture({}, {
+      createRelayClient: () => ({
+        enrollHost: async () => {
+          throw new RelayClientError(400, 'nonce must contain exactly 16 bytes');
+        },
+      }),
+    });
+    const result = await checkStrictOnboardingReadiness(failedEnrollment.input, failedEnrollment.deps);
+    expect(result.ready).toBe(false);
+    expect(result.checks.find((check) => check.id === 'relay-health')).toMatchObject({ ready: true });
+    expect(result.checks.find((check) => check.id === 'relay-enrollment')).toMatchObject({
+      ready: false,
+      code: 'ERR_RELAY_UNREACHABLE',
+    });
+  });
+
   test('exact Pi evidence remains honestly reload-pending and cannot claim adapter-ready', async () => {
     const candidate = fixture();
     const result = await checkStrictOnboardingReadiness(candidate.input, candidate.deps);

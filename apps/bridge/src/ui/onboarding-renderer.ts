@@ -134,7 +134,17 @@ function assertFits(asset: string, columns: number): string {
 
 function renderFailure(result: OnboardingResult): string {
   const failed = result.steps.find((step) => step.status === 'failed');
-  const code = typeof failed?.detail?.code === 'string' ? failed.detail.code : 'ERR_ONBOARDING_NOT_READY';
+  let code = typeof failed?.detail?.code === 'string' ? failed.detail.code : 'ERR_ONBOARDING_NOT_READY';
+  if (code === 'ERR_ONBOARDING_NOT_READY' && Array.isArray(failed?.detail?.checks)) {
+    for (const check of failed.detail.checks) {
+      if (!check || typeof check !== 'object' || Array.isArray(check)) continue;
+      const entry = check as { ready?: unknown; code?: unknown };
+      if (entry.ready === false && typeof entry.code === 'string') {
+        code = entry.code;
+        break;
+      }
+    }
+  }
   const action = result.nextActions[0];
   let next = 'Retry onboarding after correcting the reported condition.';
   if (action?.command) next = `Next: ${action.command}`;

@@ -1,5 +1,6 @@
+import { randomBytes } from 'node:crypto';
 import type { HostPlatform, HostEnrollmentResponse } from '@ariava/protocol';
-import { isCanonicalTimestamp } from '@ariava/protocol';
+import { base64UrlEncode, isCanonicalTimestamp } from '@ariava/protocol';
 import { readAgentAdapterConfig, type AgentAdapterDiscoveryFile } from '../../agent-adapter/config';
 import type { HostIdentity, HostIdentityInspection, HostPrivateKeyStorage } from '../../identity/types';
 import { RelayClient, RelayClientError } from '../../relay-client';
@@ -53,7 +54,8 @@ const defaultDependencies: StrictReadinessDependencies = {
   readDiscovery: readAgentAdapterConfig,
   serviceStatus: () => { throw new Error('A service status dependency is required'); },
   createRelayClient: (options, requestSignal) => new RelayClient(options, requestSignal),
-  nonce: () => crypto.randomUUID(),
+  // Signed-request nonces must be canonical base64url of exactly 16 bytes.
+  nonce: () => base64UrlEncode(randomBytes(16)),
 };
 
 export async function checkStrictOnboardingReadiness(
@@ -80,9 +82,8 @@ export async function checkStrictOnboardingReadiness(
   add('service-paths', servicePathsReady(input, service), 'ERR_SERVICE_METADATA');
   add('service-references', serviceReferencesReady(input), 'ERR_SERVICE_METADATA');
 
-  let discovery: AgentAdapterDiscoveryFile | undefined;
   try {
-    discovery = await pollForDiscoveryAndHealth(input, deps);
+    await pollForDiscoveryAndHealth(input, deps);
     add('agent-adapter-discovery', true);
     add('agent-adapter-health', true);
   } catch (error) {
@@ -91,13 +92,21 @@ export async function checkStrictOnboardingReadiness(
     add('agent-adapter-health', false, code);
   }
 
+  // Keep health and enrollment independent so an enrollment-only failure does not
+  // misreport Relay health as unreachable.
   try {
-    await checkRelay(input, deps);
+    await checkRelayHealth(input, deps);
     add('relay-health', true);
-    add('relay-enrollment', true);
+    try {
+      await checkRelayEnrollment(input, deps);
+      add('relay-enrollment', true);
+    } catch (error) {
+      const code = errorCode(error, 'ERR_RELAY_UNREACHABLE');
+      add('relay-enrollment', false, code);
+    }
   } catch (error) {
     const code = errorCode(error, 'ERR_RELAY_UNREACHABLE');
-    add('relay-health', code !== 'ERR_RELAY_UNREACHABLE');
+    add('relay-health', false, code);
     add('relay-enrollment', false, code);
   }
 
@@ -169,6 +178,15 @@ export async function checkRelay(
   overrides: Partial<StrictReadinessDependencies> = {},
 ): Promise<void> {
   const deps = { ...defaultDependencies, ...overrides };
+  await checkRelayHealth(input, deps);
+  await checkRelayEnrollment(input, deps);
+}
+
+export async function checkRelayHealth(
+  input: Pick<StrictReadinessInput, 'config' | 'requestTimeoutMs' | 'signal'>,
+  overrides: Partial<StrictReadinessDependencies> = {},
+): Promise<void> {
+  const deps = { ...defaultDependencies, ...overrides };
   const timeoutMs = boundedPositive(input.requestTimeoutMs, 5_000);
   let health: Response;
   try {
@@ -185,7 +203,14 @@ export async function checkRelay(
   } catch {
     throw readinessError('ERR_RELAY_UNREACHABLE', 'Relay returned malformed health evidence.');
   }
+}
 
+export async function checkRelayEnrollment(
+  input: Pick<StrictReadinessInput, 'config' | 'identity' | 'hostMetadata' | 'requestTimeoutMs' | 'signal'>,
+  overrides: Partial<StrictReadinessDependencies> = {},
+): Promise<void> {
+  const deps = { ...defaultDependencies, ...overrides };
+  const timeoutMs = boundedPositive(input.requestTimeoutMs, 5_000);
   const controller = linkedAbortController(input.signal);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -214,8 +239,7 @@ export async function checkRelay(
       throw readinessError('ERR_RELAY_UNREACHABLE', 'Relay signed Host enrollment could not be reached.');
     }
     throw readinessError('ERR_IDENTITY_INVALID', 'Relay returned malformed Host enrollment evidence.', false);
-  }
-  finally {
+  } finally {
     clearTimeout(timeout);
   }
 }
@@ -286,7 +310,7 @@ function isAgentAdapterHealth(value: unknown, hostId: string): boolean {
 function isExactOk(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return Object.keys(record).join(',') === 'ok' && record.ok === true;
+  return Object.keys(record).sort().join(',') === 'ok' && record.ok === true;
 }
 
 function assertEnrollmentResponse(response: HostEnrollmentResponse, hostId: string, metadata: StrictReadinessInput['hostMetadata']): void {

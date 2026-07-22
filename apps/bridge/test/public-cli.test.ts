@@ -542,6 +542,32 @@ describe('public ariava CLI', () => {
       expect(stderr.read()).toBe('');
     });
 
+    test('interactive Pi selection is persisted into publicArgs for stable re-entry', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      let received: Parameters<NonNullable<Parameters<typeof runPublicCli>[2]['run']>>[0] | undefined;
+      const exitCode = await runPublicCli(['setup'], { stdout: stdout.stream, stderr: stderr.stream }, {
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: true, color: false },
+        prompt: {
+          multiselect: async () => ['pi'],
+        },
+        detect: () => detection(true),
+        run: async (input) => {
+          received = input;
+          return result('adapter-installed', 'reload-pending', [
+            { id: 'reload-pi', command: '/reload' },
+            { id: 'pair-watch', command: 'ariava pair <PAIRING_CODE>' },
+          ]);
+        },
+      });
+      expect(exitCode).toBe(0);
+      expect(received).toMatchObject({
+        target: 'adapter-installed',
+        publicArgs: ['--extension', 'pi'],
+      });
+      expect(stderr.read()).toBe('');
+    });
+
     test('public --resume is accepted without internal bootstrap markers', async () => {
       const stdout = captureStream();
       let received: Parameters<NonNullable<Parameters<typeof runPublicCli>[2]['run']>>[0] | undefined;
