@@ -13,6 +13,41 @@ A Public Core tag in `noyyyy/ariava` is the sole npm release trigger. A similarl
 
 The workflows do not deploy Relay, publish Homebrew, create a GitHub Release, or build or upload watchOS/TestFlight artifacts. They do not bump versions, commit, create tags, or update another repository.
 
+## Verification evidence
+
+The authoritative release-compatible command remains:
+
+```bash
+bun install --frozen-lockfile
+bun run verify
+```
+
+`bun run verify` retains the complete shared build, generated pi bundle, extension test/typecheck, reviewed Public Core test, tarball/package smoke, and package assertion closure. The tag workflow's Ubuntu prepare job continues to invoke this exact command before packing artifacts; publication does not depend on a macOS runner or on another repository.
+
+Pull requests expose two additive Public Core host checks:
+
+- **Linux**: `ubuntu-latest` runs `bun run verify:linux`;
+- **macOS**: `macos-latest` runs `bun run verify:macos`.
+
+Both use frozen installs and exact Node 24.18.0, npm 11.18.0, and Bun 1.3.14. Required-check configuration, if adopted, is repository-administrator policy outside these workflow files.
+
+A Mac maintainer may run the explicit Docker pre-acceptance lane before pushing:
+
+```bash
+bun run verify:linux:docker
+```
+
+It uses `node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d` and runs the full `bun run verify:linux` closure as a non-root user in disposable paths. Record the reported architecture: Apple Silicon defaults to Docker Linux arm64. Docker is not a substitute for the GitHub Ubuntu check, a real systemd user manager, journald lifecycle, VM restart, physical Linux login/logout, or WSL.
+
+Stateful integration evidence remains separate and opt-in:
+
+```bash
+ARIAVA_RUN_REAL_MACOS_KEYCHAIN_LAUNCHD_TEST=1 ./scripts/test-macos-keychain-launchd.sh
+./scripts/test-linux-systemd.sh
+```
+
+These commands can touch a real user Keychain/launchd domain or manage a disposable Linux VM. They are not ordinary CI and do not alter the npm publication trigger or artifact boundary.
+
 ## Normal Trusted Publishing release
 
 1. Create a release PR that changes every common Public Core version through the existing bump tool:
@@ -22,7 +57,7 @@ The workflows do not deploy Relay, publish Homebrew, create a GitHub Release, or
    # or: node scripts/bump-version.mjs X.Y.Z
    ```
 
-2. Review the version/lockfile changes. Run `bun install --frozen-lockfile` and `bun run verify`, and wait for `.github/workflows/ci.yml` to pass.
+2. Review the version/lockfile changes. Run `bun install --frozen-lockfile` and authoritative `bun run verify`, then wait for both **Linux** and **macOS** jobs in `.github/workflows/ci.yml` to pass. Docker pre-acceptance does not replace either GitHub result.
 3. Merge the reviewed PR to the default branch.
 4. On that exact merged commit, create and push an annotated stable tag:
 
