@@ -84,47 +84,6 @@ bun install --frozen-lockfile
 bun run verify
 ```
 
-### Verification lanes
-
-Public Core keeps shared, native-host, Docker pre-acceptance, and real integration evidence separate:
-
-```bash
-# Portable shared build, package, pi extension, and shared-test closure
-bun run verify:shared
-
-# Native macOS host gate
-bun run verify:macos
-
-# Local host dispatcher (macOS only; dispatches to verify:macos)
-bun run verify:host
-
-# Native Linux lane used by the Linux GitHub Actions job
-bun run verify:linux
-
-# Explicit Linux pre-acceptance from a Mac with Docker
-bun run verify:linux:docker
-```
-
-Tests under the reviewed roots use filename ownership: `*.test.ts` is shared, `*.macos.test.ts` is macOS-only, `*.linux.test.ts` is Linux-only, and `*.integration.test.*` is opt-in. Launchd/systemd renderers, injected command runners, and portable fixtures stay shared. Native filesystem, path, identity-storage, and isolated host subprocess behavior belongs to the host-suffixed lanes.
-
-`.github/workflows/ci.yml` exposes separate **Linux** (`ubuntu-latest` → `verify:linux`) and **macOS** (`macos-latest` → `verify:macos`) checks with the same Node 24.18.0, npm 11.18.0, and Bun 1.3.14 toolchain. These jobs prove the ordinary Public Core closure on real GitHub-hosted operating systems. They do not install a real launchd agent or systemd user service.
-
-`verify:linux:docker` is an explicit pre-acceptance aid, not part of `verify`, `verify:host`, or `verify:macos`. It builds `node:24.18.0-bookworm-slim` at the reviewed multi-platform digest `sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d`, copies the source into a non-root disposable container workspace, and runs the full `bun run verify:linux` command. Its output records the selected platform and architecture; the normal Apple Silicon result is **Docker Linux arm64**, not amd64.
-
-Docker proves Linux filesystem/path/runtime behavior and the complete Linux verification closure in that pinned container. It does **not** prove a real systemd user manager, journald lifecycle, VM restart, physical Linux logout/login behavior, WSL, or the GitHub Ubuntu runner. An explicit `ARIAVA_DOCKER_PLATFORM=linux/amd64 bun run verify:linux:docker` request is emulated on Apple Silicon and is labeled as such.
-
-The destructive or stateful integration lanes remain opt-in:
-
-```bash
-# Uses the real macOS user Keychain/launchd domain; review the script before running
-ARIAVA_RUN_REAL_MACOS_KEYCHAIN_LAUNCHD_TEST=1 ./scripts/test-macos-keychain-launchd.sh
-
-# Creates and manages a disposable Linux VM for real systemd-user lifecycle evidence
-./scripts/test-linux-systemd.sh
-```
-
-These integration commands can touch real user or VM state and are not ordinary CI. Neither one supplies WSL or physical Linux logout/login evidence.
-
 ### Isolated source development profile
 
 Use the fixed `dev` profile when an installed Ariava Bridge is already running. It keeps source-development configuration, identity, state, discovery, and logs under `~/.config/ariava-dev`, and uses the loopback Agent Adapter on `127.0.0.1:7273`; the installed profile remains under `~/.config/ariava` on port `7272`.
