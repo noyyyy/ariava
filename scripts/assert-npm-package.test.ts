@@ -17,10 +17,17 @@ const required = [
   'extensions/pi/bundle/.ariava-release-bundle.json',
 ];
 
-function run(paths: string[]) {
+const validRootManifest = JSON.stringify({ name: 'ariava', version: '1.2.3' });
+
+function run(paths: string[], version: string | null = '1.2.3') {
   const root = mkdtempSync(join(tmpdir(), 'ariava-package-assert-'));
   const input = join(root, 'pack.json');
-  writeFileSync(input, JSON.stringify([{ files: paths.map((path) => ({ path })) }]));
+  const entry: { files: Array<{ path: string }>; version?: string } = {
+    files: paths.map((path) => ({ path })),
+  };
+  // null means omit version field entirely; string (including empty) is written as-is.
+  if (version !== null) entry.version = version;
+  writeFileSync(input, JSON.stringify([entry]));
   const result = Bun.spawnSync({ cmd: [process.execPath, helper, input], stdout: 'pipe', stderr: 'pipe' });
   rmSync(root, { recursive: true, force: true });
   return result;
@@ -32,7 +39,8 @@ function runTarball(paths: string[], kind: 'root' | 'pi' = 'root', contents: Rec
   for (const path of paths) {
     const target = join(packageRoot, path);
     mkdirSync(join(target, '..'), { recursive: true });
-    writeFileSync(target, contents[path] ?? 'fixture');
+    const defaultContent = path === 'package.json' && kind === 'root' ? validRootManifest : 'fixture';
+    writeFileSync(target, contents[path] ?? defaultContent);
   }
   const tarball = join(root, 'fixture.tgz');
   const packed = spawnSync('/usr/bin/tar', ['-czf', tarball, '-C', root, 'package'], { encoding: 'utf8' });
@@ -92,5 +100,42 @@ describe('npm package artifact assertion', () => {
     expect(runTarball(piFiles, 'pi', valid).exitCode).toBe(0);
     expect(runTarball([...piFiles, 'src/private.ts'], 'pi', valid).exitCode).toBe(1);
     expect(runTarball(piFiles, 'pi', { ...valid, 'package.json': JSON.stringify({ name: '@ariava/pi-extension', version: '1.2.3', private: true }) }).exitCode).toBe(1);
+  });
+
+  test('rejects missing, invalid, and placeholder package versions', () => {
+    expect(run(required, null).exitCode).toBe(1);
+    expect(run(required, '').exitCode).toBe(1);
+    expect(run(required, 'not-a-version').exitCode).toBe(1);
+    expect(run(required, '0.0.0').exitCode).toBe(1);
+
+    const missingVersion = runTarball(required, 'root', {
+      'package.json': JSON.stringify({ name: 'ariava' }),
+    });
+    expect(missingVersion.exitCode).toBe(1);
+    expect(missingVersion.stderr.toString()).toContain('non-placeholder SemVer');
+
+    const placeholder = runTarball(required, 'root', {
+      'package.json': JSON.stringify({ name: 'ariava', version: '0.0.0' }),
+    });
+    expect(placeholder.exitCode).toBe(1);
+    expect(placeholder.stderr.toString()).toContain('0.0.0');
+
+    const invalid = runTarball(required, 'root', {
+      'package.json': JSON.stringify({ name: 'ariava', version: 'v1.2.3' }),
+    });
+    expect(invalid.exitCode).toBe(1);
+
+    const piFiles = ['package.json', 'index.js', '.ariava-release-bundle.json'];
+    const piPlaceholder = {
+      'package.json': JSON.stringify({
+        name: '@ariava/pi-extension', version: '0.0.0', type: 'module', main: './index.js',
+        files: ['index.js', '.ariava-release-bundle.json'], keywords: ['pi-package'],
+        pi: { extensions: ['./index.js'] },
+      }),
+      '.ariava-release-bundle.json': JSON.stringify({
+        bundleVersion: '0.0.0', createdAt: '2026-07-22T00:00:00.000Z', entry: 'index.js', source: 'extensions/pi/dist/index.js',
+      }),
+    };
+    expect(runTarball(piFiles, 'pi', piPlaceholder).exitCode).toBe(1);
   });
 });

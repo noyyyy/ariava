@@ -21,6 +21,7 @@ describe('published root tarball', () => {
 
     try {
       const metadata = JSON.parse(readFileSync(join(repositoryRoot, 'package.json'), 'utf8')) as {
+        version?: string;
         dependencies?: Record<string, string>;
       };
       expect(metadata.dependencies?.['@ariava/protocol']).toBeUndefined();
@@ -38,7 +39,19 @@ describe('published root tarball', () => {
 
       const unrelatedCwd = join(root, 'unrelated-cwd');
       mkdirSync(unrelatedCwd);
-      const cliPath = join(installDirectory, 'node_modules', 'ariava', 'apps', 'bridge', 'dist', 'public-cli.js');
+      const installedPackageRoot = join(installDirectory, 'node_modules', 'ariava');
+      const installedManifest = JSON.parse(readFileSync(join(installedPackageRoot, 'package.json'), 'utf8')) as {
+        version?: string;
+      };
+      expect(installedManifest.version).toBeTruthy();
+      expect(installedManifest.version).toBe(metadata.version);
+
+      const cliPath = join(installedPackageRoot, 'apps', 'bridge', 'dist', 'public-cli.js');
+      const version = run(process.execPath, [cliPath, '--version'], unrelatedCwd);
+      expect(version.status, version.stderr).toBe(0);
+      expect(version.stderr).toBe('');
+      expect(version.stdout.trim()).toBe(installedManifest.version);
+
       const cli = run(process.execPath, [cliPath, 'help'], unrelatedCwd);
       expect(cli.status, cli.stderr).toBe(0);
       expect(cli.stdout).toContain('setup [options]');

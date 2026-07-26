@@ -19,6 +19,21 @@ function fail(message) {
   process.exit(1);
 }
 
+function isValidPublishedSemVer(version) {
+  if (typeof version !== 'string') return false;
+  const trimmed = version.trim();
+  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(trimmed)) return false;
+  // Published packages must not claim the silent/placeholder 0.0.0 version.
+  return trimmed !== '0.0.0';
+}
+
+function assertPublishedVersion(version, label = 'package.json.version') {
+  if (!isValidPublishedSemVer(version)) {
+    fail(`${label} must be a non-placeholder SemVer, got: ${JSON.stringify(version ?? null)}`);
+  }
+  return typeof version === 'string' ? version.trim() : version;
+}
+
 function readTarEntry(tarball, entry) {
   const result = spawnSync('tar', ['-xOf', tarball, `package/${entry}`], { encoding: 'utf8', shell: false });
   if (result.status !== 0) fail(`cannot read ${entry} from tarball`);
@@ -26,6 +41,7 @@ function readTarEntry(tarball, entry) {
 }
 
 let filePaths;
+let packVersion;
 if (inputPath.endsWith('.tgz')) {
   const listed = spawnSync('tar', ['-tzf', inputPath], { encoding: 'utf8', shell: false });
   if (listed.status !== 0) fail('tarball could not be listed');
@@ -35,6 +51,7 @@ if (inputPath.endsWith('.tgz')) {
   try { payload = JSON.parse(readFileSync(inputPath, 'utf8')); }
   catch { fail('input must be valid npm pack --json output or a .tgz'); }
   filePaths = (payload?.[0]?.files ?? []).map((entry) => entry.path);
+  packVersion = payload?.[0]?.version;
 }
 const files = new Set(filePaths);
 
@@ -71,6 +88,7 @@ if (kind === 'pi') {
       manifest = JSON.parse(readTarEntry(inputPath, 'package.json'));
       marker = JSON.parse(readTarEntry(inputPath, '.ariava-release-bundle.json'));
     } catch { fail('pi package metadata must be valid JSON'); }
+    assertPublishedVersion(manifest.version);
     if (manifest.name !== '@ariava/pi-extension' || manifest.private !== undefined || manifest.type !== 'module'
       || manifest.main !== './index.js' || !manifest.files?.includes('index.js') || !manifest.files?.includes('.ariava-release-bundle.json')
       || !manifest.keywords?.includes('pi-package') || JSON.stringify(manifest.pi?.extensions) !== JSON.stringify(['./index.js'])) {
@@ -80,6 +98,8 @@ if (kind === 'pi') {
       || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(marker.createdAt ?? '')) {
       fail('pi release bundle marker is invalid');
     }
+  } else {
+    assertPublishedVersion(packVersion, 'pack metadata version');
   }
   console.log(`npm pi package assertion passed: ${files.size} artifacts allowlisted`);
   process.exit(0);
@@ -118,4 +138,14 @@ const unexpected = [...files].filter((path) => {
   return forbiddenPatterns.some((pattern) => pattern.test(path));
 });
 if (unexpected.length > 0) fail(`unexpected artifact(s): ${unexpected.sort().join(', ')}`);
+if (inputPath.endsWith('.tgz')) {
+  let manifest;
+  try {
+    manifest = JSON.parse(readTarEntry(inputPath, 'package.json'));
+  } catch { fail('root package.json must be valid JSON'); }
+  assertPublishedVersion(manifest.version);
+  if (manifest.name !== 'ariava') fail(`root package name must be ariava, got: ${JSON.stringify(manifest.name ?? null)}`);
+} else {
+  assertPublishedVersion(packVersion, 'pack metadata version');
+}
 console.log(`npm root package assertion passed: ${required.length} required artifacts present; ${files.size} artifacts allowlisted`);

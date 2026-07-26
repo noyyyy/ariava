@@ -84,8 +84,23 @@ const CLI_VERSION = readPackageVersion();
 const RELEASE_PI_VERSION = CLI_VERSION;
 
 function readPackageVersion(): string {
-  const manifest = JSON.parse(readFileSync(resolve(PACKAGE_ROOT, 'package.json'), 'utf8')) as { version?: string };
-  return manifest.version ?? '0.0.0';
+  let manifest: { version?: unknown };
+  try {
+    manifest = JSON.parse(readFileSync(resolve(PACKAGE_ROOT, 'package.json'), 'utf8')) as { version?: unknown };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to read Ariava package version from package.json: ${detail}`);
+  }
+  const version = typeof manifest.version === 'string' ? manifest.version.trim() : '';
+  if (!isValidPackageSemVer(version)) {
+    throw new Error(`Invalid Ariava package version in package.json: ${JSON.stringify(manifest.version ?? null)}`);
+  }
+  return version;
+}
+
+function isValidPackageSemVer(version: string): boolean {
+  // Require a concrete SemVer core (optionally with pre-release/build metadata). Reject empty, placeholders, and free-form strings.
+  return /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version);
 }
 
 export interface PublicCliDependencies {
@@ -157,6 +172,12 @@ export async function runPublicCli(
       return 0;
     }
     switch (command) {
+      case '--version':
+        if (args.length > 1) {
+          throw new Error('Usage: ariava --version');
+        }
+        print(deps, json, okEnvelope('ok', 'Ariava CLI version.', { version: CLI_VERSION }), CLI_VERSION);
+        break;
       case '--help':
       case 'help': print(deps, json, okEnvelope('ok', 'Ariava CLI', { commands: commandSummary() }), formatHelp()); break;
       case 'init': await runInit(deps, json); break;
@@ -178,15 +199,7 @@ export async function runPublicCli(
     }
     return 0;
   } catch (error) {
-    if (error instanceof AriavaCliError) {
-      printJson({ ok: false, code: error.code, message: error.message, data: error.data }, deps.stderr);
-    } else if (error instanceof HostIdentityError) {
-      printJson({ ok: false, code: error.code, message: error.message, data: {} }, deps.stderr);
-    } else if (error instanceof RelayClientError) {
-      printJson({ ok: false, code: 'ERR_RELAY', message: error.message, data: { status: error.status } }, deps.stderr);
-    } else {
-      printJson({ ok: false, code: 'ERR_CLI', message: error instanceof Error ? error.message : String(error), data: {} }, deps.stderr);
-    }
+    printCliFailure(deps, json, normalizeCliFailure(error));
     return 1;
   }
 }
@@ -861,14 +874,9 @@ async function runSetup(
     }
     return failed ? 1 : 0;
   } catch (error) {
+    // Keep onboarding's step/retryable envelope for JSON; human path matches top-level ariava: prefix.
     const normalized = normalizeOnboardingError(error);
-    if (json) printJson(normalized, deps.stderr);
-    else {
-      deps.stderr.write(`Onboarding stopped: ${normalized.message}\n`);
-      const remediation = normalized.data.remediation as { message?: string; command?: string } | undefined;
-      if (remediation?.message) deps.stderr.write(`${remediation.message}\n`);
-      if (remediation?.command) deps.stderr.write(`Next: ${remediation.command}\n`);
-    }
+    printCliFailure(deps, json, normalized);
     return 1;
   } finally {
     prompt?.close?.();
@@ -1158,6 +1166,96 @@ function readOption(argv: string[], name: string): string | undefined {
   return argv[index + 1];
 }
 
+type CliFailure = {
+  ok: false;
+  code: string;
+  message: string;
+  data: Record<string, unknown>;
+};
+
+
+export function normalizeCliFailure(error: unknown): CliFailure {
+  if (error instanceof AriavaCliError) {
+    return { ok: false, code: error.code, message: error.message, data: error.data };
+  }
+  if (error instanceof HostIdentityError) {
+    return { ok: false, code: error.code, message: error.message, data: {} };
+  }
+  if (error instanceof RelayClientError) {
+    return { ok: false, code: 'ERR_RELAY', message: error.message, data: { status: error.status } };
+  }
+  return {
+    ok: false,
+    code: 'ERR_CLI',
+    message: error instanceof Error ? error.message : String(error),
+    data: {},
+  };
+}
+
+
+export function formatHumanCliFailure(failure: CliFailure): string {
+  const lines: string[] = [`ariava: ${failure.message}`];
+
+
+  const advice = failure.data.advice;
+  if (typeof advice === 'string' && advice.trim() !== '') {
+    lines.push(`Next: ${advice}`);
+  }
+
+
+  const remediation = failure.data.remediation;
+  if (remediation && typeof remediation === 'object' && !Array.isArray(remediation)) {
+    const remediationRecord = remediation as { message?: unknown; command?: unknown };
+    if (typeof remediationRecord.message === 'string' && remediationRecord.message.trim() !== '') {
+      lines.push(remediationRecord.message);
+    }
+    if (typeof remediationRecord.command === 'string' && remediationRecord.command.trim() !== '') {
+      lines.push(`Next: ${remediationRecord.command}`);
+    }
+  }
+
+
+  // Append structured WSL instructions only when the message does not already embed them.
+  // supportError() currently puts multi-line guidance into both message and data.instructions.
+  const instructions = failure.data.instructions;
+  if (instructions && typeof instructions === 'object' && !Array.isArray(instructions)) {
+    const instructionRecord = instructions as { wslConfig?: unknown; windowsCommand?: unknown };
+    const messageAlreadyHasWslGuidance =
+      failure.message.includes('/etc/wsl.conf')
+      || (typeof instructionRecord.wslConfig === 'string' && instructionRecord.wslConfig.trim() !== '' && failure.message.includes(instructionRecord.wslConfig))
+      || (typeof instructionRecord.windowsCommand === 'string' && instructionRecord.windowsCommand.trim() !== '' && failure.message.includes(instructionRecord.windowsCommand));
+    if (!messageAlreadyHasWslGuidance) {
+      if (typeof instructionRecord.wslConfig === 'string' && instructionRecord.wslConfig.trim() !== '') {
+        lines.push('Add the following to /etc/wsl.conf:');
+        lines.push('');
+        lines.push(instructionRecord.wslConfig);
+        lines.push('');
+      }
+      if (typeof instructionRecord.windowsCommand === 'string' && instructionRecord.windowsCommand.trim() !== '') {
+        lines.push(`Then run \`${instructionRecord.windowsCommand}\` from Windows PowerShell, reopen the distribution, and retry.`);
+      }
+    }
+  }
+
+
+  if (failure.message.includes('Unknown command:')) {
+    lines.push(`Run 'ariava help' for usage.`);
+  }
+
+
+  return `${lines.join('\n')}\n`;
+}
+
+
+function printCliFailure(deps: PublicCliDependencies, json: boolean, failure: CliFailure): void {
+  if (json) {
+    printJson(failure, deps.stderr);
+    return;
+  }
+  deps.stderr.write(formatHumanCliFailure(failure));
+}
+
+
 function print(deps: PublicCliDependencies, json: boolean, envelope: unknown, human: string): void {
   if (json) {
     printJson(envelope, deps.stdout);
@@ -1270,6 +1368,7 @@ function formatHelp(): string {
     '',
     'Global options:',
     '  --json                          Emit machine-readable JSON',
+    '  --version                       Show the current Ariava CLI version',
     '  --help                          Show this help',
     '',
     'Examples:',

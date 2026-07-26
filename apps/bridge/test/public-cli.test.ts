@@ -2,8 +2,10 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AriavaCliError, type OnboardingDetection, type OnboardingResult } from '../src/host-manager';
-import { runPublicCli } from '../src/public-cli-app';
+import { AriavaCliError, type OnboardingDetection, type OnboardingResult, type ServiceManager } from '../src/host-manager';
+import { HostIdentityError } from '../src/identity';
+import { RelayClientError } from '../src/relay-client';
+import { formatHumanCliFailure, normalizeCliFailure, runPublicCli } from '../src/public-cli-app';
 import { createIsolatedPublicCliEnvironment } from './fixtures/isolated-public-cli-env';
 
 const publicCoreRoot = join(import.meta.dir, '..', '..', '..');
@@ -32,7 +34,417 @@ afterEach(() => {
   }
 });
 
+function captureStream() {
+  let output = '';
+  return {
+    stream: { write(chunk: unknown) { output += String(chunk); return true; } } as NodeJS.WritableStream,
+    read: () => output,
+  };
+}
+
 describe('public ariava CLI', () => {
+  describe('Unix-style default error rendering', () => {
+    test('unknown top-level command without --json prints ariava: text on stderr', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const exitCode = await runPublicCli(['definitely-unknown'], { stdout: stdout.stream, stderr: stderr.stream });
+      expect(exitCode).toBe(1);
+      expect(stdout.read()).toBe('');
+      const text = stderr.read();
+      expect(text.startsWith('ariava: Unknown command: definitely-unknown')).toBe(true);
+      expect(text).toContain(`Run 'ariava help' for usage.`);
+      expect(text).not.toContain('{"ok":false');
+      expect(() => JSON.parse(text.trim())).toThrow();
+    });
+
+
+    test('unknown top-level command with --json keeps ERR_CLI envelope on stderr', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const exitCode = await runPublicCli(['definitely-unknown', '--json'], { stdout: stdout.stream, stderr: stderr.stream });
+      expect(exitCode).toBe(1);
+      expect(stdout.read()).toBe('');
+      expect(JSON.parse(stderr.read())).toEqual({
+        ok: false,
+        code: 'ERR_CLI',
+        message: 'Unknown command: definitely-unknown',
+        data: {},
+      });
+    });
+
+
+    test('AriavaCliError with advice renders Next: line in human mode', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const support = {
+        platform: 'linux' as const,
+        backend: 'systemd-user' as const,
+        supported: true,
+        isWsl: false,
+        reason: 'supported' as const,
+      };
+      const installedManager: ServiceManager = {
+        backend: 'systemd-user',
+        support,
+        install() { throw new Error('install should not run'); },
+        uninstall() { throw new Error('uninstall should not run'); },
+        start() { throw new Error('start should not run'); },
+        stop() { throw new Error('stop should not run'); },
+        restart() { throw new Error('restart should not run'); },
+        status() {
+          return {
+            support,
+            installed: false,
+            enabled: false,
+            loaded: false,
+            processRunning: false,
+            logBackend: 'unavailable',
+          };
+        },
+        logsAvailable() { return false; },
+        logs() { return { source: 'files' as const, text: '' }; },
+      };
+      const exitCode = await runPublicCli(['service', 'start'], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        createServiceManager: () => installedManager,
+        loadInstallMetadata: () => ({}),
+      });
+      expect(exitCode).toBe(1);
+      expect(stdout.read()).toBe('');
+      const text = stderr.read();
+      expect(text.startsWith('ariava: Ariava service is not installed.')).toBe(true);
+      expect(text).toContain('Next: ariava service install');
+      expect(text).not.toContain('{"ok":false');
+      expect(text).not.toContain('"advice"');
+    });
+
+
+    test('Host identity errors render human text and preserve identity codes in JSON', async () => {
+      const humanStdout = captureStream();
+      const humanStderr = captureStream();
+      const store = {
+        load: async () => null,
+        hasEvidence: () => false,
+        create: async () => { throw new Error('unused'); },
+        rotate: async () => { throw new Error('unused'); },
+        commitRotation: async () => { throw new Error('unused'); },
+        abortRotation: async () => { throw new Error('unused'); },
+        reset: async () => { throw new Error('unused'); },
+      } as any;
+      const manager = {
+        backend: 'systemd-user' as const,
+        support: {
+          platform: 'linux' as const,
+          backend: 'systemd-user' as const,
+          supported: true,
+          isWsl: false,
+          reason: 'supported' as const,
+        },
+        install() { throw new Error('unused'); },
+        uninstall() {},
+        start() {},
+        stop() {},
+        restart() {},
+        status() {
+          return {
+            support: this.support,
+            installed: false,
+            enabled: false,
+            loaded: false,
+            processRunning: false,
+            logBackend: 'unavailable' as const,
+          };
+        },
+        logsAvailable() { return false; },
+        logs() { return { source: 'files' as const, text: '' }; },
+      };
+      const deps = {
+        createServiceManager: () => manager,
+        createHostIdentityStore: () => store,
+        resolveAriavaConfig: () => ({
+          configPath: '/tmp/ariava-config.json',
+          identityPath: '/tmp/ariava-host-identity.json',
+          logDir: '/tmp/ariava-logs',
+          relayBaseUrl: 'http://127.0.0.1:8787',
+          agentAdapter: { port: 7272, configPath: '/tmp/agent-adapter.json', secret: 'test-secret' },
+        } as any),
+      };
+
+
+      const humanCode = await runPublicCli(['pair', 'ABCDEF'], {
+        stdout: humanStdout.stream,
+        stderr: humanStderr.stream,
+        ...deps,
+      });
+      expect(humanCode).toBe(1);
+      expect(humanStdout.read()).toBe('');
+      expect(humanStderr.read()).toBe('ariava: Host identity is not initialized; run `ariava init`.\n');
+
+
+      const jsonStdout = captureStream();
+      const jsonStderr = captureStream();
+      const jsonCode = await runPublicCli(['pair', 'ABCDEF', '--json'], {
+        stdout: jsonStdout.stream,
+        stderr: jsonStderr.stream,
+        ...deps,
+      });
+      expect(jsonCode).toBe(1);
+      expect(jsonStdout.read()).toBe('');
+      expect(JSON.parse(jsonStderr.read())).toEqual({
+        ok: false,
+        code: 'ERR_IDENTITY_NOT_INITIALIZED',
+        message: 'Host identity is not initialized; run `ariava init`.',
+        data: {},
+      });
+    });
+
+
+    test('generic and relay failures normalize to stable codes', () => {
+      expect(normalizeCliFailure(new Error('boom'))).toEqual({
+        ok: false,
+        code: 'ERR_CLI',
+        message: 'boom',
+        data: {},
+      });
+      expect(normalizeCliFailure(new RelayClientError(503, 'relay unavailable'))).toEqual({
+        ok: false,
+        code: 'ERR_RELAY',
+        message: 'relay unavailable',
+        data: { status: 503 },
+      });
+      expect(normalizeCliFailure(new HostIdentityError('ERR_IDENTITY_MISSING', 'missing'))).toEqual({
+        ok: false,
+        code: 'ERR_IDENTITY_MISSING',
+        message: 'missing',
+        data: {},
+      });
+    });
+
+
+    test('generic error without --json prints ariava: message only', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const exitCode = await runPublicCli(['install', 'not-pi'], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+      expect(exitCode).toBe(1);
+      expect(stdout.read()).toBe('');
+      expect(stderr.read()).toBe('ariava: Usage: ariava install pi\n');
+      expect(stderr.read()).not.toContain('Error');
+    });
+
+
+    test('generic error with --json keeps ERR_CLI envelope', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const exitCode = await runPublicCli(['install', 'not-pi', '--json'], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+      expect(exitCode).toBe(1);
+      expect(stdout.read()).toBe('');
+      expect(JSON.parse(stderr.read())).toEqual({
+        ok: false,
+        code: 'ERR_CLI',
+        message: 'Usage: ariava install pi',
+        data: {},
+      });
+    });
+
+
+    test('WSL multi-line instructions format as plain text without JSON data dumps', () => {
+      const failure = normalizeCliFailure(new AriavaCliError(
+        'ERR_SYSTEMD_USER_UNAVAILABLE',
+        'Ariava requires an available systemd user manager on WSL.',
+        {
+          platform: 'linux',
+          isWsl: true,
+          backend: 'systemd-user',
+          reason: 'systemd-user-manager-unavailable',
+          instructions: { wslConfig: '[boot]\nsystemd=true', windowsCommand: 'wsl.exe --shutdown' },
+        },
+      ));
+      const text = formatHumanCliFailure(failure);
+      expect(text.startsWith('ariava: Ariava requires an available systemd user manager on WSL.')).toBe(true);
+      expect(text).toContain('/etc/wsl.conf');
+      expect(text).toContain('[boot]\nsystemd=true');
+      expect(text).toContain('wsl.exe --shutdown');
+      expect(text).not.toContain('"instructions"');
+      expect(text).not.toContain('JSON');
+      expect(() => JSON.parse(text.trim())).toThrow();
+
+      // When the message already embeds the WSL guidance (production supportError shape),
+      // do not duplicate the structured instructions block.
+      const embedded = normalizeCliFailure(new AriavaCliError(
+        'ERR_SYSTEMD_USER_UNAVAILABLE',
+        'Ariava requires systemd user services on WSL. Add the following to /etc/wsl.conf:\n\n[boot]\nsystemd=true\n\nThen run `wsl.exe --shutdown` from Windows PowerShell, reopen the distribution, and retry `ariava init`.',
+        {
+          platform: 'linux',
+          isWsl: true,
+          backend: 'systemd-user',
+          reason: 'systemd-user-manager-unavailable',
+          instructions: { wslConfig: '[boot]\nsystemd=true', windowsCommand: 'wsl.exe --shutdown' },
+        },
+      ));
+      const embeddedText = formatHumanCliFailure(embedded);
+      expect(embeddedText).toBe(`ariava: ${embedded.message}\n`);
+      expect(embeddedText).toContain('/etc/wsl.conf');
+      expect(embeddedText).toContain('wsl.exe --shutdown');
+      expect(embeddedText.split('wsl.exe --shutdown').length - 1).toBe(1);
+    });
+
+
+    test('setup human errors use ariava: prefix and remediation lines', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const exitCode = await runPublicCli(['setup', '--no-extensions'], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      }, {
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+        detect: () => ({
+          platform: 'linux', architecture: 'arm64', nodeVersion: '22.0.0', npm: { present: true }, pi: { present: true },
+          serviceSupport: { platform: 'linux', backend: 'systemd-user', supported: true, isWsl: false, reason: 'supported' },
+          interactive: false, machineOutput: false, configPath: '/isolated/config.json', config: {}, installMetadata: {},
+          currentCli: { executablePath: '/isolated/bin/ariava' },
+        }),
+        run: async () => {
+          throw new AriavaCliError('ERR_STABLE_CLI_INSTALL', 'npm global prefix is not writable.', {
+            step: 'stable-cli', retryable: true,
+            remediation: { message: 'Configure a user-writable npm prefix.', command: 'npm config set prefix ~/.local' },
+          });
+        },
+      });
+      expect(exitCode).toBe(1);
+      expect(stdout.read()).toBe('');
+      const text = stderr.read();
+      expect(text.startsWith('ariava: npm global prefix is not writable.')).toBe(true);
+      expect(text).toContain('Configure a user-writable npm prefix.');
+      expect(text).toContain('Next: npm config set prefix ~/.local');
+      expect(text).not.toContain('Onboarding stopped:');
+    });
+  });
+
+  describe('--version option', () => {
+    const expectedVersion = JSON.parse(readFileSync(join(publicCoreRoot, 'package.json'), 'utf8')).version as string;
+
+    test('prints package SemVer only on stdout without config side effects', async () => {
+      const home = mkdtempSync(join(tmpdir(), 'ariava-cli-version-home-'));
+      roots.push(home);
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const previousHome = process.env.HOME;
+      process.env.HOME = home;
+      try {
+        const exitCode = await runPublicCli(['--version'], { stdout: stdout.stream, stderr: stderr.stream });
+        expect(exitCode).toBe(0);
+        expect(stdout.read()).toBe(`${expectedVersion}\n`);
+        expect(stderr.read()).toBe('');
+        expect(existsSync(join(home, '.config', 'ariava'))).toBe(false);
+      } finally {
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+      }
+    });
+
+    test('accepts --version --json and --json --version success envelopes', async () => {
+      const expectedEnvelope = {
+        ok: true,
+        code: 'ok',
+        message: 'Ariava CLI version.',
+        data: { version: expectedVersion },
+      };
+
+      for (const args of [['--version', '--json'], ['--json', '--version']] as const) {
+        const stdout = captureStream();
+        const stderr = captureStream();
+        const exitCode = await runPublicCli([...args], { stdout: stdout.stream, stderr: stderr.stream });
+        expect(exitCode).toBe(0);
+        expect(JSON.parse(stdout.read())).toEqual(expectedEnvelope);
+        expect(stderr.read()).toBe('');
+      }
+    });
+
+    test('rejects extra arguments under human and JSON contracts', async () => {
+      const humanStdout = captureStream();
+      const humanStderr = captureStream();
+      const humanCode = await runPublicCli(['--version', 'extra'], {
+        stdout: humanStdout.stream,
+        stderr: humanStderr.stream,
+      });
+      expect(humanCode).toBe(1);
+      expect(humanStdout.read()).toBe('');
+      const humanText = humanStderr.read();
+      expect(humanText.startsWith('ariava:')).toBe(true);
+      expect(humanText).toMatch(/version|extra|Usage/i);
+      expect(humanText).not.toContain('{"ok":false');
+
+      const jsonStdout = captureStream();
+      const jsonStderr = captureStream();
+      const jsonCode = await runPublicCli(['--version', 'extra', '--json'], {
+        stdout: jsonStdout.stream,
+        stderr: jsonStderr.stream,
+      });
+      expect(jsonCode).toBe(1);
+      expect(jsonStdout.read()).toBe('');
+      const envelope = JSON.parse(jsonStderr.read());
+      expect(envelope).toMatchObject({ ok: false, code: 'ERR_CLI' });
+      expect(String(envelope.message)).toMatch(/version|extra|Usage/i);
+    });
+
+    test('does not treat version as a subcommand alias', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const exitCode = await runPublicCli(['version'], { stdout: stdout.stream, stderr: stderr.stream });
+      expect(exitCode).toBe(1);
+      expect(stdout.read()).toBe('');
+      const text = stderr.read();
+      expect(text.startsWith('ariava: Unknown command: version')).toBe(true);
+      expect(text).toContain(`Run 'ariava help' for usage.`);
+    });
+
+    test('help documents --version and command catalog omits version subcommand', async () => {
+      const humanStdout = captureStream();
+      const humanStderr = captureStream();
+      const humanCode = await runPublicCli(['help'], { stdout: humanStdout.stream, stderr: humanStderr.stream });
+      expect(humanCode).toBe(0);
+      expect(humanStderr.read()).toBe('');
+      expect(humanStdout.read()).toContain('--version                       Show the current Ariava CLI version');
+
+      const jsonStdout = captureStream();
+      const jsonStderr = captureStream();
+      const jsonCode = await runPublicCli(['--help', '--json'], { stdout: jsonStdout.stream, stderr: jsonStderr.stream });
+      expect(jsonCode).toBe(0);
+      expect(jsonStderr.read()).toBe('');
+      const json = JSON.parse(jsonStdout.read());
+      expect(json.data.commands).not.toContain('ariava version');
+      expect(json.data.commands.some((entry: string) => entry.includes('ariava version'))).toBe(false);
+    });
+
+    test('works from an unrelated cwd with isolated HOME via spawn', async () => {
+      const home = mkdtempSync(join(tmpdir(), 'ariava-cli-version-spawn-home-'));
+      const cwd = mkdtempSync(join(tmpdir(), 'ariava-cli-version-cwd-'));
+      roots.push(home, cwd);
+      const proc = Bun.spawn({
+        cmd: [bunPath, cliPath, '--version'],
+        cwd,
+        env: isolatedEnv(home),
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      expect(exitCode, stderr).toBe(0);
+      expect(stdout).toBe(`${expectedVersion}\n`);
+      expect(stderr).toBe('');
+      expect(existsSync(join(home, '.config', 'ariava'))).toBe(false);
+    });
+  });
   test('renders structured top-level help while preserving the JSON command catalog', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-help-'));
     roots.push(home);
