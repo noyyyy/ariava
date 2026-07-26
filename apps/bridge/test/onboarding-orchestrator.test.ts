@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { HostIdentityError } from '../src/identity/errors';
 import type { HostIdentity, HostIdentityInspection } from '../src/identity/types';
 import {
   runOnboardingOrchestrator,
@@ -261,7 +262,100 @@ describe('onboarding orchestrator', () => {
     const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
     expect(result.steps[0]?.detail).toMatchObject({
       code: 'ERR_SYSTEMD_USER_UNAVAILABLE',
+      message: expect.any(String),
       remediation: { message: 'Enable systemd, then run wsl.exe --shutdown.' },
+    });
+    expect(result.nextActions[0]).toMatchObject({
+      message: 'Enable systemd, then run wsl.exe --shutdown.',
+    });
+  });
+
+  test('invalid Host identity surfaces ERR_IDENTITY_INVALID with reset remediation', async () => {
+    const scenario = fixture();
+    scenario.deps.loadHostState = async () => ({
+      ...hostState(),
+      identityInspection: {
+        ...inspection,
+        status: 'invalid',
+        ownerIntegrity: false,
+        permissionIntegrity: false,
+        metadataIntegrity: false,
+      },
+    });
+    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
+    expect(result.readiness).toBe('failed');
+    expect(result.steps.find((step) => step.id === 'host-init')).toMatchObject({
+      status: 'failed',
+      detail: {
+        code: 'ERR_IDENTITY_INVALID',
+        message: expect.stringContaining('invalid or unreadable'),
+        remediation: { command: 'ariava host reset --confirm' },
+      },
+    });
+    expect(result.nextActions[0]).toMatchObject({
+      id: 'resolve-failure',
+      command: 'ariava host reset --confirm',
+      message: expect.stringContaining('invalid or unreadable'),
+    });
+  });
+
+  test('strict-readiness failure exposes first failed check message and next action', async () => {
+    const scenario = fixture();
+    scenario.deps.checkReadiness = async () => ({
+      ready: false,
+      readiness: 'failed',
+      checks: [
+        { id: 'stable-cli', ready: true },
+        {
+          id: 'relay-health',
+          ready: false,
+          code: 'ERR_RELAY_UNREACHABLE',
+          message: 'Relay health could not be reached.',
+        },
+      ],
+      nextActions: [{
+        id: 'retry-onboarding',
+        message: 'Relay health could not be reached.',
+        command: 'ariava doctor',
+      }],
+    });
+    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
+    expect(result.readiness).toBe('failed');
+    expect(result.steps.find((step) => step.id === 'strict-readiness')).toMatchObject({
+      status: 'failed',
+      detail: {
+        code: 'ERR_RELAY_UNREACHABLE',
+        message: 'Relay health could not be reached.',
+        remediation: { command: 'ariava doctor' },
+      },
+    });
+    expect(result.nextActions[0]).toMatchObject({
+      message: 'Relay health could not be reached.',
+      command: 'ariava doctor',
+    });
+  });
+
+  test('HostIdentityError from initializeHost keeps concrete code and message', async () => {
+    const scenario = fixture({ existingHost: false, existingService: false });
+    scenario.deps.initializeHost = async () => {
+      throw new HostIdentityError(
+        'ERR_IDENTITY_RESET_REQUIRED',
+        'Host identity evidence already exists; explicit reset is required',
+      );
+    };
+    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
+    expect(result.readiness).toBe('failed');
+    expect(result.steps.find((step) => step.id === 'host-init')).toMatchObject({
+      status: 'failed',
+      detail: {
+        code: 'ERR_IDENTITY_RESET_REQUIRED',
+        message: 'Host identity evidence already exists; explicit reset is required',
+        remediation: { command: 'ariava host reset --confirm' },
+      },
+    });
+    expect(result.nextActions[0]).toMatchObject({
+      command: 'ariava host reset --confirm',
+      message: 'Host identity evidence already exists; explicit reset is required',
     });
   });
 

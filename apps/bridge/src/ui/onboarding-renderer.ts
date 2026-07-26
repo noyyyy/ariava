@@ -135,19 +135,37 @@ function assertFits(asset: string, columns: number): string {
 function renderFailure(result: OnboardingResult): string {
   const failed = result.steps.find((step) => step.status === 'failed');
   let code = typeof failed?.detail?.code === 'string' ? failed.detail.code : 'ERR_ONBOARDING_NOT_READY';
-  if (code === 'ERR_ONBOARDING_NOT_READY' && Array.isArray(failed?.detail?.checks)) {
+  let message = typeof failed?.detail?.message === 'string' ? failed.detail.message : undefined;
+  if (Array.isArray(failed?.detail?.checks)) {
     for (const check of failed.detail.checks) {
       if (!check || typeof check !== 'object' || Array.isArray(check)) continue;
-      const entry = check as { ready?: unknown; code?: unknown };
-      if (entry.ready === false && typeof entry.code === 'string') {
-        code = entry.code;
-        break;
+      const entry = check as { ready?: unknown; code?: unknown; message?: unknown };
+      if (entry.ready === false) {
+        if ((code === 'ERR_ONBOARDING_NOT_READY' || !code) && typeof entry.code === 'string') code = entry.code;
+        if ((!message || message === code) && typeof entry.message === 'string' && entry.message.length > 0) {
+          message = entry.message;
+        }
+        if (code !== 'ERR_ONBOARDING_NOT_READY' || message) break;
       }
     }
   }
+  const remediation = failed?.detail?.remediation;
+  if ((!message || message === code) && remediation && typeof remediation === 'object' && !Array.isArray(remediation)) {
+    const entry = remediation as { message?: unknown };
+    if (typeof entry.message === 'string' && entry.message.length > 0) message = entry.message;
+  }
   const action = result.nextActions[0];
+  if ((!message || message === code) && action?.message && action.message !== code) message = action.message;
+  const lines = [`Onboarding incomplete: ${code}`];
+  if (message && message !== code) lines.push(message);
   let next = 'Retry onboarding after correcting the reported condition.';
   if (action?.command) next = `Next: ${action.command}`;
-  else if (action?.message) next = `Next: ${action.message}`;
-  return [`Onboarding incomplete: ${code}`, next].join('\n');
+  else if (action?.message && action.message !== message) next = `Next: ${action.message}`;
+  else if (remediation && typeof remediation === 'object' && !Array.isArray(remediation)) {
+    const entry = remediation as { command?: unknown; message?: unknown };
+    if (typeof entry.command === 'string' && entry.command.length > 0) next = `Next: ${entry.command}`;
+    else if (typeof entry.message === 'string' && entry.message.length > 0 && entry.message !== message) next = `Next: ${entry.message}`;
+  }
+  lines.push(next);
+  return lines.join('\n');
 }

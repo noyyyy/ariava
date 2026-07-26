@@ -54,6 +54,65 @@ describe('onboarding renderer', () => {
     expect(output).not.toMatch(/Ariava ready|Host ready|host_|watch_|secret/i);
   });
 
+  test('checks-only failure detail still prints concrete message and next command', () => {
+    const failed: OnboardingResult = {
+      target: 'adapter-installed',
+      readiness: 'failed',
+      steps: [{
+        id: 'strict-readiness',
+        status: 'failed',
+        detail: {
+          code: 'ERR_AGENT_ADAPTER_DISCOVERY',
+          checks: [
+            { id: 'agent-adapter-discovery', ready: false, code: 'ERR_AGENT_ADAPTER_DISCOVERY', message: 'Agent Adapter authentication failed.' },
+            { id: 'agent-adapter-health', ready: false, code: 'ERR_AGENT_ADAPTER_DISCOVERY', message: 'Agent Adapter authentication failed.' },
+          ],
+        },
+      }],
+      nextActions: [{
+        id: 'retry-onboarding',
+        message: 'Agent Adapter authentication failed.',
+        command: 'ariava service restart',
+      }],
+    };
+    const output = renderOnboardingResult(failed, { terminal: terminal(80), assetLoader: () => { throw new Error('must not load'); } });
+    expect(output).toBe([
+      'Onboarding incomplete: ERR_AGENT_ADAPTER_DISCOVERY',
+      'Agent Adapter authentication failed.',
+      'Next: ariava service restart',
+    ].join('\n'));
+  });
+
+  test('failure output prints concrete message and recovery command', () => {
+    const failed: OnboardingResult = {
+      target: 'adapter-installed',
+      readiness: 'failed',
+      steps: [{
+        id: 'host-init',
+        status: 'failed',
+        detail: {
+          code: 'ERR_IDENTITY_INVALID',
+          message: 'Host identity evidence exists but is invalid or unreadable (for example a locked or inaccessible Keychain private key). Explicit reset is required.',
+          remediation: {
+            message: 'Host identity evidence exists but is invalid or unreadable (for example a locked or inaccessible Keychain private key). Explicit reset is required.',
+            command: 'ariava host reset --confirm',
+          },
+        },
+      }],
+      nextActions: [{
+        id: 'resolve-failure',
+        message: 'Host identity evidence exists but is invalid or unreadable (for example a locked or inaccessible Keychain private key). Explicit reset is required.',
+        command: 'ariava host reset --confirm',
+      }],
+    };
+    const output = renderOnboardingResult(failed, { terminal: terminal(80), assetLoader: () => { throw new Error('must not load'); } });
+    expect(output).toBe([
+      'Onboarding incomplete: ERR_IDENTITY_INVALID',
+      'Host identity evidence exists but is invalid or unreadable (for example a locked or inaccessible Keychain private key). Explicit reset is required.',
+      'Next: ariava host reset --confirm',
+    ].join('\n'));
+  });
+
   test('selector presents agent extensions as an optional multi-select', async () => {
     const calls: string[] = [];
     const prompt: OnboardingPrompt = {

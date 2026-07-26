@@ -139,6 +139,7 @@ export interface HostReadinessCheck {
   id: HostReadinessCheckId;
   ready: boolean;
   code?: string;
+  message?: string;
 }
 
 export interface StrictReadinessResult {

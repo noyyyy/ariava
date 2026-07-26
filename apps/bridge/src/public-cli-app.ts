@@ -853,7 +853,7 @@ async function runSetup(
       printJson({
         ok: !failed,
         code: failed ? onboardingFailureCode(result) : 'ok',
-        message: failed ? 'Ariava onboarding is incomplete.' : 'Ariava onboarding completed.',
+        message: failed ? onboardingFailureMessage(result) : 'Ariava onboarding completed.',
         data: result,
       }, deps.stdout);
     } else {
@@ -1017,8 +1017,13 @@ async function initializeOnboardingHost(deps: PublicCliDependencies, manager: Se
 async function loadOnboardingHostState(deps: PublicCliDependencies, manager: ServiceManager) {
   const config = deps.resolveAriavaConfig();
   const store = deps.createHostIdentityStore(config.identityPath, manager.support.platform);
-  const [identityInspection, identity] = await Promise.all([store.inspect(), store.load()]);
-  return identity ? { config, identityInspection, identity } : undefined;
+  const identityInspection = await store.inspect();
+  // Fail closed with the concrete HostIdentityError when evidence exists but cannot be loaded.
+  // Returning undefined here would hide ERR_IDENTITY_* as a generic onboarding failure.
+  if (identityInspection.status === 'not-initialized') return undefined;
+  const identity = await store.load();
+  if (!identity) return undefined;
+  return { config, identityInspection, identity };
 }
 
 function buildReadinessInput(
@@ -1090,6 +1095,21 @@ function onboardingFailureCode(result: OnboardingResult): string {
   }
   return 'ERR_ONBOARDING_NOT_READY';
 }
+
+function onboardingFailureMessage(result: OnboardingResult): string {
+  const failed = result.steps.find((step) => step.status === 'failed');
+  const detail = failed?.detail;
+  if (detail && typeof detail.message === 'string' && detail.message.length > 0) return detail.message;
+  if (detail?.remediation && typeof detail.remediation === 'object' && !Array.isArray(detail.remediation)) {
+    const remediation = detail.remediation as { message?: unknown };
+    if (typeof remediation.message === 'string' && remediation.message.length > 0) return remediation.message;
+  }
+  const action = result.nextActions[0];
+  if (action?.message && action.message.length > 0) return action.message;
+  const code = onboardingFailureCode(result);
+  return code === 'ERR_ONBOARDING_NOT_READY' ? 'Ariava onboarding is incomplete.' : code;
+}
+
 
 function selectionPublicArgs(selection: { extensions: readonly string[] }, publicArgs: readonly string[]): string[] {
   if (publicArgs.includes('--extension') || publicArgs.includes('--no-extensions')) return [...publicArgs];

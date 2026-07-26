@@ -64,23 +64,58 @@ export async function checkStrictOnboardingReadiness(
 ): Promise<StrictReadinessResult> {
   const deps = { ...defaultDependencies, ...overrides };
   const checks: HostReadinessCheck[] = [];
-  const add = (id: HostReadinessCheck['id'], ready: boolean, code?: string): boolean => {
-    checks.push({ id, ready, ...(ready || !code ? {} : { code }) });
+  const add = (id: HostReadinessCheck['id'], ready: boolean, code?: string, message?: string): boolean => {
+    checks.push({
+      id,
+      ready,
+      ...(ready || !code ? {} : { code }),
+      ...(ready || !message ? {} : { message }),
+    });
     return ready;
   };
 
-  add('stable-cli', stableCliMatches(input), 'ERR_STABLE_CLI_PATH');
-  add('persisted-config', persistedConfigReady(input), 'ERR_RELAY_CONFIG_REQUIRED');
-  add('identity', identityReady(input), 'ERR_IDENTITY_INVALID');
+  add(
+    'stable-cli',
+    stableCliMatches(input),
+    'ERR_STABLE_CLI_PATH',
+    'Stable Ariava CLI path or version evidence does not match the executing CLI.',
+  );
+  add(
+    'persisted-config',
+    persistedConfigReady(input),
+    'ERR_RELAY_CONFIG_REQUIRED',
+    'Persisted Host configuration is incomplete, or ambient environment overrides are present.',
+  );
+  add(
+    'identity',
+    identityReady(input),
+    'ERR_IDENTITY_INVALID',
+    'Host identity is not ready (invalid, pending rotation, or integrity checks failed).',
+  );
 
   const service = await pollForService(input, deps);
-  add('service-support', service.support.supported, 'ERR_UNSUPPORTED_PLATFORM');
-  add('service-installed', service.installed, 'ERR_SERVICE_NOT_INSTALLED');
-  add('service-enabled', service.enabled, 'ERR_ONBOARDING_NOT_READY');
-  add('service-loaded', service.loaded, 'ERR_ONBOARDING_NOT_READY');
-  add('service-running', service.processRunning, 'ERR_ONBOARDING_NOT_READY');
-  add('service-paths', servicePathsReady(input, service), 'ERR_SERVICE_METADATA');
-  add('service-references', serviceReferencesReady(input), 'ERR_SERVICE_METADATA');
+  add(
+    'service-support',
+    service.support.supported,
+    'ERR_UNSUPPORTED_PLATFORM',
+    service.support.message ?? 'A supported user service backend is not available.',
+  );
+  add('service-installed', service.installed, 'ERR_SERVICE_NOT_INSTALLED', 'Bridge service is not installed.');
+  add('service-enabled', service.enabled, 'ERR_ONBOARDING_NOT_READY', 'Bridge service is installed but not enabled.');
+  add('service-loaded', service.loaded, 'ERR_ONBOARDING_NOT_READY', 'Bridge service is not loaded by the user service manager.');
+  add('service-running', service.processRunning, 'ERR_ONBOARDING_NOT_READY', 'Bridge service process is not running.');
+  add(
+    'service-paths',
+    servicePathsReady(input, service),
+    'ERR_SERVICE_METADATA',
+    'Bridge service runtime or CLI paths do not match the current stable install.',
+  );
+  add(
+    'service-references',
+    serviceReferencesReady(input),
+    'ERR_SERVICE_METADATA',
+    'Bridge service metadata does not reference the current config or Host identity storage.',
+  );
 
   try {
     await pollForDiscoveryAndHealth(input, deps);
@@ -88,8 +123,9 @@ export async function checkStrictOnboardingReadiness(
     add('agent-adapter-health', true);
   } catch (error) {
     const code = errorCode(error, 'ERR_AGENT_ADAPTER_DISCOVERY');
-    add('agent-adapter-discovery', false, code);
-    add('agent-adapter-health', false, code);
+    const message = errorMessage(error, 'Agent Adapter discovery or authenticated health failed.');
+    add('agent-adapter-discovery', false, code, message);
+    add('agent-adapter-health', false, code, message);
   }
 
   // Keep health and enrollment independent so an enrollment-only failure does not
@@ -102,20 +138,38 @@ export async function checkStrictOnboardingReadiness(
       add('relay-enrollment', true);
     } catch (error) {
       const code = errorCode(error, 'ERR_RELAY_UNREACHABLE');
-      add('relay-enrollment', false, code);
+      add('relay-enrollment', false, code, errorMessage(error, 'Relay signed Host enrollment failed.'));
     }
   } catch (error) {
     const code = errorCode(error, 'ERR_RELAY_UNREACHABLE');
-    add('relay-health', false, code);
-    add('relay-enrollment', false, code);
+    const message = errorMessage(error, 'Relay health is unavailable.');
+    add('relay-health', false, code, message);
+    add('relay-enrollment', false, code, message);
   }
 
   const hostReady = checks.every((check) => check.ready);
-  if (!hostReady) return { ready: false, readiness: 'failed', checks, nextActions: [] };
+  if (!hostReady) {
+    return {
+      ready: false,
+      readiness: 'failed',
+      checks,
+      nextActions: readinessFailureActions(checks),
+    };
+  }
   if (input.target === 'host-ready') return { ready: true, readiness: 'host-ready', checks, nextActions: [] };
 
   if (!exactPiPackageReady(input.piStatus, input.cliVersion)) {
-    return { ready: false, readiness: 'failed', checks, nextActions: [] };
+    const message = piPackageNotReadyMessage(input.piStatus, input.cliVersion);
+    return {
+      ready: false,
+      readiness: 'failed',
+      checks,
+      nextActions: [{
+        id: 'retry-onboarding',
+        message,
+        command: 'ariava setup --extension pi',
+      }],
+    };
   }
   // Current session registration contains neither extension version nor capability
   // evidence, so even a visible Pi provider session cannot prove adapter readiness.
@@ -135,7 +189,9 @@ export async function pollForDiscoveryAndHealth(
   const timeoutMs = boundedPositive(input.timeoutMs, 10_000);
   const intervalMs = boundedPositive(input.pollIntervalMs, 100);
   const deadline = deps.clock.now() + timeoutMs;
-  let lastCode = 'ERR_AGENT_ADAPTER_DISCOVERY';
+  let lastCode: 'ERR_AGENT_ADAPTER_DISCOVERY' | 'ERR_AGENT_ADAPTER_NOT_LOOPBACK' = 'ERR_AGENT_ADAPTER_DISCOVERY';
+  let lastMessage = 'Timed out waiting for authenticated Agent Adapter health.';
+  let sawProbeFailure = false;
 
   throwIfAborted(input.signal);
   while (true) {
@@ -163,11 +219,17 @@ export async function pollForDiscoveryAndHealth(
         return discovery;
       }
     } catch (error) {
-      lastCode = errorCode(error, 'ERR_AGENT_ADAPTER_DISCOVERY');
+      const code = errorCode(error, 'ERR_AGENT_ADAPTER_DISCOVERY');
+      lastCode = code === 'ERR_AGENT_ADAPTER_NOT_LOOPBACK' ? 'ERR_AGENT_ADAPTER_NOT_LOOPBACK' : 'ERR_AGENT_ADAPTER_DISCOVERY';
+      lastMessage = errorMessage(error, lastMessage);
+      sawProbeFailure = true;
     }
     throwIfAborted(input.signal);
     if (deps.clock.now() >= deadline) {
-      throw readinessError(lastCode as 'ERR_AGENT_ADAPTER_DISCOVERY' | 'ERR_AGENT_ADAPTER_NOT_LOOPBACK', 'Timed out waiting for authenticated Agent Adapter health.');
+      throw readinessError(
+        lastCode,
+        sawProbeFailure ? lastMessage : 'Timed out waiting for authenticated Agent Adapter health.',
+      );
     }
     await deps.clock.sleep(Math.min(intervalMs, Math.max(1, deadline - deps.clock.now())));
   }
@@ -363,6 +425,66 @@ function errorCode(error: unknown, fallback: string): string {
   return error instanceof AriavaCliError ? error.code : fallback;
 }
 
+function errorMessage(error: unknown, fallback: string): string {
+  if (error instanceof AriavaCliError && error.message.trim().length > 0) return error.message;
+  if (error instanceof Error && error.message.trim().length > 0) return error.message;
+  return fallback;
+}
+
+function firstFailedCheck(checks: HostReadinessCheck[]): HostReadinessCheck | undefined {
+  return checks.find((check) => !check.ready);
+}
+
+function readinessFailureActions(checks: HostReadinessCheck[]): StrictReadinessResult['nextActions'] {
+  const failed = firstFailedCheck(checks);
+  if (!failed) {
+    return [{ id: 'retry-onboarding', message: 'Strict readiness checks failed.' }];
+  }
+  const message = failed.message
+    ?? (typeof failed.code === 'string' ? failed.code : 'Strict readiness checks failed.');
+  const remediation = defaultReadinessRemediation(failed.code, message);
+  return [{
+    id: failed.id === 'identity' ? 'resolve-failure' : 'retry-onboarding',
+    message: remediation.message,
+    ...(remediation.command ? { command: remediation.command } : {}),
+  }];
+}
+
+function defaultReadinessRemediation(code: string | undefined, message: string): { message: string; command?: string } {
+  if (code === 'ERR_IDENTITY_INVALID' || code === 'ERR_IDENTITY_MISSING' || code === 'ERR_IDENTITY_PERMISSIONS' || code === 'ERR_IDENTITY_RESET_REQUIRED') {
+    return { message, command: 'ariava host reset --confirm' };
+  }
+  if (code === 'ERR_SERVICE_NOT_INSTALLED' || code === 'ERR_SERVICE_METADATA') {
+    return { message, command: 'ariava service reinstall' };
+  }
+  if (code === 'ERR_AGENT_ADAPTER_DISCOVERY' || code === 'ERR_AGENT_ADAPTER_NOT_LOOPBACK') {
+    return { message, command: 'ariava service restart' };
+  }
+  if (code === 'ERR_RELAY_UNREACHABLE' || code === 'ERR_RELAY_AUTH_FAILED' || code === 'ERR_RELAY_CONFIG_REQUIRED') {
+    return { message, command: 'ariava doctor' };
+  }
+  if (code === 'ERR_STABLE_CLI_PATH') {
+    return { message, command: 'npx --yes ariava@latest setup' };
+  }
+  return { message, command: 'ariava setup --resume' };
+}
+
+function piPackageNotReadyMessage(status: PiExtensionStatus | undefined, version: string): string {
+  if (!status?.installed) {
+    return `Exact Pi extension package @ariava/pi-extension@${version} is not installed.`;
+  }
+  if (!status.managed || status.sourceOwnership !== 'managed-exact') {
+    return 'Pi extension is present but not managed by Ariava at the exact CLI version.';
+  }
+  if (status.manifestVersion !== version) {
+    return `Pi extension version ${status.manifestVersion ?? 'unknown'} does not match CLI version ${version}.`;
+  }
+  if (status.mismatchReasons.length > 0) {
+    return `Pi extension readiness failed: ${status.mismatchReasons.join(', ')}.`;
+  }
+  return `Exact Pi extension package evidence for @ariava/pi-extension@${version} is not ready.`;
+}
+
 function readinessError(
   code: 'ERR_AGENT_ADAPTER_DISCOVERY' | 'ERR_AGENT_ADAPTER_NOT_LOOPBACK' | 'ERR_RELAY_UNREACHABLE' | 'ERR_RELAY_AUTH_FAILED' | 'ERR_IDENTITY_INVALID',
   message: string,
@@ -371,6 +493,6 @@ function readinessError(
   return new AriavaCliError(code, message, {
     step: 'strict-readiness',
     retryable,
-    remediation: { message: 'Retry onboarding after correcting the reported readiness condition.' },
+    remediation: defaultReadinessRemediation(code, message),
   });
 }

@@ -1,3 +1,4 @@
+import { HostIdentityError } from '../../identity/errors';
 import type { HostIdentity, HostIdentityInspection } from '../../identity/types';
 import {
   ARIAVA_PRODUCTION_RELAY_BASE_URL,
@@ -184,13 +185,33 @@ export async function runOnboardingOrchestrator(
       });
       cancellation.throwIfCancelled();
       if (!readiness.ready) {
-        const failedCode = firstFailedCheckCode(readiness.checks);
+        const failedCheck = firstFailedCheck(readiness.checks);
+        const failedCode = failedCheck?.code ?? firstFailedCheckCode(readiness.checks);
+        const failedMessage = failedCheck?.message
+          ?? readiness.nextActions[0]?.message
+          ?? (failedCode ? failedCode : 'Strict readiness checks failed.');
+        const remediation = readiness.nextActions[0]
+          ? {
+              message: readiness.nextActions[0].message ?? failedMessage,
+              ...(readiness.nextActions[0].command ? { command: readiness.nextActions[0].command } : {}),
+            }
+          : undefined;
         steps.push(step('strict-readiness', 'failed', {
           checks: readiness.checks,
-          ...(failedCode ? { code: failedCode } : {}),
+          ...(failedCode ? { code: failedCode } : { code: 'ERR_ONBOARDING_NOT_READY' }),
+          message: failedMessage,
+          ...(remediation ? { remediation } : {}),
         }));
         steps.push(step('completion', 'skipped'));
-        return failureResult(input.target, steps, 'strict-readiness', true, failedCode);
+        return failureResult(
+          input.target,
+          steps,
+          'strict-readiness',
+          true,
+          failedCode ?? 'ERR_ONBOARDING_NOT_READY',
+          failedMessage,
+          remediation,
+        );
       }
       steps.push(step('strict-readiness', readiness.readiness === 'reload-pending' ? 'reload-pending' : 'ready', {
         checks: readiness.checks,
@@ -257,11 +278,39 @@ function requireReadyHostState(state: OnboardingHostState): void {
 
 function requireReadyIdentity(state: OnboardingHostState): void {
   const inspection = state.identityInspection;
-  if (inspection.status !== 'ready' || inspection.pendingRotation || !inspection.ownerIntegrity
-    || !inspection.permissionIntegrity || !inspection.metadataIntegrity
-    || inspection.hostId !== state.identity.hostId || inspection.keyId !== state.identity.keyId) {
-    throw onboardingError('ERR_IDENTITY_INVALID', 'Existing Host identity state is not safe to reuse.', 'host-init', false);
+  if (inspection.status === 'ready' && !inspection.pendingRotation && inspection.ownerIntegrity
+    && inspection.permissionIntegrity && inspection.metadataIntegrity
+    && inspection.hostId === state.identity.hostId && inspection.keyId === state.identity.keyId) {
+    return;
   }
+  const reason = identityNotReadyReason(inspection, state.identity);
+  throw onboardingError('ERR_IDENTITY_INVALID', reason, 'host-init', false, {
+    identityStatus: inspection.status,
+    pendingRotation: inspection.pendingRotation,
+    remediation: {
+      message: reason,
+      command: 'ariava host reset --confirm',
+    },
+  });
+}
+
+function identityNotReadyReason(inspection: HostIdentityInspection, identity: HostIdentity): string {
+  if (inspection.status === 'rotation-pending' || inspection.pendingRotation) {
+    return 'Host identity key rotation is pending and must be completed or explicitly reset before onboarding can continue.';
+  }
+  if (inspection.status === 'invalid') {
+    return 'Host identity evidence exists but is invalid or unreadable (for example a locked or inaccessible Keychain private key). Explicit reset is required.';
+  }
+  if (inspection.status === 'not-initialized') {
+    return 'Host identity is not initialized.';
+  }
+  if (!inspection.ownerIntegrity || !inspection.permissionIntegrity || !inspection.metadataIntegrity) {
+    return 'Host identity integrity checks failed; the persisted identity is not safe to reuse.';
+  }
+  if (inspection.hostId !== identity.hostId || inspection.keyId !== identity.keyId) {
+    return 'Persisted Host identity metadata does not match the loaded Host key material.';
+  }
+  return 'Existing Host identity state is not safe to reuse.';
 }
 
 function persistStableInstallerMetadata(
@@ -387,18 +436,105 @@ function failureFromError(
   current: OnboardingStepId,
   error: unknown,
 ): OnboardingResult {
-  const code = error instanceof AriavaCliError ? error.code : 'ERR_ONBOARDING_NOT_READY';
-  const errorData = error instanceof AriavaCliError ? error.data : {};
-  const retryable = error instanceof AriavaCliError ? error.data.retryable !== false : true;
+  const normalized = normalizeOrchestratorFailure(error, current);
   const steps = [...completed];
   if (!steps.some((entry) => entry.id === current)) {
-    steps.push(step(current, 'failed', { code, retryable, ...errorData }));
+    steps.push(step(current, 'failed', {
+      ...normalized.detail,
+      code: normalized.code,
+      message: normalized.message,
+      retryable: normalized.retryable,
+    }));
   }
   appendSkippedSteps(steps);
-  const remediation = errorData.remediation && typeof errorData.remediation === 'object'
-    ? errorData.remediation as { message?: string; command?: string }
-    : undefined;
-  return failureResult(target, steps, current, retryable, code, remediation);
+  return failureResult(
+    target,
+    steps,
+    current,
+    normalized.retryable,
+    normalized.code,
+    normalized.message,
+    normalized.remediation,
+  );
+}
+
+function normalizeOrchestratorFailure(error: unknown, current: OnboardingStepId): {
+  code: string;
+  message: string;
+  retryable: boolean;
+  detail: Record<string, unknown>;
+  remediation?: { message?: string; command?: string };
+} {
+  if (error instanceof AriavaCliError) {
+    const detail = { ...error.data };
+    const remediation = remediationFromUnknown(detail.remediation)
+      ?? defaultRemediationForCode(error.code, error.message);
+    if (remediation) detail.remediation = remediation;
+    return {
+      code: error.code,
+      message: error.message,
+      retryable: error.data.retryable !== false,
+      detail,
+      ...(remediation ? { remediation } : {}),
+    };
+  }
+  if (error instanceof HostIdentityError) {
+    const remediation = defaultRemediationForCode(error.code, error.message) ?? {
+      message: error.message,
+      command: 'ariava host reset --confirm',
+    };
+    return {
+      code: error.code,
+      message: error.message,
+      retryable: false,
+      detail: { step: current, remediation },
+      remediation,
+    };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    code: 'ERR_ONBOARDING_NOT_READY',
+    message,
+    retryable: true,
+    detail: { step: current },
+  };
+}
+
+function remediationFromUnknown(value: unknown): { message?: string; command?: string } | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const entry = value as { message?: unknown; command?: unknown };
+  const remediation: { message?: string; command?: string } = {};
+  if (typeof entry.message === 'string' && entry.message.length > 0) remediation.message = entry.message;
+  if (typeof entry.command === 'string' && entry.command.length > 0) remediation.command = entry.command;
+  return remediation.message || remediation.command ? remediation : undefined;
+}
+
+function defaultRemediationForCode(code: string, message: string): { message: string; command?: string } | undefined {
+  if (code === 'ERR_IDENTITY_INVALID' || code === 'ERR_IDENTITY_MISSING' || code === 'ERR_IDENTITY_PERMISSIONS' || code === 'ERR_IDENTITY_RESET_REQUIRED') {
+    return { message, command: 'ariava host reset --confirm' };
+  }
+  if (code === 'ERR_IDENTITY_NOT_INITIALIZED') {
+    return { message, command: 'ariava setup' };
+  }
+  if (code === 'ERR_SERVICE_NOT_INSTALLED' || code === 'ERR_SERVICE_METADATA' || code === 'ERR_SERVICE_INSTALL') {
+    return { message, command: 'ariava service reinstall' };
+  }
+  if (code === 'ERR_AGENT_ADAPTER_DISCOVERY' || code === 'ERR_AGENT_ADAPTER_NOT_LOOPBACK') {
+    return { message, command: 'ariava service restart' };
+  }
+  if (code === 'ERR_RELAY_UNREACHABLE' || code === 'ERR_RELAY_AUTH_FAILED' || code === 'ERR_RELAY_CONFIG_REQUIRED') {
+    return { message, command: 'ariava doctor' };
+  }
+  if (code === 'ERR_AGENT_RUNTIME_NOT_FOUND' || code === 'ERR_EXTENSION_INSTALL' || code === 'ERR_EXTENSION_VERSION_MISMATCH' || code === 'ERR_EXTENSION_UNMANAGED') {
+    return { message, command: 'ariava setup --extension pi' };
+  }
+  if (code === 'ERR_STABLE_CLI_PATH' || code === 'ERR_STABLE_CLI_INSTALL') {
+    return { message, command: 'npx --yes ariava@latest setup' };
+  }
+  if (code === 'ERR_ONBOARDING_NOT_READY') {
+    return { message, command: 'ariava setup --resume' };
+  }
+  return { message };
 }
 
 function failureResult(
@@ -407,19 +543,20 @@ function failureResult(
   failedStep: OnboardingStepId,
   retryable: boolean,
   code = 'ERR_ONBOARDING_NOT_READY',
+  message = code,
   remediation?: { message?: string; command?: string },
 ): OnboardingResult {
+  const actionMessage = remediation?.message ?? message ?? code;
+  const action = {
+    id: failedStep === 'adapter-detect' ? 'install-pi' : retryable ? 'retry-onboarding' : 'resolve-failure',
+    message: actionMessage,
+    ...(remediation?.command ? { command: remediation.command } : {}),
+  };
   return {
     target,
     readiness: 'failed',
     steps,
-    nextActions: retryable
-      ? [{
-          id: failedStep === 'adapter-detect' ? 'install-pi' : 'retry-onboarding',
-          message: remediation?.message ?? code,
-          ...(remediation?.command ? { command: remediation.command } : {}),
-        }]
-      : [],
+    nextActions: [action],
   };
 }
 
@@ -444,6 +581,10 @@ function completionActions(target: OnboardingTarget): OnboardingResult['nextActi
 
 function step(id: OnboardingStepId, status: OnboardingStepResult['status'], detail?: Record<string, unknown>): OnboardingStepResult {
   return { id, status, ...(detail && Object.keys(detail).length > 0 ? { detail } : {}) };
+}
+
+function firstFailedCheck(checks: StrictReadinessResult['checks']): StrictReadinessResult['checks'][number] | undefined {
+  return checks.find((check) => !check.ready);
 }
 
 function firstFailedCheckCode(checks: StrictReadinessResult['checks']): string | undefined {

@@ -113,17 +113,20 @@ describe('strict onboarding readiness', () => {
     expect(result.checks.every((check) => check.ready)).toBe(true);
     expect(result.readiness).toBe('reload-pending');
 
-    const cases: Array<[string, Partial<StrictReadinessInput>]> = [
-      ['stable-cli', { stableCli: { ...healthy.input.stableCli, packageVersion: 'old' } }],
-      ['persisted-config', { config: { ...config, environmentOverrides: ['ARIAVA_RELAY_BASE_URL'] } }],
-      ['identity', { identityInspection: { ...inspection, pendingRotation: true, status: 'rotation-pending' } }],
-      ['service-references', { serviceRecord: { ...healthy.input.serviceRecord!, configPath: '/wrong' } }],
+    const cases: Array<[string, Partial<StrictReadinessInput>, RegExp]> = [
+      ['stable-cli', { stableCli: { ...healthy.input.stableCli, packageVersion: 'old' } }, /Stable Ariava CLI/i],
+      ['persisted-config', { config: { ...config, environmentOverrides: ['ARIAVA_RELAY_BASE_URL'] } }, /Persisted Host configuration/i],
+      ['identity', { identityInspection: { ...inspection, pendingRotation: true, status: 'rotation-pending' } }, /Host identity is not ready/i],
+      ['service-references', { serviceRecord: { ...healthy.input.serviceRecord!, configPath: '/wrong' } }, /service metadata/i],
     ];
-    for (const [id, override] of cases) {
+    for (const [id, override, messagePattern] of cases) {
       const candidate = fixture(override);
       const failed = await checkStrictOnboardingReadiness(candidate.input, candidate.deps);
       expect(failed.ready).toBe(false);
-      expect(failed.checks.find((check) => check.id === id)?.ready).toBe(false);
+      const check = failed.checks.find((entry) => entry.id === id);
+      expect(check?.ready).toBe(false);
+      expect(check?.message).toMatch(messagePattern);
+      expect(failed.nextActions[0]?.message).toMatch(messagePattern);
     }
   });
 
@@ -188,6 +191,11 @@ describe('strict onboarding readiness', () => {
     expect(result.checks.find((check) => check.id === 'relay-enrollment')).toMatchObject({
       ready: false,
       code: 'ERR_RELAY_UNREACHABLE',
+      message: expect.stringMatching(/enrollment|Relay/i),
+    });
+    expect(result.nextActions[0]).toMatchObject({
+      message: expect.stringMatching(/enrollment|Relay/i),
+      command: 'ariava doctor',
     });
   });
 
@@ -198,6 +206,30 @@ describe('strict onboarding readiness', () => {
     expect(result.readiness).not.toBe('adapter-ready');
 
     const mismatch = fixture({ piStatus: { ...piStatus, manifestVersion: '1.2.2', mismatchReasons: ['manifest-version-mismatch'] } });
-    expect(await checkStrictOnboardingReadiness(mismatch.input, mismatch.deps)).toMatchObject({ ready: false, readiness: 'failed' });
+    const failedPi = await checkStrictOnboardingReadiness(mismatch.input, mismatch.deps);
+    expect(failedPi).toMatchObject({ ready: false, readiness: 'failed' });
+    expect(failedPi.nextActions[0]).toMatchObject({
+      message: expect.stringMatching(/Pi extension|manifest|version/i),
+      command: 'ariava setup --extension pi',
+    });
+  });
+
+  test('adapter discovery failures preserve concrete message on both related checks', async () => {
+    const candidate = fixture({}, {
+      readDiscovery: () => ({ url: 'http://10.0.0.1:7272', secret: 'secret-value' }),
+    });
+    const failed = await checkStrictOnboardingReadiness(candidate.input, candidate.deps);
+    expect(failed.ready).toBe(false);
+    for (const id of ['agent-adapter-discovery', 'agent-adapter-health'] as const) {
+      expect(failed.checks.find((check) => check.id === id)).toMatchObject({
+        ready: false,
+        code: 'ERR_AGENT_ADAPTER_NOT_LOOPBACK',
+        message: expect.stringMatching(/loopback/i),
+      });
+    }
+    expect(failed.nextActions[0]).toMatchObject({
+      message: expect.stringMatching(/loopback/i),
+      command: 'ariava service restart',
+    });
   });
 });
