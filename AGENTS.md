@@ -21,13 +21,38 @@ This repository contains the Ariava Bridge, pi extension, protocol, and shared u
 - Strict onboarding readiness is read-only evidence aggregation and is separate from `ariava doctor`; preserve doctor's current health formula and exit behavior.
 - Services remain per-user launchd on macOS and systemd user services on capable Linux/WSL. Never add root/system units, linger, detached/PID/profile/Task Scheduler fallbacks, or optimistic unsupported-platform behavior.
 
-## Validation
+## Test lanes and validation
+
+Reviewed test roots classify files by suffix:
+
+- `*.test.ts` — shared Public Core coverage;
+- `*.macos.test.ts` — native macOS lane;
+- `*.linux.test.ts` — native Linux lane;
+- `*.integration.test.*` — explicit opt-in integration, excluded from ordinary lanes.
+
+Keep launchd/systemd renderers, fake or injected command runners, and portable fixtures in the shared lane. Put genuine host runtime behavior in the matching suffix-specific lane. Do not hide host ownership behind `skipIf` in shared tests.
+
+Copyable gates:
 
 ```bash
 bun install --frozen-lockfile
-bun run verify
-bun run --cwd extensions/pi test
-bun run --cwd extensions/pi typecheck
+bun run verify:shared
+bun run verify:macos        # native macOS
+bun run verify:host         # local Darwin dispatcher
+bun run verify:linux        # native Linux / Public CI
+bun run verify:linux:docker # explicit Docker pre-acceptance, normally from macOS
+bun run verify              # authoritative npm release-compatible closure
 ```
 
-Use module-specific builds after changing protocol, shared-utils, Bridge, or pi. Keep public package assertions green.
+`verify:linux:docker` must stay explicit and must not be added to `verify`, `verify:shared`, `verify:macos`, or `verify:host`. It must run the complete `bun run verify:linux` closure as the image's non-root user, with no Docker socket, host home/config/credential mount, privileged mode, or systemd simulation. The reviewed base is `node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d`; update the digest, exact Node/npm/Bun pins, CI, tests, and docs together.
+
+Report Docker evidence with its architecture. Apple Silicon defaults to Docker Linux arm64. Docker does not prove GitHub Ubuntu, a real systemd user manager, journald lifecycle, VM restart, physical logout/login, or WSL.
+
+Real integration remains opt-in and stateful:
+
+```bash
+ARIAVA_RUN_REAL_MACOS_KEYCHAIN_LAUNCHD_TEST=1 ./scripts/test-macos-keychain-launchd.sh
+./scripts/test-linux-systemd.sh
+```
+
+Use module-specific builds after changing protocol, shared-utils, Bridge, or pi. Keep public package assertions green. The GitHub workflow owns separate Linux (`verify:linux`) and macOS (`verify:macos`) jobs; both use pinned actions, frozen installs, least privilege, and exact Node 24.18.0, npm 11.18.0, and Bun 1.3.14. The tag publication workflow remains Ubuntu-only and calls authoritative `bun run verify`; never add publication credentials to ordinary CI.

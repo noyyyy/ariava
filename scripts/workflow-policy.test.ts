@@ -7,6 +7,9 @@ const releaseLibrary = readFileSync('scripts/npm-release-lib.mjs', 'utf8');
 
 const FULL_SHA_ACTION = /^\s*uses:\s*[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[0-9a-f]{40}\s*$/u;
 const FORBIDDEN_PUBLICATION_INPUT = /NPM_TOKEN|NODE_AUTH_TOKEN|npm[_ -]?password|TOTP|--otp|secrets\./iu;
+const NODE_VERSION = '24.18.0';
+const NPM_VERSION = '11.18.0';
+const BUN_VERSION = '1.3.14';
 
 function jobBody(source: string, name: string): string {
   const match = new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:\\n|(?![\\s\\S]))`, 'mu').exec(source);
@@ -22,20 +25,45 @@ function assertPinnedActions(source: string) {
   expect(source).toMatch(/# actions\/setup-node v4\.4\.0/u);
 }
 
+function assertCiHostJob(source: string, options: { job: string; name: string; runner: string; command: string }) {
+  const body = jobBody(source, options.job);
+  expect(body).toContain(`name: ${options.name}`);
+  expect(body).toContain(`runs-on: ${options.runner}`);
+  expect(body).toContain('persist-credentials: false');
+  expect(body).toContain(`node-version: ${NODE_VERSION}`);
+  expect(body).toContain(`bun-version: ${BUN_VERSION}`);
+  expect(body).toContain(`npm@${NPM_VERSION}`);
+  expect(body).toContain('node --version');
+  expect(body).toContain('npm --version');
+  expect(body).toContain('bun --version');
+  expect(body).toContain('bun install --frozen-lockfile');
+  expect(body).toContain(`run: bun run ${options.command}`);
+  expect(body).not.toMatch(/^\s*run:\s*bun run verify\s*$/mu);
+  expect(body).not.toMatch(FORBIDDEN_PUBLICATION_INPUT);
+  expect(body).not.toMatch(/id-token:\s*write/u);
+}
+
 export function assertWorkflowPolicy(ciSource: string, publishSource: string) {
   expect(ciSource).toContain('pull_request:');
   expect(ciSource).toContain('branches:\n      - main');
   expect(ciSource).toContain('permissions:\n  contents: read');
   expect(ciSource).not.toContain('id-token: write');
-  expect(ciSource).toContain('bun install --frozen-lockfile');
-  expect(ciSource).toContain('bun run verify');
   expect(ciSource).not.toMatch(FORBIDDEN_PUBLICATION_INPUT);
+  assertCiHostJob(ciSource, { job: 'linux', name: 'Linux', runner: 'ubuntu-latest', command: 'verify:linux' });
+  assertCiHostJob(ciSource, { job: 'macos', name: 'macOS', runner: 'macos-latest', command: 'verify:macos' });
+  expect((ciSource.match(/bun install --frozen-lockfile/gu) ?? [])).toHaveLength(2);
+  expect((ciSource.match(/node-version: 24\.18\.0/gu) ?? [])).toHaveLength(2);
+  expect((ciSource.match(/bun-version: 1\.3\.14/gu) ?? [])).toHaveLength(2);
+  expect((ciSource.match(/npm@11\.18\.0/gu) ?? [])).toHaveLength(2);
+  expect(ciSource).not.toMatch(/verify:linux:docker|docker.sock|--privileged/iu);
 
   expect(publishSource).toContain('tags:\n      - "v*.*.*"');
   expect(publishSource).toContain('group: npm-production');
   expect(publishSource).toContain('cancel-in-progress: false');
   const prepare = jobBody(publishSource, 'prepare');
   const publishJob = jobBody(publishSource, 'publish');
+  expect(prepare).toContain('runs-on: ubuntu-latest');
+  expect(publishJob).toContain('runs-on: ubuntu-latest');
   expect(prepare).toContain('permissions:\n      contents: read');
   expect(prepare).not.toContain('id-token: write');
   expect(publishJob).toContain('environment: npm-production');
@@ -72,19 +100,29 @@ export function assertWorkflowPolicy(ciSource: string, publishSource: string) {
   expect(releaseLibrary).toContain('parseStableTag');
   expect(releaseLibrary).toContain('validateGitRelease');
   expect(releaseLibrary).toContain("['install', '--frozen-lockfile']");
+  expect(releaseLibrary).toContain("['run', 'verify']");
 
   assertPinnedActions(ciSource);
   assertPinnedActions(publishSource);
 }
 
 describe('GitHub workflow least-privilege policy', () => {
-  test('CI is read-only and tag publication uses exact dependent artifacts with OIDC only in publish', () => {
+  test('CI has separate exact-toolchain Linux/macOS host jobs and publication remains Ubuntu/OIDC-only', () => {
     assertWorkflowPolicy(ci, publish);
   });
 
-  test('negative mutation: adding OIDC to CI is rejected', () => {
-    const mutated = ci.replace('contents: read', 'contents: read\n  id-token: write');
-    expect(() => assertWorkflowPolicy(mutated, publish)).toThrow();
+  test('negative mutation: adding OIDC or publication credentials to CI is rejected', () => {
+    const oidc = ci.replace('contents: read', 'contents: read\n  id-token: write');
+    expect(() => assertWorkflowPolicy(oidc, publish)).toThrow();
+    const token = ci.replace('permissions:', 'env:\n  NPM_TOKEN: ${{ secrets.NPM_TOKEN }}\n\npermissions:');
+    expect(() => assertWorkflowPolicy(token, publish)).toThrow();
+  });
+
+  test('negative mutation: swapping runners, weakening commands, or drifting toolchains is rejected', () => {
+    expect(() => assertWorkflowPolicy(ci.replace('runs-on: macos-latest', 'runs-on: ubuntu-latest'), publish)).toThrow();
+    expect(() => assertWorkflowPolicy(ci.replace('bun run verify:linux', 'bun run verify:shared'), publish)).toThrow();
+    expect(() => assertWorkflowPolicy(ci.replace('node-version: 24.18.0', 'node-version: 24'), publish)).toThrow();
+    expect(() => assertWorkflowPolicy(ci.replace('bun install --frozen-lockfile', 'bun install'), publish)).toThrow();
   });
 
   test('negative mutation: introducing a publication token is rejected', () => {
