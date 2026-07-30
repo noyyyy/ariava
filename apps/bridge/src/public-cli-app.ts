@@ -193,13 +193,12 @@ export async function runPublicCli(
         break;
       case '--help':
       case 'help': print(deps, json, okEnvelope('ok', 'Ariava CLI', { commands: commandSummary(), runtime: deps.inspectRuntime() }), formatHelp()); break;
-      case 'version': print(deps, json, okEnvelope('ok', CLI_VERSION, { version: CLI_VERSION, runtime: deps.inspectRuntime() }), CLI_VERSION); break;
       default: requireProductionRuntime(deps.inspectRuntime());
     }
     switch (command) {
+      case '--version':
       case '--help':
-      case 'help':
-      case 'version': break;
+      case 'help': break;
       case 'init': await runInit(deps, json); break;
       case 'config': await runConfig(deps, args.slice(1), json); break;
       case 'status': await runStatus(deps, args.slice(1), json); break;
@@ -1380,7 +1379,6 @@ const IDENTITY_MANAGED_CONFIG_KEYS = new Set([
 function commandSummary(): string[] {
   return [
     'ariava setup [--extension pi ... | --no-extensions] [--resume] [--json] [--yes] [--relay-base-url <URL>]',
-    'ariava version',
     'ariava init',
     'ariava status [pi]',
     'ariava pair <PAIRING_CODE> [--codes-match]',

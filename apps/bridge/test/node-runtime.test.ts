@@ -39,7 +39,7 @@ describe('production Node runtime contract', () => {
       createServiceManager: () => { serviceManagerCreated = true; throw new Error('must not run'); },
     };
     expect(await runPublicCli(['help', '--json'], deps)).toBe(0);
-    expect(await runPublicCli(['version', '--json'], deps)).toBe(0);
+    expect(await runPublicCli(['--version', '--json'], deps)).toBe(0);
     expect(await runPublicCli(['init', '--json'], deps)).toBe(1);
     expect(serviceManagerCreated).toBe(false);
     expect(errors.text()).toContain('ERR_NODE_RUNTIME_UNSUPPORTED');
