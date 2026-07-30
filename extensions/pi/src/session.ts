@@ -9,6 +9,8 @@ export interface PiSessionInfo {
   provider: 'pi';
   projectName: string;
   cwd: string;
+  hbaseSessionKey?: string;
+  harnessProvider?: 'pi';
   rawSessionName?: string;
   nameText: string;
   openingText?: string;
@@ -145,7 +147,7 @@ export function fallbackAssistantForEventType(type: EventType, session: Pick<PiS
   switch (type) {
     case 'done': return 'Task complete';
     case 'blocked': return 'Review needed on desktop';
-    case 'question_requested': return 'Agent has a question';
+    case 'question_requested': return 'Agent needs input';
     case 'working': return `${session.nameText} is running`;
     case 'driver_error': return 'Driver error';
     case 'host_unavailable': return 'Host unavailable';
@@ -156,9 +158,9 @@ export function fallbackAssistantForEventType(type: EventType, session: Pick<PiS
 export function normalizeAssistantTextForEvent(
   type: EventType,
   session: Pick<PiSessionInfo, 'nameText' | 'latestActivityText'>,
-  assistantText?: string,
+  agentText?: string,
 ): string {
-  return clampAssistantText(assistantText) ?? clampAssistantText(session.latestActivityText) ?? fallbackAssistantForEventType(type, session);
+  return clampAssistantText(agentText) ?? clampAssistantText(session.latestActivityText) ?? fallbackAssistantForEventType(type, session);
 }
 
 export function deriveSession(ctx: ExtensionContext): PiSessionInfo {
@@ -172,6 +174,8 @@ export function deriveSession(ctx: ExtensionContext): PiSessionInfo {
     provider: 'pi',
     projectName,
     cwd,
+    hbaseSessionKey: deriveSessionId(ctx),
+    harnessProvider: 'pi',
     rawSessionName,
     nameText: deriveNameText(rawSessionName, projectName),
     openingText: clampAssistantText(firstUserText),

@@ -266,7 +266,17 @@ export class BridgeStateStore {
   rememberCommandResult(result: CommandResult): void { this.state.commandResults[result.commandId] = result; this.state.seenCommands[result.commandId] = result.updatedAt; this.persist(); }
 }
 
-function protectedMarkers(events: CanonicalEvent[]): string[] { return events.flatMap((event) => [event.assistantText, event.userMessageText, event.contextText, event.actionablePrompt?.label, ...(event.actionablePrompt?.options ?? [])]).filter((value): value is string => Boolean(value)); }
+function protectedMarkers(events: CanonicalEvent[]): string[] {
+  return events
+    .flatMap((event) => [
+      event.agentText,
+      event.humanText,
+      event.contextText,
+      event.actionablePrompt?.label,
+      ...(event.actionablePrompt?.options ?? []),
+    ])
+    .filter((value): value is string => Boolean(value));
+}
 function sessionHandleKey(hostId: string, sessionId: string): string { return `${hostId}:${sessionId}`; }
 function comparePendingHandles(left: PendingSessionHandle, right: PendingSessionHandle): number {
   const cursorCompare = (left.handledThroughEventCreatedAt ?? left.handledAt).localeCompare(right.handledThroughEventCreatedAt ?? right.handledAt);

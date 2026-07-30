@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 
-export type StoredAssistantClassification =
-  | { type: 'question_requested'; assistantText: string; fingerprint: string }
-  | { type: 'blocked'; assistantText: string; fingerprint: string; blockedReason: string }
-  | { type: 'done'; assistantText: string; fingerprint: string }
-  | { type: 'suppress_duplicate'; fingerprint: string; assistantText?: string; blockedReason?: string };
+export type StoredAgentTextClassification =
+  | { type: 'question_requested'; agentText: string; fingerprint: string }
+  | { type: 'blocked'; agentText: string; fingerprint: string; blockedReason: string }
+  | { type: 'done'; agentText: string; fingerprint: string }
+  | { type: 'suppress_duplicate'; fingerprint: string; agentText?: string; blockedReason?: string };
 
 export interface ClassifyStoredAssistantInput {
   sessionId: string;
@@ -40,22 +40,22 @@ const emittedFingerprints = new Set<string>();
 export function classifyStoredAssistantText(
   text: string | undefined,
   input: ClassifyStoredAssistantInput,
-): StoredAssistantClassification {
+): StoredAgentTextClassification {
   const normalizedText = text?.trim() ?? '';
   const fingerprint = buildFingerprint(input.sessionId, input.activeLeafId, normalizedText);
 
   if (emittedFingerprints.has(fingerprint)) return { type: 'suppress_duplicate', fingerprint };
 
   if (looksLikeQuestion(normalizedText)) {
-    return { type: 'question_requested', assistantText: normalizedText, fingerprint };
+    return { type: 'question_requested', agentText: normalizedText, fingerprint };
   }
 
   const blockedReason = extractBlockedReason(normalizedText);
-  if (blockedReason) return { type: 'blocked', assistantText: blockedReason, fingerprint, blockedReason };
+  if (blockedReason) return { type: 'blocked', agentText: blockedReason, fingerprint, blockedReason };
 
   return {
     type: 'done',
-    assistantText: normalizedText || 'Task complete',
+    agentText: normalizedText || 'Task complete',
     fingerprint,
   };
 }

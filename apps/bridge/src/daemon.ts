@@ -417,13 +417,13 @@ export class BridgeDaemon {
   private buildDriverErrorEvent(driverName: string, error: unknown): CanonicalEvent {
     return { eventId: createId('evt'), hostId: this.config.hostId, sessionId: `driver:${driverName}`, provider: driverName,
       type: 'driver_error', status: 'unknown', typeLabel: deriveEventTypeLabel('driver_error'),
-      assistantText: `Driver ${driverName} failed: ${this.formatError(error)}`, contextText: `driver:${driverName}`, createdAt: isoNow() };
+      agentText: `Driver ${driverName} failed: ${this.formatError(error)}`, contextText: `driver:${driverName}`, createdAt: isoNow() };
   }
 
   private buildBridgeFailureEvent(error: unknown): CanonicalEvent {
     return { eventId: createId('evt'), hostId: this.config.hostId, sessionId: `host:${this.config.hostId}`, provider: 'bridge',
       type: 'host_unavailable', status: 'unknown', typeLabel: deriveEventTypeLabel('host_unavailable'),
-      assistantText: `Bridge loop recovered from an error: ${this.formatError(error)}`, contextText: this.config.hostName, createdAt: isoNow() };
+      agentText: `Bridge loop recovered from an error: ${this.formatError(error)}`, contextText: this.config.hostName, createdAt: isoNow() };
   }
 
   private formatError(error: unknown): string {

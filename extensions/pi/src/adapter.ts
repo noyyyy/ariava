@@ -68,6 +68,8 @@ export class AgentAdapterClient implements AgentAdapter {
       body.openingText = currentSession.openingText ?? null;
       body.projectName = currentSession.projectName;
       body.nameText = currentSession.nameText;
+      body.hbaseSessionKey = currentSession.hbaseSessionKey ?? currentSession.sessionId;
+      body.harnessProvider = currentSession.harnessProvider ?? currentSession.provider;
     }
     const path = `/v1/agent/sessions/${encodeURIComponent(sessionId)}/heartbeat`;
     const response = await this.fetchResponse('POST', path, body);

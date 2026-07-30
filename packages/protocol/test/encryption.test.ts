@@ -74,15 +74,15 @@ describe('E2E protocol v1', () => {
 
   test('encodes protected plaintext with dedicated deterministic key order', () => {
     expect(new TextDecoder().decode(buildProtectedEventContentBytes({
-      contextText: 'context', version: 1, assistantText: 'answer', userMessageText: 'question',
+      contextText: 'context', version: 1, agentText: 'answer', humanText: 'question',
       actionablePrompt: { type: 'question', promptId: 'prompt_1', label: 'Choose', options: ['A'], expiresAt: '2026-07-20T00:01:00.000Z' },
-    }))).toBe('{"version":1,"assistantText":"answer","userMessageText":"question","contextText":"context","actionablePrompt":{"promptId":"prompt_1","type":"question","label":"Choose","options":["A"],"expiresAt":"2026-07-20T00:01:00.000Z"}}');
+    }))).toBe('{"version":1,"agentText":"answer","humanText":"question","contextText":"context","actionablePrompt":{"promptId":"prompt_1","type":"question","label":"Choose","options":["A"],"expiresAt":"2026-07-20T00:01:00.000Z"}}');
     expect(new TextDecoder().decode(buildProtectedSessionContentBytes({ latestActivityText: 'latest', version: 1, projectName: 'ariava', nameText: 'session' })))
       .toBe('{"version":1,"projectName":"ariava","nameText":"session","latestActivityText":"latest"}');
     expect(new TextDecoder().decode(buildProtectedReplyContentBytes({ text: 'continue', version: 1 })))
       .toBe('{"version":1,"text":"continue"}');
     expect(() => buildProtectedReplyContentBytes({ version: 1, text: 'continue', extra: true } as any)).toThrow();
-    expect(() => buildProtectedEventContentBytes({ version: 1, assistantText: 'answer', extra: true } as any)).toThrow();
+    expect(() => buildProtectedEventContentBytes({ version: 1, agentText: 'answer', extra: true } as any)).toThrow();
   });
 
   test('changes canonical bytes when generation, epoch, or direction changes', () => {

@@ -17,7 +17,7 @@ describe('classifyStoredAssistantText', () => {
     });
 
     expect(result.type).toBe('question_requested');
-    expect(result.assistantText).toBe('What should I name this file?');
+    expect(result.agentText).toBe('What should I name this file?');
   });
 
   test('classifies stored explicit blocked evidence', () => {
@@ -26,7 +26,7 @@ describe('classifyStoredAssistantText', () => {
     });
 
     expect(result.type).toBe('blocked');
-    expect(result.assistantText).toContain('credentials');
+    expect(result.agentText).toContain('credentials');
   });
 
   test('classifies stable stored text as done by default', () => {
@@ -35,13 +35,13 @@ describe('classifyStoredAssistantText', () => {
     });
 
     expect(result.type).toBe('done');
-    expect(result.assistantText).toBe('I have updated the configuration file.');
+    expect(result.agentText).toBe('I have updated the configuration file.');
   });
 
   test('uses the stable done fallback for empty stored text', () => {
     const result = classifyStoredAssistantText(undefined, { sessionId: 'session-1' });
     expect(result.type).toBe('done');
-    expect(result.assistantText).toBe('Task complete');
+    expect(result.agentText).toBe('Task complete');
   });
 
   test('suppresses an emitted fingerprint in the same session and active leaf', () => {

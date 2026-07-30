@@ -27,9 +27,13 @@ export interface CanonicalEvent {
   type: EventType;
   status: SessionStatus;
   typeLabel: string;
-  assistantText: string;
-  userMessageText?: string;
+  agentText: string;
+  humanText?: string;
+  projectName?: string;
   contextText?: string;
+  workingDirectory?: string;
+  hbaseSessionKey?: string;
+  harnessProvider?: string;
   actionablePrompt?: ActionablePrompt;
   correlationId?: string;
   createdAt: string;

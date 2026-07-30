@@ -8,7 +8,7 @@ setDefaultTimeout(60_000);
 
 const QUIET_WAIT_MS = 1_650;
 type Handler = (event: any, ctx: ExtensionContext) => Promise<void> | void;
-type PushedEvent = { type?: string; status?: string; assistantText?: string; userMessageText?: string };
+type PushedEvent = { type?: string; status?: string; agentText?: string; humanText?: string };
 
 function makeAdapter(pushedEvents: PushedEvent[], overrides: Partial<AgentAdapter> = {}): AgentAdapter {
   let eventSequence = 0;
@@ -175,8 +175,8 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await Bun.sleep(QUIET_WAIT_MS);
 
     expect(harness.terminalEvents()).toHaveLength(1);
-    expect(lastTerminal(harness)).toMatchObject({ type: 'done', assistantText: finalText });
-    expect(lastTerminal(harness)?.assistantText).not.toContain(earlierError ?? 'Partial output');
+    expect(lastTerminal(harness)).toMatchObject({ type: 'done', agentText: finalText });
+    expect(lastTerminal(harness)?.agentText).not.toContain(earlierError ?? 'Partial output');
     await harness.shutdown();
   });
 
@@ -196,7 +196,7 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await Bun.sleep(QUIET_WAIT_MS);
 
     expect(harness.terminalEvents()).toHaveLength(1);
-    expect(lastTerminal(harness)).toMatchObject({ type: 'blocked', assistantText: preview });
+    expect(lastTerminal(harness)).toMatchObject({ type: 'blocked', agentText: preview });
     expect(harness.terminalEvents().some((event) => event.type === 'done')).toBe(false);
     await harness.shutdown();
   });
@@ -210,10 +210,10 @@ describe('ariavaPiExtension settled lifecycle', () => {
 
     const terminal = lastTerminal(harness);
     expect(terminal?.type).toBe('blocked');
-    expect(terminal?.assistantText).toStartWith('Pi stopped for an unsupported reason: future reason ');
-    expect(terminal?.assistantText).not.toMatch(/[\u0000-\u001F\u007F-\u009F\p{Cf}]/u);
-    expect(terminal?.assistantText?.length).toBeLessThanOrEqual(122);
-    expect(terminal?.assistantText).not.toContain('Provider partial output');
+    expect(terminal?.agentText).toStartWith('Pi stopped for an unsupported reason: future reason ');
+    expect(terminal?.agentText).not.toMatch(/[\u0000-\u001F\u007F-\u009F\p{Cf}]/u);
+    expect(terminal?.agentText?.length).toBeLessThanOrEqual(122);
+    expect(terminal?.agentText).not.toContain('Provider partial output');
     await harness.shutdown();
   });
 
@@ -224,7 +224,7 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await settleAndWait(harness);
     expect(lastTerminal(harness)).toMatchObject({
       type: 'blocked',
-      assistantText: 'Pi stopped for an unsupported reason.',
+      agentText: 'Pi stopped for an unsupported reason.',
     });
     await harness.shutdown();
   });
@@ -241,8 +241,8 @@ describe('ariavaPiExtension settled lifecycle', () => {
 
     expect(lastTerminal(harness)).toMatchObject({
       type: expectedType,
-      assistantText: text,
-      userMessageText: 'Please complete the task.',
+      agentText: text,
+      humanText: 'Please complete the task.',
     });
     await harness.shutdown();
   });
@@ -252,7 +252,7 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await harness.start();
     await end(harness, { text: 'Omitted reason completed normally.' });
     await settleAndWait(harness);
-    expect(lastTerminal(harness)).toMatchObject({ type: 'done', assistantText: 'Omitted reason completed normally.' });
+    expect(lastTerminal(harness)).toMatchObject({ type: 'done', agentText: 'Omitted reason completed normally.' });
     await harness.shutdown();
   });
 
@@ -289,7 +289,7 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await Bun.sleep(QUIET_WAIT_MS);
 
     expect(harness.terminalEvents()).toEqual([
-      expect.objectContaining({ type: 'done', assistantText: 'Final answer after queued follow-up.' }),
+      expect.objectContaining({ type: 'done', agentText: 'Final answer after queued follow-up.' }),
     ]);
     await harness.shutdown();
   });

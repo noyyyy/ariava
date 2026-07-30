@@ -150,7 +150,7 @@ describe('AgentAdapterRegistry', () => {
         status: 'idle', latestActivityText: 'Old activity',
       });
       registry.pushEvent('sess-activity', {
-        type: 'working', status: 'working', assistantText: 'Running the integration suite',
+        type: 'working', status: 'working', agentText: 'Running the integration suite',
       });
       expect(registry.listSessions()[0]).toMatchObject({
         status: 'working', latestActivityText: 'Running the integration suite',
@@ -168,7 +168,7 @@ describe('AgentAdapterRegistry', () => {
       const eventId = registry.pushEvent('sess-1', {
         type: 'working',
         status: 'working',
-        assistantText: 'Agent is running',
+        agentText: 'Agent is running',
       });
 
       expect(typeof eventId).toBe('string');
@@ -178,7 +178,7 @@ describe('AgentAdapterRegistry', () => {
       expect(pending[0]?.sessionId).toBe('sess-1');
       expect(pending[0]?.provider).toBe('pi');
       expect(pending[0]?.type).toBe('working');
-      expect(pending[0]?.assistantText).toBe('Agent is running');
+      expect(pending[0]?.agentText).toBe('Agent is running');
     } finally {
       cleanup();
     }
@@ -192,14 +192,13 @@ describe('AgentAdapterRegistry', () => {
       registry.pushEvent('sess-1', {
         type: 'question_requested',
         status: 'blocked',
-        assistantText: 'Which environment should I target?',
-        assistantText: 'Which environment should I target?',
-        userMessageText: 'Deploy the latest build.',
+        agentText: 'Which environment should I target?',
+        humanText: 'Deploy the latest build.',
       });
 
       const pending = store.peekPendingEvents();
-      expect(pending[0]?.assistantText).toBe('Which environment should I target?');
-      expect(pending[0]?.userMessageText).toBe('Deploy the latest build.');
+      expect(pending[0]?.agentText).toBe('Which environment should I target?');
+      expect(pending[0]?.humanText).toBe('Deploy the latest build.');
     } finally {
       cleanup();
     }
@@ -210,15 +209,15 @@ describe('AgentAdapterRegistry', () => {
     try {
       const registry = new AgentAdapterRegistry('host-1', store);
       registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', cwd: '/' });
-      const assistantText = "First line\n\n  - indented item\n    code-ish spacing";
+      const agentText = "First line\n\n  - indented item\n    code-ish spacing";
 
       registry.pushEvent('sess-1', {
         type: 'done',
         status: 'done',
-        assistantText,
+        agentText,
       });
 
-      expect(store.peekPendingEvents()[0]?.assistantText).toBe(assistantText);
+      expect(store.peekPendingEvents()[0]?.agentText).toBe(agentText);
     } finally {
       cleanup();
     }
@@ -229,14 +228,14 @@ describe('AgentAdapterRegistry', () => {
     try {
       const registry = new AgentAdapterRegistry('host-1', store);
       registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'Task' });
-      registry.pushEvent('sess-1', { type: 'done', status: 'done', assistantText: '' });
-      registry.pushEvent('sess-1', { type: 'blocked', status: 'blocked', assistantText: '   ' });
+      registry.pushEvent('sess-1', { type: 'done', status: 'done', agentText: '' });
+      registry.pushEvent('sess-1', { type: 'blocked', status: 'blocked', agentText: '   ' });
       registry.pushEvent('sess-1', { type: 'question_requested', status: 'blocked' });
 
       const pending = store.peekPendingEvents();
-      expect(pending[0]?.assistantText).toBe('Task complete');
-      expect(pending[1]?.assistantText).toBe('Review needed on desktop');
-      expect(pending[2]?.assistantText).toBe('Agent has a question');
+      expect(pending[0]?.agentText).toBe('Task complete');
+      expect(pending[1]?.agentText).toBe('Review needed on desktop');
+      expect(pending[2]?.agentText).toBe('Agent has a question');
     } finally {
       cleanup();
     }
@@ -253,9 +252,9 @@ describe('AgentAdapterRegistry', () => {
         cwd: '/',
         latestActivityText: 'Latest useful activity',
       });
-      registry.pushEvent('sess-1', { type: 'blocked', status: 'blocked', assistantText: '   ' });
+      registry.pushEvent('sess-1', { type: 'blocked', status: 'blocked', agentText: '   ' });
 
-      expect(store.peekPendingEvents()[0]?.assistantText).toBe('Latest useful activity');
+      expect(store.peekPendingEvents()[0]?.agentText).toBe('Latest useful activity');
     } finally {
       cleanup();
     }
@@ -265,7 +264,7 @@ describe('AgentAdapterRegistry', () => {
     const { store, cleanup } = makeStore();
     try {
       const registry = new AgentAdapterRegistry('host-1', store);
-      expect(() => registry.pushEvent('missing', { type: 'done', status: 'done', assistantText: '' })).toThrow(
+      expect(() => registry.pushEvent('missing', { type: 'done', status: 'done', agentText: '' })).toThrow(
         /not registered/,
       );
     } finally {
@@ -344,8 +343,8 @@ describe('AgentAdapterRegistry terminal alert guard', () => {
       const command = makeCommand('sess-1');
       registry.enqueueCommand(command);
 
-      registry.pushEvent('sess-1', { type: 'done', status: 'done', assistantText: 'First done' });
-      registry.pushEvent('sess-1', { type: 'blocked', status: 'blocked', assistantText: 'Latest blocker' });
+      registry.pushEvent('sess-1', { type: 'done', status: 'done', agentText: 'First done' });
+      registry.pushEvent('sess-1', { type: 'blocked', status: 'blocked', agentText: 'Latest blocker' });
       expect(store.peekPendingEvents()).toHaveLength(0);
 
       await registry.dequeueCommand('sess-1', 0);
@@ -362,7 +361,7 @@ describe('AgentAdapterRegistry terminal alert guard', () => {
       const pending = store.peekPendingEvents();
       expect(pending).toHaveLength(1);
       expect(pending[0]?.type).toBe('blocked');
-      expect(pending[0]?.assistantText).toBe('Latest blocker');
+      expect(pending[0]?.agentText).toBe('Latest blocker');
     } finally {
       cleanup();
     }
@@ -374,7 +373,7 @@ describe('AgentAdapterRegistry terminal alert guard', () => {
       const registry = new AgentAdapterRegistry('host-1', store);
       registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', cwd: '/' });
       registry.enqueueCommand(makeCommand('sess-1'));
-      registry.pushEvent('sess-1', { type: 'working', status: 'working', assistantText: 'Still running' });
+      registry.pushEvent('sess-1', { type: 'working', status: 'working', agentText: 'Still running' });
       expect(store.peekPendingEvents()).toHaveLength(1);
       expect(store.peekPendingEvents()[0]?.type).toBe('working');
     } finally {

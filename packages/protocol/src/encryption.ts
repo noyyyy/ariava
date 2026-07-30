@@ -149,9 +149,13 @@ export interface ProtectedActionablePromptV1 {
 
 export interface ProtectedEventContentV1 {
   version: 1;
-  assistantText: string;
-  userMessageText?: string;
+  agentText: string;
+  humanText?: string;
+  projectName?: string;
   contextText?: string;
+  workingDirectory?: string;
+  hbaseSessionKey?: string;
+  harnessProvider?: string;
   actionablePrompt?: ProtectedActionablePromptV1;
 }
 
@@ -161,6 +165,9 @@ export interface ProtectedSessionContentV1 {
   nameText: string;
   openingText?: string;
   latestActivityText?: string;
+  workingDirectory?: string;
+  hbaseSessionKey?: string;
+  harnessProvider?: string;
 }
 
 export interface ProtectedReplyContentV1 { version: 1; text: string }
@@ -277,9 +284,13 @@ export function buildProtectedEventContentBytes(content: ProtectedEventContentV1
   assertProtectedEventContent(content);
   return encoder.encode(JSON.stringify({
     version: 1,
-    assistantText: content.assistantText,
-    ...(content.userMessageText === undefined ? {} : { userMessageText: content.userMessageText }),
+    agentText: content.agentText,
+    ...(content.humanText === undefined ? {} : { humanText: content.humanText }),
+    ...(content.projectName === undefined ? {} : { projectName: content.projectName }),
     ...(content.contextText === undefined ? {} : { contextText: content.contextText }),
+    ...(content.workingDirectory === undefined ? {} : { workingDirectory: content.workingDirectory }),
+    ...(content.hbaseSessionKey === undefined ? {} : { hbaseSessionKey: content.hbaseSessionKey }),
+    ...(content.harnessProvider === undefined ? {} : { harnessProvider: content.harnessProvider }),
     ...(content.actionablePrompt === undefined ? {} : { actionablePrompt: {
       promptId: content.actionablePrompt.promptId,
       type: 'question',
@@ -298,6 +309,9 @@ export function buildProtectedSessionContentBytes(content: ProtectedSessionConte
     nameText: content.nameText,
     ...(content.openingText === undefined ? {} : { openingText: content.openingText }),
     ...(content.latestActivityText === undefined ? {} : { latestActivityText: content.latestActivityText }),
+    ...(content.workingDirectory === undefined ? {} : { workingDirectory: content.workingDirectory }),
+    ...(content.hbaseSessionKey === undefined ? {} : { hbaseSessionKey: content.hbaseSessionKey }),
+    ...(content.harnessProvider === undefined ? {} : { harnessProvider: content.harnessProvider }),
   }));
 }
 
@@ -423,10 +437,14 @@ function assertValidEncryptionBinding(binding: Omit<EncryptionKeyBindingV1, 'bin
 }
 
 function assertProtectedEventContent(content: ProtectedEventContentV1): void {
-  assertExactKeys(content, ['version', 'assistantText', 'userMessageText', 'contextText', 'actionablePrompt'], 'protected event content');
-  if (content.version !== 1 || typeof content.assistantText !== 'string'
-    || (content.userMessageText !== undefined && typeof content.userMessageText !== 'string')
+  assertExactKeys(content, ['version', 'agentText', 'humanText', 'projectName', 'contextText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider', 'actionablePrompt'], 'protected event content');
+  if (content.version !== 1 || typeof content.agentText !== 'string'
+    || (content.humanText !== undefined && typeof content.humanText !== 'string')
+    || (content.projectName !== undefined && typeof content.projectName !== 'string')
     || (content.contextText !== undefined && typeof content.contextText !== 'string')
+    || (content.workingDirectory !== undefined && typeof content.workingDirectory !== 'string')
+    || (content.hbaseSessionKey !== undefined && typeof content.hbaseSessionKey !== 'string')
+    || (content.harnessProvider !== undefined && typeof content.harnessProvider !== 'string')
     || encoder.encode(JSON.stringify(content)).byteLength > E2E_LIMITS.eventPlaintextBytes) {
     throw new TypeError('protected event content is invalid');
   }
@@ -442,10 +460,13 @@ function assertProtectedEventContent(content: ProtectedEventContentV1): void {
 }
 
 function assertProtectedSessionContent(content: ProtectedSessionContentV1): void {
-  assertExactKeys(content, ['version', 'projectName', 'nameText', 'openingText', 'latestActivityText'], 'protected session content');
+  assertExactKeys(content, ['version', 'projectName', 'nameText', 'openingText', 'latestActivityText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider'], 'protected session content');
   if (content.version !== 1 || typeof content.projectName !== 'string' || typeof content.nameText !== 'string'
     || (content.openingText !== undefined && typeof content.openingText !== 'string')
     || (content.latestActivityText !== undefined && typeof content.latestActivityText !== 'string')
+    || (content.workingDirectory !== undefined && typeof content.workingDirectory !== 'string')
+    || (content.hbaseSessionKey !== undefined && typeof content.hbaseSessionKey !== 'string')
+    || (content.harnessProvider !== undefined && typeof content.harnessProvider !== 'string')
     || encoder.encode(JSON.stringify(content)).byteLength > E2E_LIMITS.sessionPlaintextBytes) {
     throw new TypeError('protected session content is invalid');
   }

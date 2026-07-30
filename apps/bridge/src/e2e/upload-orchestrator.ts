@@ -163,12 +163,12 @@ export class EncryptedUploadOrchestrator {
 
 function syntheticSessionForEvent(event: import('@ariava/protocol').CanonicalEvent): import('@ariava/protocol').CanonicalSessionState {
   return { sessionId: event.sessionId, hostId: event.hostId, provider: event.provider, projectName: 'system',
-    nameText: event.contextText ?? event.sessionId, latestActivityText: event.assistantText, stateLabel: 'Unknown', status: event.status, updatedAt: event.createdAt };
+    nameText: event.contextText ?? event.sessionId, latestActivityText: event.agentText, stateLabel: 'Unknown', status: event.status, updatedAt: event.createdAt };
 }
 function eventEncryptionInput(event: import('@ariava/protocol').CanonicalEvent, session: import('@ariava/protocol').CanonicalSessionState) {
   return { event: { eventId: event.eventId, hostId: event.hostId, sessionId: event.sessionId, provider: event.provider, type: event.type, status: event.status,
-    ...(event.correlationId ? { correlationId: event.correlationId } : {}), createdAt: event.createdAt }, protectedEvent: { version: 1 as const, assistantText: event.assistantText,
-    ...(event.userMessageText !== undefined ? { userMessageText: event.userMessageText } : {}), ...(event.contextText !== undefined ? { contextText: event.contextText } : {}),
+    ...(event.correlationId ? { correlationId: event.correlationId } : {}), createdAt: event.createdAt }, protectedEvent: { version: 1 as const, agentText: event.agentText,
+    ...(event.humanText !== undefined ? { humanText: event.humanText } : {}), ...(event.contextText !== undefined ? { contextText: event.contextText } : {}),
     ...(event.actionablePrompt ? { actionablePrompt: event.actionablePrompt } : {}) }, ...sessionEncryptionInput(session) };
 }
 function sessionEncryptionInput(session: import('@ariava/protocol').CanonicalSessionState) {

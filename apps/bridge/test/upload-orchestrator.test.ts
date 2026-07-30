@@ -32,7 +32,7 @@ describe('EncryptedUploadOrchestrator', () => {
       latestActivityText: 'historical working activity', stateLabel: 'Working', status: 'working' as const, updatedAt: '2026-08-01T00:00:00.000Z' };
     stateStore.replaceDriverSessions('pi', [workingSession]);
     stateStore.queuePendingEvent({ eventId: 'event-working', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'working', status: 'working',
-      typeLabel: 'Working', assistantText: 'historical event content', createdAt: '2026-08-01T00:00:01.000Z' });
+      typeLabel: 'Working', agentText: 'historical event content', createdAt: '2026-08-01T00:00:01.000Z' });
     stateStore.replaceDriverSessions('pi', [{ ...workingSession, latestActivityText: 'latest blocked activity', stateLabel: 'Blocked', status: 'blocked', updatedAt: '2026-08-01T00:00:02.000Z' }]);
 
     const eventUploads: any[] = []; const sessionUploads: any[] = [];
@@ -49,7 +49,7 @@ describe('EncryptedUploadOrchestrator', () => {
     expect(flushed).toBe(1);
     expect(eventUploads).toHaveLength(1);
     expect(eventUploads[0].event).toMatchObject({ eventId: 'event-working', status: 'working' });
-    expect(openMockedContent(eventUploads[0].event.content)).toEqual({ version: 1, assistantText: 'historical event content' });
+    expect(openMockedContent(eventUploads[0].event.content)).toEqual({ version: 1, agentText: 'historical event content' });
     expect(eventUploads[0].session).toMatchObject({ sessionId: 'session-test', status: 'blocked', updatedAt: '2026-08-01T00:00:02.000Z', revision: 2 });
     expect(openMockedContent(eventUploads[0].session.content)).toEqual({ version: 1, projectName: 'project', nameText: 'Session', latestActivityText: 'latest blocked activity' });
     expect(sessionUploads.map((session) => ({ revision: session.revision, status: session.status }))).toEqual([{ revision: 1, status: 'blocked' }]);

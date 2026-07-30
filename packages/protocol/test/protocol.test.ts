@@ -21,7 +21,7 @@ import {
 
 const baseEvent: CanonicalEvent = {
   eventId: 'evt_1', hostId: 'host_1', sessionId: 'sess_1', provider: 'pi', type: 'blocked', status: 'blocked',
-  typeLabel: 'Session blocked', assistantText: 'Needs help', createdAt: '2026-06-28T10:00:00Z',
+  typeLabel: 'Session blocked', agentText: 'Needs help', createdAt: '2026-06-28T10:00:00Z',
 };
 
 describe('protocol helpers', () => {

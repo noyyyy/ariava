@@ -10,8 +10,8 @@ import { normalizeAssistantTextForEvent } from './session';
 export interface EventBuilderInput {
   type: EventType;
   status: SessionStatus;
-  assistantText: string;
-  userMessageText?: string;
+  agentText?: string;
+  humanText?: string;
   contextText?: string;
   actionablePrompt?: {
     promptId: string;
@@ -30,49 +30,53 @@ export function buildEvent(session: PiSessionInfo, input: EventBuilderInput): Pa
     type: input.type,
     status: input.status,
     typeLabel: deriveEventTypeLabel(input.type),
-    assistantText: normalizeAssistantTextForEvent(input.type, session, input.assistantText),
-    userMessageText: input.userMessageText,
+    agentText: normalizeAssistantTextForEvent(input.type, session, input.agentText),
+    humanText: input.humanText,
+    projectName: session.projectName,
     contextText: input.contextText,
+    workingDirectory: session.cwd,
+    hbaseSessionKey: session.hbaseSessionKey ?? session.sessionId,
+    harnessProvider: session.harnessProvider ?? session.provider,
     actionablePrompt: input.actionablePrompt,
     correlationId: input.correlationId,
   };
 }
 
-export function buildWorkingEvent(session: PiSessionInfo, assistantText?: string): Partial<CanonicalEvent> {
+export function buildWorkingEvent(session: PiSessionInfo, agentText?: string): Partial<CanonicalEvent> {
   return buildEvent(session, {
     type: 'working',
     status: 'working',
-    assistantText: normalizeAssistantTextForEvent('working', session, assistantText),
+    agentText,
     contextText: buildContextText(session),
   });
 }
 
-export function buildDoneEvent(session: PiSessionInfo, assistantText?: string, userMessageText?: string): Partial<CanonicalEvent> {
+export function buildDoneEvent(session: PiSessionInfo, agentText?: string, humanText?: string): Partial<CanonicalEvent> {
   return buildEvent(session, {
     type: 'done',
     status: 'done',
-    assistantText: normalizeAssistantTextForEvent('done', session, assistantText),
-    userMessageText,
+    agentText,
+    humanText,
     contextText: buildContextText(session),
   });
 }
 
-export function buildBlockedEvent(session: PiSessionInfo, assistantText?: string, userMessageText?: string): Partial<CanonicalEvent> {
+export function buildBlockedEvent(session: PiSessionInfo, agentText?: string, humanText?: string): Partial<CanonicalEvent> {
   return buildEvent(session, {
     type: 'blocked',
     status: 'blocked',
-    assistantText: normalizeAssistantTextForEvent('blocked', session, assistantText),
-    userMessageText,
+    agentText,
+    humanText,
     contextText: buildContextText(session),
   });
 }
 
-export function buildQuestionEvent(session: PiSessionInfo, question: string, userMessageText?: string): Partial<CanonicalEvent> {
+export function buildQuestionEvent(session: PiSessionInfo, question: string, humanText?: string): Partial<CanonicalEvent> {
   return buildEvent(session, {
     type: 'question_requested',
     status: 'blocked',
-    assistantText: normalizeAssistantTextForEvent('question_requested', session, question),
-    userMessageText,
+    agentText: question,
+    humanText,
     contextText: buildContextText(session),
     actionablePrompt: {
       promptId: `question-${Date.now()}`,
@@ -91,6 +95,9 @@ export function toCanonicalSessionState(session: PiSessionInfo) {
     nameText: session.nameText,
     openingText: session.openingText,
     latestActivityText: session.latestActivityText,
+    workingDirectory: session.cwd,
+    hbaseSessionKey: session.hbaseSessionKey ?? session.sessionId,
+    harnessProvider: session.harnessProvider ?? session.provider,
     stateLabel: statusToStateLabel(session.status),
     status: session.status,
     updatedAt: new Date().toISOString(),
@@ -108,10 +115,10 @@ function buildContextText(session: Pick<PiSessionInfo, 'nameText' | 'projectName
 
 function deriveEventTypeLabel(type: EventType): string {
   switch (type) {
-    case 'question_requested': return 'Agent question';
-    case 'blocked': return 'Session blocked';
-    case 'done': return 'Task complete';
-    case 'working': return 'In progress';
+    case 'question_requested': return 'Human';
+    case 'blocked':
+    case 'done':
+    case 'working': return 'Agent';
     case 'driver_error': return 'Driver error';
     case 'host_unavailable': return 'Host unavailable';
   }

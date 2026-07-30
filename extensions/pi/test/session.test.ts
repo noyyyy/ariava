@@ -146,13 +146,13 @@ describe('active preview extraction', () => {
   });
 
   test('preserves assistant text line breaks and spacing when normalizing event text', () => {
-    const assistantText = "First line\n\n  - indented item\n    code-ish spacing";
+    const agentText = "First line\n\n  - indented item\n    code-ish spacing";
     const session = {
       nameText: 'pi · ariava',
       latestActivityText: undefined,
     } as const;
 
-    expect(normalizeAssistantTextForEvent('done', session, assistantText)).toBe(assistantText);
+    expect(normalizeAssistantTextForEvent('done', session, agentText)).toBe(agentText);
   });
 
   test('returns undefined when no text exists', () => {

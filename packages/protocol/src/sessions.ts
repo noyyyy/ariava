@@ -11,6 +11,9 @@ export interface CanonicalSessionState {
   nameText: string;
   openingText?: string;
   latestActivityText?: string;
+  workingDirectory?: string;
+  hbaseSessionKey?: string;
+  harnessProvider?: string;
   stateLabel: string;
   status: SessionStatus;
   actionablePrompt?: ActionablePrompt;
@@ -38,6 +41,9 @@ export interface SessionSummaryAssistant {
   nameText: string;
   openingText?: string;
   latestActivityText?: string;
+  workingDirectory?: string;
+  hbaseSessionKey?: string;
+  harnessProvider?: string;
   stateLabel: string;
   status: SessionStatus;
   updatedAt: string;

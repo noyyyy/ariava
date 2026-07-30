@@ -6,9 +6,9 @@ const DEFAULT_MAX_RECENT_ENTRIES = 20;
 
 export function generateSummary(ctx: ExtensionContext, maxLength = 180): string {
   const entries = ctx.sessionManager?.getEntries?.() ?? [];
-  const assistantTexts: string[] = [];
+  const agentTexts: string[] = [];
 
-  for (let i = entries.length - 1; i >= 0 && assistantTexts.length < DEFAULT_MAX_RECENT_ENTRIES; i--) {
+  for (let i = entries.length - 1; i >= 0 && agentTexts.length < DEFAULT_MAX_RECENT_ENTRIES; i--) {
     const entry = entries[i];
     if (entry?.type !== 'message') continue;
     const message = (entry as { message: AgentMessage }).message;
@@ -16,11 +16,11 @@ export function generateSummary(ctx: ExtensionContext, maxLength = 180): string 
 
     const text = extractText(message);
     if (text) {
-      assistantTexts.unshift(text);
+      agentTexts.unshift(text);
     }
   }
 
-  const combined = assistantTexts.join(' ').trim();
+  const combined = agentTexts.join(' ').trim();
   return clampText(combined, maxLength);
 }
 

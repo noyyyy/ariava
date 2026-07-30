@@ -34,15 +34,15 @@ const ERROR_PREVIEW_MAX_LENGTH = 240;
 type LatestAgentEndResult = {
   assistantFound: boolean;
   stopReason?: string;
-  assistantText?: string;
+  agentText?: string;
   errorText?: string;
 };
 
 type PendingTerminalAlert = {
   type: 'done' | 'blocked' | 'question_requested';
-  assistantText: string;
+  agentText: string;
   fingerprint?: string;
-  userMessageText?: string;
+  humanText?: string;
   createdAt: string;
   flowRevision: number;
 };
@@ -115,9 +115,9 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     });
   }
 
-  async function pushWorking(ctx: ExtensionContext, assistantText?: string) {
+  async function pushWorking(ctx: ExtensionContext, agentText?: string) {
     if (!session || !state?.rootSessionActive) return;
-    const latestActivityText = normalizeAssistantTextForEvent('working', session, assistantText ?? deriveLatestActivityText(ctx));
+    const latestActivityText = normalizeAssistantTextForEvent('working', session, agentText ?? deriveLatestActivityText(ctx));
     session = withSessionStatus(session, 'working', latestActivityText);
     heartbeatContext.status = 'working';
     heartbeatContext.latestActivityText = session.latestActivityText;
@@ -141,7 +141,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       return {
         assistantFound: true,
         stopReason: typeof message.stopReason === 'string' ? message.stopReason : undefined,
-        assistantText: extractTextContent(message.content),
+        agentText: extractTextContent(message.content),
         errorText: stringifyErrorLike(message.errorMessage) ?? stringifyErrorLike(message.error),
       };
     }
@@ -195,20 +195,20 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   async function emitTerminalAlert(alert: PendingTerminalAlert) {
     if (!session || !state?.rootSessionActive || state.flowRevision !== alert.flowRevision) return;
 
-    const normalizedAssistant = normalizeAssistantTextForEvent(alert.type, session, alert.assistantText);
+    const normalizedAgentText = normalizeAssistantTextForEvent(alert.type, session, alert.agentText);
     const sessionStatus = alert.type === 'done' ? 'done' : 'blocked';
-    session = withSessionStatus(session, sessionStatus, normalizedAssistant);
+    session = withSessionStatus(session, sessionStatus, normalizedAgentText);
     heartbeatContext.status = sessionStatus;
     heartbeatContext.latestActivityText = session.latestActivityText;
 
     const event = (() => {
       switch (alert.type) {
         case 'done':
-          return buildDoneEvent(session!, normalizedAssistant, alert.userMessageText);
+          return buildDoneEvent(session!, normalizedAgentText, alert.humanText);
         case 'blocked':
-          return buildBlockedEvent(session!, normalizedAssistant, alert.userMessageText);
+          return buildBlockedEvent(session!, normalizedAgentText, alert.humanText);
         case 'question_requested':
-          return buildQuestionEvent(session!, normalizedAssistant, alert.userMessageText);
+          return buildQuestionEvent(session!, normalizedAgentText, alert.humanText);
       }
     })();
 
@@ -275,14 +275,14 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   function submitTerminalCandidate(
     type: 'done' | 'blocked' | 'question_requested',
     ctx: ExtensionContext,
-    assistantText: string,
+    agentText: string,
     fingerprint?: string,
   ) {
     if (!session || !state?.rootSessionActive || state.terminalEmittedForCurrentLoop || state.latestPendingAlert) return;
     state.latestPendingAlert = {
       type,
-      assistantText: normalizeAssistantTextForEvent(type, session, assistantText),
-      userMessageText: deriveMessageTexts(ctx).latestUserText,
+      agentText: normalizeAssistantTextForEvent(type, session, agentText),
+      humanText: deriveMessageTexts(ctx).latestUserText,
       fingerprint,
       createdAt: new Date().toISOString(),
       flowRevision: state.flowRevision,
@@ -399,8 +399,8 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     clearQuietTimer(state);
 
     if (session && state?.rootSessionActive) {
-      const assistantText = clampAssistantText(deriveLatestActivityText(ctx) ?? 'pi session ended');
-      session = withSessionStatus(session, session.status, assistantText);
+      const agentText = clampAssistantText(deriveLatestActivityText(ctx) ?? 'pi session ended');
+      session = withSessionStatus(session, session.status, agentText);
       heartbeatContext.latestActivityText = session.latestActivityText;
     }
     if (sessionId) runAdapterTask('unregister session', () => adapter.unregisterSession(sessionId));
@@ -446,7 +446,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     loopState.agentEndConsumedForCurrentRun = true;
     loopState.loopRunning = false;
     loopState.latestAgentEndResult = extractLatestAssistantEnd(event.messages);
-    await pushWorking(ctx, loopState.latestAgentEndResult.errorText ?? loopState.latestAgentEndResult.assistantText);
+    await pushWorking(ctx, loopState.latestAgentEndResult.errorText ?? loopState.latestAgentEndResult.agentText);
   });
 
   pi.on('agent_settled', async (_event, ctx) => {
@@ -494,12 +494,12 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       return;
     }
 
-    const classification = classifyStoredAssistantText(result.assistantText, {
+    const classification = classifyStoredAssistantText(result.agentText, {
       sessionId: loopState.sessionId,
       activeLeafId: loopState.activeLeafId,
     });
     if (classification.type === 'suppress_duplicate') return;
-    submitTerminalCandidate(classification.type, ctx, classification.assistantText, classification.fingerprint);
+    submitTerminalCandidate(classification.type, ctx, classification.agentText, classification.fingerprint);
   });
 
   pi.on('session_tree', async (event, ctx) => {

@@ -75,7 +75,7 @@ export function buildSimulatedEvent(session: CanonicalSessionState, scenario: Si
     type,
     status: session.status,
     typeLabel,
-    assistantText:
+    agentText:
       scenario === 'question'
         ? 'Which environment should the rollout target?'
         : session.latestActivityText ?? 'Agent update',

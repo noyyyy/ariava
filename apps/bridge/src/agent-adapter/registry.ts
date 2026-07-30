@@ -186,8 +186,8 @@ export class AgentAdapterRegistry {
       type: eventType,
       status: event.status ?? session.status,
       typeLabel: event.typeLabel ?? deriveEventTypeLabel(eventType),
-      assistantText: normalizeEventAssistantText(eventType, event.assistantText, session),
-      userMessageText: event.userMessageText,
+      agentText: normalizeEventAgentText(eventType, event.agentText, session),
+      humanText: event.humanText,
       contextText: event.contextText ?? buildContextText(session),
       actionablePrompt: event.actionablePrompt,
       correlationId: event.correlationId,
@@ -196,8 +196,7 @@ export class AgentAdapterRegistry {
 
     const before = semanticFingerprint(session);
     if (event.status !== undefined) session.status = event.status;
-    const activity = event.assistantText?.trim();
-    if (activity) session.latestActivityText = event.assistantText;
+    if (event.agentText?.trim()) session.latestActivityText = event.agentText;
     if (semanticFingerprint(session) !== before) {
       session.semanticUpdatedAt = now;
       this.onMutation('semantic');
@@ -442,13 +441,13 @@ function buildContextText(session: RegisteredSession): string | undefined {
   return project || rawName || undefined;
 }
 
-function normalizeEventAssistantText(
+function normalizeEventAgentText(
   type: CanonicalEvent['type'],
-  assistantText: string | undefined,
+  agentText: string | undefined,
   session: Pick<RegisteredSession, 'latestActivityText' | 'nameText'>,
 ): string {
-  const eventAssistant = assistantText?.trim();
-  if (eventAssistant) return eventAssistant;
+  const eventAgentText = agentText?.trim();
+  if (eventAgentText) return eventAgentText;
 
   const latestActivityText = session.latestActivityText?.trim();
   if (latestActivityText) return latestActivityText;

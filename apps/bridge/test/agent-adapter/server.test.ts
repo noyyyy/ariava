@@ -85,7 +85,7 @@ describe('AgentAdapterServer', () => {
     const response = await fetch(url('/v1/agent/sessions/sess-1/events'), {
       method: 'POST',
       headers: headers(),
-      body: JSON.stringify({ type: 'working', status: 'working', assistantText: 'Running' }),
+      body: JSON.stringify({ type: 'working', status: 'working', agentText: 'Running' }),
     });
 
     expect(response.status).toBe(200);

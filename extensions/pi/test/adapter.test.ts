@@ -81,7 +81,7 @@ describe('AgentAdapterClient', () => {
       sessionId: session.sessionId,
       type: 'working',
       status: 'working',
-      assistantText: 'Running tests',
+      agentText: 'Running tests',
     });
 
     expect(typeof result.eventId).toBe('string');
