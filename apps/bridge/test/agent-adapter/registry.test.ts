@@ -50,6 +50,7 @@ describe('AgentAdapterRegistry', () => {
       expect(sessions[0]?.provider).toBe('pi');
       expect(sessions[0]?.projectName).toBe('deploy-tools');
       expect(sessions[0]?.nameText).toBe('Fix deploy');
+      expect(sessions[0]?.workingDirectory).toBe('/Users/demo/deploy-tools');
       expect(sessions[0]?.status).toBe('idle');
     } finally {
       cleanup();

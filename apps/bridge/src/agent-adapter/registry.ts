@@ -395,6 +395,7 @@ export class AgentAdapterRegistry {
       nameText: session.nameText,
       openingText: session.openingText,
       latestActivityText: session.latestActivityText,
+      workingDirectory: session.cwd,
       stateLabel: statusToStateLabel(session.status),
       status: session.status,
       updatedAt,

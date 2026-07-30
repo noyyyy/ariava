@@ -42,14 +42,6 @@ export function buildEvent(session: PiSessionInfo, input: EventBuilderInput): Pa
   };
 }
 
-export function buildWorkingEvent(session: PiSessionInfo, agentText?: string): Partial<CanonicalEvent> {
-  return buildEvent(session, {
-    type: 'working',
-    status: 'working',
-    agentText,
-    contextText: buildContextText(session),
-  });
-}
 
 export function buildDoneEvent(session: PiSessionInfo, agentText?: string, humanText?: string): Partial<CanonicalEvent> {
   return buildEvent(session, {

@@ -9,7 +9,7 @@ setDefaultTimeout(60_000);
 const QUIET_WAIT_MS = 1_650;
 type Handler = (event: any, ctx: ExtensionContext) => Promise<void> | void;
 type PushedEvent = { type?: string; status?: string; agentText?: string; humanText?: string };
-
+type HeartbeatCall = { sessionId: string; status: string; latestActivityText?: string | null };
 function makeAdapter(pushedEvents: PushedEvent[], overrides: Partial<AgentAdapter> = {}): AgentAdapter {
   let eventSequence = 0;
   return {
@@ -41,6 +41,7 @@ function createHarness(options: {
 } = {}) {
   const handlers = new Map<string, Handler>();
   const pushedEvents: PushedEvent[] = [];
+  const heartbeats: HeartbeatCall[] = [];
   const runtime = { idle: true, pending: false };
   let sessionId = options.sessionId ?? 'sess-1';
   let leafId = options.leafId ?? 'leaf-1';
@@ -62,10 +63,17 @@ function createHarness(options: {
     hasPendingMessages: () => runtime.pending,
   } as unknown as ExtensionContext;
 
-  ariavaPiExtension(pi, makeAdapter(pushedEvents, options.adapter));
+  ariavaPiExtension(pi, makeAdapter(pushedEvents, {
+    ...options.adapter,
+    heartbeat: async (heartbeatSessionId, status, latestActivityText) => {
+      heartbeats.push({ sessionId: heartbeatSessionId, status, latestActivityText });
+      await options.adapter?.heartbeat?.(heartbeatSessionId, status, latestActivityText);
+    },
+  }));
 
   return {
     pushedEvents,
+    heartbeats,
     runtime,
     ctx,
     setSessionId: (value: string) => { sessionId = value; },
@@ -151,7 +159,22 @@ describe('ariavaPiExtension settled lifecycle', () => {
 
     await Bun.sleep(QUIET_WAIT_MS);
     expect(harness.terminalEvents()).toEqual([]);
-    expect(harness.pushedEvents.at(-1)?.type).toBe('working');
+    expect(harness.pushedEvents).toEqual([]);
+    await harness.shutdown();
+  });
+
+  test('agent_start updates working status without inventing running activity text', async () => {
+    const harness = createHarness();
+    await harness.start();
+
+    await harness.emit('agent_start');
+
+    expect(harness.heartbeats.at(-1)).toEqual({
+      sessionId: 'sess-1',
+      status: 'working',
+      latestActivityText: null,
+    });
+    expect(harness.pushedEvents).toEqual([]);
     await harness.shutdown();
   });
 
@@ -463,11 +486,16 @@ describe('unchanged extension integration behavior', () => {
 
   test('session_start and agent_start do not wait for adapter delivery', async () => {
     let registrationStarted = false;
+    let heartbeatStarted = false;
     let pushStarted = false;
     const harness = createHarness({
       adapter: {
         registerSession: () => {
           registrationStarted = true;
+          return new Promise(() => undefined);
+        },
+        heartbeat: () => {
+          heartbeatStarted = true;
           return new Promise(() => undefined);
         },
         pushEvent: () => {
@@ -486,7 +514,8 @@ describe('unchanged extension integration behavior', () => {
       Bun.sleep(50).then(() => 'timeout'),
     ])).resolves.toBe('returned');
     expect(registrationStarted).toBe(true);
-    expect(pushStarted).toBe(true);
+    expect(heartbeatStarted).toBe(true);
+    expect(pushStarted).toBe(false);
     await harness.shutdown();
   });
 
@@ -495,7 +524,7 @@ describe('unchanged extension integration behavior', () => {
     await harness.start();
     await harness.emit('agent_start');
     const eventCountBeforeTreeSwitch = harness.pushedEvents.length;
-    expect(eventCountBeforeTreeSwitch).toBe(1);
+    expect(eventCountBeforeTreeSwitch).toBe(0);
 
     harness.setLeafId('leaf-2');
     await harness.emit('session_tree', { newLeafId: 'leaf-2' });
@@ -521,7 +550,7 @@ describe('unchanged extension integration behavior', () => {
     await harness.emit('input');
     await Bun.sleep(20);
 
-    expect(handled).toEqual([{ sessionId: 'sess-1', eventId: 'event-2', action: 'pi_input' }]);
+    expect(handled).toEqual([{ sessionId: 'sess-1', eventId: 'event-1', action: 'pi_input' }]);
     await harness.shutdown();
   });
 

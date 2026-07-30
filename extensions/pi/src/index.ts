@@ -3,7 +3,7 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { AgentAdapterClient } from './adapter';
 import type { AgentAdapter } from './adapter-interface';
 import { executeCommand } from './commands';
-import { buildBlockedEvent, buildDoneEvent, buildQuestionEvent, buildWorkingEvent } from './events';
+import { buildBlockedEvent, buildDoneEvent, buildQuestionEvent } from './events';
 import { startHeartbeat, stopHeartbeat, type HeartbeatContext } from './heartbeat';
 import {
   classifyStoredAssistantText,
@@ -117,11 +117,19 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
 
   async function pushWorking(ctx: ExtensionContext, agentText?: string) {
     if (!session || !state?.rootSessionActive) return;
-    const latestActivityText = normalizeAssistantTextForEvent('working', session, agentText ?? deriveLatestActivityText(ctx));
+    const latestActivityText = normalizeAssistantTextForEvent(
+      'working',
+      session,
+      agentText ?? deriveLatestActivityText(ctx),
+      { allowFallback: false },
+    );
     session = withSessionStatus(session, 'working', latestActivityText);
     heartbeatContext.status = 'working';
     heartbeatContext.latestActivityText = session.latestActivityText;
-    runAdapterTask('push working event', () => adapter.pushEvent(buildWorkingEvent(session!, latestActivityText)));
+    const workingSession = session;
+    runAdapterTask('heartbeat working session', () =>
+      adapter.heartbeat(workingSession.sessionId, 'working', latestActivityText ?? null, workingSession),
+    );
   }
 
   function runtimeHasNewWork(ctx: ExtensionContext): boolean {

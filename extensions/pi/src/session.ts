@@ -159,8 +159,24 @@ export function normalizeAssistantTextForEvent(
   type: EventType,
   session: Pick<PiSessionInfo, 'nameText' | 'latestActivityText'>,
   agentText?: string,
-): string {
-  return clampAssistantText(agentText) ?? clampAssistantText(session.latestActivityText) ?? fallbackAssistantForEventType(type, session);
+  options?: { allowFallback?: true },
+): string;
+export function normalizeAssistantTextForEvent(
+  type: EventType,
+  session: Pick<PiSessionInfo, 'nameText' | 'latestActivityText'>,
+  agentText: string | undefined,
+  options: { allowFallback: false },
+): string | undefined;
+export function normalizeAssistantTextForEvent(
+  type: EventType,
+  session: Pick<PiSessionInfo, 'nameText' | 'latestActivityText'>,
+  agentText?: string,
+  options: { allowFallback?: boolean } = {},
+): string | undefined {
+  const normalized = clampAssistantText(agentText) ?? clampAssistantText(session.latestActivityText);
+  if (normalized) return normalized;
+  if (options.allowFallback === false) return undefined;
+  return fallbackAssistantForEventType(type, session);
 }
 
 export function deriveSession(ctx: ExtensionContext): PiSessionInfo {
