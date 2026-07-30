@@ -55,7 +55,7 @@
     "verify:linux:docker": "./scripts/verify-linux-docker.sh",
     "verify:host": "bun run ./scripts/verify-host.mjs",
     "verify": "bun run verify:shared",
-    "dev:setup": "bun run ./apps/bridge/src/dev-profile-cli.ts setup"
+    "dev:setup": "npm run build:bridge && node ./apps/bridge/dist/dev-profile-cli.js setup"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
