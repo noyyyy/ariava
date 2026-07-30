@@ -21,8 +21,8 @@ function assertPinnedActions(source: string) {
   const uses = source.split('\n').filter((line) => /^\s*uses:/u.test(line));
   expect(uses.length).toBeGreaterThan(0);
   for (const line of uses) expect(line, `action must use a reviewed full SHA: ${line.trim()}`).toMatch(FULL_SHA_ACTION);
-  expect(source).toMatch(/# actions\/checkout v4\.2\.2/u);
-  expect(source).toMatch(/# actions\/setup-node v4\.4\.0/u);
+  expect(source).toMatch(/# actions\/checkout v5\.1\.0/u);
+  expect(source).toMatch(/# actions\/setup-node v5\.0\.0/u);
 }
 
 function assertCiHostJob(source: string, options: { job: string; name: string; runner: string; command: string }) {
