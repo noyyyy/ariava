@@ -5,6 +5,12 @@ import type {
   CanonicalSessionState,
   CommandEnvelope,
   CommandResult,
+  EncryptedCommandEnvelopeV1,
+  E2EActivationAckV1,
+  E2EConfirmationSubmissionV1,
+  E2ERecipientSnapshotV1,
+  EncryptedEventUploadV1,
+  EncryptedSessionSnapshotUploadV1,
   HandleSessionRequest,
   HostEnrollmentRequest,
   HostEnrollmentResponse,
@@ -17,8 +23,8 @@ import type {
   MarkSessionReadResponse,
   QueryPair,
   QuerySchema,
-  ReplaceCurrentSessionsRequest,
-  ReplaceCurrentSessionsResponse,
+  ReplaceE2ECurrentSessionsRequestV1,
+  ReplaceE2ECurrentSessionsResponseV1,
 } from '@ariava/protocol';
 import {
   assertRestrictedDynamicValue,
@@ -43,6 +49,7 @@ export interface RelayClientOptions {
 export type RelayRequestSignal = () => AbortSignal | undefined;
 
 export class RelayClientError extends Error {
+  readonly reason?: string;
   constructor(
     readonly status: number,
     message: string,
@@ -50,6 +57,13 @@ export class RelayClientError extends Error {
   ) {
     super(message);
     this.name = 'RelayClientError';
+    if (body && typeof body === 'object') {
+      const parsed = body as { error?: unknown; reason?: unknown };
+      this.reason = typeof parsed.reason === 'string'
+        ? parsed.reason : typeof parsed.error === 'string' ? parsed.error : message;
+    } else {
+      this.reason = message;
+    }
   }
 }
 
@@ -137,8 +151,38 @@ export class RelayClient {
     return this.request('POST', '/v2/bridge/events', { event, session });
   }
 
-  replaceCurrentSessions(request: ReplaceCurrentSessionsRequest): Promise<ReplaceCurrentSessionsResponse> {
-    return this.request('PUT', '/v2/bridge/sessions/current', request);
+  replaceE2ECurrentSessions(request: ReplaceE2ECurrentSessionsRequestV1): Promise<ReplaceE2ECurrentSessionsResponseV1> {
+    return this.request('PUT', '/v2/bridge/e2e/sessions/current', request);
+  }
+
+  recipientSnapshot(): Promise<E2ERecipientSnapshotV1> {
+    return this.request('GET', '/v2/bridge/e2e/recipients', undefined);
+  }
+
+  publishEncryptedEvent(event: EncryptedEventUploadV1, session: EncryptedSessionSnapshotUploadV1): Promise<{ ok: true }> {
+    return this.request('POST', '/v2/bridge/e2e/events', { event, session });
+  }
+
+  reconcileEncryptedEvent(event: EncryptedEventUploadV1, session: EncryptedSessionSnapshotUploadV1): Promise<{ committed: boolean }> {
+    return this.request('POST', '/v2/bridge/e2e/events/reconcile', { event, session });
+  }
+
+  reconcileEncryptedSession(session: EncryptedSessionSnapshotUploadV1): Promise<boolean> {
+    return this.request<{ committed: boolean }>('POST', '/v2/bridge/e2e/sessions/reconcile', { session }).then((value) => value.committed);
+  }
+
+  publishEncryptedSession(session: EncryptedSessionSnapshotUploadV1): Promise<{ ok: true }> {
+    return this.request('POST', '/v2/bridge/e2e/sessions', { session });
+  }
+
+  confirmLink(linkId: string, request: E2EConfirmationSubmissionV1): Promise<{ state: string; peerConfirmationProof?: E2EConfirmationSubmissionV1 }> {
+    assertRestrictedDynamicValue(linkId, 'link ID');
+    return this.request('POST', `/v2/bridge/e2e/links/${linkId}/confirm`, request);
+  }
+
+  activateLink(linkId: string, request: E2EActivationAckV1): Promise<{ state: string }> {
+    assertRestrictedDynamicValue(linkId, 'link ID');
+    return this.request('POST', `/v2/bridge/e2e/links/${linkId}/activate`, request);
   }
 
   markSessionRead(sessionId: string, request: MarkSessionReadRequest): Promise<MarkSessionReadResponse> {
@@ -151,7 +195,7 @@ export class RelayClient {
     return this.request('POST', `/v2/bridge/sessions/${sessionId}/handle`, request);
   }
 
-  pullCommands(hostId: string, limit = 20): Promise<{ commands: CommandEnvelope[] }> {
+  pullCommands(hostId: string, limit = 20): Promise<{ commands: Array<CommandEnvelope | EncryptedCommandEnvelopeV1> }> {
     return this.request('POST', '/v2/bridge/commands/pull', { hostId, limit });
   }
 

@@ -25,6 +25,8 @@ export interface AriavaServiceInstallRecord {
   backend: ServiceBackend;
   installedAt: string;
   runtimePath: string;
+  runtimeName?: 'node';
+  runtimeVersion?: string;
   ariavaBinPath: string;
   configPath?: string;
   identityReference?: HostPrivateKeyStorage;
@@ -34,6 +36,8 @@ export interface AriavaServiceInstallRecord {
 
 export interface ServiceInstallInput {
   runtimePath: string;
+  runtimeName?: 'node';
+  runtimeVersion?: string;
   ariavaBinPath: string;
   configPath?: string;
   identityReference?: HostPrivateKeyStorage;
@@ -50,9 +54,16 @@ export interface ServiceStatus {
   loaded: boolean;
   processRunning: boolean;
   runtimePath?: string;
+  runtimeName?: 'node';
+  runtimeVersion?: string;
+  recordedRuntimeVersion?: string;
+  runtimeVersionMatchesRecorded?: boolean;
   ariavaBinPath?: string;
+  runtimeNameIsNode?: boolean;
+  runtimeVersionSupported?: boolean;
   runtimePathMatchesCurrent?: boolean;
   ariavaBinPathMatchesCurrent?: boolean;
+  runtimeCryptoSelfTestPassed?: boolean;
   logBackend: LogBackend;
   stdoutLogPath?: string;
   stderrLogPath?: string;

@@ -29,13 +29,16 @@ class Ariava < Formula
   end
 
   service do
-    run [opt_bin/"ariava", "internal", "bridge-daemon", "--config", File.expand_path("~/.config/ariava/config.json")]
+    run [Formula["node"].opt_bin/"node", opt_libexec/"apps/bridge/dist/public-cli.js", "internal", "bridge-daemon", "--config", File.expand_path("~/.config/ariava/config.json")]
     keep_alive true
     log_path var/"log/ariava.log"
     error_log_path var/"log/ariava.log"
   end
 
   test do
+    node_major = shell_output("#{Formula[\"node\"].opt_bin}/node --version").delete_prefix("v").split(".").first.to_i
+    assert_operator node_major, :>=, 22
     assert_match "Ariava CLI", shell_output("#{bin}/ariava help")
+    assert_match "true", shell_output("#{Formula[\"node\"].opt_bin}/node -e 'import(\"#{libexec}/apps/bridge/dist/e2e/node-crypto-self-test.js\").then(m => console.log(m.runNodeCryptoSelfTest()))'")
   end
 end

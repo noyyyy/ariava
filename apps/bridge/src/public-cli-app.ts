@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { BridgeDaemon, loadBridgeConfig } from './daemon';
 import {
   createRuntimeHostIdentityStore,
+  createRuntimeHostEncryptionIdentityStore,
+  createHostEncryptionBinding,
   enrollCurrentIdentity,
   HostIdentityError,
   inspectPublicIdentity,
@@ -18,6 +20,8 @@ import {
   type HostIdentityStore,
 } from './identity';
 import { RelayClient, RelayClientError } from './relay-client';
+import { LocalLinkKeyring } from './e2e/link-keyring';
+import { promptSafetyCodeMatch, runHostSafetyCodeActivation } from './e2e/host-safety-code-activation';
 import { probeHostPlatform } from './host-platform';
 import {
   createReadlineOnboardingPrompt,
@@ -78,6 +82,8 @@ import {
 import { ARIAVA_CONFIG_ROOT } from './host-manager/paths';
 import { buildHostManagerStatus, isConfigComplete } from './host-manager/status';
 import { readAgentAdapterConfig } from './agent-adapter/config';
+import { inspectCurrentNodeRuntime, probeNodeRuntimePath } from './runtime/node-runtime';
+import { runNodeCryptoSelfTest } from './e2e/node-crypto-self-test';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const CLI_VERSION = readPackageVersion();
@@ -123,6 +129,9 @@ export interface PublicCliDependencies {
   spawn(command: string, args: string[], options?: Parameters<typeof spawnSync>[2]): ReturnType<typeof spawnSync>;
   spawnAsync(command: string, args: string[], options: { signal?: AbortSignal }): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }>;
   createHostIdentityStore(path: string, platform: NodeJS.Platform | string): HostIdentityStore;
+  inspectRuntime(): ReturnType<typeof inspectCurrentNodeRuntime>;
+  probeRuntimePath(path: string): ReturnType<typeof inspectCurrentNodeRuntime>;
+  cryptoSelfTest(): boolean;
 }
 
 export interface PublicCliOnboardingDependencies {
@@ -152,6 +161,9 @@ const defaultDependencies: PublicCliDependencies = {
   spawn: spawnSync,
   spawnAsync: spawnOnboardingChild,
   createHostIdentityStore: createRuntimeHostIdentityStore,
+  inspectRuntime: inspectCurrentNodeRuntime,
+  probeRuntimePath: probeNodeRuntimePath,
+  cryptoSelfTest: runNodeCryptoSelfTest,
 };
 
 export async function runPublicCli(
@@ -167,6 +179,7 @@ export async function runPublicCli(
     return runSetup(deps, args.slice(1), json, onboardingOverrides);
   }
   try {
+    if (command === 'internal') requireProductionRuntime(deps.inspectRuntime());
     if (command === 'internal') {
       await runInternal(args.slice(1), deps);
       return 0;
@@ -179,7 +192,14 @@ export async function runPublicCli(
         print(deps, json, okEnvelope('ok', 'Ariava CLI version.', { version: CLI_VERSION }), CLI_VERSION);
         break;
       case '--help':
-      case 'help': print(deps, json, okEnvelope('ok', 'Ariava CLI', { commands: commandSummary() }), formatHelp()); break;
+      case 'help': print(deps, json, okEnvelope('ok', 'Ariava CLI', { commands: commandSummary(), runtime: deps.inspectRuntime() }), formatHelp()); break;
+      case 'version': print(deps, json, okEnvelope('ok', CLI_VERSION, { version: CLI_VERSION, runtime: deps.inspectRuntime() }), CLI_VERSION); break;
+      default: requireProductionRuntime(deps.inspectRuntime());
+    }
+    switch (command) {
+      case '--help':
+      case 'help':
+      case 'version': break;
       case 'init': await runInit(deps, json); break;
       case 'config': await runConfig(deps, args.slice(1), json); break;
       case 'status': await runStatus(deps, args.slice(1), json); break;
@@ -221,9 +241,12 @@ async function runInit(deps: PublicCliDependencies, json: boolean): Promise<void
   });
   const resolved = deps.resolveAriavaConfig();
   if (!store) throw new Error('Host identity store was not initialized');
+  const hostId = initialized.config.identity?.hostId;
+  if (!hostId) throw new Error('Host identity was not initialized');
+  createRuntimeHostEncryptionIdentityStore(resolved.identityPath, manager.support.platform).loadOrCreate(hostId);
   print(deps, json, okEnvelope('ok', initialized.identityCreated ? 'Ariava identity initialized.' : 'Ariava identity already initialized.', {
     configPath: resolved.configPath, config: redactUserConfig(initialized.config), identity: await inspectPublicIdentity(store), created: initialized.identityCreated,
-  }), `${initialized.identityCreated ? 'Initialized' : 'Reused'} Host identity ${initialized.config.identity?.hostId}`);
+  }), `${initialized.identityCreated ? 'Initialized' : 'Reused'} Host identity ${hostId}`);
 }
 
 async function runConfig(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
@@ -285,6 +308,7 @@ async function runStatus(deps: PublicCliDependencies, argv: string[], json: bool
   };
   const installMetadata = deps.loadInstallMetadata();
   const serviceStatus = currentServiceStatus(deps, manager, installMetadata);
+  serviceStatus.runtimeCryptoSelfTestPassed = deps.cryptoSelfTest();
   const piStatus = getPiExtensionStatus(RELEASE_PI_VERSION);
   const identityInspection = manager.support.platform === 'darwin' || manager.support.platform === 'linux'
     ? await inspectPublicIdentity(deps.createHostIdentityStore(resolved.identityPath, manager.support.platform))
@@ -313,6 +337,13 @@ async function runDoctor(deps: PublicCliDependencies, json: boolean): Promise<nu
     serviceSupportReason: manager.support.reason,
     ...serviceSupportInstructions(manager),
     nodeFound: Boolean(deps.currentRuntimePath()),
+    runtimeNameIsNode: deps.inspectRuntime().runtimeNameIsNode,
+    runtimeVersionSupported: deps.inspectRuntime().runtimeVersionSupported,
+    runtimePathMatchesCurrent: Boolean(serviceStatus.runtimePathMatchesCurrent ?? true),
+    serviceRuntimeNameIsNode: serviceStatus.runtimeNameIsNode ?? null,
+    serviceRuntimeVersionSupported: serviceStatus.runtimeVersionSupported ?? null,
+    serviceRuntimeVersionMatchesRecorded: serviceStatus.runtimeVersionMatchesRecorded ?? null,
+    runtimeCryptoSelfTestPassed: deps.cryptoSelfTest(),
     piFound: deps.commandExists('pi'),
     configComplete: isConfigComplete(resolved),
     serviceInstalled: serviceStatus.installed,
@@ -320,6 +351,10 @@ async function runDoctor(deps: PublicCliDependencies, json: boolean): Promise<nu
     serviceLoaded: serviceStatus.loaded,
     serviceRunning: serviceStatus.processRunning,
     servicePathCurrent: Boolean(serviceStatus.runtimePathMatchesCurrent ?? true) && Boolean(serviceStatus.ariavaBinPathMatchesCurrent ?? true),
+    serviceRuntimeCurrent: Boolean(serviceStatus.runtimeNameIsNode ?? true)
+      && Boolean(serviceStatus.runtimeVersionSupported ?? true)
+      && Boolean(serviceStatus.runtimeVersionMatchesRecorded ?? true),
+    serviceReinstallRecommendation: serviceNeedsReinstall(serviceStatus) ? 'Run `ariava service reinstall`.' : undefined,
     serviceMetadataValid: metadataResult.diagnostics.serviceMetadataValid,
     installerMetadataValid: metadataResult.diagnostics.installerMetadataValid !== false,
     documentMetadataValid: metadataResult.diagnostics.documentMetadataValid !== false,
@@ -341,7 +376,9 @@ async function runDoctor(deps: PublicCliDependencies, json: boolean): Promise<nu
     identityReady,
     identityWarning: identity.status === 'rotation-pending' ? 'Host key rotation is pending; recover it before normal operation.' : undefined,
   });
-  const healthy = manager.support.supported && checks.nodeFound && checks.configComplete
+  const healthy = manager.support.supported && checks.nodeFound && checks.runtimeNameIsNode
+    && checks.runtimeVersionSupported && checks.runtimeCryptoSelfTestPassed && checks.configComplete
+    && checks.servicePathCurrent && checks.serviceRuntimeCurrent
     && checks.serviceMetadataValid && checks.installerMetadataValid && checks.documentMetadataValid && identityReady;
   const envelope = {
     ok: healthy,
@@ -354,14 +391,51 @@ async function runDoctor(deps: PublicCliDependencies, json: boolean): Promise<nu
 }
 
 async function runPair(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
-  const pairingCode = argv[0];
-  if (!pairingCode) throw new Error('Usage: ariava pair <PAIRING_CODE>');
+  const args = [...argv];
+  const codesMatch = stripFlag(args, '--codes-match');
+  const pairingCode = args[0];
+  if (!pairingCode || args.length > 1) throw new Error('Usage: ariava pair <PAIRING_CODE> [--codes-match]');
   const normalizedPairingCode = normalizePairingCode(pairingCode);
   const context = await loadIdentityClient(deps);
   await ensureHostEnrollment(context);
   const result = await context.client.pairWatch(normalizedPairingCode);
-  print(deps, json, okEnvelope('ok', 'Watch paired successfully.', result),
-    `Paired watch ${result.watchDevice.watchDeviceId} with host ${result.host.hostName} (${result.host.hostId})`);
+  const pairedLine = `Pairing code accepted for watch ${result.watchDevice.watchDeviceId} with host ${result.host.hostName} (${result.host.hostId}). Pairing completes after Safety Code confirmation.`;
+  if (!json) deps.stdout.write(`${pairedLine}\n`);
+
+  const resolved = deps.resolveAriavaConfig();
+  const keyring = new LocalLinkKeyring(`${resolved.identityPath}.e2e-keyring.json`, context.encryptionIdentity);
+  const hostBinding = await createHostEncryptionBinding(context.identity, context.encryptionIdentity);
+  const lines: string[] = [];
+  const interactive = !json && (deps.stdout as NodeJS.WritableStream & { isTTY?: boolean }).isTTY === true
+    && process.stdin.isTTY === true && process.env.CI === undefined && process.env.TERM !== 'dumb';
+  const outcome = await runHostSafetyCodeActivation({
+    projection: result.e2e,
+    alreadyPaired: result.alreadyPaired,
+    hostIdentity: context.encryptionIdentity,
+    hostBinding,
+    keyring,
+    transport: context.client,
+    write: (line) => {
+      lines.push(line);
+      if (!json) deps.stdout.write(`${line}\n`);
+    },
+    confirmMatch: () => promptSafetyCodeMatch({
+      stdin: process.stdin,
+      stdout: deps.stdout,
+      interactive,
+      codesMatchFlag: codesMatch,
+    }),
+  });
+  if (outcome === 'cancelled') {
+    throw new AriavaCliError('ERR_PAIR_CANCELLED', 'Safety Code confirmation cancelled.');
+  }
+  // Human-readable Safety Code lines were already streamed above for interactive pair.
+  if (json) {
+    printJson(
+      okEnvelope('ok', 'Watch paired successfully.', { ...result, safetyCodeActivation: outcome, messages: lines }),
+      deps.stdout,
+    );
+  }
 }
 
 async function runWatches(deps: PublicCliDependencies, argv: string[], json: boolean): Promise<void> {
@@ -409,8 +483,9 @@ async function runHost(deps: PublicCliDependencies, argv: string[], json: boolea
   if (action === 'reset') {
     if (!argv.includes('--confirm')) throw new AriavaCliError('ERR_CONFIRMATION_REQUIRED', 'Usage: ariava host reset --confirm');
     const result = await resetHostIdentity(store, resolved.relayBaseUrl);
+    const encryptionIdentity = createRuntimeHostEncryptionIdentityStore(resolved.identityPath, platform).replaceForReset(result.identity.hostId);
     deps.saveUserConfig({ ...buildInitializedConfig(deps.loadUserConfig()), identity: publicIdentityMetadata(result.identity) });
-    await enrollCurrentIdentity(resolved.relayBaseUrl, result.identity, hostMetadataContext(deps));
+    await enrollCurrentIdentity(resolved.relayBaseUrl, result.identity, hostMetadataContext(deps), encryptionIdentity);
     print(deps, json, okEnvelope('ok', 'Host identity reset.', {
       hostId: result.identity.hostId, keyId: result.identity.keyId, revokedOldIdentity: result.revokedOldIdentity, links: [],
       ...(result.warning ? { warning: result.warning } : {}),
@@ -423,6 +498,7 @@ async function runHost(deps: PublicCliDependencies, argv: string[], json: boolea
 interface IdentityClientContext {
   client: RelayClient;
   identity: HostIdentity;
+  encryptionIdentity: ReturnType<ReturnType<typeof createRuntimeHostEncryptionIdentityStore>['loadOrCreate']>;
   metadata: ReturnType<typeof hostMetadataContext>;
 }
 
@@ -434,6 +510,7 @@ async function loadIdentityClient(deps: PublicCliDependencies): Promise<Identity
   return {
     client: new RelayClient({ baseUrl: resolved.relayBaseUrl, signer: identity.signer }),
     identity,
+    encryptionIdentity: createRuntimeHostEncryptionIdentityStore(resolved.identityPath, platform).loadOrCreate(identity.hostId),
     metadata: hostMetadataContext(deps),
   };
 }
@@ -444,6 +521,7 @@ async function ensureHostEnrollment(context: IdentityClientContext): Promise<voi
     keyId: context.identity.keyId,
     algorithm: context.identity.algorithm,
     publicKey: context.identity.publicKey,
+    encryptionBinding: await createHostEncryptionBinding(context.identity, context.encryptionIdentity),
     ...context.metadata,
   });
 }
@@ -799,8 +877,13 @@ async function runInternal(argv: string[], deps: Pick<PublicCliDependencies, 'st
 
 function serviceInstallInput(deps: PublicCliDependencies, resolved: ResolvedAriavaConfig) {
   if (!resolved.identity) throw new HostIdentityError('ERR_IDENTITY_NOT_INITIALIZED', 'Host identity is not initialized; run `ariava init`');
+  const runtimePath = deps.realpath(deps.currentRuntimePath());
+  const runtime = deps.probeRuntimePath(runtimePath);
+  requireProductionRuntime(runtime);
   return {
-    runtimePath: deps.realpath(deps.currentRuntimePath()),
+    runtimePath,
+    runtimeName: 'node' as const,
+    runtimeVersion: runtime.runtimeVersion,
     ariavaBinPath: deps.realpath(deps.currentAriavaBinPath()),
     configPath: resolved.configPath,
     identityReference: structuredClone(resolved.identity.privateKeyStorage),
@@ -815,6 +898,16 @@ function installerPatch(deps: PublicCliDependencies, metadata: AriavaInstallMeta
     ariavaBinRealPath: deps.realpath(deps.currentAriavaBinPath()),
     recordedAt: new Date().toISOString(),
   } };
+}
+
+function requireProductionRuntime(runtime: ReturnType<typeof inspectCurrentNodeRuntime>): void {
+  if (!runtime.runtimeNameIsNode || !runtime.runtimeVersionSupported) {
+    throw new AriavaCliError(
+      'ERR_NODE_RUNTIME_UNSUPPORTED',
+      `Ariava requires Node.js 22 or newer for its production Bridge runtime. Current runtime: ${runtime.runtimeName} ${runtime.runtimeVersion}`,
+      { runtimeName: runtime.runtimeName, runtimeVersion: runtime.runtimeVersion },
+    );
+  }
 }
 
 async function runSetup(
@@ -1153,6 +1246,15 @@ function currentServiceStatus(
   );
 }
 
+function serviceNeedsReinstall(status: ServiceStatus): boolean {
+  if (!status.runtimePath && !status.ariavaBinPath) return false;
+  return status.runtimePathMatchesCurrent === false
+    || status.ariavaBinPathMatchesCurrent === false
+    || status.runtimeNameIsNode === false
+    || status.runtimeVersionSupported === false
+    || status.runtimeVersionMatchesRecorded === false;
+}
+
 function stripFlag(argv: string[], flag: string): boolean {
   const index = argv.indexOf(flag);
   if (index === -1) return false;
@@ -1278,9 +1380,10 @@ const IDENTITY_MANAGED_CONFIG_KEYS = new Set([
 function commandSummary(): string[] {
   return [
     'ariava setup [--extension pi ... | --no-extensions] [--resume] [--json] [--yes] [--relay-base-url <URL>]',
+    'ariava version',
     'ariava init',
     'ariava status [pi]',
-    'ariava pair <PAIRING_CODE>',
+    'ariava pair <PAIRING_CODE> [--codes-match]',
     'ariava watches list',
     'ariava watches remove <WATCH_DEVICE_ID>',
     'ariava identity status',
@@ -1325,7 +1428,7 @@ function formatHelp(): string {
     '  logs                            Show Bridge service logs',
     '',
     'Watch pairing:',
-    '  pair <PAIRING_CODE>             Pair this Host with a Watch',
+    '  pair <PAIRING_CODE> [--codes-match]  Pair this Host with a Watch and confirm Safety Code',
     '  watches list                    List Watches linked to this Host',
     '  watches remove <WATCH_DEVICE_ID>',
     '                                  Remove one Watch link',

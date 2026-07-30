@@ -1,3 +1,4 @@
+<!-- ARIAVA_PUBLIC_CORE_README: PUBLISHABLE -->
 <p align="center">
   <img src="https://raw.githubusercontent.com/noyyyy/ariava/main/ariava.png" alt="Ariava" width="160" height="160">
 </p>
@@ -32,8 +33,8 @@
 
 ### Requirements
 
-- Node.js and npm
-- macOS, or Linux/WSL with a reachable systemd user service manager
+- Node.js 22 or newer and npm (the shipped CLI and service run on Node; end users do not need Bun)
+- macOS, or Linux/WSL with a reachable systemd user service manager (see the [WSL installation guide](docs/install-guide.md#wsl))
 - [Pi](https://pi.dev/) when selecting the Pi adapter
 
 The shortest first-run path is:
@@ -75,7 +76,7 @@ The command surface is intentionally narrow. Ariava does not expose arbitrary sh
 
 ## Build from Source
 
-Requirements: [Bun](https://bun.sh/) and Node.js.
+Requirements: [Bun](https://bun.sh/) for workspace/build orchestration and Node.js 22+ for the production Bridge crypto/runtime gate.
 
 ```bash
 git clone https://github.com/noyyyy/ariava.git
@@ -98,9 +99,16 @@ bun run dev:bridge
 # In another terminal, run Pi with only the source Ariava extension
 bun run dev:pi -- <pi args...>
 
+# Pair this isolated dev Host with a Watch pairing code, then confirm Safety Code
+bun run dev:pair -- <PAIRING_CODE>
+# Noninteractive: after verifying the Watch shows the same Safety Code
+# bun run dev:pair -- <PAIRING_CODE> --codes-match
+
 # Inspect paths, Host ID, Relay URL, and Adapter status (secret redacted)
 bun run dev:status
 ```
+
+After a successful pair, the CLI prints a 6-symbol **Safety Code**. Confirm only when the Watch **Verify Safety Code** screen shows the same code (`y`/`N` interactively, or pass `--codes-match`). The Host then submits confirmation and waits for the Watch proof before activating the encrypted link.
 
 `dev:pi` launches `pi --no-extensions -e <source-extension>`, so other automatically discovered Pi extensions are intentionally disabled in that process. These commands do not install or modify a launchd/systemd service, do not replace the globally installed Ariava Pi extension, and do not read or write the installed Ariava profile.
 

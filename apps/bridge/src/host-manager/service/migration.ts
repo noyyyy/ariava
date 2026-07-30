@@ -85,6 +85,9 @@ export function normalizeServiceInstallRecord(value: unknown): AriavaServiceInst
       backend: value.backend,
       installedAt: value.installedAt as string,
       runtimePath: value.runtimePath as string,
+      ...(value.runtimeName === 'node' && typeof value.runtimeVersion === 'string' && value.runtimeVersion.trim()
+        ? { runtimeName: 'node' as const, runtimeVersion: value.runtimeVersion }
+        : {}),
       ariavaBinPath: value.ariavaBinPath as string,
       definitionPath: value.definitionPath as string,
       serviceId: value.serviceId as string,

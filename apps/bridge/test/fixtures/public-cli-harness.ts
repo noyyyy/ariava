@@ -92,6 +92,11 @@ function createFakeManager(): ServiceManager {
       ariavaBinPath: stored?.ariavaBinPath,
       runtimePathMatchesCurrent: stored ? stored.runtimePath === '/fixture/node' : undefined,
       ariavaBinPathMatchesCurrent: stored ? stored.ariavaBinPath === '/fixture/ariava' : undefined,
+      runtimeNameIsNode: stored ? true : undefined,
+      runtimeVersion: stored ? scenario === 'service-runtime-downgrade' ? 'v21.9.0' : 'v22.0.0' : undefined,
+      recordedRuntimeVersion: stored?.runtimeVersion,
+      runtimeVersionSupported: stored ? scenario !== 'service-runtime-downgrade' : undefined,
+      runtimeVersionMatchesRecorded: stored?.runtimeVersion ? scenario !== 'service-runtime-downgrade' : undefined,
       logBackend: support.supported ? backend === 'launchd' ? 'files' : 'journald' : 'unavailable',
       ...(backend === 'launchd' ? { stdoutLogPath: '/fixture/stdout.log', stderrLogPath: '/fixture/stderr.log' } : {}),
       detail: stored && stored.backend !== backend ? `metadata backend ${stored.backend} does not match ${backend}` : undefined,
@@ -101,11 +106,12 @@ function createFakeManager(): ServiceManager {
     backend,
     support,
     install(input) {
-      recordCall({ operation: 'install', ...input });
+      const { runtimeName: _runtimeName, runtimeVersion: _runtimeVersion, ...legacyObservableInput } = input;
+      recordCall({ operation: 'install', ...legacyObservableInput });
       if (scenario === 'install-failure') {
         throw new AriavaCliError('ERR_SERVICE_INSTALL', 'fixture install failed', { command: 'fixture install' });
       }
-      return record;
+      return { ...record, runtimeName: input.runtimeName, runtimeVersion: input.runtimeVersion };
     },
     uninstall() {
       recordCall({ operation: 'uninstall' });
@@ -164,5 +170,14 @@ const exitCode = await runPublicCli(process.argv.slice(2), {
   stdout: process.stdout,
   stderr: process.stderr,
   commandExists: () => false,
+  inspectRuntime: () => ({
+    runtimeName: 'node', runtimeVersion: 'v22.0.0', runtimePath: '/fixture/node',
+    runtimeNameIsNode: true, runtimeVersionSupported: true,
+  }),
+  probeRuntimePath: (runtimePath) => ({
+    runtimeName: 'node', runtimeVersion: 'v22.0.0', runtimePath,
+    runtimeNameIsNode: true, runtimeVersionSupported: true,
+  }),
+  cryptoSelfTest: () => true,
 });
 process.exitCode = exitCode;

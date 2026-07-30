@@ -1,6 +1,7 @@
+import { normalizePairingCode } from '@ariava/protocol';
 import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,17 +15,26 @@ import {
   type AriavaUserConfig,
 } from './host-manager';
 import { readSecureJson } from './host-manager/secure-files';
+import { probeHostPlatform } from './host-platform';
 import {
+  createHostEncryptionBinding,
+  createRuntimeHostEncryptionIdentityStore,
   createRuntimeHostIdentityStore,
+  enrollCurrentIdentity,
   ensureFirstRunIdentity,
+  HostIdentityError,
   publicIdentityMetadata,
   type HostIdentityStore,
 } from './identity';
+import { LocalLinkKeyring } from './e2e/link-keyring';
+import { promptSafetyCodeMatch, runHostSafetyCodeActivation } from './e2e/host-safety-code-activation';
+import { RelayClient } from './relay-client';
 import type { BridgeConfig } from './types';
 import { createReadlineOnboardingPrompt, promptForOnboardingSelection } from './ui/onboarding-renderer';
 
 const PUBLIC_CORE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const SOURCE_PI_EXTENSION_PATH = resolve(PUBLIC_CORE_ROOT, 'extensions', 'pi', 'index.ts');
+const DEV_BRIDGE_VERSION = readPackageVersion(PUBLIC_CORE_ROOT);
 
 interface DevBridgeDaemon {
   start(): Promise<void>;
@@ -45,6 +55,7 @@ export interface DevProfileDependencies {
   platform: NodeJS.Platform | string;
   stdout: NodeJS.WritableStream;
   stderr: NodeJS.WritableStream;
+  stdin: NodeJS.ReadableStream;
   sourcePiExtensionPath: string;
   pathExists(path: string): boolean;
   loadUserConfig(path: string): AriavaUserConfig;
@@ -58,6 +69,8 @@ export interface DevProfileDependencies {
   environment: NodeJS.ProcessEnv;
   hostName(): string;
   generateSecret(): string;
+  confirmSafetyCodeMatch?(): Promise<boolean>;
+  sleep?(ms: number): Promise<void>;
 }
 
 export function createDefaultDevProfileDependencies(): DevProfileDependencies {
@@ -66,6 +79,7 @@ export function createDefaultDevProfileDependencies(): DevProfileDependencies {
     platform: process.platform,
     stdout: process.stdout,
     stderr: process.stderr,
+    stdin: process.stdin,
     sourcePiExtensionPath: SOURCE_PI_EXTENSION_PATH,
     pathExists: existsSync,
     loadUserConfig,
@@ -98,8 +112,10 @@ export async function runDevProfileCommand(
       return runDevPi(argv.slice(1), dependencies);
     case 'status':
       return showDevStatus(dependencies);
+    case 'pair':
+      return runDevPair(argv.slice(1), dependencies);
     default:
-      throw new Error('Usage: dev-profile-cli <setup|init|bridge|pi|status>');
+      throw new Error('Usage: dev-profile-cli <setup|init|bridge|pi|status|pair>');
   }
 }
 
@@ -257,6 +273,93 @@ async function showDevStatus(deps: DevProfileDependencies): Promise<number> {
     relayUrl: resolved.relayBaseUrl,
   }, null, 2)}\n`);
   return 0;
+}
+
+async function runDevPair(args: string[], deps: DevProfileDependencies): Promise<number> {
+  const { pairingCode, codesMatch } = parseDevPairArgs(args);
+  const normalizedPairingCode = normalizePairingCode(pairingCode);
+  requireInitializedConfig(deps);
+  const config = resolvePersistedAriavaConfig(deps.paths.configPath);
+  const identity = await deps.createIdentityStore(deps.paths.identityPath, deps.platform, 'dev').load();
+  if (!identity) {
+    throw new HostIdentityError(
+      'ERR_IDENTITY_NOT_INITIALIZED',
+      `Dev identity is not initialized at ${deps.paths.identityPath}; run dev:init first`,
+    );
+  }
+  const encryptionIdentity = createRuntimeHostEncryptionIdentityStore(
+    deps.paths.identityPath,
+    deps.platform,
+  ).loadOrCreate(identity.hostId);
+  await enrollCurrentIdentity(
+    config.relayBaseUrl,
+    identity,
+    {
+      hostName: config.hostName,
+      platform: probeHostPlatform(deps.platform),
+      bridgeVersion: DEV_BRIDGE_VERSION,
+    },
+    encryptionIdentity,
+  );
+  const client = new RelayClient({
+    baseUrl: config.relayBaseUrl,
+    signer: identity.signer,
+  });
+  const result = await client.pairWatch(normalizedPairingCode);
+  deps.stdout.write(
+    `Pairing code accepted for watch ${result.watchDevice.watchDeviceId} with host ${result.host.hostName} (${result.host.hostId}).\n`,
+  );
+  deps.stdout.write('Pairing is not complete until both sides confirm the Safety Code.\n');
+
+  const hostBinding = await createHostEncryptionBinding(identity, encryptionIdentity);
+  const keyring = new LocalLinkKeyring(`${deps.paths.identityPath}.e2e-keyring.json`, encryptionIdentity);
+  const outcome = await runHostSafetyCodeActivation({
+    projection: result.e2e,
+    alreadyPaired: result.alreadyPaired,
+    hostIdentity: encryptionIdentity,
+    hostBinding,
+    keyring,
+    transport: client,
+    write: (line) => deps.stdout.write(`${line}\n`),
+    sleep: deps.sleep,
+    confirmMatch: () => deps.confirmSafetyCodeMatch
+      ? deps.confirmSafetyCodeMatch()
+      : promptSafetyCodeMatch({
+        stdin: deps.stdin,
+        stdout: deps.stdout,
+        interactive: deps.interactive,
+        codesMatchFlag: codesMatch,
+      }),
+  });
+  if (outcome === 'cancelled') return 1;
+  return 0;
+}
+
+function parseDevPairArgs(args: string[]): { pairingCode: string; codesMatch: boolean } {
+  let pairingCode: string | undefined;
+  let codesMatch = false;
+  for (const arg of args) {
+    if (arg === '--codes-match') {
+      codesMatch = true;
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      throw new Error(`Unknown dev:pair option: ${arg}`);
+    }
+    if (pairingCode) throw new Error('Usage: dev-profile-cli pair <PAIRING_CODE> [--codes-match]');
+    pairingCode = arg;
+  }
+  if (!pairingCode) throw new Error('Usage: dev-profile-cli pair <PAIRING_CODE> [--codes-match]');
+  return { pairingCode, codesMatch };
+}
+
+function readPackageVersion(root: string): string {
+  try {
+    const manifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as { version?: string };
+    return typeof manifest.version === 'string' && manifest.version.length > 0 ? manifest.version : '0.0.0-dev';
+  } catch {
+    return '0.0.0-dev';
+  }
 }
 
 function requireInitializedConfig(deps: DevProfileDependencies): void {

@@ -1088,6 +1088,13 @@ describe('public ariava CLI', () => {
           serviceSupported: true,
           serviceSupportReason: 'supported',
           nodeFound: true,
+          runtimeNameIsNode: true,
+          runtimeVersionSupported: true,
+          runtimePathMatchesCurrent: true,
+          serviceRuntimeNameIsNode: null,
+          serviceRuntimeVersionSupported: null,
+          serviceRuntimeVersionMatchesRecorded: null,
+          runtimeCryptoSelfTestPassed: true,
           piFound: false,
           configComplete: false,
           serviceInstalled: false,
@@ -1095,6 +1102,7 @@ describe('public ariava CLI', () => {
           serviceLoaded: false,
           serviceRunning: false,
           servicePathCurrent: true,
+          serviceRuntimeCurrent: true,
           serviceMetadataValid: true,
           installerMetadataValid: true,
           documentMetadataValid: true,
@@ -1173,6 +1181,13 @@ describe('public ariava CLI', () => {
           windowsCommand: 'wsl.exe --shutdown',
         },
         nodeFound: true,
+        runtimeNameIsNode: true,
+        runtimeVersionSupported: true,
+        runtimePathMatchesCurrent: true,
+        serviceRuntimeNameIsNode: null,
+        serviceRuntimeVersionSupported: null,
+        serviceRuntimeVersionMatchesRecorded: null,
+        runtimeCryptoSelfTestPassed: true,
         piFound: false,
         configComplete: false,
         serviceInstalled: false,
@@ -1180,6 +1195,7 @@ describe('public ariava CLI', () => {
         serviceLoaded: false,
         serviceRunning: false,
         servicePathCurrent: true,
+        serviceRuntimeCurrent: true,
         serviceMetadataValid: true,
         installerMetadataValid: true,
         documentMetadataValid: true,
@@ -1203,6 +1219,22 @@ describe('public ariava CLI', () => {
       });
     });
 
+    test('doctor fails runtime drift and recommends service reinstall', async () => {
+      const home = mkdtempSync(join(tmpdir(), 'ariava-cli-doctor-runtime-drift-'));
+      roots.push(home);
+      await runHarness(home, 'linux-supported', 'service', 'install');
+      const doctor = await runHarness(home, 'service-runtime-downgrade', 'doctor');
+      expectStdoutFailure(doctor, 'ERR_DOCTOR');
+      expect(doctor.stdout.data).toMatchObject({
+        serviceInstalled: true,
+        serviceRuntimeNameIsNode: true,
+        serviceRuntimeVersionSupported: false,
+        serviceRuntimeVersionMatchesRecorded: false,
+        serviceRuntimeCurrent: false,
+        serviceReinstallRecommendation: 'Run `ariava service reinstall`.',
+      });
+    });
+
     test('service install persists neutral metadata only after success', async () => {
       const home = mkdtempSync(join(tmpdir(), 'ariava-cli-service-install-'));
       roots.push(home);
@@ -1212,6 +1244,8 @@ describe('public ariava CLI', () => {
         backend: 'systemd-user',
         installedAt: '2026-07-15T00:00:00.000Z',
         runtimePath: '/fixture/node',
+        runtimeName: 'node',
+        runtimeVersion: 'v22.0.0',
         ariavaBinPath: '/fixture/ariava',
         configPath: join(home, '.config', 'ariava', 'config.json'),
         identityReference: { type: 'linux-json', path: join(home, '.config', 'ariava', 'host-identity.json') },
@@ -1231,6 +1265,7 @@ describe('public ariava CLI', () => {
       for (const args of [['status'], ['service', 'status']] as const) {
         const result = await runHarness(home, 'linux-supported', ...args);
         expect(result).toMatchObject({ exitCode: 0, stdout: { ok: true }, stderr: undefined });
+        if (args.length === 1) expect(result.stdout.data.service.runtimeCryptoSelfTestPassed).toBe(true);
         const serialized = JSON.stringify(result.stdout.data);
         expect(serialized).not.toMatch(/launchdLoaded|plistPath|nodePath/);
         expect(result.stdout.data).not.toHaveProperty('label');

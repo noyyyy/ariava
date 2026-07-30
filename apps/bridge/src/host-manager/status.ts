@@ -14,8 +14,12 @@ export interface HostServiceStatusInput {
   enabled: boolean;
   loaded: boolean;
   processRunning: boolean;
+  runtimeNameIsNode?: boolean;
+  runtimeVersionSupported?: boolean;
+  runtimeVersionMatchesRecorded?: boolean;
   runtimePathMatchesCurrent?: boolean;
   ariavaBinPathMatchesCurrent?: boolean;
+  runtimeCryptoSelfTestPassed?: boolean;
 }
 
 export interface HostManagerStatus {
@@ -33,8 +37,12 @@ export interface HostManagerStatus {
     enabled: boolean;
     loaded: boolean;
     processRunning: boolean;
+    runtimeNameIsNode?: boolean;
+    runtimeVersionSupported?: boolean;
+    runtimeVersionMatchesRecorded?: boolean;
     runtimePathMatchesCurrent?: boolean;
     ariavaBinPathMatchesCurrent?: boolean;
+    runtimeCryptoSelfTestPassed?: boolean;
   };
   piExtension: PiExtensionStatus;
   environmentOverrides: string[];
@@ -81,12 +89,16 @@ export function buildHostManagerStatus(args: {
       enabled: serviceStatus.enabled,
       loaded: serviceStatus.loaded,
       processRunning: serviceStatus.processRunning,
+      ...(serviceStatus.runtimeNameIsNode === undefined ? {} : { runtimeNameIsNode: serviceStatus.runtimeNameIsNode }),
+      ...(serviceStatus.runtimeVersionSupported === undefined ? {} : { runtimeVersionSupported: serviceStatus.runtimeVersionSupported }),
+      ...(serviceStatus.runtimeVersionMatchesRecorded === undefined ? {} : { runtimeVersionMatchesRecorded: serviceStatus.runtimeVersionMatchesRecorded }),
       ...(serviceStatus.runtimePathMatchesCurrent === undefined
         ? {}
         : { runtimePathMatchesCurrent: serviceStatus.runtimePathMatchesCurrent }),
       ...(serviceStatus.ariavaBinPathMatchesCurrent === undefined
         ? {}
         : { ariavaBinPathMatchesCurrent: serviceStatus.ariavaBinPathMatchesCurrent }),
+      ...(serviceStatus.runtimeCryptoSelfTestPassed === undefined ? {} : { runtimeCryptoSelfTestPassed: serviceStatus.runtimeCryptoSelfTestPassed }),
     },
     piExtension: piStatus,
     environmentOverrides: config.environmentOverrides,

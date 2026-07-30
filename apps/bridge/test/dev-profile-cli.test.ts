@@ -31,6 +31,7 @@ function createHarness(): {
   roots.push(root);
   const stdout = new PassThrough();
   const stderr = new PassThrough();
+  const stdin = new PassThrough();
   const defaults = createDefaultDevProfileDependencies();
   const deps: DevProfileDependencies = {
     ...defaults,
@@ -38,6 +39,8 @@ function createHarness(): {
     platform: 'linux',
     stdout,
     stderr,
+    stdin,
+    interactive: false,
     hostName: () => 'test-host',
     environment: { HOME: root, PATH: process.env.PATH, ARIAVA_RELAY_BASE_URL: 'https://stale.invalid' },
     generateSecret: () => 'dev-secret',
@@ -299,6 +302,85 @@ describe('source dev profile commands', () => {
     expect(harness.output()).toContain(harness.deps.paths.configPath);
     expect(harness.output()).not.toContain('must-not-appear');
     expect(readFileSync(join(defaultRoot, 'config.json'), 'utf8')).toBe('{not-json');
+  });
+
+  test('pair enrolls the dev Host then pairs the Watch using only the isolated profile', async () => {
+    const harness = createHarness();
+    await runDevProfileCommand(['init'], harness.deps);
+    const defaultRoot = join(harness.root, '.config', 'ariava');
+    mkdirSync(defaultRoot, { recursive: true, mode: 0o700 });
+    const defaultConfig = join(defaultRoot, 'config.json');
+    writeFileSync(defaultConfig, '{"production":true}\n', { mode: 0o600 });
+
+    const identity = await harness.deps.createIdentityStore(
+      harness.deps.paths.identityPath,
+      harness.deps.platform,
+      'dev',
+    ).load();
+    expect(identity).not.toBeNull();
+
+    const paths: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      expect(url.origin).toBe('http://127.0.0.1:8787');
+      paths.push(url.pathname);
+      if (url.pathname === '/v2/bridge/enroll') {
+        const body = await request.json() as { hostId: string; hostName: string };
+        expect(body.hostId).toBe(identity!.hostId);
+        expect(body.hostName).toBe('test-host (Dev)');
+        return Response.json({
+          host: {
+            hostId: identity!.hostId,
+            hostName: body.hostName,
+            platform: 'linux',
+            bridgeVersion: '0.0.0-test',
+            status: 'active',
+            enrolledAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+          },
+        });
+      }
+      if (url.pathname === '/v2/bridge/pair-watch') {
+        expect(await request.json()).toEqual({ pairingCode: 'PEYX7K' });
+        return Response.json({
+          host: {
+            hostId: identity!.hostId,
+            hostName: 'test-host (Dev)',
+            platform: 'linux',
+            bridgeVersion: '0.0.0-test',
+            status: 'active',
+            enrolledAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+          },
+          watchDevice: { watchDeviceId: `watch_${'C'.repeat(43)}` },
+        });
+      }
+      throw new Error(`unexpected path ${url.pathname}`);
+    }) as typeof fetch;
+
+    try {
+      expect(await runDevProfileCommand(['pair', 'peyx7k'], harness.deps)).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(paths).toEqual(['/v2/bridge/enroll', '/v2/bridge/pair-watch']);
+    expect(harness.output()).toContain(`watch_${'C'.repeat(43)}`);
+    expect(harness.output()).toContain(identity!.hostId);
+    expect(harness.output()).toContain('test-host (Dev)');
+    expect(harness.output()).toContain('Safety Code activation was skipped');
+    expect(readFileSync(defaultConfig, 'utf8')).toBe('{"production":true}\n');
+  });
+
+  test('pair requires a pairing code and fails closed when the profile is not initialized', async () => {
+    const harness = createHarness();
+    await expect(runDevProfileCommand(['pair'], harness.deps)).rejects.toThrow(
+      'Usage: dev-profile-cli pair <PAIRING_CODE> [--codes-match]',
+    );
+    await expect(runDevProfileCommand(['pair', 'peyx7k'], harness.deps)).rejects.toThrow('Dev profile is not initialized');
+    expect(harness.deps.pathExists(harness.deps.paths.configPath)).toBe(false);
   });
 });
 

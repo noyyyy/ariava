@@ -5,7 +5,7 @@ import type {
   CommandResult,
   HostProjection,
   HostPlatform,
-  ReplaceCurrentSessionsRequest,
+  ReplaceE2ECurrentSessionsRequestV1,
 } from '@ariava/protocol';
 import type { HostIdentityMetadata } from './identity/types';
 
@@ -70,7 +70,7 @@ export interface PendingSessionHandle {
 export interface PendingCurrentSessionsSnapshot {
   digest: string;
   contentDigest: string;
-  request: ReplaceCurrentSessionsRequest;
+  request: ReplaceE2ECurrentSessionsRequestV1;
 }
 
 /** Host-wide active-set revisions; never reuse these as per-session content revisions. */
@@ -80,7 +80,21 @@ export interface PersistedCurrentSessionsSnapshotState {
   lastAcceptedRevision: number;
   lastAcceptedDigest?: string;
   lastAcceptedContentDigest?: string;
+  lastAcceptedRecipientSetVersion?: number;
   pending?: PendingCurrentSessionsSnapshot;
+}
+
+export interface EventUploadCompletionV1 {
+  version: 1;
+  eventId: string;
+  sessionId: string;
+  revision: number;
+  eventContentId: string;
+  sessionContentId: string;
+  committedAt: string;
+  revisionCommitted?: boolean;
+  inflightRemoved?: boolean;
+  sourceRemoved?: boolean;
 }
 
 export interface PersistedBridgeState {
@@ -89,7 +103,12 @@ export interface PersistedBridgeState {
   sessionDrivers: Record<string, string>;
   reconciledDrivers: Record<string, true>;
   recentEvents: CanonicalEvent[];
-  pendingEvents: CanonicalEvent[];
+  /** Legacy load-only plaintext queue. New state writes always remove this field. */
+  pendingEvents?: CanonicalEvent[];
+  sessionRevisions: Record<string, number>;
+  recipientSetVersion?: number;
+  spoolMigration?: { version: 1; remainingEventIds: string[]; startedAt: string };
+  eventUploadCompletions?: Record<string, EventUploadCompletionV1>;
   pendingHandles: Record<string, PendingSessionHandle>;
   commandResults: Record<string, CommandResult>;
   seenCommands: Record<string, string>;

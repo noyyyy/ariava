@@ -10,6 +10,7 @@ import {
 } from '../paths';
 import { SpawnSyncCommandRunner } from './command-runner';
 import { AriavaCliError, commandFailureData, sanitizeCommandDetail } from './errors';
+import { probeRecordedServiceRuntime } from './runtime-probe';
 import type {
   AriavaServiceInstallRecord,
   CommandResult,
@@ -155,6 +156,9 @@ export class LaunchdServiceManager implements ServiceManager {
       backend: 'launchd',
       installedAt: input.installedAt ?? this.now(),
       runtimePath,
+      ...(input.runtimeName && input.runtimeVersion
+        ? { runtimeName: input.runtimeName, runtimeVersion: input.runtimeVersion }
+        : {}),
       ariavaBinPath,
       ...(input.configPath && input.identityReference
         ? { configPath, identityReference: structuredClone(input.identityReference) }
@@ -245,6 +249,7 @@ export class LaunchdServiceManager implements ServiceManager {
       };
     }
 
+    const runtimeProbe = probeRecordedServiceRuntime(this.runner, record);
     const definitionPath = record.definitionPath;
     const serviceId = record.serviceId;
     let plist: string;
@@ -261,6 +266,7 @@ export class LaunchdServiceManager implements ServiceManager {
         loaded: false,
         processRunning: false,
         runtimePath: record.runtimePath,
+        ...runtimeProbe,
         ariavaBinPath: record.ariavaBinPath,
         runtimePathMatchesCurrent: resolve(record.runtimePath) === resolve(currentRuntimePath),
         ariavaBinPathMatchesCurrent: resolve(record.ariavaBinPath) === resolve(currentAriavaBinPath),
@@ -289,6 +295,7 @@ export class LaunchdServiceManager implements ServiceManager {
       loaded,
       processRunning: loaded && /\bpid\s*=\s*\d+\b/.test(printResult.stdout),
       runtimePath: record.runtimePath,
+      ...runtimeProbe,
       ariavaBinPath: record.ariavaBinPath,
       runtimePathMatchesCurrent: resolve(record.runtimePath) === resolve(currentRuntimePath),
       ariavaBinPathMatchesCurrent: resolve(record.ariavaBinPath) === resolve(currentAriavaBinPath),
@@ -535,6 +542,7 @@ ${escapedArgs}
 </plist>
 `;
 }
+
 
 function absoluteServicePath(path: string, field: string): string {
   if (!path.startsWith('/') || /[\u0000-\u001f\u007f-\u009f]/.test(path)) {

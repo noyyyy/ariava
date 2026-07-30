@@ -1,333 +1,176 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BridgeDaemon, loadBridgeConfig, type ReconciliationScheduler } from '../src/daemon';
-import { LinuxJsonHostIdentityStore, publicIdentityMetadata } from '../src/identity';
-import type { ActiveSessionSnapshot, CanonicalSessionState } from '@ariava/protocol';
-import type { AgentDriver } from '../src/types';
+mock.module('../src/e2e/node-crypto', () => ({
+  chachaPolySeal: (_key: Uint8Array, plaintext: Uint8Array) => ({ nonce: new Uint8Array(12).fill(1), ciphertext: new Uint8Array([...plaintext, ...new Uint8Array(16)]) }),
+  chachaPolyOpen: (_key: Uint8Array, _nonce: Uint8Array, ciphertext: Uint8Array) => ciphertext.slice(0, -16),
+  generateX25519KeyMaterial: () => ({ privateKeyPkcs8: new Uint8Array(48).fill(2), publicKeyRaw: new Uint8Array(32).fill(3) }),
+  x25519SharedSecret: () => new Uint8Array(32).fill(4),
+  hkdfSha256: () => new Uint8Array(32).fill(5),
+}));
+const { BridgeDaemon, loadBridgeConfig } = await import('../src/daemon');
+const { LinuxJsonHostIdentityStore, publicIdentityMetadata } = await import('../src/identity');
 
 const roots: string[] = [];
 const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
-afterEach(() => {
-  for (const server of servers.splice(0)) server.stop(true);
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-});
+afterEach(() => { for (const server of servers.splice(0)) server.stop(true); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-function session(status: CanonicalSessionState['status'] = 'idle'): CanonicalSessionState {
-  return {
-    sessionId: 'sess-1', hostId: '', provider: 'test', projectName: 'project', nameText: 'Session',
-    stateLabel: status === 'idle' ? 'Ready' : 'In progress', status, updatedAt: '2026-07-20T00:00:00.000Z',
-  };
-}
-
-async function fixture(
-  handler: (request: Request) => Response | Promise<Response>,
-  driverInput?: (() => Promise<CanonicalSessionState[]>) | AgentDriver[],
-  registryNow?: () => Date,
-  reconciliationScheduler?: ReconciliationScheduler,
-) {
-  const root = join(tmpdir(), `bridge-snapshot-sync-${Date.now()}-${roots.length}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
-  const identityPath = join(root, 'identity.json');
-  const identityStore = new LinuxJsonHostIdentityStore(identityPath);
-  const identity = await identityStore.createFirstRun();
+async function fixture(handler: (request: Request) => Response | Promise<Response>, sessions: any[] = []) {
+  const root = join(tmpdir(), `bridge-e2e-lifecycle-${Date.now()}-${roots.length}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
+  const identityPath = join(root, 'identity.json'); const identityStore = new LinuxJsonHostIdentityStore(identityPath); const identity = await identityStore.createFirstRun();
   const server = Bun.serve({ port: 0, fetch: handler }); servers.push(server);
-  const config = loadBridgeConfig();
-  Object.assign(config, {
-    runtimePlatform: 'linux', hostPlatform: 'linux', hostId: identity.hostId, identity: publicIdentityMetadata(identity),
-    relayBaseUrl: `http://127.0.0.1:${server.port}`, pollIntervalMs: 60_000,
-    configPath: join(root, 'config.json'), statePath: join(root, 'state.json'), identityPath,
-    agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
-  });
-  const drivers = Array.isArray(driverInput)
-    ? driverInput
-    : driverInput
-      ? [{ name: 'test', listSessions: driverInput, executeCommand: async () => { throw new Error('unused'); } }]
-      : undefined;
-  const daemon = new BridgeDaemon(config, drivers, identityStore, registryNow, reconciliationScheduler);
-  return { root, identity, config, identityStore, daemon };
+  const config = loadBridgeConfig(); Object.assign(config, { runtimePlatform: 'linux', hostPlatform: 'linux', hostId: identity.hostId,
+    identity: publicIdentityMetadata(identity), relayBaseUrl: `http://127.0.0.1:${server.port}`, configPath: join(root, 'config.json'),
+    statePath: join(root, 'state.json'), identityPath, agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') } });
+  const driver = { name: 'test', listSessions: async () => sessions.map((session) => ({ ...session, hostId: identity.hostId })), executeCommand: async () => { throw new Error('unused'); } };
+  const daemon = new BridgeDaemon(config, [driver], identityStore);
+  if (sessions.length) (daemon as any).stateStore.initializeEncryptedSpool(identity.hostId, identityPath, 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
+  return { daemon, config, identity, driver };
 }
 
-function relay(handler: (request: Request) => Response | Promise<Response>) {
+const activeSession = (sessionId: string) => ({ sessionId, provider: 'pi', projectName: 'secret-project', nameText: `Session ${sessionId}`,
+  latestActivityText: 'protected activity', stateLabel: 'Working', status: 'working', updatedAt: '2026-07-29T00:00:00.000Z' });
+
+function relay(hostId: string, lifecycle: (body: any) => Response) {
   return async (request: Request) => {
     const path = new URL(request.url).pathname;
-    if (path === '/v2/bridge/enroll') {
-      const body = await request.json() as { hostId: string };
-      return Response.json({ host: { hostId: body.hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
-    }
+    if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
+    if (path === '/v2/bridge/e2e/recipients') return Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] });
+    if (path === '/v2/bridge/e2e/sessions/current') return lifecycle(await request.json());
     if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] });
-    return handler(request);
+    return Response.json({ ok: true });
   };
 }
 
-async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error('timed out waiting for condition');
-    await Bun.sleep(10);
-  }
-}
-
-class ManualReconciliationScheduler implements ReconciliationScheduler {
-  private scheduled?: { callback: () => void; delayMs: number };
-
-  schedule(callback: () => void, delayMs: number): unknown {
-    if (this.scheduled) throw new Error('coalescing scheduled more than one timer');
-    this.scheduled = { callback, delayMs };
-    return this.scheduled;
-  }
-
-  cancel(handle: unknown): void {
-    if (this.scheduled === handle) this.scheduled = undefined;
-  }
-
-  get pendingCount(): number { return this.scheduled ? 1 : 0; }
-  get pendingDelayMs(): number | undefined { return this.scheduled?.delayMs; }
-
-  fire(): void {
-    const scheduled = this.scheduled;
-    if (!scheduled) throw new Error('no reconciliation timer is scheduled');
-    this.scheduled = undefined;
-    scheduled.callback();
-  }
-}
-
-describe('Bridge authoritative current-session reconciliation', () => {
-  test('startup sends a complete snapshot and retries the exact pending request after restart', async () => {
-    const bodies: unknown[] = [];
-    let online = false;
-    let hostId = '';
-    const fx = await fixture(relay(async (request) => {
-      if (new URL(request.url).pathname !== '/v2/bridge/sessions/current') return Response.json({ ok: true });
-      const body = await request.json(); bodies.push(body);
-      if (!online) return new Response('offline', { status: 503 });
-      const snapshot = body as { hostId: string; revision: number; sessions: unknown[] };
-      return Response.json({ ok: true, hostId: snapshot.hostId, revision: snapshot.revision, activeSessionCount: snapshot.sessions.length });
-    }), async () => [{ ...session(), hostId }]);
+describe('Bridge E2E authoritative current-session reconciliation', () => {
+  test('empty startup convergence publishes a metadata-only lifecycle manifest', async () => {
+    let body: any; let hostId = '';
+    const fx = await fixture((request) => relay(hostId, (value) => { body = value; return Response.json({ ok: true, hostId: value.hostId, revision: value.revision, activeSessionCount: 0 }); })(request));
     hostId = fx.identity.hostId;
+    expect((await fx.daemon.syncOnce()).offline).toBe(false);
+    expect(body).toEqual({ hostId, revision: 1, observedAt: expect.any(String), recipientSetVersion: 1, sessions: [] });
+    expect(JSON.stringify(body)).not.toMatch(/projectName|nameText|openingText|latestActivityText|actionablePrompt/);
+  });
 
-    const first = await fx.daemon.syncOnce();
-    expect(first.offline).toBe(true);
+  test('process-style restart restores and retries the exact signed manifest after a network failure', async () => {
+    const bodies: any[] = []; let online = false; let hostId = '';
+    const fx = await fixture((request) => relay(hostId, (body) => { bodies.push(body); return online
+      ? Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: 0 })
+      : new Response('offline', { status: 503 }); })(request));
+    hostId = fx.identity.hostId;
+    expect((await fx.daemon.syncOnce()).offline).toBe(true);
     const persisted = JSON.parse(readFileSync(fx.config.statePath, 'utf8')).currentSessionsSnapshot.pending.request;
     online = true;
-    const restarted = new BridgeDaemon(fx.config, [{ name: 'test', listSessions: async () => [{ ...session(), hostId }], executeCommand: async () => { throw new Error('unused'); } }], fx.identityStore);
+    const restartedIdentityStore = new LinuxJsonHostIdentityStore(fx.config.identityPath);
+    const restarted = new BridgeDaemon(fx.config, [{ name: 'test', listSessions: async () => [], executeCommand: async () => { throw new Error('unused'); } }], restartedIdentityStore);
     expect((await restarted.syncOnce()).offline).toBe(false);
     expect(bodies.at(-1)).toEqual(persisted);
   });
 
-  test('real Agent Adapter registry restart preserves the persisted Pi set until re-registration', async () => {
-    const uploads: ActiveSessionSnapshot[][] = [];
-    const fx = await fixture(relay(async (request) => {
-      const body = await request.json() as { hostId: string; revision: number; sessions: ActiveSessionSnapshot[] };
-      uploads.push(body.sessions);
-      return Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: body.sessions.length });
-    }));
-    await fx.daemon.start();
-    const { AgentAdapterClient: PiAdapterClient } = await import('../../../extensions/pi/src/adapter');
-    const registration = {
-      sessionId: 'sess-live-pi', provider: 'pi' as const, projectName: 'p', cwd: '/', nameText: 'Live Pi',
-      stateLabel: 'In progress', status: 'working' as const, latestActivityText: 'Still running',
-    };
-    const piBeforeRestart = new PiAdapterClient({ baseUrl: fx.daemon.adapterUrl, secret: fx.config.agentAdapter.secret });
-    await piBeforeRestart.registerSession(registration);
-    await fx.daemon.syncOnce();
-    expect(uploads.at(-1)?.map((item) => item.sessionId)).toEqual(['sess-live-pi']);
-    fx.daemon.stop();
-
-    const restarted = new BridgeDaemon(fx.config, undefined, fx.identityStore);
-    await restarted.start();
-    try {
-      await restarted.syncOnce();
-      expect(uploads.at(-1)?.map((item) => item.sessionId)).toEqual(['sess-live-pi']);
-      expect(uploads).toHaveLength(1);
-
-      const piAfterRestart = new PiAdapterClient({ baseUrl: restarted.adapterUrl, secret: fx.config.agentAdapter.secret });
-      await piAfterRestart.heartbeat('sess-live-pi', 'working', 'Recovered after restart', registration);
-      await restarted.syncOnce();
-      expect(uploads.at(-1)).toMatchObject([{ sessionId: 'sess-live-pi', status: 'working', latestActivityText: 'Recovered after restart' }]);
-    } finally {
-      restarted.stop();
-    }
-  });
-
-  test('offline mutations coalesce to the newest full set and stale response advances revision', async () => {
-    let current: CanonicalSessionState[] = [];
-    const uploaded: Array<{ revision: number; sessions: ActiveSessionSnapshot[] }> = [];
-    let mode: 'offline' | 'stale' | 'online' = 'offline';
-    let hostId = '';
-    const fx = await fixture(relay(async (request) => {
-      const body = await request.json() as { hostId: string; revision: number; sessions: ActiveSessionSnapshot[] };
-      uploaded.push(body);
-      if (mode === 'offline') return new Response('offline', { status: 503 });
-      if (mode === 'stale') { mode = 'online'; return Response.json({ ok: false, code: 'session_snapshot_stale', hostId: body.hostId, acceptedRevision: 7 }, { status: 409 }); }
-      return Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: body.sessions.length });
-    }), async () => current.map((item) => ({ ...item, hostId })));
+  test('stale Host revision rebuilds only the Host revision domain', async () => {
+    const revisions: number[] = []; let first = true; let hostId = '';
+    const fx = await fixture((request) => relay(hostId, (body) => { revisions.push(body.revision); if (first) { first = false; return Response.json({ ok: false, code: 'session_snapshot_stale', hostId, acceptedRevision: 7 }, { status: 409 }); }
+      return Response.json({ ok: true, hostId, revision: body.revision, activeSessionCount: 0 }); })(request));
     hostId = fx.identity.hostId;
-
-    current = [{ ...session(), hostId }]; await fx.daemon.syncOnce();
-    current = []; await fx.daemon.syncOnce();
-    mode = 'stale'; await fx.daemon.syncOnce();
-    expect(uploaded.at(-1)?.revision).toBe(8);
-    expect(uploaded.at(-1)?.sessions).toEqual([]);
+    expect((await fx.daemon.syncOnce()).offline).toBe(false);
+    expect(revisions).toEqual([1, 8]);
   });
 
-  test('preserves an established driver set when its next listing fails', async () => {
-    const uploads: ActiveSessionSnapshot[][] = [];
-    let fail = false; let hostId = '';
-    const fx = await fixture(relay(async (request) => {
-      if (new URL(request.url).pathname === '/v2/bridge/events') return Response.json({ ok: true });
-      const body = await request.json() as { hostId: string; revision: number; sessions: ActiveSessionSnapshot[] };
-      uploads.push(body.sessions);
-      return Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: body.sessions.length });
-    }), async () => { if (fail) throw new Error('driver unavailable'); return [{ ...session(), hostId }]; });
-    hostId = fx.identity.hostId;
-    await fx.daemon.syncOnce(); fail = true;
-    const failed = await fx.daemon.syncOnce();
-    expect(failed.sessions.map((item) => item.sessionId)).toEqual(['sess-1']);
-    expect(uploads).toHaveLength(1);
-    expect(uploads[0]?.map((item) => item.sessionId)).toEqual(['sess-1']);
+  test('uploads every distinct active encrypted Session before an exact manifest and suppresses manifest on upload failure', async () => {
+    const paths: string[] = []; const uploads: Array<{ sessionId: string; revision: number }> = []; let manifest: any; let failSecond = true; let hostId = '';
+    const fx = await fixture(async (request) => {
+      const path = new URL(request.url).pathname; paths.push(path);
+      if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
+      if (path === '/v2/bridge/e2e/recipients') return Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] });
+      if (path === '/v2/bridge/e2e/sessions') { const body: any = await request.json(); uploads.push({ sessionId: body.session.sessionId, revision: body.session.revision }); if (failSecond && body.session.sessionId === 'session-b') return new Response('failed', { status: 503 }); return Response.json({ ok: true }); }
+      if (path === '/v2/bridge/e2e/sessions/current') { manifest = await request.json(); return Response.json({ ok: true, hostId, revision: manifest.revision, activeSessionCount: manifest.sessions.length }); }
+      if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] });
+      return Response.json({ ok: true });
+    }, [activeSession('session-a'), activeSession('session-b')]); hostId = fx.identity.hostId;
+    expect((await fx.daemon.syncOnce()).offline).toBe(true);
+    expect(paths).not.toContain('/v2/bridge/e2e/sessions/current');
+    failSecond = false; paths.length = 0; uploads.length = 0;
+    expect((await fx.daemon.syncOnce()).offline).toBe(false);
+    const manifestIndex = paths.indexOf('/v2/bridge/e2e/sessions/current');
+    expect(manifestIndex).toBeGreaterThan(0);
+    expect(paths.slice(0, manifestIndex).filter((path) => path === '/v2/bridge/e2e/sessions')).toHaveLength(2);
+    expect(uploads).toHaveLength(2);
+    expect(new Set(uploads.map((item) => item.sessionId))).toEqual(new Set(['session-a', 'session-b']));
+    expect(manifest.sessions).toEqual(uploads.map((item) => ({ sessionId: item.sessionId, sessionRevision: item.revision })));
   });
 
-  test('first reconciliation skips publication when any driver has no established set', async () => {
-    const uploads: ActiveSessionSnapshot[][] = []; let hostId = '';
-    const drivers: AgentDriver[] = [
-      { name: 'healthy', listSessions: async () => [{ ...session(), hostId }], executeCommand: async () => { throw new Error('unused'); } },
-      { name: 'unknown-failing', listSessions: async () => { throw new Error('not yet available'); }, executeCommand: async () => { throw new Error('unused'); } },
-    ];
-    const fx = await fixture(relay(async (request) => {
-      if (new URL(request.url).pathname === '/v2/bridge/events') return Response.json({ ok: true });
-      const body = await request.json() as { sessions: ActiveSessionSnapshot[] }; uploads.push(body.sessions); return Response.json({ ok: true });
-    }), drivers);
-    hostId = fx.identity.hostId;
-    const result = await fx.daemon.syncOnce();
-    expect(result.sessions.map((item) => item.sessionId)).toEqual(['sess-1']);
-    expect(uploads).toEqual([]);
-    const state = JSON.parse(readFileSync(fx.config.statePath, 'utf8'));
-    expect(state.currentSessionsSnapshot.pending).toBeUndefined();
+  test('recipient churn revisits earlier Sessions and manifests only final-version revisions', async () => {
+    const uploads: Array<{ sessionId: string; revision: number; recipientSetVersion: number }> = []; let version = 1; let churned = false; let manifest: any; let hostId = '';
+    const fx = await fixture(async (request) => {
+      const path = new URL(request.url).pathname;
+      if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
+      if (path === '/v2/bridge/e2e/recipients') return Response.json({ version: 1, hostId, recipientSetVersion: version, recipients: [] });
+      if (path === '/v2/bridge/e2e/sessions') { const body: any = await request.json(); const item = body.session; uploads.push({ sessionId: item.sessionId, revision: item.revision, recipientSetVersion: item.recipientSetVersion });
+        if (!churned && item.sessionId === 'session-b') { churned = true; version = 2; return Response.json({ ok: false, code: 'e2e_recipient_set_changed' }, { status: 409 }); } return Response.json({ ok: true }); }
+      if (path === '/v2/bridge/e2e/sessions/reconcile') return Response.json({ committed: false });
+      if (path === '/v2/bridge/e2e/sessions/current') { manifest = await request.json(); return Response.json({ ok: true, hostId, revision: manifest.revision, activeSessionCount: 2 }); }
+      if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] }); return Response.json({ ok: true });
+    }, [activeSession('session-a'), activeSession('session-b')]); hostId = fx.identity.hostId;
+    expect((await fx.daemon.syncOnce()).offline).toBe(false);
+    expect(uploads.filter((item) => item.sessionId === 'session-a').map((item) => item.recipientSetVersion)).toEqual([1, 2]);
+    expect(manifest.recipientSetVersion).toBe(2);
+    for (const member of manifest.sessions) expect(uploads).toContainEqual({ sessionId: member.sessionId, revision: member.sessionRevision, recipientSetVersion: 2 });
   });
 
-  test('excludes diagnostic sessions from the Bridge authoritative snapshot', async () => {
-    let uploaded: ActiveSessionSnapshot[] = []; let hostId = '';
-    const fx = await fixture(relay(async (request) => {
-      const body = await request.json() as { hostId: string; revision: number; sessions: ActiveSessionSnapshot[] }; uploaded = body.sessions;
-      return Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: body.sessions.length });
-    }), async () => [{ ...session(), hostId }, { ...session(), sessionId: 'driver:test', hostId, provider: 'bridge', nameText: 'Diagnostic' }]);
-    hostId = fx.identity.hostId; await fx.daemon.syncOnce();
-    expect(uploaded.map((item) => item.sessionId)).toEqual(['sess-1']);
+  test('same recipient-version conflict fails closed without submitting a manifest or spinning', async () => {
+    let hostId = ''; let recipientReads = 0; let uploads = 0; let reconciles = 0; let manifests = 0;
+    const fx = await fixture(async (request) => {
+      const path = new URL(request.url).pathname;
+      if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
+      if (path === '/v2/bridge/e2e/recipients') { recipientReads += 1; return Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] }); }
+      if (path === '/v2/bridge/e2e/sessions') { uploads += 1; return Response.json({ ok: false, code: 'e2e_recipient_set_changed' }, { status: 409 }); }
+      if (path === '/v2/bridge/e2e/sessions/reconcile') { reconciles += 1; return Response.json({ committed: false }); }
+      if (path === '/v2/bridge/e2e/sessions/current') { manifests += 1; return Response.json({ ok: true }); }
+      if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] }); return Response.json({ ok: true });
+    }, [activeSession('session-a')]); hostId = fx.identity.hostId;
+    expect((await fx.daemon.syncOnce()).offline).toBe(true);
+    expect({ recipientReads, uploads, reconciles, manifests }).toEqual({ recipientReads: 2, uploads: 1, reconciles: 1, manifests: 0 });
   });
 
-  test('same-revision conflict is fail-closed and leaves the immutable request pending', async () => {
-    const fx = await fixture(relay(async (request) => {
-      const body = await request.json() as { hostId: string; revision: number };
-      return Response.json({ ok: false, code: 'session_snapshot_conflict', hostId: body.hostId, acceptedRevision: body.revision }, { status: 409 });
-    }), async () => []);
-    await expect(fx.daemon.syncOnce()).rejects.toThrow('snapshot revision as conflicting');
-    const pending = JSON.parse(readFileSync(fx.config.statePath, 'utf8')).currentSessionsSnapshot.pending;
-    expect(pending.request.revision).toBe(1);
-    expect(typeof pending.digest).toBe('string');
+  test('invalid finalized references rebuild all active Sessions under a higher Host revision', async () => {
+    const manifests: any[] = []; const uploads: any[] = []; let hostId = '';
+    const fx = await fixture(async (request) => {
+      const path = new URL(request.url).pathname;
+      if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
+      if (path === '/v2/bridge/e2e/recipients') return Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] });
+      if (path === '/v2/bridge/e2e/sessions') { uploads.push((await request.json() as any).session); return Response.json({ ok: true }); }
+      if (path === '/v2/bridge/e2e/sessions/current') { const body: any = await request.json(); manifests.push(body); if (manifests.length === 1) return Response.json({ ok: false, code: 'e2e_session_reference_invalid', hostId }, { status: 409 }); return Response.json({ ok: true, hostId, revision: body.revision, activeSessionCount: 1 }); }
+      if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] }); return Response.json({ ok: true });
+    }, [activeSession('session-a')]); hostId = fx.identity.hostId;
+    expect((await fx.daemon.syncOnce()).offline).toBe(false);
+    expect(manifests.map((item) => item.revision)).toEqual([1, 2]);
+    expect(uploads.map((item) => item.revision)).toEqual([1, 2]);
+    expect(manifests[1].sessions[0].sessionRevision).toBe(2);
   });
 
-  test('actual adapter mutations deterministically coalesce into one 300ms runForever wake and pure heartbeat stays quiet', async () => {
-    const uploads: ActiveSessionSnapshot[][] = [];
-    const scheduler = new ManualReconciliationScheduler();
-    const fx = await fixture(relay(async (request) => {
-      const body = await request.json() as { hostId: string; revision: number; sessions: ActiveSessionSnapshot[] }; uploads.push(body.sessions);
-      return Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: body.sessions.length });
-    }), undefined, undefined, scheduler);
-    await fx.daemon.start(); const run = fx.daemon.runForever();
-    try {
-      await waitUntil(() => uploads.length === 1);
-      const headers = { authorization: `Bearer ${fx.config.agentAdapter.secret}`, 'content-type': 'application/json' };
-      for (const sessionId of ['sess-a', 'sess-b']) {
-        const response = await fetch(`${fx.daemon.adapterUrl}/v1/agent/sessions`, { method: 'POST', headers, body: JSON.stringify({ sessionId, provider: 'pi', project: 'p', cwd: '/' }) });
-        expect(response.status).toBe(201);
-      }
-      expect(scheduler.pendingCount).toBe(1);
-      expect(scheduler.pendingDelayMs).toBe(300);
-      expect(uploads).toHaveLength(1);
-      scheduler.fire();
-      await waitUntil(() => uploads.length === 2);
-      expect(uploads[1]?.map((item) => item.sessionId).sort()).toEqual(['sess-a', 'sess-b']);
-      const heartbeat = await fetch(`${fx.daemon.adapterUrl}/v1/agent/sessions/sess-a/heartbeat`, { method: 'POST', headers, body: JSON.stringify({ status: 'idle' }) });
-      expect(heartbeat.status).toBe(200);
-      expect(scheduler.pendingCount).toBe(0);
-      expect(uploads).toHaveLength(2);
-    } finally { fx.daemon.stop(); await run; }
-  });
-
-  test('authenticated DELETE uploads omission from the persisted authoritative set', async () => {
-    const uploads: ActiveSessionSnapshot[][] = [];
-    const fx = await fixture(relay(async (request) => {
-      const body = await request.json() as { hostId: string; revision: number; sessions: ActiveSessionSnapshot[] }; uploads.push(body.sessions);
-      return Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: body.sessions.length });
-    }));
-    await fx.daemon.start(); const run = fx.daemon.runForever();
-    try {
-      await waitUntil(() => uploads.length === 1);
-      const headers = { authorization: `Bearer ${fx.config.agentAdapter.secret}`, 'content-type': 'application/json' };
-      await fetch(`${fx.daemon.adapterUrl}/v1/agent/sessions`, { method: 'POST', headers, body: JSON.stringify({ sessionId: 'sess-delete', provider: 'pi', project: 'p', cwd: '/' }) });
-      await waitUntil(() => uploads.length === 2);
-      expect(uploads[1]?.map((item) => item.sessionId)).toEqual(['sess-delete']);
-      const removed = await fetch(`${fx.daemon.adapterUrl}/v1/agent/sessions/sess-delete`, { method: 'DELETE', headers });
-      expect(removed.status).toBe(200);
-      await waitUntil(() => uploads.length === 3);
-      expect(uploads[2]).toEqual([]);
-    } finally { fx.daemon.stop(); await run; }
-  });
-
-  test('adapter mutation during an in-flight upload schedules a follow-up reconciliation', async () => {
-    const uploads: ActiveSessionSnapshot[][] = []; let release!: () => void; let blocked = false;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const fx = await fixture(relay(async (request) => {
-      const body = await request.json() as { hostId: string; revision: number; sessions: ActiveSessionSnapshot[] }; uploads.push(body.sessions);
-      if (uploads.length === 2) { blocked = true; await gate; }
-      return Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: body.sessions.length });
-    }));
-    await fx.daemon.start(); const run = fx.daemon.runForever();
-    try {
-      await waitUntil(() => uploads.length === 1);
-      const headers = { authorization: `Bearer ${fx.config.agentAdapter.secret}`, 'content-type': 'application/json' };
-      await fetch(`${fx.daemon.adapterUrl}/v1/agent/sessions`, { method: 'POST', headers, body: JSON.stringify({ sessionId: 'sess-a', provider: 'pi', project: 'p', cwd: '/' }) });
-      await waitUntil(() => blocked);
-      await fetch(`${fx.daemon.adapterUrl}/v1/agent/sessions`, { method: 'POST', headers, body: JSON.stringify({ sessionId: 'sess-b', provider: 'pi', project: 'p', cwd: '/' }) });
-      release();
-      await waitUntil(() => uploads.length === 3);
-      expect(uploads[2]?.map((item) => item.sessionId).sort()).toEqual(['sess-a', 'sess-b']);
-    } finally { release(); fx.daemon.stop(); await run; }
-  });
-
-  test('fake-clock TTL eviction uploads omission from the persisted authoritative set', async () => {
-    const uploads: ActiveSessionSnapshot[][] = [];
-    let now = new Date('2026-07-20T00:00:00.000Z');
-    const fx = await fixture(relay(async (request) => {
-      const body = await request.json() as { hostId: string; revision: number; sessions: ActiveSessionSnapshot[] }; uploads.push(body.sessions);
-      return Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: body.sessions.length });
-    }), undefined, () => now);
-    await fx.daemon.start();
-    try {
-      await fx.daemon.syncOnce();
-      const headers = { authorization: `Bearer ${fx.config.agentAdapter.secret}`, 'content-type': 'application/json' };
-      await fetch(`${fx.daemon.adapterUrl}/v1/agent/sessions`, { method: 'POST', headers, body: JSON.stringify({ sessionId: 'sess-ttl', provider: 'pi', project: 'p', cwd: '/' }) });
-      await fx.daemon.syncOnce();
-      expect(uploads.at(-1)?.map((item) => item.sessionId)).toEqual(['sess-ttl']);
-      now = new Date('2026-07-20T00:00:45.001Z');
-      await fx.daemon.syncOnce();
-      expect(uploads.at(-1)).toEqual([]);
-    } finally { fx.daemon.stop(); }
-  });
-
-  test('concurrent sync calls are single-flight', async () => {
-    let snapshotCalls = 0;
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const fx = await fixture(relay(async (request) => {
-      const body = await request.json() as { hostId: string; revision: number; sessions: unknown[] };
-      snapshotCalls += 1; await gate;
-      return Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: body.sessions.length });
-    }), async () => []);
-    const one = fx.daemon.syncOnce(); const two = fx.daemon.syncOnce();
-    await Bun.sleep(20); expect(snapshotCalls).toBe(1);
-    release(); await Promise.all([one, two]);
-    expect(snapshotCalls).toBe(1);
+  test('process-style restart restores a non-empty partial-upload spool and completes the exact manifest', async () => {
+    const uploads: Array<{ sessionId: string; revision: number }> = []; let manifest: any; let failSecond = true; let hostId = '';
+    const fx = await fixture(async (request) => {
+      const path = new URL(request.url).pathname;
+      if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
+      if (path === '/v2/bridge/e2e/recipients') return Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] });
+      if (path === '/v2/bridge/e2e/sessions') { const body: any = await request.json(); uploads.push({ sessionId: body.session.sessionId, revision: body.session.revision }); if (failSecond && body.session.sessionId === 'session-b') return new Response('offline', { status: 503 }); return Response.json({ ok: true }); }
+      if (path === '/v2/bridge/e2e/sessions/current') { manifest = await request.json(); return Response.json({ ok: true, hostId, revision: manifest.revision, activeSessionCount: manifest.sessions.length }); }
+      if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] }); return Response.json({ ok: true });
+    }, [activeSession('session-a'), activeSession('session-b')]); hostId = fx.identity.hostId;
+    expect((await fx.daemon.syncOnce()).offline).toBe(true);
+    expect((fx.daemon as any).stateStore.listInflightSessionIds()).toEqual(['session-b']);
+    failSecond = false; uploads.length = 0;
+    const restartedIdentityStore = new LinuxJsonHostIdentityStore(fx.config.identityPath);
+    const restartedDriver = { name: 'test', listSessions: async () => [activeSession('session-a'), activeSession('session-b')].map((session) => ({ ...session, hostId })), executeCommand: async () => { throw new Error('unused'); } };
+    const restarted = new BridgeDaemon(fx.config, [restartedDriver], restartedIdentityStore);
+    (restarted as any).stateStore.initializeEncryptedSpool(hostId, fx.config.identityPath, 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
+    expect((restarted as any).stateStore.listInflightSessionIds()).toEqual(['session-b']);
+    expect((await restarted.syncOnce()).offline).toBe(false);
+    expect((restarted as any).encryptionIdentity).toBeDefined();
+    expect((restarted as any).keyring).toBeDefined();
+    expect(new Set(uploads.map((item) => item.sessionId))).toEqual(new Set(['session-a', 'session-b']));
+    expect(manifest.sessions).toEqual(uploads.map((item) => ({ sessionId: item.sessionId, sessionRevision: item.revision })));
   });
 });

@@ -1,4 +1,5 @@
 import type { IdentityAlgorithm, IdentityStatus } from './identity.js';
+import type { EncryptionKeyBindingV1 } from './encryption.js';
 
 export const HOST_PLATFORMS = ['macos', 'linux'] as const;
 export type HostPlatform = (typeof HOST_PLATFORMS)[number];
@@ -25,6 +26,7 @@ export interface HostEnrollmentRequest {
   hostName: string;
   platform: HostPlatform;
   bridgeVersion: string;
+  encryptionBinding?: EncryptionKeyBindingV1;
 }
 
 export interface HostEnrollmentResponse {

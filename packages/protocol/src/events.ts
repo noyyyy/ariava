@@ -35,6 +35,14 @@ export interface CanonicalEvent {
   createdAt: string;
 }
 
+/** Host-local plaintext model. It must never be used as a Relay persistence/read projection. */
+export type LocalCanonicalEventPlaintext = CanonicalEvent;
+export interface DecryptedWatchEvent extends CanonicalEvent {
+  seen: boolean;
+  handled: boolean;
+  actionable: boolean;
+}
+
 /** Legacy shared read model retained only for compatibility aliases/backfill. */
 export type SessionReadSource = 'watch_view' | 'watch_reply' | 'pi_local_interaction' | 'bridge_recovery';
 

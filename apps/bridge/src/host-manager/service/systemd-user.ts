@@ -6,6 +6,7 @@ import { ARIAVA_CONFIG_PATH, ARIAVA_SYSTEMD_SERVICE_ID, ARIAVA_SYSTEMD_UNIT_PATH
 import { SpawnSyncCommandRunner } from './command-runner';
 import { AriavaCliError, commandFailureData, sanitizeCommandDetail } from './errors';
 import { supportError } from './platform';
+import { probeRecordedServiceRuntime } from './runtime-probe';
 import { removeOwnerControlledFile, writeOwnerControlledFile } from '../secure-files';
 import type {
   AriavaServiceInstallRecord,
@@ -131,6 +132,9 @@ export class SystemdUserServiceManager implements ServiceManager {
       backend: this.backend,
       installedAt: input.installedAt ?? this.now(),
       runtimePath,
+      ...(input.runtimeName && input.runtimeVersion
+        ? { runtimeName: input.runtimeName, runtimeVersion: input.runtimeVersion }
+        : {}),
       ariavaBinPath,
       ...(input.configPath && input.identityReference
         ? { configPath, identityReference: structuredClone(input.identityReference) }
@@ -230,12 +234,14 @@ export class SystemdUserServiceManager implements ServiceManager {
       };
     }
 
+    const runtimeProbe = probeRecordedServiceRuntime(this.runner, record);
     const base = {
       backend: this.backend,
       support: this.support,
       definitionPath: this.definitionPath,
       serviceId: this.serviceId,
       runtimePath: record.runtimePath,
+      ...runtimeProbe,
       ariavaBinPath: record.ariavaBinPath,
       runtimePathMatchesCurrent: resolve(record.runtimePath) === resolve(currentRuntimePath),
       ariavaBinPathMatchesCurrent: resolve(record.ariavaBinPath) === resolve(currentAriavaBinPath),

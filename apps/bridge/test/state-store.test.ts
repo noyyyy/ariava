@@ -227,4 +227,37 @@ describe('BridgeStateStore', () => {
       action: 'bridge_recovery', updatedAt: '2026-07-16T00:00:05Z',
     }]);
   });
+
+  test('fails closed on legacy plaintext pending lifecycle state without rewriting its revision lower bound', () => {
+    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json');
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const legacy = { currentSessionsSnapshot: { version: 1, lastAllocatedRevision: 3, lastAcceptedRevision: 2, pending: {
+      digest: 'legacy', contentDigest: 'legacy-content', request: { hostId: 'host-1', revision: 7, observedAt: '2026-07-20T00:00:00.000Z',
+        sessions: [{ sessionId: 'sess-1', projectName: 'protected-marker' }] } } } };
+    writeFileSync(statePath, JSON.stringify(legacy)); chmodSync(statePath, 0o600);
+    expect(() => new BridgeStateStore(statePath)).toThrow('Bridge state file is invalid or insecure');
+    expect(JSON.parse(readFileSync(statePath, 'utf8'))).toEqual(legacy);
+  });
+
+  test('fails closed without digest proof and leaves protected pending bytes untouched', () => {
+    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json'); mkdirSync(root, { recursive: true, mode: 0o700 });
+    const bytes = JSON.stringify({ currentSessionsSnapshot: { version: 1, lastAllocatedRevision: 9, lastAcceptedRevision: 4, pending: {
+      request: { hostId: 'host-1', revision: 9, observedAt: '2026-07-20T00:00:00.000Z', recipientSetVersion: 1,
+        sessions: [{ sessionId: 'sess-1', sessionRevision: 1, nameText: 'protected-marker' }] } } } });
+    writeFileSync(statePath, bytes); chmodSync(statePath, 0o600);
+    expect(() => new BridgeStateStore(statePath)).toThrow('Bridge state file is invalid or insecure');
+    expect(readFileSync(statePath, 'utf8')).toBe(bytes);
+  });
+
+  test('fails closed on non-positive persisted member session revisions', () => {
+    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json'); mkdirSync(root, { recursive: true, mode: 0o700 });
+    const persisted = { currentSessionsSnapshot: { version: 1, lastAllocatedRevision: 3, lastAcceptedRevision: 2, pending: {
+      digest: 'digest', contentDigest: 'content', request: { hostId: 'host-1', revision: 3, observedAt: '2026-07-20T00:00:00.000Z',
+        recipientSetVersion: 1, sessions: [{ sessionId: 'sess-1', sessionRevision: 0 }] } } } };
+    writeFileSync(statePath, JSON.stringify(persisted)); chmodSync(statePath, 0o600);
+    expect(() => new BridgeStateStore(statePath)).toThrow('Bridge state file is invalid or insecure');
+  });
 });

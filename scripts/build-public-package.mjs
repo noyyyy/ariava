@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const packageName = process.argv[2];
 const entries = packageName === 'protocol'
-  ? ['index', 'commands', 'events', 'hosts', 'identity', 'pairing', 'request-signing', 'session-snapshots', 'sessions', 'validation']
+  ? ['index', 'commands', 'encryption', 'events', 'hosts', 'identity', 'pairing', 'request-signing', 'session-snapshots', 'sessions', 'validation']
   : packageName === 'shared-utils'
     ? ['index']
     : undefined;
@@ -42,8 +42,7 @@ if (declarations.status !== 0) process.exit(declarations.status ?? 1);
 if (packageName === 'protocol') {
   const fixtureDir = resolve(dist, 'fixtures');
   mkdirSync(fixtureDir, { recursive: true });
-  cpSync(
-    resolve(packageRoot, 'test', 'fixtures', 'ed25519-request-vectors.json'),
-    resolve(fixtureDir, 'ed25519-request-vectors.json'),
-  );
+  for (const fixture of ['ed25519-request-vectors.json', 'e2e-v1-vectors.json']) {
+    cpSync(resolve(packageRoot, 'test', 'fixtures', fixture), resolve(fixtureDir, fixture));
+  }
 }

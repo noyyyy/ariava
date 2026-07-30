@@ -3,6 +3,7 @@ import { isCanonicalTimestamp, type HostPlatform, type KeyRotationRequest, type 
 import { HostIdentityError } from './errors';
 import { generateHostRotationIdentity } from './host-identity';
 import type { HostIdentity, HostIdentityInspection, HostIdentityMetadata, HostIdentityStore, PendingHostIdentity } from './types';
+import { createHostEncryptionBinding, type HostEncryptionIdentity } from './host-encryption-key';
 import { RelayClient, RelayClientError } from '../relay-client';
 
 const encoder = new TextEncoder();
@@ -34,13 +35,15 @@ export async function enrollCurrentIdentity(
   relayBaseUrl: string,
   identity: HostIdentity,
   metadata: HostMetadataContext,
-): Promise<void> {
+  encryptionIdentity?: HostEncryptionIdentity,
+ ): Promise<void> {
   await new RelayClient({ baseUrl: relayBaseUrl, signer: identity.signer }).enrollHost({
     hostId: identity.hostId,
     keyId: identity.keyId,
     algorithm: identity.algorithm,
     publicKey: identity.publicKey,
     ...metadata,
+    ...(encryptionIdentity ? { encryptionBinding: await createHostEncryptionBinding(identity, encryptionIdentity) } : {}),
   });
 }
 

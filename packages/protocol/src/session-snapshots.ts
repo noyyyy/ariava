@@ -1,195 +1,131 @@
-import { SESSION_STATUSES, statusToStateLabel } from './events.js';
-import type { ActiveSessionSnapshot } from './sessions.js';
 import { isCanonicalTimestamp } from './validation.js';
 import type { ValidationResult } from './validation.js';
+import { contentSha256 } from './request-signing.js';
 
 export const SESSION_SNAPSHOT_ERROR_CODES = [
   'session_snapshot_stale',
   'session_snapshot_conflict',
+  'e2e_recipient_set_changed',
+  'e2e_session_reference_invalid',
 ] as const;
 export type SessionSnapshotErrorCode = (typeof SESSION_SNAPSHOT_ERROR_CODES)[number];
 
-export interface ReplaceCurrentSessionsRequest {
+export interface E2ECurrentSessionReferenceV1 {
+  sessionId: string;
+  sessionRevision: number;
+}
+
+/** Host lifecycle revisions and encrypted Session revisions are independent domains. */
+export interface ReplaceE2ECurrentSessionsRequestV1 {
   hostId: string;
   revision: number;
   observedAt: string;
-  sessions: ActiveSessionSnapshot[];
+  recipientSetVersion: number;
+  sessions: E2ECurrentSessionReferenceV1[];
 }
 
-export interface ReplaceCurrentSessionsResponse {
+export interface ReplaceE2ECurrentSessionsResponseV1 {
   ok: true;
   hostId: string;
   revision: number;
   activeSessionCount: number;
 }
 
-export interface ReplaceCurrentSessionsErrorResponse {
+export interface ReplaceE2ECurrentSessionsErrorResponseV1 {
   ok: false;
   code: SessionSnapshotErrorCode;
   hostId: string;
-  acceptedRevision: number;
+  acceptedRevision?: number;
 }
 
-const REQUEST_KEYS = ['hostId', 'revision', 'observedAt', 'sessions'] as const;
-const SESSION_KEYS = [
-  'sessionId',
-  'hostId',
-  'provider',
-  'projectName',
-  'nameText',
-  'openingText',
-  'latestActivityText',
-  'stateLabel',
-  'status',
-  'actionablePrompt',
-  'updatedAt',
-  'lastEventId',
-  'snoozedUntil',
-  'presence',
-] as const;
-const PROMPT_KEYS = ['promptId', 'type', 'label', 'options', 'expiresAt'] as const;
+const REQUEST_KEYS = ['hostId', 'revision', 'observedAt', 'recipientSetVersion', 'sessions'] as const;
+const SESSION_KEYS = ['sessionId', 'sessionRevision'] as const;
+const SEMANTIC_OMITTED_KEYS = new Set(['hostId', 'updatedAt', 'presence', 'sessionRevision']);
 
-/**
- * This Host-wide active-set snapshot revision is independent from any future
- * per-session encrypted content revision; the two revision domains must not be reused.
- */
-
-/**
- * Validates an exact authoritative Host current-session snapshot without
- * normalizing free text, labels, timestamps, or Host scope.
- */
-export function validateReplaceCurrentSessionsRequest(
+export function validateReplaceE2ECurrentSessionsRequestV1(
   value: unknown,
-): ValidationResult<ReplaceCurrentSessionsRequest> {
+): ValidationResult<ReplaceE2ECurrentSessionsRequestV1> {
   const issues: string[] = [];
   const request = asRecord(value, 'body', issues);
   if (!request) return { success: false, issues };
-
-  requireExactKeys(request, REQUEST_KEYS, 'body', issues);
-  requireNonBlankString(request.hostId, 'hostId', issues);
-  if (typeof request.revision !== 'number' || !Number.isSafeInteger(request.revision) || request.revision <= 0) {
-    issues.push('revision must be a positive integer');
-  }
-  requireCanonicalTimestamp(request.observedAt, 'observedAt', issues);
-
-  if (!Array.isArray(request.sessions)) {
-    issues.push('sessions must be an array');
-  } else {
+  exactKeys(request, REQUEST_KEYS, 'body', issues);
+  nonBlank(request.hostId, 'hostId', issues);
+  positiveRevision(request.revision, 'revision', issues);
+  positiveRevision(request.recipientSetVersion, 'recipientSetVersion', issues);
+  if (!isCanonicalTimestamp(request.observedAt)) issues.push('observedAt must be a canonical RFC3339 timestamp');
+  if (!Array.isArray(request.sessions)) issues.push('sessions must be an array');
+  else {
     const seen = new Set<string>();
     request.sessions.forEach((candidate, index) => {
       const path = `sessions[${index}]`;
       const session = asRecord(candidate, path, issues);
       if (!session) return;
-      validateActiveSession(session, path, issues);
-
-      if (typeof request.hostId === 'string' && typeof session.hostId === 'string' && session.hostId !== request.hostId) {
-        issues.push(`${path}.hostId must match hostId`);
+      exactKeys(session, SESSION_KEYS, path, issues);
+      nonBlank(session.sessionId, `${path}.sessionId`, issues);
+      if (typeof session.sessionId === 'string') {
+        if (session.sessionId.startsWith('driver:') || session.sessionId.startsWith('host:')) issues.push(`${path}.sessionId must not be diagnostic`);
+        if (seen.has(session.sessionId)) issues.push(`${path}.sessionId must be unique`);
+        seen.add(session.sessionId);
       }
-      if (typeof session.hostId === 'string' && typeof session.sessionId === 'string') {
-        const key = `${session.hostId}\u0000${session.sessionId}`;
-        if (seen.has(key)) issues.push(`${path} duplicates a hostId/sessionId entry`);
-        seen.add(key);
-      }
+      positiveRevision(session.sessionRevision, `${path}.sessionRevision`, issues);
     });
   }
-
-  return issues.length
-    ? { success: false, issues }
-    : { success: true, value: value as ReplaceCurrentSessionsRequest, issues };
+  return issues.length ? { success: false, issues } : { success: true, value: value as ReplaceE2ECurrentSessionsRequestV1, issues };
 }
 
-function validateActiveSession(
-  session: Record<string, unknown>,
-  path: string,
-  issues: string[],
-): void {
-  requireExactKeys(session, SESSION_KEYS, path, issues, [
-    'sessionId', 'hostId', 'provider', 'projectName', 'nameText',
-    'stateLabel', 'status', 'updatedAt', 'presence',
-  ]);
-  requireNonBlankString(session.sessionId, `${path}.sessionId`, issues);
-  requireNonBlankString(session.hostId, `${path}.hostId`, issues);
-  requireNonBlankString(session.provider, `${path}.provider`, issues);
-  requireNonBlankString(session.projectName, `${path}.projectName`, issues);
-  requireNonBlankString(session.nameText, `${path}.nameText`, issues);
-  requireOptionalString(session.openingText, `${path}.openingText`, issues);
-  requireOptionalString(session.latestActivityText, `${path}.latestActivityText`, issues);
-  requireNonBlankString(session.stateLabel, `${path}.stateLabel`, issues);
-
-  if (typeof session.status !== 'string' || !(SESSION_STATUSES as readonly string[]).includes(session.status)) {
-    issues.push(`${path}.status is unsupported`);
-  } else if (session.stateLabel !== statusToStateLabel(session.status as ActiveSessionSnapshot['status'])) {
-    issues.push(`${path}.stateLabel must match status`);
-  }
-
-  if (session.presence !== 'active') issues.push(`${path}.presence must be active`);
-  requireCanonicalTimestamp(session.updatedAt, `${path}.updatedAt`, issues);
-  requireOptionalNonBlankString(session.lastEventId, `${path}.lastEventId`, issues);
-  requireOptionalCanonicalTimestamp(session.snoozedUntil, `${path}.snoozedUntil`, issues);
-  if (session.actionablePrompt !== undefined) validateActionablePrompt(session.actionablePrompt, `${path}.actionablePrompt`, issues);
+/** Canonical digest sorts members by Session ID, so set ordering is not semantic. */
+export async function canonicalE2ECurrentSessionsDigestV1(request: ReplaceE2ECurrentSessionsRequestV1): Promise<string> {
+  const canonical = {
+    hostId: request.hostId,
+    observedAt: request.observedAt,
+    recipientSetVersion: request.recipientSetVersion,
+    revision: request.revision,
+    sessions: [...request.sessions].sort((a, b) => compareCanonicalStrings(a.sessionId, b.sessionId))
+      .map(({ sessionId, sessionRevision }) => ({ sessionId, sessionRevision })),
+  };
+  return contentSha256(new TextEncoder().encode(stableJson(canonical)));
 }
 
-function validateActionablePrompt(value: unknown, path: string, issues: string[]): void {
-  const prompt = asRecord(value, path, issues);
-  if (!prompt) return;
-  requireExactKeys(prompt, PROMPT_KEYS, path, issues, ['promptId', 'type', 'label']);
-  requireNonBlankString(prompt.promptId, `${path}.promptId`, issues);
-  if (prompt.type !== 'question') issues.push(`${path}.type must be question`);
-  requireNonBlankString(prompt.label, `${path}.label`, issues);
-  if (prompt.options !== undefined) {
-    if (!Array.isArray(prompt.options)) {
-      issues.push(`${path}.options must be an array`);
-    } else {
-      prompt.options.forEach((option, index) => requireNonBlankString(option, `${path}.options[${index}]`, issues));
-    }
-  }
-  requireOptionalCanonicalTimestamp(prompt.expiresAt, `${path}.expiresAt`, issues);
+/** Digest used by Bridge change detection; excludes liveness and allocated revisions. */
+export async function e2eCurrentSessionsSemanticDigestV1(
+  hostId: string,
+  sessions: readonly E2ECurrentSessionReferenceV1[] | readonly { sessionId: string }[],
+): Promise<string> {
+  const semanticSessions = sessions.map((item) => {
+    const value = item as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(value)
+      .filter(([key]) => !SEMANTIC_OMITTED_KEYS.has(key))
+      .sort(([left], [right]) => compareCanonicalStrings(left, right)));
+  }).sort((left, right) => compareCanonicalStrings(String(left.sessionId), String(right.sessionId)));
+  return contentSha256(new TextEncoder().encode(stableJson({ hostId, sessions: semanticSessions })));
 }
 
-function asRecord(value: unknown, path: string, issues: string[]): Record<string, unknown> | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    issues.push(`${path} must be an object`);
-    return undefined;
-  }
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  for (const [key, descriptor] of Object.entries(descriptors)) {
-    if (!('value' in descriptor)) issues.push(`${path}.${key} must be an own data property`);
-  }
-  return Object.fromEntries(
-    Object.entries(descriptors)
-      .filter(([, descriptor]) => 'value' in descriptor)
-      .map(([key, descriptor]) => [key, descriptor.value]),
-  );
+function positiveRevision(value: unknown, path: string, issues: string[]): void {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) issues.push(`${path} must be a positive safe integer`);
 }
-
-function requireExactKeys(
-  object: Record<string, unknown>,
-  allowed: readonly string[],
-  path: string,
-  issues: string[],
-  required: readonly string[] = allowed,
-): void {
-  const supported = new Set(allowed);
-  for (const key of Object.keys(object)) if (!supported.has(key)) issues.push(`${path}.${key} is unsupported`);
-  for (const key of required) if (!Object.prototype.hasOwnProperty.call(object, key)) issues.push(`${path}.${key} is required`);
-}
-
-function requireNonBlankString(value: unknown, path: string, issues: string[]): void {
+function nonBlank(value: unknown, path: string, issues: string[]): void {
   if (typeof value !== 'string' || !value.trim()) issues.push(`${path} must be a non-blank string`);
 }
-
-function requireOptionalString(value: unknown, path: string, issues: string[]): void {
-  if (value !== undefined && typeof value !== 'string') issues.push(`${path} must be a string`);
+function exactKeys(value: Record<string, unknown>, keys: readonly string[], path: string, issues: string[]): void {
+  const allowed = new Set(keys);
+  for (const key of Object.keys(value)) if (!allowed.has(key)) issues.push(`${path}.${key} is unsupported`);
+  for (const key of keys) if (!Object.hasOwn(value, key)) issues.push(`${path}.${key} is required`);
+}
+function asRecord(value: unknown, path: string, issues: string[]): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) { issues.push(`${path} must be an object`); return undefined; }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const [key, descriptor] of Object.entries(descriptors)) if (!('value' in descriptor)) issues.push(`${path}.${key} must be an own data property`);
+  return Object.fromEntries(Object.entries(descriptors).filter(([, descriptor]) => 'value' in descriptor).map(([key, descriptor]) => [key, descriptor.value]));
+}
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${stableJson(object[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
-function requireOptionalNonBlankString(value: unknown, path: string, issues: string[]): void {
-  if (value !== undefined) requireNonBlankString(value, path, issues);
-}
-
-function requireCanonicalTimestamp(value: unknown, path: string, issues: string[]): void {
-  if (!isCanonicalTimestamp(value)) issues.push(`${path} must be a canonical RFC3339 timestamp`);
-}
-
-function requireOptionalCanonicalTimestamp(value: unknown, path: string, issues: string[]): void {
-  if (value !== undefined) requireCanonicalTimestamp(value, path, issues);
+function compareCanonicalStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
