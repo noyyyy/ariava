@@ -92,7 +92,8 @@ export class BridgeDaemon {
   private syncFlight?: Promise<BridgeSyncResult>;
   private reconciliationTimer?: unknown;
   private reconciliationRequested = true;
-
+  private currentSessionsSnapshotFailureCount = 0;
+  private lastCurrentSessionsSnapshotFailureLogAt = 0;
   constructor(
     private readonly config: BridgeConfig,
     drivers?: AgentDriver[],
@@ -245,13 +246,66 @@ export class BridgeDaemon {
       try { await this.flushCurrentSessionsSnapshot(activeSessions); }
       catch (error) {
         if (snapshotError(error, 'session_snapshot_conflict')) throw new Error('Relay rejected the persisted E2E lifecycle revision as conflicting', { cause: error });
-        offline = true;
+        offline = !(await this.handleCurrentSessionsSnapshotFailure(error, activeSessions));
       }
     }
     const flushedEvents = offline ? 0 : await this.flushPendingEvents();
     const flushedReads = offline ? 0 : await this.flushPendingHandles();
     const handledCommands = offline ? [] : await this.pullAndHandleCommands();
     return { host: this.stateStore.getHost(), sessions: nextSessions, emittedEvents: newEvents, flushedEvents, flushedReads, handledCommands, offline };
+  }
+
+  private resetCurrentSessionsSnapshotFailures(): void { this.currentSessionsSnapshotFailureCount = 0; }
+
+  private async handleCurrentSessionsSnapshotFailure(error: unknown, activeSessions: CanonicalSessionState[]): Promise<boolean> {
+    this.currentSessionsSnapshotFailureCount += 1;
+    this.logCurrentSessionsSnapshotFailure(error, activeSessions);
+    this.scheduleRegistryReconciliation();
+    if (this.currentSessionsSnapshotFailureCount < 2) return false;
+    try {
+      await this.recoverCurrentSessionsSnapshotPipeline(activeSessions);
+      const recoveredAfter = this.currentSessionsSnapshotFailureCount;
+      await this.flushCurrentSessionsSnapshot(activeSessions);
+      this.resetCurrentSessionsSnapshotFailures();
+      process.stderr.write(`Ariava recovered current-session snapshot publication after ${recoveredAfter} failure(s).\n`);
+      return true;
+    } catch (recoveryError) {
+      this.logCurrentSessionsSnapshotFailure(recoveryError, activeSessions, 'recovery');
+      this.scheduleRegistryReconciliation();
+      return false;
+    }
+  }
+
+  private async recoverCurrentSessionsSnapshotPipeline(activeSessions: CanonicalSessionState[]): Promise<void> {
+    if (this.encryptionIdentity) this.keyring = new LocalLinkKeyring(`${this.config.identityPath}.e2e-keyring.json`, this.encryptionIdentity);
+    this.stateStore.clearCurrentSessionsSnapshotPending();
+    this.stateStore.clearInflightSessionUploads(activeSessions.map((session) => session.sessionId));
+  }
+
+  private logCurrentSessionsSnapshotFailure(error: unknown, activeSessions: CanonicalSessionState[], phase = 'publish'): void {
+    const now = Date.now();
+    if (phase === 'publish' && now - this.lastCurrentSessionsSnapshotFailureLogAt < 30_000) return;
+    this.lastCurrentSessionsSnapshotFailureLogAt = now;
+    const snapshot = this.stateStore.getCurrentSessionsSnapshotState();
+    const sessionsWithoutRevision = activeSessions.filter((session) => this.stateStore.currentSessionRevision(session.sessionId) === 0);
+    const sessionIdsWithoutRevision = sessionsWithoutRevision.slice(0, 10).map((session) => session.sessionId);
+    const detail = {
+      phase,
+      failures: this.currentSessionsSnapshotFailureCount,
+      activeSessionCount: activeSessions.length,
+      noRevisionSessionCount: sessionsWithoutRevision.length,
+      noRevisionSessionIds: sessionIdsWithoutRevision,
+      lastAcceptedRevision: snapshot.lastAcceptedRevision,
+      lastAllocatedRevision: snapshot.lastAllocatedRevision,
+      lastAcceptedRecipientSetVersion: snapshot.lastAcceptedRecipientSetVersion,
+      pendingRevision: snapshot.pending?.request.revision,
+      pendingRecipientSetVersion: snapshot.pending?.request.recipientSetVersion,
+      localRecipientSetVersion: this.stateStore.getRecipientSetVersion(),
+      error: this.formatError(error),
+      relayStatus: error instanceof RelayClientError ? error.status : undefined,
+      relayCode: error instanceof RelayClientError && error.body && typeof error.body === 'object' ? (error.body as Record<string, unknown>).code : undefined,
+    };
+    process.stderr.write(`Ariava current-session snapshot ${phase} failed: ${JSON.stringify(detail)}\n`);
   }
 
   async pairWatch(pairingCode: string): Promise<BridgePairWatchResponse> {
@@ -310,6 +364,7 @@ export class BridgeDaemon {
     const response = await this.client().replaceE2ECurrentSessions(pending.request);
     if (response.hostId !== pending.request.hostId || response.revision !== pending.request.revision) throw new Error('Relay returned a mismatched current session snapshot response');
     this.stateStore.acceptCurrentSessionsSnapshot(pending.request.revision, pending.digest);
+    this.resetCurrentSessionsSnapshotFailures();
   }
 
   private async flushCurrentSessionsSnapshot(currentSessions: CanonicalSessionState[]): Promise<void> {

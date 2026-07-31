@@ -143,6 +143,11 @@ export class BridgeStateStore {
     if (!pending || pending.request.revision !== revision || pending.digest !== digest) return false;
     const { pending: _pending, ...current } = this.state.currentSessionsSnapshot; this.state.currentSessionsSnapshot = current; this.persist(); return true;
   }
+  clearCurrentSessionsSnapshotPending(): boolean {
+    const pending = this.state.currentSessionsSnapshot.pending;
+    if (!pending) return false;
+    return this.clearPendingCurrentSessionsSnapshot(pending.request.revision, pending.digest);
+  }
   appendRecentEvent(event: CanonicalEvent): void { this.state.recentEvents = [event, ...this.state.recentEvents].slice(0, 200); this.persist(); }
   queuePendingEvent(event: CanonicalEvent): void {
     this.state.recentEvents = [event, ...this.state.recentEvents].slice(0, 200);
@@ -194,6 +199,19 @@ export class BridgeStateStore {
       payloadKind: 'session-upload-v1', createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) }]);
   }
   removeInflightSessionUpload(sessionId: string): void { this.spool?.remove(`inflight:session:${sessionId}`); }
+  clearInflightSessionUploads(sessionIds?: readonly string[]): number {
+    const ids = sessionIds ? new Set(sessionIds) : undefined;
+    let removed = 0;
+    if (!this.spool) return 0;
+    const shouldRemove = (sessionId: string): boolean => !ids || ids.has(sessionId);
+    for (const item of this.spool.list('session-upload-v1')) {
+      if (!shouldRemove(item.sessionId)) continue;
+      this.spool.remove(item.spoolItemId);
+      removed += 1;
+    }
+    if (removed > 0) this.persist();
+    return removed;
+  }
   private openSpoolJson(itemId: string): unknown | undefined {
     const item = this.spool?.get(itemId); if (!item) return undefined; const bytes = this.spool!.open(item);
     try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); } finally { bytes.fill(0); }
