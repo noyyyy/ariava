@@ -90,7 +90,7 @@ export async function runOnboardingOrchestrator(
   try {
     const detection = deps.detect();
     requireSupportedPreflight(detection);
-    steps.push(step('preflight', 'reused', { backend: detection.serviceSupport.backend }));
+    steps.push(step('preflight', 'reused', preflightDetail(detection)));
 
     currentStep = 'stable-cli';
     let bootstrap: StableBootstrapResult;
@@ -246,6 +246,13 @@ function requireSupportedPreflight(detection: OnboardingDetection): void {
     reason: support.reason,
     ...(remediation ? { remediation: { message: remediation } } : {}),
   });
+}
+
+function preflightDetail(detection: OnboardingDetection): Record<string, unknown> {
+  return {
+    backend: detection.serviceSupport.backend,
+    ...(detection.sourceDev.kind !== 'absent' ? { sourceDev: detection.sourceDev } : {}),
+  };
 }
 
 function persistRelaySelection(

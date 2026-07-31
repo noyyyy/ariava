@@ -77,6 +77,7 @@ function fixture(options: {
   piAction?: 'reused' | 'installed' | 'upgraded';
   piFailure?: boolean;
   cancelAt?: string;
+  sourceDev?: OnboardingDetection['sourceDev'];
 } = {}) {
   const calls: string[] = [];
   const backend = options.backend ?? 'systemd-user';
@@ -119,6 +120,7 @@ function fixture(options: {
         platform: support.platform, architecture: 'arm64', nodeVersion: '22', npm: { present: true }, pi: { present: true },
         serviceSupport: support, interactive: false, machineOutput: true, configPath: '/home/test/.config/ariava/config.json',
         config: userConfig, installMetadata: metadata,
+        sourceDev: options.sourceDev ?? { kind: 'absent' },
         currentCli: { executablePath: cli, packageRoot: '/prefix/lib/node_modules/ariava', packageVersion: version, npmPrefix: '/prefix', npmBinPath: '/prefix/bin' },
       } as OnboardingDetection;
     },
@@ -188,6 +190,34 @@ describe('onboarding orchestrator', () => {
     expect(scenario.metadata.installer).toMatchObject({ manager: 'npm', ariavaBinRealPath: cli });
     expect(scenario.metadata.bridgeSource).toMatchObject({ kind: 'npm-package', package: `ariava@${version}` });
     expect(scenario.calls.indexOf('metadata.save')).toBeLessThan(scenario.calls.indexOf('readiness'));
+  });
+
+  test('isolated source dev profile appears in preflight detail and production onboarding continues', async () => {
+    const sourceDev = {
+      kind: 'present-isolated' as const,
+      devRoot: '/home/test/.config/ariava-dev',
+      devConfigPath: '/home/test/.config/ariava-dev/config.json',
+    };
+    const scenario = fixture({ target: 'host-ready', existingService: false, running: false, sourceDev });
+
+    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
+
+    expect(result.readiness).toBe('host-ready');
+    expect(result.steps.map(({ id }) => id)).toEqual([
+      'preflight', 'stable-cli', 'relay-config', 'host-init', 'bridge-service',
+      'adapter-detect', 'adapter-install', 'strict-readiness', 'completion',
+    ]);
+    expect(result.steps[0]).toMatchObject({
+      id: 'preflight',
+      status: 'reused',
+      detail: {
+        backend: 'systemd-user',
+        sourceDev,
+      },
+    });
+    expect(result.nextActions).toEqual([{ id: 'pair-watch', command: 'ariava pair <PAIRING_CODE>' }]);
+    expect(result.nextActions.some((action) => action.id === 'resolve-failure' || action.id === 'retry-onboarding')).toBe(false);
+    expect(scenario.calls).toContain('service.install');
   });
 
   test('supports capable native Linux and WSL while unsupported WSL fails before writes', async () => {

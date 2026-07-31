@@ -19,6 +19,7 @@ import {
   isConfigComplete,
   resolveAriavaConfig,
   type ServiceStatus,
+  buildInitializedConfig,
 } from '../src/host-manager';
 import type { BridgeConfig } from '../src/types';
 import type { ResolvedAriavaConfig } from '../src/host-manager/config';
@@ -120,6 +121,17 @@ describe('host-manager helpers', () => {
     expect(fromEnv.agentAdapterSecret).toBe('env-secret');
     expect(fromEnv.environmentOverrides).toContain('ARIAVA_AGENT_ADAPTER_SECRET');
     delete process.env.ARIAVA_AGENT_ADAPTER_SECRET;
+  });
+
+  test('production onboarding initialization can ignore transient identity environment paths', () => {
+    const initialized = buildInitializedConfig({}, { useEnvironmentIdentityPath: false }, {
+      hostName: () => 'Test Host',
+      generateSecret: () => 'secret',
+      environment: { ARIAVA_HOST_IDENTITY_PATH: '/tmp/ariava-dev/host-identity.json' },
+    });
+
+    expect(initialized.identityPath).toMatch(/\/\.config\/ariava\/host-identity\.json$/);
+    expect(initialized.identityPath).not.toContain('ariava-dev');
   });
 
   test('treats host config as complete without a relay token', () => {

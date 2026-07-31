@@ -79,7 +79,7 @@ import {
   type ServiceManager,
   type ServiceStatus,
 } from './host-manager';
-import { ARIAVA_CONFIG_ROOT } from './host-manager/paths';
+import { ARIAVA_CONFIG_PATH, ARIAVA_CONFIG_ROOT } from './host-manager/paths';
 import { buildHostManagerStatus, isConfigComplete } from './host-manager/status';
 import { readAgentAdapterConfig } from './agent-adapter/config';
 import { inspectCurrentNodeRuntime, probeNodeRuntimePath } from './runtime/node-runtime';
@@ -1037,7 +1037,7 @@ function createOnboardingDetection(deps: PublicCliDependencies, machineOutput: b
   const prefix = resolveNpmPrefix(runner);
   return detectOnboardingEnvironment({
     platform: manager.support.platform as NodeJS.Platform, architecture: process.arch, nodeVersion: process.version, runner,
-    detectServiceSupport: () => manager.support, isTty: interactive, machineOutput, configPath: deps.resolveAriavaConfig().configPath,
+    detectServiceSupport: () => manager.support, isTty: interactive, machineOutput, configPath: ARIAVA_CONFIG_PATH,
     devConfigPath: resolveAriavaDevProfilePaths().configPath, pathExists: deps.pathExists, loadConfig: deps.loadUserConfig,
     loadInstallMetadata: deps.loadInstallMetadata, currentCli: {
       executablePath: binPath, packageRoot: PACKAGE_ROOT, packageVersion: CLI_VERSION, npmPrefix: prefix, npmBinPath: prefix ? join(prefix, 'bin') : undefined,
@@ -1111,11 +1111,11 @@ async function runDefaultOnboarding(deps: PublicCliDependencies, input: Paramete
 }
 
 async function initializeOnboardingHost(deps: PublicCliDependencies, manager: ServiceManager, relayBaseUrl: string) {
-  return initializeHost({ relayBaseUrl }, { loadUserConfig: deps.loadUserConfig, saveUserConfig: deps.saveUserConfig, createIdentityStore: (path) => deps.createHostIdentityStore(path, manager.support.platform), hostName: hostname, generateSecret: generateAgentAdapterSecret, environment: process.env });
+  return initializeHost({ relayBaseUrl, useEnvironmentIdentityPath: false }, { loadUserConfig: deps.loadUserConfig, saveUserConfig: deps.saveUserConfig, createIdentityStore: (path) => deps.createHostIdentityStore(path, manager.support.platform), hostName: hostname, generateSecret: generateAgentAdapterSecret, environment: process.env });
 }
 
 async function loadOnboardingHostState(deps: PublicCliDependencies, manager: ServiceManager) {
-  const config = deps.resolveAriavaConfig();
+  const config = resolveAriavaConfig({}, ARIAVA_CONFIG_PATH, false);
   const store = deps.createHostIdentityStore(config.identityPath, manager.support.platform);
   const identityInspection = await store.inspect();
   // Fail closed with the concrete HostIdentityError when evidence exists but cannot be loaded.

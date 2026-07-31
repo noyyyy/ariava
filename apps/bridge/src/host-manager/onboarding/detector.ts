@@ -1,3 +1,5 @@
+import { dirname, resolve, sep } from 'node:path';
+import type { AriavaUserConfig } from '../config';
 import { AriavaCliError } from '../service/errors';
 import type { CommandResult } from '../service/types';
 import type {
@@ -5,14 +7,17 @@ import type {
   OnboardingDetectorDependencies,
   OnboardingSelection,
   OnboardingSelectionInput,
+  ProductionContaminationIssue,
   RuntimeProbe,
+  SourceDevObservation,
 } from './types';
 import { getProductionAdapter } from './catalog';
 
 export function detectOnboardingEnvironment(deps: OnboardingDetectorDependencies): OnboardingDetection {
   const config = deps.loadConfig(deps.configPath);
   const installMetadata = deps.loadInstallMetadata();
-  assertProductionEvidence(deps, installMetadata);
+  const sourceDev = observeSourceDev(deps, config, installMetadata);
+  assertProductionEvidence(sourceDev);
   return {
     platform: deps.platform,
     architecture: deps.architecture,
@@ -25,6 +30,7 @@ export function detectOnboardingEnvironment(deps: OnboardingDetectorDependencies
     configPath: deps.configPath,
     config,
     installMetadata,
+    sourceDev,
     currentCli: deps.currentCli,
     ...(deps.stableCli ? { stableCli: deps.stableCli } : {}),
   };
@@ -64,18 +70,97 @@ function probeVersion(result: CommandResult): RuntimeProbe {
   return { present: true, ...(version ? { version } : {}) };
 }
 
-function assertProductionEvidence(
+function observeSourceDev(
   deps: OnboardingDetectorDependencies,
+  config: AriavaUserConfig,
   installMetadata: ReturnType<OnboardingDetectorDependencies['loadInstallMetadata']>,
-): void {
-  const sourceKinds = [installMetadata.bridgeSource?.kind, installMetadata.piSource?.kind];
-  const devEvidence = deps.pathExists(deps.devConfigPath) || sourceKinds.includes('dev-repo') || sourceKinds.includes('explicit-path');
-  if (!devEvidence) return;
-  throw new AriavaCliError('ERR_STABLE_CLI_PATH', 'Production onboarding cannot continue while source-dev or ambiguous install evidence is present.', {
+): SourceDevObservation {
+  const devConfigExists = deps.pathExists(deps.devConfigPath);
+  const devRoot = dirname(deps.devConfigPath);
+  const issues = productionContaminationIssues(deps.configPath, config, installMetadata, devRoot);
+  if (issues.length > 0) {
+    const allIssuesAreExplicitPaths = issues.every((issue) => issue.sourceKind === 'explicit-path');
+    return { kind: allIssuesAreExplicitPaths ? 'ambiguous' : 'production-contaminated', issues };
+  }
+  if (devConfigExists) {
+    return { kind: 'present-isolated', devRoot, devConfigPath: deps.devConfigPath };
+  }
+  return { kind: 'absent' };
+}
+
+function productionContaminationIssues(
+  configPath: string,
+  config: AriavaUserConfig,
+  installMetadata: ReturnType<OnboardingDetectorDependencies['loadInstallMetadata']>,
+  devRoot: string,
+ ): ProductionContaminationIssue[] {
+  return [
+    sourceIssue('installMetadata.bridgeSource', installMetadata.bridgeSource?.kind),
+    sourceIssue('installMetadata.piSource', installMetadata.piSource?.kind),
+    configPathIssue('productionConfig.configPath', configPath, devRoot),
+    configPathIssue('productionConfig.agentAdapterConfigPath', config.agentAdapterConfigPath, devRoot),
+    configPathIssue('productionConfig.statePath', config.statePath, devRoot),
+    configPathIssue('productionConfig.identityPath', config.identityPath, devRoot),
+    config.agentAdapterPort === 7273 ? {
+      resource: 'productionConfig.agentAdapterPort',
+      reason: 'production config uses the source dev Agent Adapter port',
+    } : undefined,
+  ].filter((issue): issue is ProductionContaminationIssue => issue !== undefined);
+}
+
+function sourceIssue(
+  resource: string,
+  sourceKind: string | undefined,
+): ProductionContaminationIssue | undefined {
+  if (sourceKind === 'dev-repo') {
+    return {
+      resource,
+      sourceKind,
+      reason: 'production install metadata points to a source development repository',
+    };
+  }
+  if (sourceKind === 'explicit-path') {
+    return {
+      resource,
+      sourceKind,
+      reason: 'production install metadata points to an explicit local path that is not safe to persist for production onboarding',
+    };
+  }
+  return undefined;
+}
+
+function configPathIssue(resource: string, path: string | undefined, devRoot: string): ProductionContaminationIssue | undefined {
+  if (!path || !isInsidePath(path, devRoot)) return undefined;
+  return {
+    resource,
+    reason: 'production config points to the source dev profile path',
+  };
+}
+
+function isInsidePath(path: string, root: string): boolean {
+  const resolvedPath = resolve(path);
+  const resolvedRoot = resolve(root);
+  return resolvedPath === resolvedRoot || resolvedPath.startsWith(`${resolvedRoot}${sep}`);
+}
+
+function assertProductionEvidence(sourceDev: SourceDevObservation): void {
+  if (sourceDev.kind === 'absent' || sourceDev.kind === 'present-isolated') return;
+  let code: AriavaCliError['code'];
+  let message: string;
+  if (sourceDev.kind === 'ambiguous') {
+    code = 'ERR_PRODUCTION_INSTALL_METADATA_AMBIGUOUS';
+    message = 'Production onboarding cannot safely continue because production evidence contains ambiguous local path metadata.';
+  } else {
+    code = 'ERR_PRODUCTION_PROFILE_CONTAMINATED';
+    message = 'Production onboarding cannot safely continue because production resources point to source development evidence.';
+  }
+  throw new AriavaCliError(code, message, {
     step: 'preflight',
     retryable: false,
+    sourceDev,
+    issues: sourceDev.issues,
     remediation: {
-      message: 'Exit Ariava source dev mode explicitly, then retry production onboarding.',
+      message: 'Repair or remove the contaminated production config or install metadata, then retry production onboarding.',
     },
   });
 }

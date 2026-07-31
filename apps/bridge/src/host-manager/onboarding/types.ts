@@ -70,6 +70,18 @@ export interface RuntimeProbe {
   reason?: 'not-found' | 'probe-failed';
 }
 
+export interface ProductionContaminationIssue {
+  resource: string;
+  reason: string;
+  sourceKind?: 'dev-repo' | 'explicit-path';
+}
+
+export type SourceDevObservation =
+  | { kind: 'absent' }
+  | { kind: 'present-isolated'; devRoot: string; devConfigPath: string; devPort?: number; devBridgeRunning?: boolean }
+  | { kind: 'production-contaminated'; issues: ProductionContaminationIssue[] }
+  | { kind: 'ambiguous'; issues: ProductionContaminationIssue[] };
+
 export interface OnboardingDetection {
   platform: NodeJS.Platform;
   architecture: string;
@@ -82,6 +94,7 @@ export interface OnboardingDetection {
   configPath: string;
   config: AriavaUserConfig;
   installMetadata: AriavaInstallMetadata;
+  sourceDev: SourceDevObservation;
   currentCli: OnboardingCliEvidence;
   stableCli?: OnboardingCliEvidence;
 }

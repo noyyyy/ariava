@@ -21,6 +21,7 @@ function detector(options: {
   results?: CommandResult[];
   installMetadata?: AriavaInstallMetadata;
   devPathExists?: boolean;
+  config?: ReturnType<OnboardingDetectorDependencies['loadConfig']>;
 } = {}) {
   const calls: string[] = [];
   const results = [...(options.results ?? [
@@ -51,7 +52,7 @@ function detector(options: {
     },
     loadConfig(path) {
       calls.push(`load-config ${path}`);
-      return { relayBaseUrl: 'https://ariava-relay.noyx.io' };
+      return options.config ?? { relayBaseUrl: 'https://ariava-relay.noyx.io' };
     },
     loadInstallMetadata() {
       calls.push('load-install');
@@ -111,26 +112,141 @@ describe('onboarding detector', () => {
     }
   });
 
-  test('fails closed for a dev profile or dev source metadata and returns redacted remediation', () => {
-    for (const options of [
-      { devPathExists: true },
-      { installMetadata: { bridgeSource: { kind: 'dev-repo' as const, path: '/secret/repo', updatedAt: 'now' } } },
-    ]) {
-      const probe = detector(options);
+  test('classifies an existing dev config as present-isolated and continues detection', () => {
+    const probe = detector({ devPathExists: true });
+    const detection = detectOnboardingEnvironment(probe.deps);
+
+    expect(detection.sourceDev).toEqual({
+      kind: 'present-isolated',
+      devRoot: '/home/test/.config/ariava-dev',
+      devConfigPath: '/home/test/.config/ariava-dev/config.json',
+    });
+    expect(detection.installMetadata).toEqual({});
+    expect(probe.calls).toEqual([
+      'load-config /home/test/.config/ariava/config.json',
+      'load-install',
+      'exists /home/test/.config/ariava-dev/config.json',
+      'npm --version',
+      'pi --version',
+      'service-support',
+    ]);
+  });
+
+  test('isolated dev config with normal npm metadata succeeds', () => {
+    const probe = detector({
+      devPathExists: true,
+      installMetadata: {
+        bridgeSource: { kind: 'npm-package', package: 'ariava@1.2.3', updatedAt: 'now' },
+        piSource: { kind: 'npm-package', package: '@ariava/pi-extension@1.2.3', updatedAt: 'now' },
+      },
+    });
+
+    const detection = detectOnboardingEnvironment(probe.deps);
+
+    expect(detection.sourceDev.kind).toBe('present-isolated');
+    expect(detection.installMetadata.bridgeSource?.kind).toBe('npm-package');
+    expect(detection.installMetadata.piSource?.kind).toBe('npm-package');
+  });
+
+  test('fails closed for dev source metadata with precise redacted contamination detail', () => {
+    const probe = detector({
+      installMetadata: {
+        bridgeSource: { kind: 'dev-repo' as const, path: '/secret/repo', updatedAt: 'now' },
+        piSource: { kind: 'explicit-path' as const, path: '/secret/pi', updatedAt: 'now' },
+      },
+    });
+
+    try {
+      detectOnboardingEnvironment(probe.deps);
+      throw new Error('expected detector to reject contaminated production metadata');
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: 'ERR_PRODUCTION_PROFILE_CONTAMINATED',
+        message: 'Production onboarding cannot safely continue because production resources point to source development evidence.',
+        data: {
+          step: 'preflight',
+          retryable: false,
+          sourceDev: {
+            kind: 'production-contaminated',
+            issues: [
+              { resource: 'installMetadata.bridgeSource', sourceKind: 'dev-repo' },
+              { resource: 'installMetadata.piSource', sourceKind: 'explicit-path' },
+            ],
+          },
+          remediation: { message: 'Repair or remove the contaminated production config or install metadata, then retry production onboarding.' },
+        },
+      });
+      expect(JSON.stringify(error)).not.toContain('/secret/repo');
+      expect(JSON.stringify(error)).not.toContain('/secret/pi');
+      expect(JSON.stringify(error)).not.toContain('Exit Ariava source dev mode explicitly');
+    }
+  });
+
+  test('fails closed for ambiguous explicit-path metadata without exposing source paths', () => {
+    const probe = detector({
+      installMetadata: { bridgeSource: { kind: 'explicit-path' as const, path: '/secret/repo', updatedAt: 'now' } },
+    });
+
+    try {
+      detectOnboardingEnvironment(probe.deps);
+      throw new Error('expected detector to reject ambiguous production metadata');
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: 'ERR_PRODUCTION_INSTALL_METADATA_AMBIGUOUS',
+        data: {
+          sourceDev: {
+            kind: 'ambiguous',
+            issues: [{ resource: 'installMetadata.bridgeSource', sourceKind: 'explicit-path' }],
+          },
+        },
+      });
+      expect(JSON.stringify(error)).not.toContain('/secret/repo');
+      expect(JSON.stringify(error)).not.toContain('Exit Ariava source dev mode explicitly');
+    }
+  });
+
+  test('fails closed when production config points to source dev profile resources', () => {
+    for (const [resource, config] of [
+      ['productionConfig.agentAdapterConfigPath', { agentAdapterConfigPath: '/home/test/.config/ariava-dev/agent-adapter.json' }],
+      ['productionConfig.statePath', { statePath: '/home/test/.config/ariava-dev/state/bridge-state.json' }],
+      ['productionConfig.identityPath', { identityPath: '/home/test/.config/ariava-dev/host-identity.json' }],
+      ['productionConfig.agentAdapterPort', { agentAdapterPort: 7273 }],
+    ] as const) {
+      const probe = detector({ config });
       try {
         detectOnboardingEnvironment(probe.deps);
-        throw new Error('expected detector to reject dev evidence');
+        throw new Error(`expected detector to reject ${resource}`);
       } catch (error) {
         expect(error).toMatchObject({
-          code: 'ERR_STABLE_CLI_PATH',
+          code: 'ERR_PRODUCTION_PROFILE_CONTAMINATED',
           data: {
             step: 'preflight',
             retryable: false,
-            remediation: { message: 'Exit Ariava source dev mode explicitly, then retry production onboarding.' },
+            sourceDev: {
+              kind: 'production-contaminated',
+              issues: [{ resource }],
+            },
           },
         });
-        expect(JSON.stringify(error)).not.toContain('/secret/repo');
+        expect(JSON.stringify(error)).not.toContain('Exit Ariava source dev mode explicitly');
       }
+    }
+    const configPathProbe = detector();
+    configPathProbe.deps.configPath = '/home/test/.config/ariava-dev/config.json';
+    try {
+      detectOnboardingEnvironment(configPathProbe.deps);
+      throw new Error('expected detector to reject productionConfig.configPath');
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: 'ERR_PRODUCTION_PROFILE_CONTAMINATED',
+        data: {
+          sourceDev: {
+            kind: 'production-contaminated',
+            issues: [{ resource: 'productionConfig.configPath' }],
+          },
+        },
+      });
+      expect(JSON.stringify(error)).not.toContain('Exit Ariava source dev mode explicitly');
     }
   });
 

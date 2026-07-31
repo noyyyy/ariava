@@ -18,6 +18,8 @@ import {
 
 export interface HostInitializationOptions {
   relayBaseUrl?: string;
+  /** Honor ARIAVA_HOST_IDENTITY_PATH when present; production onboarding disables this. */
+  useEnvironmentIdentityPath?: boolean;
 }
 
 export interface HostInitializationDependencies {
@@ -51,7 +53,11 @@ export function buildInitializedConfig(
     hostName: existing.hostName ?? dependencies.environment.ARIAVA_HOST_NAME?.trim() ?? dependencies.hostName(),
     agentAdapterPort: existing.agentAdapterPort ?? 7272,
     agentAdapterSecret: existing.agentAdapterSecret ?? dependencies.generateSecret(),
-    identityPath: existing.identityPath ?? resolve(dependencies.environment.ARIAVA_HOST_IDENTITY_PATH ?? ARIAVA_HOST_IDENTITY_PATH),
+    identityPath: existing.identityPath ?? resolve(
+      options.useEnvironmentIdentityPath === false
+        ? ARIAVA_HOST_IDENTITY_PATH
+        : dependencies.environment.ARIAVA_HOST_IDENTITY_PATH ?? ARIAVA_HOST_IDENTITY_PATH,
+    ),
     agentAdapterConfigPath: resolve(existing.agentAdapterConfigPath ?? ARIAVA_AGENT_ADAPTER_CONFIG_PATH),
     statePath: resolve(existing.statePath ?? ARIAVA_STATE_PATH),
   };
