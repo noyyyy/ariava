@@ -3,8 +3,9 @@ import type { HostEncryptionIdentity } from '../identity';
 import type { RelayClient } from '../relay-client';
 import { RelayClientError } from '../relay-client';
 import type { BridgeStateStore } from '../state-store';
-import { encryptEventUpload, encryptSessionSnapshot, type ActiveRecipientMaterial } from './envelope';
+import { encryptEventUpload, encryptNotificationPreviews, encryptSessionSnapshot, type ActiveRecipientMaterial } from './envelope';
 import type { LocalLinkKeyring } from './link-keyring';
+import { buildNotificationPreview } from './notification-preview';
 
 export interface EncryptedUploadHooks {
   eventCompletionStep?: (phase: 'journaled' | 'revision-committed' | 'inflight-removed' | 'source-removed' | 'journal-removed', eventId: string) => void;
@@ -81,10 +82,14 @@ export class EncryptedUploadOrchestrator {
     for (const pending of this.stateStore.peekPendingUploads()) {
       const event = pending.event; const session = this.stateStore.getSession(event.sessionId) ?? pending.session ?? syntheticSessionForEvent(event);
       let inflight = this.stateStore.getInflightEventUpload(event.eventId) as EncryptedEventAndSession | undefined;
-      if (!inflight) {
-        inflight = encryptEventUpload({ ...eventEncryptionInput(event, session), revision: this.stateStore.nextSessionRevision(event.sessionId),
+      if (!inflight || inflight.event.recipientSetVersion !== snapshot.recipientSetVersion
+        || inflight.session.recipientSetVersion !== snapshot.recipientSetVersion) {
+        const replacement = encryptEventUpload({ ...eventEncryptionInput(event, session), revision: inflight?.session.revision ?? this.stateStore.nextSessionRevision(event.sessionId),
           recipientSetVersion: snapshot.recipientSetVersion, recipients, hostIdentity: this.encryptionIdentity });
-        this.stateStore.persistInflightEventUpload(event.eventId, event.sessionId, inflight);
+        attachNotificationPreviews(replacement, event, session, recipients, this.encryptionIdentity);
+        if (inflight) this.stateStore.replaceInflightEventUpload(event.eventId, event.sessionId, replacement);
+        else this.stateStore.persistInflightEventUpload(event.eventId, event.sessionId, replacement);
+        inflight = replacement;
       }
       try { await this.client.publishEncryptedEvent(inflight.event, inflight.session); } catch (error) {
         if (!isRelayConflict(error)) return flushed;
@@ -93,6 +98,7 @@ export class EncryptedUploadOrchestrator {
             try { snapshot = await this.client.recipientSnapshot(); recipients = this.keyring.reconcileRecipients(snapshot); } catch { return flushed; }
             const replacement = encryptEventUpload({ ...eventEncryptionInput(event, session), revision: inflight.session.revision,
               recipientSetVersion: snapshot.recipientSetVersion, recipients, hostIdentity: this.encryptionIdentity });
+            attachNotificationPreviews(replacement, event, session, recipients, this.encryptionIdentity);
             this.stateStore.replaceInflightEventUpload(event.eventId, event.sessionId, replacement); inflight = replacement;
             try { await this.client.publishEncryptedEvent(inflight.event, inflight.session); } catch { return flushed; }
           }
@@ -178,6 +184,30 @@ function sessionEncryptionInput(session: import('@ariava/protocol').CanonicalSes
       ...(session.openingText !== undefined ? { openingText: session.openingText } : {}),
       ...(session.latestActivityText !== undefined ? { latestActivityText: session.latestActivityText } : {}) } };
 }
+function attachNotificationPreviews(
+  upload: EncryptedEventAndSession,
+  event: import('@ariava/protocol').CanonicalEvent,
+  session: import('@ariava/protocol').CanonicalSessionState,
+  recipients: ActiveRecipientMaterial[],
+  hostIdentity: HostEncryptionIdentity,
+  ): void {
+  try {
+    const plaintext = buildNotificationPreview(event, session);
+    if (!plaintext) {
+      upload.event.notificationPreviews = [];
+      return;
+    }
+    upload.event.notificationPreviews = encryptNotificationPreviews({
+      event: upload.event,
+      plaintext,
+      recipients,
+      hostIdentity,
+    });
+  } catch {
+    upload.event.notificationPreviews = [];
+  }
+}
+
 function isRelayConflict(error: unknown): error is RelayClientError {
   return error instanceof RelayClientError || (Boolean(error) && typeof error === 'object'
     && (error as { status?: unknown }).status === 409 && typeof (error as { reason?: unknown }).reason === 'string');

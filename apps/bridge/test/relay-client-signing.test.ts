@@ -33,7 +33,7 @@ const rotation = { rotation: { operationId: 'op_12345678-1234-4123-8123-12345678
 const linkId = 'link_test';
 const confirmation = { linkId, linkGeneration: 1, epoch: 1, transcriptDigest: 'A'.repeat(43), confirmationProof: 'B'.repeat(43) };
 const activation = { linkId, linkGeneration: 1, epoch: 1, transcriptDigest: 'A'.repeat(43), peerRole: 'watch', peerProofDigest: 'C'.repeat(43), activatedAt: '2026-07-20T00:00:00.000Z' } as const;
-const encryptedUpload = { event: { encrypted: true }, session: { encrypted: true } } as any;
+const encryptedUpload = { event: { encrypted: true, notificationPreviews: [{ watchDeviceId: watchId, content: { ciphertext: 'opaque' }, keyWrap: { ciphertext: 'opaque-wrap' } }] }, session: { encrypted: true } } as any;
 
 const cases: Array<{ name: string; method: string; path: string; body?: unknown; invoke(client: RelayClient): Promise<unknown> }> = [
   { name: 'enroll', method: 'POST', path: '/v2/bridge/enroll', body: enrollment, invoke: (c) => c.enrollHost(enrollment) },

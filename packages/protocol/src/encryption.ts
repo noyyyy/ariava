@@ -22,7 +22,11 @@ export const E2E_EPOCH_OPERATIONS = [
 ] as const;
 export type E2EEpochOperation = (typeof E2E_EPOCH_OPERATIONS)[number];
 export type E2EDirection = 'bridge-to-watch' | 'watch-to-bridge';
-export type ProtectedPayloadKind = 'event-content-v1' | 'session-content-v1' | 'reply-content-v1';
+export type ProtectedPayloadKind =
+  | 'event-content-v1'
+  | 'session-content-v1'
+  | 'reply-content-v1'
+  | 'notification-preview-v1';
 
 export const E2E_LIMITS = {
   publicKeyBytes: 32,
@@ -33,6 +37,11 @@ export const E2E_LIMITS = {
   eventPlaintextBytes: 32 * 1024,
   sessionPlaintextBytes: 16 * 1024,
   replyPlaintextBytes: 4_000,
+  notificationPreviewPlaintextBytes: 4_000,
+  notificationPreviewProjectNameBytes: 256,
+  notificationPreviewBodyTextBytes: 4_000,
+  notificationPreviewIdentifierBytes: 256,
+  notificationPreviewContentIdBytes: 256,
   promptOptions: 10,
   promptOptionBytes: 500,
 } as const;
@@ -172,6 +181,15 @@ export interface ProtectedSessionContentV1 {
 
 export interface ProtectedReplyContentV1 { version: 1; text: string }
 
+export interface EncryptedNotificationPreviewPlaintextV1 {
+  version: 1;
+  projectName: string;
+  state: 'done' | 'block' | 'error';
+  bodyText: string;
+  source: 'agentText' | 'error' | 'fallback';
+  truncated: boolean;
+}
+
 export interface RelayEventMetadataV1 {
   eventId: string;
   hostId: string;
@@ -208,6 +226,7 @@ export interface EncryptedEventUploadV1 extends RelayEventMetadataV1 {
   recipientSetVersion: number;
   content: EncryptedContentV1;
   keyWraps: RecipientKeyWrapV1[];
+  notificationPreviews?: NotificationPreviewEnvelopeV1[];
 }
 
 export interface EncryptedSessionSnapshotUploadV1 extends RelaySessionMetadataV1 {
@@ -237,6 +256,27 @@ export interface ReplyContentAADInput {
   nonce: string;
   contentId: string;
 }
+export interface NotificationPreviewAADInput {
+  hostId: string;
+  watchDeviceId: string;
+  eventId: string;
+  sessionId: string;
+  linkId: string;
+  linkGeneration: number;
+  epoch: number;
+  senderEncryptionKeyId: string;
+  recipientEncryptionKeyId: string;
+  contentId: string;
+  payloadKind: 'notification-preview-v1';
+}
+
+export interface NotificationPreviewEnvelopeV1 {
+  eventId: string;
+  sessionId: string;
+  watchDeviceId: string;
+  content: EncryptedContentV1 & { payloadKind: 'notification-preview-v1' };
+  keyWrap: RecipientKeyWrapV1;
+}
 export interface WrapAADInput {
   direction: E2EDirection;
   linkId: string;
@@ -248,6 +288,25 @@ export interface WrapAADInput {
   recipientEncryptionKeyId: string;
   contentId: string;
   payloadKind: ProtectedPayloadKind;
+}
+
+function isBoundedWellFormedString(value: unknown, maxBytes: number): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && encoder.encode(value).byteLength <= maxBytes
+    && isWellFormedUnicode(value);
+}
+
+function isWellFormedUnicode(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) return false;
+  }
+  return true;
 }
 
 const CANONICAL_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -323,6 +382,18 @@ export function buildProtectedReplyContentBytes(content: ProtectedReplyContentV1
   return encoder.encode(JSON.stringify({ version: 1, text: content.text }));
 }
 
+export function buildNotificationPreviewPlaintextBytes(content: EncryptedNotificationPreviewPlaintextV1): Uint8Array {
+  if (!validateNotificationPreviewPlaintextV1(content)) throw new TypeError('notification preview plaintext is invalid');
+  return encoder.encode(JSON.stringify({
+    version: 1,
+    projectName: content.projectName,
+    state: content.state,
+    bodyText: content.bodyText,
+    source: content.source,
+    truncated: content.truncated,
+  }));
+}
+
 export function buildLinkTranscriptBytes(input: {
   linkId: string; hostId: string; watchDeviceId: string; linkGeneration: number; epoch: number;
   hostBindingDigest: string; watchBindingDigest: string; suite?: typeof E2E_SUITE_V1;
@@ -370,6 +441,26 @@ export function buildReplyContentAAD(input: ReplyContentAADInput): Uint8Array {
   ]);
 }
 
+export function buildNotificationPreviewAAD(input: NotificationPreviewAADInput): Uint8Array {
+  if (input.payloadKind !== 'notification-preview-v1'
+    || !isBoundedWellFormedString(input.hostId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || !isBoundedWellFormedString(input.watchDeviceId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || !isBoundedWellFormedString(input.eventId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || !isBoundedWellFormedString(input.sessionId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || !isBoundedWellFormedString(input.linkId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || !isPositiveInteger(input.linkGeneration) || !isPositiveInteger(input.epoch)
+    || !isBoundedWellFormedString(input.senderEncryptionKeyId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || !isBoundedWellFormedString(input.recipientEncryptionKeyId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || !isBoundedWellFormedString(input.contentId, E2E_LIMITS.notificationPreviewContentIdBytes)) {
+    throw new TypeError('notification preview AAD input is invalid');
+  }
+  return encodeLengthPrefixedFields([
+    'ariava-notification-preview-aad-v1', 'bridge-to-watch', input.hostId, input.watchDeviceId,
+    input.eventId, input.sessionId, input.linkId, String(input.linkGeneration), String(input.epoch),
+    input.senderEncryptionKeyId, input.recipientEncryptionKeyId, input.contentId, input.payloadKind,
+  ]);
+}
+
 export function buildWrapAAD(input: WrapAADInput): Uint8Array {
   return encodeLengthPrefixedFields([
     'ariava-wrap-aad-v1', input.direction, input.linkId, String(input.linkGeneration), String(input.epoch),
@@ -412,15 +503,56 @@ export function validateEncryptionKeyBindingV1(value: unknown): value is Encrypt
 
 export function validateEncryptedContentV1(value: unknown): value is EncryptedContentV1 {
   if (!isExactRecord(value, ['version', 'suite', 'contentId', 'payloadKind', 'nonce', 'ciphertext'])) return false;
-  const max = value.payloadKind === 'event-content-v1' ? E2E_LIMITS.eventPlaintextBytes
-    : value.payloadKind === 'session-content-v1' ? E2E_LIMITS.sessionPlaintextBytes
-      : value.payloadKind === 'reply-content-v1' ? E2E_LIMITS.replyPlaintextBytes : -1;
+  let maxPlaintextBytes: number;
+  switch (value.payloadKind) {
+    case 'event-content-v1':
+      maxPlaintextBytes = E2E_LIMITS.eventPlaintextBytes;
+      break;
+    case 'session-content-v1':
+      maxPlaintextBytes = E2E_LIMITS.sessionPlaintextBytes;
+      break;
+    case 'reply-content-v1':
+      maxPlaintextBytes = E2E_LIMITS.replyPlaintextBytes;
+      break;
+    case 'notification-preview-v1':
+      maxPlaintextBytes = E2E_LIMITS.notificationPreviewPlaintextBytes;
+      break;
+    default:
+      return false;
+  }
   try {
     const ciphertext = typeof value.ciphertext === 'string' ? base64UrlDecode(value.ciphertext) : new Uint8Array();
     return value.version === 1 && value.suite === E2E_SUITE_V1 && typeof value.contentId === 'string'
-      && max >= 0 && decodeBase64Url(value.nonce, 12) && ciphertext.byteLength >= 16
-      && ciphertext.byteLength <= max + 16;
+      && decodeBase64Url(value.nonce, 12) && ciphertext.byteLength >= 16
+      && ciphertext.byteLength <= maxPlaintextBytes + 16;
   } catch { return false; }
+}
+
+export function validateNotificationPreviewPlaintextV1(value: unknown): value is EncryptedNotificationPreviewPlaintextV1 {
+  if (!isExactRecord(value, ['version', 'projectName', 'state', 'bodyText', 'source', 'truncated'])) return false;
+  const hasValidState = value.state === 'done' || value.state === 'block' || value.state === 'error';
+  const hasValidSource = value.source === 'agentText' || value.source === 'error' || value.source === 'fallback';
+  return value.version === 1
+    && isBoundedWellFormedString(value.projectName, E2E_LIMITS.notificationPreviewProjectNameBytes)
+    && hasValidState
+    && isBoundedWellFormedString(value.bodyText, E2E_LIMITS.notificationPreviewBodyTextBytes)
+    && hasValidSource
+    && typeof value.truncated === 'boolean'
+    && encoder.encode(JSON.stringify(value)).byteLength <= E2E_LIMITS.notificationPreviewPlaintextBytes;
+}
+
+export function validateNotificationPreviewEnvelopeV1(value: unknown): value is NotificationPreviewEnvelopeV1 {
+  if (!isExactRecord(value, ['eventId', 'sessionId', 'watchDeviceId', 'content', 'keyWrap'])) return false;
+  if (!isBoundedWellFormedString(value.eventId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || !isBoundedWellFormedString(value.sessionId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || typeof value.watchDeviceId !== 'string' || !ID_PATTERNS.watch.test(value.watchDeviceId)
+    || !validateEncryptedContentV1(value.content) || value.content.payloadKind !== 'notification-preview-v1'
+    || !isBoundedWellFormedString(value.content.contentId, E2E_LIMITS.notificationPreviewContentIdBytes)
+    || !validateRecipientKeyWrapV1(value.keyWrap)
+    || !isBoundedWellFormedString(value.keyWrap.linkId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || !isBoundedWellFormedString(value.keyWrap.senderEncryptionKeyId, E2E_LIMITS.notificationPreviewIdentifierBytes)
+    || !isBoundedWellFormedString(value.keyWrap.recipientEncryptionKeyId, E2E_LIMITS.notificationPreviewIdentifierBytes)) return false;
+  return value.content.contentId === value.keyWrap.contentId;
 }
 
 export function validateRecipientKeyWrapV1(value: unknown): value is RecipientKeyWrapV1 {

@@ -125,6 +125,7 @@ const required = [
   'packages/protocol/dist/encryption.d.ts',
   'packages/protocol/dist/fixtures/ed25519-request-vectors.json',
   'packages/protocol/dist/fixtures/e2e-v1-vectors.json',
+  'packages/protocol/dist/fixtures/notification-preview-v1-vector.json',
   'packages/shared-utils/dist/index.js',
   'packages/shared-utils/dist/index.d.ts',
   'extensions/pi/bundle/index.js',

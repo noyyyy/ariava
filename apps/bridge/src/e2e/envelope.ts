@@ -4,6 +4,8 @@ import {
   base64UrlDecode,
   base64UrlEncode,
   buildEventContentAAD,
+  buildNotificationPreviewAAD,
+  buildNotificationPreviewPlaintextBytes,
   buildProtectedEventContentBytes,
   buildProtectedReplyContentBytes,
   buildProtectedSessionContentBytes,
@@ -15,7 +17,9 @@ import {
   type EncryptedCommandEnvelopeV1,
   type EncryptedContentV1,
   type EncryptedEventUploadV1,
+  type EncryptedNotificationPreviewPlaintextV1,
   type EncryptedSessionSnapshotUploadV1,
+  type NotificationPreviewEnvelopeV1,
   type ProtectedEventContentV1,
   type ProtectedSessionContentV1,
   type RecipientKeyWrapV1,
@@ -59,6 +63,58 @@ export function encryptEventUpload(input: {
     eventContent.dek.fill(0);
     sessionContent.dek.fill(0);
   }
+}
+
+export function encryptNotificationPreviews({
+  event,
+  plaintext,
+  recipients,
+  hostIdentity,
+}: {
+  event: RelayEventMetadataV1;
+  plaintext: EncryptedNotificationPreviewPlaintextV1;
+  recipients: ActiveRecipientMaterial[];
+  hostIdentity: HostEncryptionIdentity;
+}): NotificationPreviewEnvelopeV1[] {
+  return recipients.map((recipient) => {
+    const contentId = crypto.randomUUID();
+    const sealed = sealContent(
+      'notification-preview-v1',
+      contentId,
+      buildNotificationPreviewPlaintextBytes(plaintext),
+      buildNotificationPreviewAAD({
+        hostId: event.hostId,
+        watchDeviceId: recipient.watchDeviceId,
+        eventId: event.eventId,
+        sessionId: event.sessionId,
+        linkId: recipient.linkId,
+        linkGeneration: recipient.linkGeneration,
+        epoch: recipient.epoch,
+        senderEncryptionKeyId: hostIdentity.encryptionKeyId,
+        recipientEncryptionKeyId: recipient.watchBinding.encryptionKeyId,
+        contentId,
+        payloadKind: 'notification-preview-v1',
+      }),
+    );
+    try {
+      const [keyWrap] = wrapDekForRecipients(
+        sealed.dek,
+        contentId,
+        'notification-preview-v1',
+        [recipient],
+        hostIdentity,
+      );
+      return {
+        eventId: event.eventId,
+        sessionId: event.sessionId,
+        watchDeviceId: recipient.watchDeviceId,
+        content: sealed.content as NotificationPreviewEnvelopeV1['content'],
+        keyWrap: keyWrap!,
+      };
+    } finally {
+      sealed.dek.fill(0);
+    }
+  });
 }
 
 export function encryptSessionSnapshot(input: { session: RelaySessionMetadataV1; protectedSession: ProtectedSessionContentV1;

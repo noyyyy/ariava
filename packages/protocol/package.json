@@ -51,6 +51,7 @@
       "default": "./dist/validation.js"
     },
     "./fixtures/ed25519-request-vectors": "./dist/fixtures/ed25519-request-vectors.json",
-    "./fixtures/e2e-v1-vectors": "./dist/fixtures/e2e-v1-vectors.json"
+    "./fixtures/e2e-v1-vectors": "./dist/fixtures/e2e-v1-vectors.json",
+    "./fixtures/notification-preview-v1-vector": "./dist/fixtures/notification-preview-v1-vector.json"
   }
 }

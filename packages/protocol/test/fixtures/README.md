@@ -20,3 +20,9 @@ The initial reviewed fixture omitted binding canonical/signature bytes even thou
 frozen convergence contract requires them. The `binding` object was added during this
 pre-freeze review completion without changing any previously frozen value. Its Ed25519
 signature uses the existing public RFC 8032 test seed from the request-signing fixture.
+
+`notification-preview-v1-vector.json` is a separate reviewed additive vector. The
+original `e2e-v1-vectors.json` is frozen byte-for-byte, so preview bytes were not
+inserted into it. The preview fixture freezes canonical plaintext, recipient-bound
+AAD, content encryption, and key-wrap output using fixed keys and nonces. Binary
+encoding and cross-language review rules are the same as for the original fixture.
