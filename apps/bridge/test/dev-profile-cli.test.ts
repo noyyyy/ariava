@@ -203,27 +203,27 @@ describe('source dev profile commands', () => {
     const harness = createHarness();
     await runDevProfileCommand(['init'], harness.deps);
     const production = await listenOrUseExisting(7272);
-    let active: Server | undefined;
+    let attemptedPort: number | undefined;
     let finishRun: (() => void) | undefined;
     harness.deps.createBridge = (config) => ({
-      start: async () => { active = await listen(config.agentAdapter.port); },
+      start: async () => { attemptedPort = config.agentAdapter.port; },
       runForever: () => new Promise<void>((resolveRun) => { finishRun = resolveRun; }),
-      stop: () => { active?.close(); finishRun?.(); },
+      stop: () => { finishRun?.(); },
     });
     harness.deps.waitForShutdown = async () => {};
     try {
       expect(await runDevProfileCommand(['bridge'], harness.deps)).toBe(0);
+      expect(attemptedPort).toBe(7273);
       expect(production.server?.listening ?? true).toBe(true);
     } finally {
       production.server?.close();
-      active?.close();
     }
   });
 
   test('occupied dev port 7273 fails without fallback or process actions', async () => {
     const harness = createHarness();
     await runDevProfileCommand(['init'], harness.deps);
-    const occupiedDev = await listen(7273);
+    const occupiedDev = await listenOrUseExisting(7273);
     const attemptedPorts: number[] = [];
     let spawnCalls = 0;
     harness.deps.createBridge = (config) => ({
@@ -234,11 +234,11 @@ describe('source dev profile commands', () => {
     harness.deps.spawn = () => { spawnCalls += 1; return { status: 0 }; };
     try {
       await expect(runDevProfileCommand(['bridge'], harness.deps)).rejects.toMatchObject({ code: 'EADDRINUSE' });
-      expect(occupiedDev.listening).toBe(true);
+      expect(occupiedDev.server?.listening ?? true).toBe(true);
       expect(spawnCalls).toBe(0);
       expect(attemptedPorts).toEqual([7273]);
     } finally {
-      occupiedDev.close();
+      occupiedDev.server?.close();
     }
   });
 
