@@ -24,12 +24,12 @@ bun run verify
 
 `bun run verify` retains the complete shared build, generated pi bundle, extension test/typecheck, reviewed Public Core test, tarball/package smoke, and package assertion closure. The tag workflow's Ubuntu prepare job continues to invoke this exact command before packing artifacts; publication does not depend on a macOS runner or on another repository.
 
-Pull requests expose two additive Public Core host checks:
+Direct pushes to `main` run two additive Public Core host checks:
 
 - **Linux**: `ubuntu-latest` runs `bun run verify:linux`;
 - **macOS**: `macos-latest` runs `bun run verify:macos`.
 
-Both use frozen installs and exact Node 24.18.0, npm 11.18.0, and Bun 1.3.14. Required-check configuration, if adopted, is repository-administrator policy outside these workflow files.
+Both use frozen installs and exact Node 24.18.0, npm 11.18.0, and Bun 1.3.14. `bun run release:tag` requires the exact pushed commit's `Public Core CI` run and both named jobs to succeed before it creates a tag.
 
 A Mac maintainer may run the explicit Docker pre-acceptance lane before pushing:
 
@@ -50,24 +50,28 @@ These commands can touch a real user Keychain/launchd domain or manage a disposa
 
 ## Normal Trusted Publishing release
 
-1. Create a release PR that changes every common Public Core version through the existing bump tool:
+1. Start from a synchronized `main` branch. Commit unrelated feature or test changes separately, then change every common release version through the existing bump tool:
 
    ```bash
    bun run version:bump patch
    # or: node scripts/bump-version.mjs X.Y.Z
    ```
 
-2. Review the version/lockfile changes. Run `bun install --frozen-lockfile` and authoritative `bun run verify`, then wait for both **Linux** and **macOS** jobs in `.github/workflows/ci.yml` to pass. Docker pre-acceptance does not replace either GitHub result.
-3. Merge the reviewed PR to the default branch.
-4. On that exact merged commit, create and push an annotated stable tag:
+2. Review the version and lockfile changes, then run:
 
    ```bash
-   git tag -a vX.Y.Z -m "Release vX.Y.Z"
-   git push origin vX.Y.Z
+   bun run release:push
    ```
 
-   Never move, delete, or recreate a public release tag to replace published content.
+   This command requires exactly the common version files and `bun.lock` to be modified. It fetches and confirms `HEAD == origin/main`, rejects an existing release tag, runs `bun install --frozen-lockfile` and authoritative `bun run verify`, revalidates the release state, creates `release: bump to X.Y.Z`, and pushes directly to the origin default branch. It never creates a tag.
+3. The direct push starts `.github/workflows/ci.yml`. After GitHub has created the run, execute:
 
+   ```bash
+   bun run release:tag
+   ```
+
+   The command requires a clean synchronized default branch and authenticated `gh`. It finds the exact commit's `Public Core CI` push run, waits for completion, requires successful **Linux** and **macOS** jobs, revalidates the remote branch and release state, then creates and pushes annotated tag `vX.Y.Z`. Missing, ambiguous, incomplete, failed, or cancelled CI evidence fails closed before tag creation.
+4. Never move, delete, or recreate a public release tag to replace published content.
 5. Observe `publish-npm.yml`. Its read-only prepare job validates the strict tag, peeled commit, common versions, and default-branch ancestry; performs the frozen install and complete Public Core verification; packs, inspects, and smoke-tests the exact artifacts; then uploads only two tarballs and `release-manifest.json`.
 6. If the `npm-production` GitHub Environment requires approval, inspect the tag, commit, versions, filenames, and SHA-256 values before approving.
 7. The dependent publish job downloads those exact artifacts, verifies their manifest and digests, and publishes through npm Trusted Publishing. Only this job has `id-token: write`.

@@ -63,8 +63,10 @@ describe('bump-version release preparation script', () => {
 
       expect(exitCode, stderr).toBe(0);
       expect(stdout).toContain('Bumped Ariava version: 0.1.4 -> 0.1.5');
-      expect(stdout).toContain('bun run verify');
-      expect(stdout).toContain('Create and push annotated tag v0.1.5');
+      expect(stdout).toContain('bun run release:push');
+      expect(stdout).toContain('Public Core CI Linux and macOS jobs');
+      expect(stdout).toContain('bun run release:tag');
+      expect(stdout).toContain('release: bump to 0.1.5');
       expect(stdout).toContain('approve publish-npm.yml in npm-production');
       expect(stdout).toContain('Break-glass/manual instructions: docs/release.md');
       expect(stdout).not.toContain('--otp');
