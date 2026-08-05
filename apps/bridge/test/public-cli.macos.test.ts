@@ -55,7 +55,7 @@ describe('public ariava CLI on macOS', () => {
     expect(readFileSync(launchctlLogPath, 'utf8')).toContain('bootout');
   });
 
-  test('renders top-level human status with neutral loaded wording and ignores adversarial ambient XDG state', async () => {
+  test('renders concise top-level human status and ignores adversarial ambient XDG state', async () => {
     const parent = mkdtempSync(join(tmpdir(), 'ariava-cli-status-'));
     const home = join(parent, 'home');
     const adversarialXdgRoot = join(parent, 'ambient-xdg');
@@ -111,8 +111,8 @@ describe('public ariava CLI on macOS', () => {
       new Response(proc.stderr).text(),
     ]);
     expect(exitCode, stderr).toBe(0);
-    expect(stdout).toContain('Service loaded: yes');
-    expect(stdout).not.toContain('Launchd loaded');
+    expect(stdout).toMatch(/\n  Bridge\s{2,}degraded\n/);
+    expect(stdout).not.toMatch(/Service loaded|Service backend|Launchd loaded/);
     expect(env.XDG_CONFIG_HOME).toBe(join(home, '.config'));
   });
 
