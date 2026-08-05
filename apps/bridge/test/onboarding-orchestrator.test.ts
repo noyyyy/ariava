@@ -389,6 +389,31 @@ describe('onboarding orchestrator', () => {
     });
   });
 
+  test('locked Keychain during initializeHost is retryable and never recommends reset', async () => {
+    const scenario = fixture({ existingHost: false, existingService: false });
+    scenario.deps.initializeHost = async () => {
+      throw new HostIdentityError(
+        'ERR_IDENTITY_KEYCHAIN_LOCKED',
+        'macOS login Keychain is locked or unavailable in this session.',
+      );
+    };
+    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
+    expect(result.readiness).toBe('failed');
+    const nativeUnlockCommand = 'security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"';
+    expect(result.steps.find((step) => step.id === 'host-init')).toMatchObject({
+      status: 'failed',
+      detail: {
+        code: 'ERR_IDENTITY_KEYCHAIN_LOCKED',
+        retryable: true,
+        remediation: { command: nativeUnlockCommand },
+      },
+    });
+    expect(result.nextActions[0]).toMatchObject({ command: nativeUnlockCommand });
+    expect(JSON.stringify(result)).not.toContain('ariava keychain unlock');
+    expect(JSON.stringify(result)).not.toContain('ariava host reset --confirm');
+  });
+
+
   test('cancellation releases only its lock and leaves completed service state intact', async () => {
     const scenario = fixture({ existingService: false, running: false, cancelAt: 'service.start' });
     const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);

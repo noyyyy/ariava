@@ -1178,7 +1178,13 @@ function isOnboardingResult(value: unknown): value is OnboardingResult {
 
 function normalizeOnboardingError(error: unknown): { ok: false; code: string; message: string; data: Record<string, unknown> } {
   if (error instanceof AriavaCliError) return { ok: false, code: error.code, message: error.message, data: error.data };
-  if (error instanceof HostIdentityError) return { ok: false, code: error.code, message: error.message, data: { step: 'host-init', retryable: false } };
+  if (error instanceof HostIdentityError) {
+    const failure = normalizeCliFailure(error);
+    return {
+      ...failure,
+      data: { step: 'host-init', retryable: false, ...failure.data },
+    };
+  }
   return { ok: false, code: 'ERR_ONBOARDING_NOT_READY', message: error instanceof Error ? error.message : String(error), data: { step: 'preflight', retryable: true } };
 }
 
@@ -1267,6 +1273,19 @@ function readOption(argv: string[], name: string): string | undefined {
   return argv[index + 1];
 }
 
+const MACOS_KEYCHAIN_UNLOCK_COMMAND = 'security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"';
+
+function keychainUnlockRemediation(): Record<string, unknown> {
+  return {
+    retryable: true,
+    remediation: {
+      message: 'Unlock the macOS login Keychain in this terminal, then retry the Ariava command.',
+      command: MACOS_KEYCHAIN_UNLOCK_COMMAND,
+    },
+  };
+}
+
+
 type CliFailure = {
   ok: false;
   code: string;
@@ -1280,7 +1299,12 @@ export function normalizeCliFailure(error: unknown): CliFailure {
     return { ok: false, code: error.code, message: error.message, data: error.data };
   }
   if (error instanceof HostIdentityError) {
-    return { ok: false, code: error.code, message: error.message, data: {} };
+    return {
+      ok: false,
+      code: error.code,
+      message: error.message,
+      data: error.code === 'ERR_IDENTITY_KEYCHAIN_LOCKED' ? keychainUnlockRemediation() : {},
+    };
   }
   if (error instanceof RelayClientError) {
     return { ok: false, code: 'ERR_RELAY', message: error.message, data: { status: error.status } };

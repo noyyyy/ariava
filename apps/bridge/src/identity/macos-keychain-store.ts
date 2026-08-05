@@ -127,7 +127,8 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
         publicKeyFingerprint: identity.publicKeyFingerprint,
         pendingOperationId: metadata.pending?.operationId,
       };
-    } catch {
+    } catch (error) {
+      if (error instanceof HostIdentityError && error.code === 'ERR_IDENTITY_KEYCHAIN_LOCKED') throw error;
       return { ...base, status: 'invalid' };
     }
   }
@@ -147,6 +148,7 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
       if (creationInterrupted) this.deleteCreationSentinel();
       return current;
     } catch (error) {
+      if (error instanceof HostIdentityError && error.code === 'ERR_IDENTITY_KEYCHAIN_LOCKED') throw error;
       if (creationInterrupted) {
         throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'Incomplete macOS identity creation requires explicit reset', error);
       }
@@ -320,6 +322,9 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
   }
 
   private failKeychain(action: string, result: KeychainCommandResult, missing = false): never {
+    if (isKeychainLocked(result)) {
+      throw new HostIdentityError('ERR_IDENTITY_KEYCHAIN_LOCKED', 'macOS login Keychain is locked or unavailable in this session.');
+    }
     const code = missing && isKeychainMissing(result) ? 'ERR_IDENTITY_MISSING' : 'ERR_IDENTITY_PERMISSIONS';
     throw new HostIdentityError(code, `macOS Keychain Host identity ${action} failed`);
   }
@@ -458,6 +463,11 @@ function decodeSecurityPassword(stdout: Uint8Array): Uint8Array {
     throw new HostIdentityError('ERR_IDENTITY_INVALID', 'macOS Keychain Host identity encoding is invalid');
   }
   return new Uint8Array(Buffer.from(encoded, 'hex'));
+}
+
+function isKeychainLocked(result: KeychainCommandResult): boolean {
+  return result.status === 36
+    || /(?:user interaction is not allowed|interaction not allowed|keychain (?:is )?locked)/iu.test(result.stderr);
 }
 
 function isKeychainMissing(result: KeychainCommandResult): boolean {

@@ -220,6 +220,34 @@ export class BridgeStateStore {
     if (this.spool) this.spool.remove(eventId); else this.state.pendingEvents = (this.state.pendingEvents ?? []).filter((event) => event.eventId !== eventId);
     this.persist();
   }
+  quarantinePendingEvent(eventId: string, sessionId: string, reason: string, quarantinedAt = new Date().toISOString()): boolean {
+    if (!this.spool) return false;
+    const source = this.openSpoolJson(eventId);
+    if (!source) return false;
+
+    const inflightItemId = `inflight:event:${eventId}`;
+    const inflight = this.openSpoolJson(inflightItemId);
+    const record = {
+      version: 1 as const,
+      eventId,
+      sessionId,
+      reason,
+      quarantinedAt,
+      source,
+      ...(inflight ? { inflight } : {}),
+    };
+    this.spool.replace([eventId, inflightItemId], [{
+      spoolItemId: `dead-letter:event:${eventId}`,
+      sessionId,
+      eventId,
+      payloadKind: 'event-dead-letter-v1',
+      createdAt: quarantinedAt,
+      plaintext: new TextEncoder().encode(JSON.stringify(record)),
+    }]);
+    this.persist();
+    return true;
+  }
+  getQuarantinedEventRecord(eventId: string): unknown | undefined { return this.openSpoolJson(`dead-letter:event:${eventId}`); }
   currentSessionRevision(sessionId: string): number { return this.state.sessionRevisions[sessionId] ?? 0; }
   nextSessionRevision(sessionId: string): number { return this.currentSessionRevision(sessionId) + 1; }
   commitSessionRevision(sessionId: string, revision: number): void {

@@ -247,6 +247,24 @@ describe('MacOSKeychainHostIdentityStore', () => {
     await expect(store.stageRotation({ operationId: 'same-op', issuedAt, identity: second.identity })).rejects.toMatchObject({ code: 'ERR_IDENTITY_INVALID' });
   });
 
+  test('reports locked Keychain as recoverable instead of invalid identity evidence', async () => {
+    const runner = new FakeKeychain();
+    const path = metadataPath();
+    const store = new MacOSKeychainHostIdentityStore(path, runner);
+    await store.createFirstRun();
+    const lockedRunner: KeychainCommandRunner = {
+      run: () => ({ status: 36, stdout: new Uint8Array(), stderr: '' }),
+    };
+    const lockedStore = new MacOSKeychainHostIdentityStore(path, lockedRunner);
+
+    await expect(lockedStore.inspect()).rejects.toMatchObject({
+      code: 'ERR_IDENTITY_KEYCHAIN_LOCKED',
+      message: 'macOS login Keychain is locked or unavailable in this session.',
+    });
+    await expect(lockedStore.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_KEYCHAIN_LOCKED' });
+  });
+
+
   test('fails closed when Keychain read is unavailable', async () => {
     const runner = new FakeKeychain();
     const path = metadataPath();
@@ -286,6 +304,23 @@ describe('MacOSKeychainHostIdentityStore', () => {
     expect((await restarted.load())?.hostId).toBe(createdHostId);
     await expect(restarted.createFirstRun()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
   });
+
+  test('locked Keychain remains recoverable when a creation sentinel is present', async () => {
+    const runner = new FakeKeychain();
+    const path = metadataPath();
+    const store = new MacOSKeychainHostIdentityStore(path, runner, {
+      afterMetadataWrite() { throw new Error('injected after metadata'); },
+    });
+    await expect(store.createFirstRun()).rejects.toThrow('injected after metadata');
+    const lockedRunner: KeychainCommandRunner = {
+      run: () => ({ status: 1, stdout: new Uint8Array(), stderr: 'User interaction is not allowed.' }),
+    };
+
+    await expect(new MacOSKeychainHostIdentityStore(path, lockedRunner).load()).rejects.toMatchObject({
+      code: 'ERR_IDENTITY_KEYCHAIN_LOCKED',
+    });
+  });
+
 
   test('metadata left by interrupted creation with a missing key is reset-required', async () => {
     const runner = new FakeKeychain();

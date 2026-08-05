@@ -77,6 +77,34 @@ const DEFAULT_RECONCILIATION_SCHEDULER: ReconciliationScheduler = {
   cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
+export class EncryptedEventFailureLogger {
+  private lastLogAt = 0;
+  private suppressed = 0;
+
+  constructor(
+    private readonly write: (line: string) => void = (line) => { process.stderr.write(line); },
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  record(failure: import('./e2e/upload-orchestrator').EncryptedEventFailure): void {
+    const timestamp = this.now();
+    if (timestamp - this.lastLogAt < 30_000) {
+      this.suppressed += 1;
+      return;
+    }
+
+    const suppressed = this.suppressed;
+    this.suppressed = 0;
+    this.lastLogAt = timestamp;
+    this.write(`Ariava encrypted Event upload failure: ${JSON.stringify({
+      outcome: failure.outcome,
+      category: failure.category,
+      status: failure.status,
+      suppressed,
+    })}\n`);
+  }
+}
+
 export class BridgeDaemon {
   private relayClient?: RelayClient;
   private readonly stateStore: BridgeStateStore;
@@ -94,6 +122,7 @@ export class BridgeDaemon {
   private reconciliationRequested = true;
   private currentSessionsSnapshotFailureCount = 0;
   private lastCurrentSessionsSnapshotFailureLogAt = 0;
+  private readonly encryptedEventFailureLogger = new EncryptedEventFailureLogger();
   constructor(
     private readonly config: BridgeConfig,
     drivers?: AgentDriver[],
@@ -419,7 +448,9 @@ export class BridgeDaemon {
   }
 
   private uploadOrchestrator(): EncryptedUploadOrchestrator {
-    return new EncryptedUploadOrchestrator(this.stateStore, this.client(), this.encryptionIdentity!, this.keyring!);
+    return new EncryptedUploadOrchestrator(this.stateStore, this.client(), this.encryptionIdentity!, this.keyring!, {
+      eventFailure: (failure) => this.encryptedEventFailureLogger.record(failure),
+    });
   }
 
   private async flushPendingHandles(): Promise<number> {

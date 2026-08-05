@@ -451,6 +451,9 @@ function readinessFailureActions(checks: HostReadinessCheck[]): StrictReadinessR
 }
 
 function defaultReadinessRemediation(code: string | undefined, message: string): { message: string; command?: string } {
+  if (code === 'ERR_IDENTITY_KEYCHAIN_LOCKED') {
+    return { message, command: 'security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"' };
+  }
   if (code === 'ERR_IDENTITY_INVALID' || code === 'ERR_IDENTITY_MISSING' || code === 'ERR_IDENTITY_PERMISSIONS' || code === 'ERR_IDENTITY_RESET_REQUIRED') {
     return { message, command: 'ariava host reset --confirm' };
   }

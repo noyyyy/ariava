@@ -7,8 +7,17 @@ import { encryptEventUpload, encryptNotificationPreviews, encryptSessionSnapshot
 import type { LocalLinkKeyring } from './link-keyring';
 import { buildNotificationPreview } from './notification-preview';
 
+export interface EncryptedEventFailure {
+  eventId: string;
+  sessionId: string;
+  outcome: 'retry-deferred' | 'quarantined';
+  status?: number;
+  category: 'network' | 'http' | 'recipient-set' | 'session-revision' | 'event-content';
+}
+
 export interface EncryptedUploadHooks {
   eventCompletionStep?: (phase: 'journaled' | 'revision-committed' | 'inflight-removed' | 'source-removed' | 'journal-removed', eventId: string) => void;
+  eventFailure?: (failure: EncryptedEventFailure) => void;
 }
 
 type EncryptedEventAndSession = { event: EncryptedEventUploadV1; session: EncryptedSessionSnapshotUploadV1 };
@@ -72,37 +81,68 @@ export class EncryptedUploadOrchestrator {
 
   async flushPendingEvents(): Promise<number> {
     let snapshot: E2ERecipientSnapshotV1;
-    try { snapshot = await this.client.recipientSnapshot(); } catch { return 0; }
+    try { snapshot = await this.client.recipientSnapshot(); } catch (error) {
+      this.reportDeferredFailure(undefined, error);
+      return 0;
+    }
     let recipients: ActiveRecipientMaterial[];
-    try { recipients = this.keyring.reconcileRecipients(snapshot); } catch { return 0; }
+    try { recipients = this.keyring.reconcileRecipients(snapshot); } catch (error) {
+      this.reportDeferredFailure(undefined, error);
+      return 0;
+    }
     if (snapshot.recipientSetVersion !== this.stateStore.getRecipientSetVersion()) {
       if (!await this.publishRecipientChangeSnapshots(snapshot, recipients)) return 0;
     }
     let flushed = 0;
     for (const pending of this.stateStore.peekPendingUploads()) {
-      const event = pending.event; const session = this.stateStore.getSession(event.sessionId) ?? pending.session ?? syntheticSessionForEvent(event);
+      const event = pending.event;
+      const session = this.stateStore.getSession(event.sessionId) ?? pending.session ?? syntheticSessionForEvent(event);
       let inflight = this.stateStore.getInflightEventUpload(event.eventId) as EncryptedEventAndSession | undefined;
       if (!inflight || inflight.event.recipientSetVersion !== snapshot.recipientSetVersion
         || inflight.session.recipientSetVersion !== snapshot.recipientSetVersion) {
-        const replacement = encryptEventUpload({ ...eventEncryptionInput(event, session), revision: inflight?.session.revision ?? this.stateStore.nextSessionRevision(event.sessionId),
-          recipientSetVersion: snapshot.recipientSetVersion, recipients, hostIdentity: this.encryptionIdentity });
-        attachNotificationPreviews(replacement, event, session, recipients, this.encryptionIdentity);
+        const replacement = this.encryptEvent(event, session, inflight?.session.revision ?? this.stateStore.nextSessionRevision(event.sessionId),
+          snapshot.recipientSetVersion, recipients);
         if (inflight) this.stateStore.replaceInflightEventUpload(event.eventId, event.sessionId, replacement);
         else this.stateStore.persistInflightEventUpload(event.eventId, event.sessionId, replacement);
         inflight = replacement;
       }
-      try { await this.client.publishEncryptedEvent(inflight.event, inflight.session); } catch (error) {
-        if (!isRelayConflict(error)) return flushed;
-        if (error.reason === 'e2e_recipient_set_changed') {
-          if (!(await this.client.reconcileEncryptedEvent(inflight.event, inflight.session).catch(() => ({ committed: false }))).committed) {
-            try { snapshot = await this.client.recipientSnapshot(); recipients = this.keyring.reconcileRecipients(snapshot); } catch { return flushed; }
-            const replacement = encryptEventUpload({ ...eventEncryptionInput(event, session), revision: inflight.session.revision,
-              recipientSetVersion: snapshot.recipientSetVersion, recipients, hostIdentity: this.encryptionIdentity });
-            attachNotificationPreviews(replacement, event, session, recipients, this.encryptionIdentity);
-            this.stateStore.replaceInflightEventUpload(event.eventId, event.sessionId, replacement); inflight = replacement;
-            try { await this.client.publishEncryptedEvent(inflight.event, inflight.session); } catch { return flushed; }
+      try {
+        await this.client.publishEncryptedEvent(inflight.event, inflight.session);
+      } catch (error) {
+        if (!isRelayConflict(error)) {
+          this.reportDeferredFailure(event, error);
+          return flushed;
+        }
+        if (!(await this.client.reconcileEncryptedEvent(inflight.event, inflight.session).catch(() => ({ committed: false }))).committed) {
+          if (error.reason === 'e2e_recipient_set_changed') {
+            try {
+              snapshot = await this.client.recipientSnapshot();
+              recipients = this.keyring.reconcileRecipients(snapshot);
+            } catch (refreshError) {
+              this.reportDeferredFailure(event, refreshError);
+              return flushed;
+            }
+            const replacement = this.encryptEvent(event, session, inflight.session.revision, snapshot.recipientSetVersion, recipients);
+            this.stateStore.replaceInflightEventUpload(event.eventId, event.sessionId, replacement);
+            inflight = replacement;
+            try {
+              await this.client.publishEncryptedEvent(inflight.event, inflight.session);
+            } catch (retryError) {
+              if (isPermanentEventConflict(retryError)) {
+                if (!this.quarantinePermanentlyConflictingEvent(event, retryError)) return flushed;
+                continue;
+              }
+              this.reportDeferredFailure(event, retryError);
+              return flushed;
+            }
+          } else if (isPermanentEventConflict(error)) {
+            if (!this.quarantinePermanentlyConflictingEvent(event, error)) return flushed;
+            continue;
+          } else {
+            this.reportDeferredFailure(event, error);
+            return flushed;
           }
-        } else if (!(await this.client.reconcileEncryptedEvent(inflight.event, inflight.session).catch(() => ({ committed: false }))).committed) return flushed;
+        }
       }
       this.stateStore.beginEventUploadCompletion({ version: 1, eventId: event.eventId, sessionId: event.sessionId,
         revision: inflight.session.revision, eventContentId: inflight.event.content.contentId,
@@ -112,6 +152,48 @@ export class EncryptedUploadOrchestrator {
       flushed += 1;
     }
     return flushed;
+  }
+
+  private quarantinePermanentlyConflictingEvent(event: import('@ariava/protocol').CanonicalEvent, error: RelayClientError): boolean {
+    let quarantined: boolean;
+    try {
+      quarantined = this.stateStore.quarantinePendingEvent(event.eventId, event.sessionId, error.reason);
+    } catch {
+      // The encrypted source and inflight records must remain retryable.
+      this.reportDeferredFailure(event, error);
+      return false;
+    }
+    if (!quarantined) {
+      this.reportDeferredFailure(event, error);
+      return false;
+    }
+    this.hooks?.eventFailure?.({
+      eventId: event.eventId,
+      sessionId: event.sessionId,
+      outcome: 'quarantined',
+      status: error.status,
+      category: relayFailureCategory(error),
+    });
+    return true;
+  }
+
+  private encryptEvent(
+    event: import('@ariava/protocol').CanonicalEvent,
+    session: import('@ariava/protocol').CanonicalSessionState,
+    revision: number,
+    recipientSetVersion: number,
+    recipients: ActiveRecipientMaterial[],
+  ): EncryptedEventAndSession {
+    const upload = encryptEventUpload({ ...eventEncryptionInput(event, session), revision, recipientSetVersion, recipients,
+      hostIdentity: this.encryptionIdentity });
+    attachNotificationPreviews(upload, event, session, recipients, this.encryptionIdentity);
+    return upload;
+  }
+
+  private reportDeferredFailure(event: import('@ariava/protocol').CanonicalEvent | undefined, error: unknown): void {
+    const status = relayErrorStatus(error);
+    this.hooks?.eventFailure?.({ eventId: event?.eventId ?? 'pending-events', sessionId: event?.sessionId ?? 'unknown',
+      outcome: 'retry-deferred', ...(status !== undefined ? { status } : {}), category: relayFailureCategory(error) });
   }
 
   async publishRecipientChangeSnapshots(snapshot: E2ERecipientSnapshotV1, recipients: ActiveRecipientMaterial[]): Promise<boolean> {
@@ -209,6 +291,40 @@ function attachNotificationPreviews(
 }
 
 function isRelayConflict(error: unknown): error is RelayClientError {
-  return error instanceof RelayClientError || (Boolean(error) && typeof error === 'object'
-    && (error as { status?: unknown }).status === 409 && typeof (error as { reason?: unknown }).reason === 'string');
+  if (error instanceof RelayClientError) return error.status === 409;
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { status?: unknown; reason?: unknown };
+  return candidate.status === 409 && typeof candidate.reason === 'string';
+}
+
+const PERMANENT_EVENT_CONFLICT_CATEGORIES = new Map<string, EncryptedEventFailure['category']>([
+  ['session_revision_stale', 'session-revision'],
+  ['session_revision_gap', 'session-revision'],
+  ['session revision conflict', 'session-revision'],
+  ['encrypted event conflict', 'event-content'],
+  ['encrypted upload conflict', 'event-content'],
+]);
+
+function isPermanentEventConflict(error: unknown): error is RelayClientError {
+  return isRelayConflict(error) && PERMANENT_EVENT_CONFLICT_CATEGORIES.has(error.reason);
+}
+
+function relayErrorStatus(error: unknown): number | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const status = (error as { status?: unknown }).status;
+  return typeof status === 'number' ? status : undefined;
+}
+
+function relayErrorReason(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const reason = (error as { reason?: unknown }).reason;
+  return typeof reason === 'string' ? reason : undefined;
+}
+
+function relayFailureCategory(error: unknown): EncryptedEventFailure['category'] {
+  const reason = relayErrorReason(error);
+  if (reason === 'e2e_recipient_set_changed') return 'recipient-set';
+  const permanentCategory = PERMANENT_EVENT_CONFLICT_CATEGORIES.get(reason ?? '');
+  if (permanentCategory) return permanentCategory;
+  return relayErrorStatus(error) === undefined ? 'network' : 'http';
 }

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BridgeDaemon, loadBridgeConfig } from '../src/daemon';
+import { BridgeDaemon, EncryptedEventFailureLogger, loadBridgeConfig } from '../src/daemon';
 import { LinuxJsonHostIdentityStore, publicIdentityMetadata } from '../src/identity';
 
 const roots: string[] = [];
@@ -183,6 +183,26 @@ describe('BridgeDaemon', () => {
     await started;
     daemon.stop();
     await expect(Promise.race([run.then(() => 'stopped'), Bun.sleep(500).then(() => 'timeout')])).resolves.toBe('stopped');
+  });
+
+  test('rate-limits and redacts encrypted Event failure logs', () => {
+    let now = 30_000;
+    const lines: string[] = [];
+    const logger = new EncryptedEventFailureLogger((line) => lines.push(line), () => now);
+
+    logger.record({ eventId: 'event-secret', sessionId: 'session-secret', outcome: 'retry-deferred', status: 503, category: 'http' });
+    now += 1_000;
+    logger.record({ eventId: 'event-secret-2', sessionId: 'session-secret-2', outcome: 'quarantined', status: 409, category: 'event-content' });
+    now += 30_000;
+    logger.record({ eventId: 'event-secret-3', sessionId: 'session-secret-3', outcome: 'retry-deferred', category: 'network' });
+
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('"outcome":"retry-deferred"');
+    expect(lines[0]).toContain('"category":"http"');
+    expect(lines[1]).toContain('"suppressed":1');
+    const output = lines.join('');
+    expect(output).not.toContain('event-secret');
+    expect(output).not.toContain('session-secret');
   });
 
   test('CLI help advertises identity-safe pair and no claim-code flow', () => {

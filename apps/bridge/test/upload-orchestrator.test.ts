@@ -14,6 +14,7 @@ mock.module('../src/e2e/node-crypto', () => ({
 
 const { EncryptedUploadOrchestrator } = await import('../src/e2e/upload-orchestrator');
 const { BridgeStateStore } = await import('../src/state-store');
+const { RelayClientError } = await import('../src/relay-client');
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -126,4 +127,167 @@ describe('EncryptedUploadOrchestrator', () => {
     expect(published).toHaveLength(1); expect(published[0].notificationPreviews).toEqual([]);
   });
 
+  test('keeps a queued Event and its inflight upload after a transient failure', async () => {
+    const root = join(tmpdir(), `bridge-upload-retry-${Date.now()}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
+    const stateStore = new BridgeStateStore(join(root, 'state.json'));
+    stateStore.initializeEncryptedSpool('host-test', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
+    stateStore.setRecipientSetVersion(1);
+    stateStore.replaceDriverSessions('pi', [{ sessionId: 'session-retry', hostId: 'host-test', provider: 'pi', projectName: 'project',
+      nameText: 'Retry', stateLabel: 'Done', status: 'done', updatedAt: '2026-08-01T00:00:00.000Z' }]);
+    stateStore.queuePendingEvent({ eventId: 'event-retry', hostId: 'host-test', sessionId: 'session-retry', provider: 'pi',
+      type: 'done', status: 'done', typeLabel: 'Done', agentText: 'retry later', createdAt: '2026-08-01T00:00:01.000Z' });
+    const failures: any[] = [];
+    const client = {
+      recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
+      publishEncryptedEvent: async () => { throw new Error('network unavailable'); },
+    };
+    const orchestrator = new EncryptedUploadOrchestrator(stateStore, client as any,
+      { version: 1, hostId: 'host-test', encryptionKeyId: 'ekey-test', publicKey: '', privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' },
+      { reconcileRecipients: () => [] } as any, { eventFailure: (failure: any) => failures.push(failure) });
+
+    expect(await orchestrator.flushPendingEvents()).toBe(0);
+    expect(stateStore.peekPendingUploads().map(({ event }) => event.eventId)).toEqual(['event-retry']);
+    expect(stateStore.getInflightEventUpload('event-retry')).toBeDefined();
+    expect(failures).toEqual([{ eventId: 'event-retry', sessionId: 'session-retry', outcome: 'retry-deferred', category: 'network' }]);
+  });
+
+  test('quarantines a permanently conflicting head Event without losing it and continues the queue', async () => {
+    const root = join(tmpdir(), `bridge-upload-poison-${Date.now()}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
+    const stateStore = new BridgeStateStore(join(root, 'state.json'));
+    stateStore.initializeEncryptedSpool('host-test', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
+    stateStore.setRecipientSetVersion(1);
+    const sessions = [
+      { sessionId: 'session-poison', hostId: 'host-test', provider: 'pi', projectName: 'project', nameText: 'Poison', stateLabel: 'Done', status: 'done' as const, updatedAt: '2026-08-01T00:00:00.000Z' },
+      { sessionId: 'session-good', hostId: 'host-test', provider: 'pi', projectName: 'project', nameText: 'Good', stateLabel: 'Done', status: 'done' as const, updatedAt: '2026-08-01T00:00:00.000Z' },
+    ];
+    stateStore.replaceDriverSessions('pi', sessions);
+    stateStore.queuePendingEvent({ eventId: 'event-poison', hostId: 'host-test', sessionId: 'session-poison', provider: 'pi',
+      type: 'done', status: 'done', typeLabel: 'Done', agentText: 'old event', createdAt: '2026-08-01T00:00:01.000Z' });
+    stateStore.queuePendingEvent({ eventId: 'event-good', hostId: 'host-test', sessionId: 'session-good', provider: 'pi',
+      type: 'done', status: 'done', typeLabel: 'Done', agentText: 'new event', createdAt: '2026-08-01T00:00:02.000Z' });
+    const snapshot = async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] });
+    const identity = { version: 1, hostId: 'host-test', encryptionKeyId: 'ekey-test', publicKey: '', privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' };
+    const keyring = { reconcileRecipients: () => [] };
+    const uploads: string[] = []; const failures: any[] = [];
+    const client = {
+      recipientSnapshot: snapshot,
+      publishEncryptedEvent: async (event: any) => {
+        uploads.push(event.eventId);
+        if (event.eventId === 'event-poison') throw new RelayClientError(409, 'session revision stale', { error: 'session_revision_stale' });
+      },
+      reconcileEncryptedEvent: async () => ({ committed: false }),
+    };
+    const flushed = await new EncryptedUploadOrchestrator(stateStore, client as any, identity, keyring as any,
+      { eventFailure: (failure: any) => failures.push(failure) }).flushPendingEvents();
+
+    expect(flushed).toBe(1);
+    expect(uploads).toEqual(['event-poison', 'event-good']);
+    expect(stateStore.peekPendingUploads()).toEqual([]);
+    expect(stateStore.getInflightEventUpload('event-poison')).toBeUndefined();
+    expect(stateStore.getQuarantinedEventRecord('event-poison')).toMatchObject({
+      version: 1, eventId: 'event-poison', sessionId: 'session-poison', reason: 'session_revision_stale',
+      source: { event: { eventId: 'event-poison', agentText: 'old event' } },
+      inflight: { event: { eventId: 'event-poison' } },
+    });
+    expect(failures).toEqual([{ eventId: 'event-poison', sessionId: 'session-poison', outcome: 'quarantined', status: 409, category: 'session-revision' }]);
+  });
+
+  test('does not quarantine transient HTTP failures carrying conflict-like reasons', async () => {
+    for (const status of [429, 500, 503]) {
+      const root = join(tmpdir(), `bridge-upload-http-${status}-${Date.now()}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
+      const stateStore = new BridgeStateStore(join(root, 'state.json'));
+      stateStore.initializeEncryptedSpool('host-test', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
+      stateStore.setRecipientSetVersion(1);
+      stateStore.replaceDriverSessions('pi', [{ sessionId: `session-${status}`, hostId: 'host-test', provider: 'pi', projectName: 'project',
+        nameText: 'Retry', stateLabel: 'Done', status: 'done', updatedAt: '2026-08-01T00:00:00.000Z' }]);
+      stateStore.queuePendingEvent({ eventId: `event-${status}`, hostId: 'host-test', sessionId: `session-${status}`, provider: 'pi',
+        type: 'done', status: 'done', typeLabel: 'Done', agentText: 'retry later', createdAt: '2026-08-01T00:00:01.000Z' });
+      const client = {
+        recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
+        publishEncryptedEvent: async () => { throw new RelayClientError(status, 'temporary failure', { error: 'session_revision_gap' }); },
+      };
+      expect(await new EncryptedUploadOrchestrator(stateStore, client as any,
+        { version: 1, hostId: 'host-test', encryptionKeyId: 'ekey-test', publicKey: '', privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' },
+        { reconcileRecipients: () => [] } as any).flushPendingEvents()).toBe(0);
+      expect(stateStore.peekPendingUploads().map(({ event }) => event.eventId)).toEqual([`event-${status}`]);
+      expect(stateStore.getInflightEventUpload(`event-${status}`)).toBeDefined();
+      expect(stateStore.getQuarantinedEventRecord(`event-${status}`)).toBeUndefined();
+    }
+  });
+
+  test('quarantines when recipient refresh retry exposes a permanent revision conflict', async () => {
+    const root = join(tmpdir(), `bridge-upload-recipient-stale-${Date.now()}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
+    const stateStore = new BridgeStateStore(join(root, 'state.json'));
+    stateStore.initializeEncryptedSpool('host-test', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
+    stateStore.setRecipientSetVersion(1);
+    stateStore.replaceDriverSessions('pi', [{ sessionId: 'session-recipient-stale', hostId: 'host-test', provider: 'pi', projectName: 'project',
+      nameText: 'Recipient stale', stateLabel: 'Done', status: 'done', updatedAt: '2026-08-01T00:00:00.000Z' }]);
+    stateStore.queuePendingEvent({ eventId: 'event-recipient-stale', hostId: 'host-test', sessionId: 'session-recipient-stale', provider: 'pi',
+      type: 'done', status: 'done', typeLabel: 'Done', agentText: 'preserve me', createdAt: '2026-08-01T00:00:01.000Z' });
+    let snapshotVersion = 1; let attempts = 0;
+    const client = {
+      recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: snapshotVersion, recipients: [] }),
+      publishEncryptedEvent: async () => {
+        attempts += 1;
+        if (attempts === 1) { snapshotVersion = 2; throw new RelayClientError(409, 'recipient changed', { error: 'e2e_recipient_set_changed' }); }
+        throw new RelayClientError(409, 'session stale', { error: 'session_revision_stale' });
+      },
+      reconcileEncryptedEvent: async () => ({ committed: false }),
+    };
+    expect(await new EncryptedUploadOrchestrator(stateStore, client as any,
+      { version: 1, hostId: 'host-test', encryptionKeyId: 'ekey-test', publicKey: '', privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' },
+      { reconcileRecipients: () => [] } as any).flushPendingEvents()).toBe(0);
+    expect(attempts).toBe(2);
+    expect(stateStore.peekPendingUploads()).toEqual([]);
+    expect(stateStore.getQuarantinedEventRecord('event-recipient-stale')).toMatchObject({
+      reason: 'session_revision_stale', source: { event: { eventId: 'event-recipient-stale', agentText: 'preserve me' } },
+    });
+  });
+
+  test('classifies encrypted content conflicts as quarantined event-content records', async () => {
+    const root = join(tmpdir(), `bridge-upload-content-conflict-${Date.now()}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
+    const stateStore = new BridgeStateStore(join(root, 'state.json'));
+    stateStore.initializeEncryptedSpool('host-test', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
+    stateStore.setRecipientSetVersion(1);
+    stateStore.replaceDriverSessions('pi', [{ sessionId: 'session-content', hostId: 'host-test', provider: 'pi', projectName: 'project',
+      nameText: 'Content conflict', stateLabel: 'Done', status: 'done', updatedAt: '2026-08-01T00:00:00.000Z' }]);
+    stateStore.queuePendingEvent({ eventId: 'event-content', hostId: 'host-test', sessionId: 'session-content', provider: 'pi',
+      type: 'done', status: 'done', typeLabel: 'Done', agentText: 'preserve content', createdAt: '2026-08-01T00:00:01.000Z' });
+    const failures: any[] = [];
+    const client = {
+      recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
+      publishEncryptedEvent: async () => { throw new RelayClientError(409, 'content conflict', { error: 'encrypted event conflict' }); },
+      reconcileEncryptedEvent: async () => ({ committed: false }),
+    };
+    expect(await new EncryptedUploadOrchestrator(stateStore, client as any,
+      { version: 1, hostId: 'host-test', encryptionKeyId: 'ekey-test', publicKey: '', privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' },
+      { reconcileRecipients: () => [] } as any, { eventFailure: (failure: any) => failures.push(failure) }).flushPendingEvents()).toBe(0);
+    expect(stateStore.getQuarantinedEventRecord('event-content')).toMatchObject({ source: { event: { agentText: 'preserve content' } } });
+    expect(failures).toEqual([{ eventId: 'event-content', sessionId: 'session-content', outcome: 'quarantined', status: 409, category: 'event-content' }]);
+  });
+
+  test('keeps source and inflight records when encrypted quarantine persistence fails', async () => {
+    const root = join(tmpdir(), `bridge-upload-quarantine-failure-${Date.now()}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
+    const stateStore = new BridgeStateStore(join(root, 'state.json'));
+    let keyUnavailable = false;
+    const keyStore = { loadOrCreate: () => { if (keyUnavailable) throw new Error('spool key unavailable'); return new Uint8Array(32).fill(7); } };
+    stateStore.initializeEncryptedSpool('host-test', join(root, 'identity.json'), 'linux', keyStore);
+    stateStore.setRecipientSetVersion(1);
+    stateStore.replaceDriverSessions('pi', [{ sessionId: 'session-quarantine-failure', hostId: 'host-test', provider: 'pi', projectName: 'project',
+      nameText: 'Quarantine failure', stateLabel: 'Done', status: 'done', updatedAt: '2026-08-01T00:00:00.000Z' }]);
+    stateStore.queuePendingEvent({ eventId: 'event-quarantine-failure', hostId: 'host-test', sessionId: 'session-quarantine-failure', provider: 'pi',
+      type: 'done', status: 'done', typeLabel: 'Done', agentText: 'must remain', createdAt: '2026-08-01T00:00:01.000Z' });
+    const client = {
+      recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
+      publishEncryptedEvent: async () => { keyUnavailable = true; throw new RelayClientError(409, 'session stale', { error: 'session_revision_stale' }); },
+      reconcileEncryptedEvent: async () => ({ committed: false }),
+    };
+    expect(await new EncryptedUploadOrchestrator(stateStore, client as any,
+      { version: 1, hostId: 'host-test', encryptionKeyId: 'ekey-test', publicKey: '', privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' },
+      { reconcileRecipients: () => [] } as any).flushPendingEvents()).toBe(0);
+    keyUnavailable = false;
+    expect(stateStore.peekPendingUploads().map(({ event }) => event.eventId)).toEqual(['event-quarantine-failure']);
+    expect(stateStore.getInflightEventUpload('event-quarantine-failure')).toBeDefined();
+    expect(stateStore.getQuarantinedEventRecord('event-quarantine-failure')).toBeUndefined();
+  });
 });

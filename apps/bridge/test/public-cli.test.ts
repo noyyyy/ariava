@@ -200,6 +200,32 @@ describe('public ariava CLI', () => {
     });
 
 
+    test('locked macOS Keychain errors guide the native interactive unlock instead of Host reset', () => {
+      const nativeUnlockCommand = 'security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"';
+      const failure = normalizeCliFailure(new HostIdentityError(
+        'ERR_IDENTITY_KEYCHAIN_LOCKED',
+        'macOS login Keychain is locked or unavailable in this session.',
+      ));
+      expect(failure).toEqual({
+        ok: false,
+        code: 'ERR_IDENTITY_KEYCHAIN_LOCKED',
+        message: 'macOS login Keychain is locked or unavailable in this session.',
+        data: {
+          retryable: true,
+          remediation: {
+            message: 'Unlock the macOS login Keychain in this terminal, then retry the Ariava command.',
+            command: nativeUnlockCommand,
+          },
+        },
+      });
+      const text = formatHumanCliFailure(failure);
+      expect(text).toContain(`Next: ${nativeUnlockCommand}`);
+      expect(text).not.toContain('ariava keychain unlock');
+      expect(text).not.toContain('ariava host reset --confirm');
+      expect(text).not.toContain(' -p ');
+    });
+
+
     test('generic and relay failures normalize to stable codes', () => {
       expect(normalizeCliFailure(new Error('boom'))).toEqual({
         ok: false,
@@ -293,6 +319,35 @@ describe('public ariava CLI', () => {
       expect(embeddedText).toContain('/etc/wsl.conf');
       expect(embeddedText).toContain('wsl.exe --shutdown');
       expect(embeddedText.split('wsl.exe --shutdown').length - 1).toBe(1);
+    });
+
+
+    test('setup normalizes locked Keychain failures with unlock remediation', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const exitCode = await runPublicCli(['setup', '--no-extensions'], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      }, {
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+        detect: () => ({
+          platform: 'darwin', architecture: 'arm64', nodeVersion: '22.0.0', npm: { present: true }, pi: { present: true },
+          serviceSupport: { platform: 'darwin', backend: 'launchd', supported: true, isWsl: false, reason: 'supported' },
+          interactive: false, machineOutput: false, configPath: '/isolated/config.json', config: {}, installMetadata: {},
+          currentCli: { executablePath: '/isolated/bin/ariava' },
+        }),
+        run: async () => {
+          throw new HostIdentityError(
+            'ERR_IDENTITY_KEYCHAIN_LOCKED',
+            'macOS login Keychain is locked or unavailable in this session.',
+          );
+        },
+      });
+      expect(exitCode).toBe(1);
+      expect(stdout.read()).toBe('');
+      expect(stderr.read()).toContain('Next: security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"');
+      expect(stderr.read()).not.toContain('ariava keychain unlock');
+      expect(stderr.read()).not.toContain('ariava host reset --confirm');
     });
 
 

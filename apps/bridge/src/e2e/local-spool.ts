@@ -4,7 +4,14 @@ import { pathHasFilesystemEvidence, readSecureJson, writeSecureJson, writeSecure
 import { MACOS_SECURITY_PATH, SpawnKeychainCommandRunner, type KeychainCommandRunner } from '../identity/macos-keychain-store';
 import { chachaPolyOpen, chachaPolySeal } from './node-crypto';
 
-export type LocalSpoolPayloadKind = 'event-source-v1' | 'session-source-v1' | 'event-upload-v1' | 'session-upload-v1';
+const LOCAL_SPOOL_PAYLOAD_KINDS = [
+  'event-source-v1',
+  'event-dead-letter-v1',
+  'session-source-v1',
+  'event-upload-v1',
+  'session-upload-v1',
+] as const;
+export type LocalSpoolPayloadKind = typeof LOCAL_SPOOL_PAYLOAD_KINDS[number];
 export interface LocalEncryptedPendingPayloadV1 {
   version: 1;
   spoolItemId: string;
@@ -144,7 +151,7 @@ function spoolAAD(item: Omit<LocalEncryptedPendingPayloadV1, 'nonce' | 'cipherte
     item.eventId ?? '', item.payloadKind, String(item.aadVersion), item.createdAt]);
 }
 function validItem(item: LocalEncryptedPendingPayloadV1, hostId: string): boolean {
-  if (item?.version !== 1 || item.hostId !== hostId || !['event-source-v1', 'session-source-v1', 'event-upload-v1', 'session-upload-v1'].includes(item.payloadKind)
+  if (item?.version !== 1 || item.hostId !== hostId || !LOCAL_SPOOL_PAYLOAD_KINDS.includes(item.payloadKind)
     || item.aadVersion !== 1 || typeof item.spoolItemId !== 'string' || typeof item.sessionId !== 'string' || typeof item.createdAt !== 'string') return false;
   try { base64UrlDecode(item.nonce, 12); return base64UrlDecode(item.ciphertext).length >= 16; } catch { return false; }
 }

@@ -493,7 +493,7 @@ function normalizeOrchestratorFailure(error: unknown, current: OnboardingStepId)
     return {
       code: error.code,
       message: error.message,
-      retryable: false,
+      retryable: error.code === 'ERR_IDENTITY_KEYCHAIN_LOCKED',
       detail: { step: current, remediation },
       remediation,
     };
@@ -517,6 +517,9 @@ function remediationFromUnknown(value: unknown): { message?: string; command?: s
 }
 
 function defaultRemediationForCode(code: string, message: string): { message: string; command?: string } | undefined {
+  if (code === 'ERR_IDENTITY_KEYCHAIN_LOCKED') {
+    return { message, command: 'security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"' };
+  }
   if (code === 'ERR_IDENTITY_INVALID' || code === 'ERR_IDENTITY_MISSING' || code === 'ERR_IDENTITY_PERMISSIONS' || code === 'ERR_IDENTITY_RESET_REQUIRED') {
     return { message, command: 'ariava host reset --confirm' };
   }
