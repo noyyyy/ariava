@@ -3,7 +3,7 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { AgentAdapterClient } from './adapter';
 import type { AgentAdapter } from './adapter-interface';
 import { executeCommand } from './commands';
-import { buildBlockedEvent, buildDoneEvent, buildQuestionEvent } from './events';
+import { buildDoneEvent, buildNeedHumanEvent } from './events';
 import { startHeartbeat, stopHeartbeat, type HeartbeatContext } from './heartbeat';
 import {
   classifyStoredAssistantText,
@@ -39,10 +39,15 @@ type LatestAgentEndResult = {
 };
 
 type PendingTerminalAlert = {
-  type: 'done' | 'blocked' | 'question_requested';
+  type: 'done' | 'need_human';
   agentText: string;
   fingerprint?: string;
   humanText?: string;
+  actionablePrompt?: {
+    promptId: string;
+    type: 'question';
+    label: string;
+  };
   createdAt: string;
   flowRevision: number;
 };
@@ -117,12 +122,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
 
   async function pushWorking(ctx: ExtensionContext, agentText?: string) {
     if (!session || !state?.rootSessionActive) return;
-    const latestActivityText = normalizeAssistantTextForEvent(
-      'working',
-      session,
-      agentText ?? deriveLatestActivityText(ctx),
-      { allowFallback: false },
-    );
+    const latestActivityText = clampAssistantText(agentText ?? deriveLatestActivityText(ctx));
     session = withSessionStatus(session, 'working', latestActivityText);
     heartbeatContext.status = 'working';
     heartbeatContext.latestActivityText = session.latestActivityText;
@@ -209,16 +209,9 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     heartbeatContext.status = sessionStatus;
     heartbeatContext.latestActivityText = session.latestActivityText;
 
-    const event = (() => {
-      switch (alert.type) {
-        case 'done':
-          return buildDoneEvent(session!, normalizedAgentText, alert.humanText);
-        case 'blocked':
-          return buildBlockedEvent(session!, normalizedAgentText, alert.humanText);
-        case 'question_requested':
-          return buildQuestionEvent(session!, normalizedAgentText, alert.humanText);
-      }
-    })();
+    const event = alert.type === 'done'
+      ? buildDoneEvent(session, normalizedAgentText, alert.humanText)
+      : buildNeedHumanEvent(session, normalizedAgentText, alert.humanText, alert.actionablePrompt);
 
     state.terminalEmittedForCurrentLoop = true;
     state.latestPendingAlert = undefined;
@@ -281,10 +274,11 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   }
 
   function submitTerminalCandidate(
-    type: 'done' | 'blocked' | 'question_requested',
+    type: PendingTerminalAlert['type'],
     ctx: ExtensionContext,
     agentText: string,
     fingerprint?: string,
+    actionablePrompt?: PendingTerminalAlert['actionablePrompt'],
   ) {
     if (!session || !state?.rootSessionActive || state.terminalEmittedForCurrentLoop || state.latestPendingAlert) return;
     state.latestPendingAlert = {
@@ -292,6 +286,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       agentText: normalizeAssistantTextForEvent(type, session, agentText),
       humanText: deriveMessageTexts(ctx).latestUserText,
       fingerprint,
+      actionablePrompt,
       createdAt: new Date().toISOString(),
       flowRevision: state.flowRevision,
     };
@@ -483,22 +478,22 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
 
     if (stopReason === 'error') {
       submitTerminalCandidate(
-        'blocked',
+        'need_human',
         ctx,
         sanitizeDisplayText(result.errorText, ERROR_PREVIEW_MAX_LENGTH) ?? 'Pi stopped after an unrecovered error.',
       );
       return;
     }
     if (stopReason === 'length') {
-      submitTerminalCandidate('blocked', ctx, 'Pi stopped after reaching the response length limit.');
+      submitTerminalCandidate('need_human', ctx, 'Pi stopped after reaching the response length limit.');
       return;
     }
     if (stopReason === 'toolUse') {
-      submitTerminalCandidate('blocked', ctx, 'Pi stopped while waiting to use a tool.');
+      submitTerminalCandidate('need_human', ctx, 'Pi stopped while waiting to use a tool.');
       return;
     }
     if (stopReason !== undefined && stopReason !== 'stop') {
-      submitTerminalCandidate('blocked', ctx, unsupportedReasonPreview(stopReason));
+      submitTerminalCandidate('need_human', ctx, unsupportedReasonPreview(stopReason));
       return;
     }
 
@@ -507,7 +502,15 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       activeLeafId: loopState.activeLeafId,
     });
     if (classification.type === 'suppress_duplicate') return;
-    submitTerminalCandidate(classification.type, ctx, classification.agentText, classification.fingerprint);
+    submitTerminalCandidate(
+      classification.type === 'done' ? 'done' : 'need_human',
+      ctx,
+      classification.agentText,
+      classification.fingerprint,
+      classification.type === 'question_requested'
+        ? { promptId: `question-${Date.now()}`, type: 'question', label: 'Reply' }
+        : undefined,
+    );
   });
 
   pi.on('session_tree', async (event, ctx) => {

@@ -1,5 +1,5 @@
 import type { CanonicalEvent, CanonicalSessionState, CommandEnvelope, CommandResult, HandleSessionRequest, MarkSessionReadRequest, SessionStatus } from '@ariava/protocol';
-import { statusToStateLabel } from '@ariava/protocol';
+import { statusToStateLabel, validateEventTypeStatusPair } from '@ariava/protocol';
 import { createId, isoNow } from '@ariava/shared-utils';
 import type { BridgeStateStore } from '../../state-store';
 
@@ -176,8 +176,12 @@ export class AgentAdapterRegistry {
       throw new Error(`Session ${sessionId} is not registered`);
     }
 
+    if (!validateEventTypeStatusPair(event.type, event.status)) {
+      throw new Error(`Invalid event type/status pair: ${String(event.type)}/${String(event.status)}`);
+    }
+
     const now = isoNow();
-    const eventType = event.type ?? 'blocked';
+    const eventType = event.type;
     const canonicalEvent: CanonicalEvent = {
       eventId: event.eventId ?? createId('evt'),
       hostId: session.hostId,
@@ -185,7 +189,7 @@ export class AgentAdapterRegistry {
       provider: event.provider ?? session.provider,
       type: eventType,
       status: event.status ?? session.status,
-      typeLabel: event.typeLabel ?? deriveEventTypeLabel(eventType),
+      typeLabel: deriveEventTypeLabel(eventType),
       agentText: normalizeEventAgentText(eventType, event.agentText, session),
       humanText: event.humanText,
       contextText: event.contextText ?? buildContextText(session),
@@ -455,28 +459,19 @@ function normalizeEventAgentText(
 
   switch (type) {
     case 'done': return 'Task complete';
-    case 'blocked': return 'Review needed on desktop';
-    case 'question_requested': return 'Agent has a question';
-    case 'working': return `${session.nameText} is running`;
-    default: return 'Agent update';
+    case 'need_human': return 'Needs attention';
   }
 }
 
 function deriveEventTypeLabel(type: CanonicalEvent['type']): string {
   switch (type) {
-    case 'approval_requested': return 'Needs approval';
-    case 'question_requested': return 'Agent question';
-    case 'blocked': return 'Session blocked';
     case 'done': return 'Task complete';
-    case 'working': return 'In progress';
-    case 'summary_updated': return 'Summary updated';
-    case 'driver_error': return 'Driver error';
-    case 'host_unavailable': return 'Host unavailable';
+    case 'need_human': return 'Needs attention';
   }
 }
 
 function isTerminalEvent(event: CanonicalEvent): boolean {
-  return event.type === 'done' || event.type === 'blocked' || event.type === 'question_requested';
+  return event.type === 'done' || event.type === 'need_human';
 }
 
 function normalizeHandledAt(value: string | undefined, fallback: string): string {

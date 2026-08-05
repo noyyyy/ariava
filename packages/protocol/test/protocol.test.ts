@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   COMMAND_TYPES,
+  EVENT_TYPES,
   SESSION_HANDLE_ACTIONS,
   SESSION_STATUSES,
   HOST_PLATFORMS,
@@ -13,6 +14,7 @@ import {
   normalizePairingCode,
   statusToStateLabel,
   validateCommandType,
+  validateEventTypeStatusPair,
   type CanonicalEvent,
   type MarkSessionReadRequest,
   type SessionReadSource,
@@ -20,8 +22,8 @@ import {
 } from '../src';
 
 const baseEvent: CanonicalEvent = {
-  eventId: 'evt_1', hostId: 'host_1', sessionId: 'sess_1', provider: 'pi', type: 'blocked', status: 'blocked',
-  typeLabel: 'Session blocked', agentText: 'Needs help', createdAt: '2026-06-28T10:00:00Z',
+  eventId: 'evt_1', hostId: 'host_1', sessionId: 'sess_1', provider: 'pi', type: 'need_human', status: 'blocked',
+  typeLabel: 'Needs attention', agentText: 'Needs help', createdAt: '2026-06-28T10:00:00Z',
 };
 
 describe('protocol helpers', () => {
@@ -50,9 +52,24 @@ describe('protocol helpers', () => {
     }
   });
 
-  test('keeps canonical actionable event behavior public', () => {
-    expect(isUserVisibleActionableAlert({ ...baseEvent, type: 'blocked' })).toBe(true);
-    expect(isUserVisibleActionableAlert({ ...baseEvent, type: 'driver_error' })).toBe(false);
+  test('exposes only exact user-visible actionable event types', () => {
+    expect(EVENT_TYPES).toEqual(['done', 'need_human']);
+    for (const type of EVENT_TYPES) {
+      expect(isUserVisibleActionableAlert({ type })).toBe(true);
+    }
+  });
+
+  test('validates exact canonical event type and status pairs at runtime', () => {
+    for (const [type, status, expected] of [
+      ['done', 'done', true],
+      ['need_human', 'blocked', true],
+      ['done', 'blocked', false],
+      ['need_human', 'done', false],
+      ['blocked', 'blocked', false],
+      ['question_requested', 'blocked', false],
+    ] as const) {
+      expect(validateEventTypeStatusPair(type, status)).toBe(expected);
+    }
   });
 
   test('keeps idle additive and maps every status to its compatibility label', () => {

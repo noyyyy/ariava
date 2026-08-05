@@ -40,8 +40,8 @@ describe('EncryptedUploadOrchestrator', () => {
     const workingSession = { sessionId: 'session-test', hostId: 'host-test', provider: 'pi', projectName: 'project', nameText: 'Session',
       latestActivityText: 'historical working activity', stateLabel: 'Working', status: 'working' as const, updatedAt: '2026-08-01T00:00:00.000Z' };
     stateStore.replaceDriverSessions('pi', [workingSession]);
-    stateStore.queuePendingEvent({ eventId: 'event-working', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'blocked', status: 'blocked',
-      typeLabel: 'Blocked', agentText: 'historical event content', createdAt: '2026-08-01T00:00:01.000Z' });
+    stateStore.queuePendingEvent({ eventId: 'event-working', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'need_human', status: 'blocked',
+      typeLabel: 'Needs attention', agentText: 'historical event content', createdAt: '2026-08-01T00:00:01.000Z' });
     stateStore.replaceDriverSessions('pi', [{ ...workingSession, latestActivityText: 'latest blocked activity', stateLabel: 'Blocked', status: 'blocked', updatedAt: '2026-08-01T00:00:02.000Z' }]);
 
     const eventUploads: any[] = []; const sessionUploads: any[] = [];
@@ -70,8 +70,8 @@ describe('EncryptedUploadOrchestrator', () => {
     const session = { sessionId: 'session-test', hostId: 'host-test', provider: 'pi', projectName: 'secret-project', nameText: 'Session',
       stateLabel: 'Blocked', status: 'blocked' as const, updatedAt: '2026-08-01T00:00:00.000Z' };
     stateStore.replaceDriverSessions('pi', [session]);
-    stateStore.queuePendingEvent({ eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'blocked', status: 'blocked',
-      typeLabel: 'Blocked', agentText: 'secret-agent-text', createdAt: '2026-08-01T00:00:01.000Z' });
+    stateStore.queuePendingEvent({ eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'need_human', status: 'blocked',
+      typeLabel: 'Needs attention', agentText: 'secret-agent-text', createdAt: '2026-08-01T00:00:01.000Z' });
     let version = 1; const published: any[] = []; let reject = true;
     const client = {
       recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: version, recipients: [] }),
@@ -97,8 +97,8 @@ describe('EncryptedUploadOrchestrator', () => {
     stateStore.initializeEncryptedSpool('host-test', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
     stateStore.replaceDriverSessions('pi', [{ sessionId: 'session-test', hostId: 'host-test', provider: 'pi', projectName: 'secret-project', nameText: 'Session',
       stateLabel: 'Blocked', status: 'blocked', updatedAt: '2026-08-01T00:00:00.000Z' }]);
-    stateStore.queuePendingEvent({ eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'blocked', status: 'blocked',
-      typeLabel: 'Blocked', agentText: 'secret-agent-text', createdAt: '2026-08-01T00:00:01.000Z' });
+    stateStore.queuePendingEvent({ eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'need_human', status: 'blocked',
+      typeLabel: 'Needs attention', agentText: 'secret-agent-text', createdAt: '2026-08-01T00:00:01.000Z' });
     let body = '';
     const client = { recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 3, recipients: [] }),
       publishEncryptedSession: async () => {}, publishEncryptedEvent: async (event: any, session: any) => { body = JSON.stringify({ event, session }); } };
@@ -118,8 +118,8 @@ describe('EncryptedUploadOrchestrator', () => {
     stateStore.initializeEncryptedSpool('host-test', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
     stateStore.replaceDriverSessions('pi', [{ sessionId: 'session-test', hostId: 'host-test', provider: 'pi', projectName: '界'.repeat(100), nameText: 'Session',
       stateLabel: 'Blocked', status: 'blocked', updatedAt: '2026-08-01T00:00:00.000Z' }]);
-    stateStore.queuePendingEvent({ eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'blocked', status: 'blocked',
-      typeLabel: 'Blocked', agentText: 'publish me', createdAt: '2026-08-01T00:00:01.000Z' });
+    stateStore.queuePendingEvent({ eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'need_human', status: 'blocked',
+      typeLabel: 'Needs attention', agentText: 'publish me', createdAt: '2026-08-01T00:00:01.000Z' });
     const published: any[] = []; const client = { recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
       publishEncryptedSession: async () => {}, publishEncryptedEvent: async (event: any) => { published.push(event); } };
     const identity = { version: 1, hostId: 'host-test', encryptionKeyId: 'ekey-test', publicKey: '', privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' };

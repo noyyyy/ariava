@@ -1,14 +1,7 @@
 export const SESSION_STATUSES = ['idle', 'working', 'blocked', 'done', 'unknown'] as const;
 export type SessionStatus = (typeof SESSION_STATUSES)[number];
 
-export const EVENT_TYPES = [
-  'working',
-  'blocked',
-  'done',
-  'question_requested',
-  'driver_error',
-  'host_unavailable',
-] as const;
+export const EVENT_TYPES = ['done', 'need_human'] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 
 export interface ActionablePrompt {
@@ -109,8 +102,13 @@ export function eventCursorCovers(cursor: EventCursor | undefined, event: EventC
   return Boolean(cursor && compareEventCursors(cursor, event) >= 0);
 }
 
+export function validateEventTypeStatusPair(type: unknown, status: unknown): type is EventType {
+  if (type === 'done') return status === 'done';
+  return type === 'need_human' && status === 'blocked';
+}
+
 export function isUserVisibleActionableAlert(event: Pick<CanonicalEvent, 'type'>): boolean {
-  return event.type === 'question_requested' || event.type === 'blocked' || event.type === 'done';
+  return EVENT_TYPES.includes(event.type);
 }
 
 export function statusToStateLabel(status: SessionStatus): string {

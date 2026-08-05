@@ -79,9 +79,9 @@ describe('AgentAdapterClient', () => {
 
     const result = await client.pushEvent({
       sessionId: session.sessionId,
-      type: 'working',
-      status: 'working',
-      agentText: 'Running tests',
+      type: 'done',
+      status: 'done',
+      agentText: 'Tests finished',
     });
 
     expect(typeof result.eventId).toBe('string');

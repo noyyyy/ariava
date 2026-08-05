@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { pathHasFilesystemEvidence, readSecureJson, writeSecureJson } from './host-manager/secure-files';
 import type { CanonicalEvent, CanonicalSessionState, CommandResult, HostProjection, ReplaceE2ECurrentSessionsRequestV1 } from '@ariava/protocol';
-import { e2eCurrentSessionsSemanticDigestV1 } from '@ariava/protocol';
+import { e2eCurrentSessionsSemanticDigestV1, validateEventTypeStatusPair } from '@ariava/protocol';
 import type { EventUploadCompletionV1, PendingCurrentSessionsSnapshot, PendingSessionHandle, PersistedBridgeState, PersistedCurrentSessionsSnapshotState } from './types';
 import { LocalEncryptedSpool, createRuntimeSpoolKeyStore, spoolPathForState, type SpoolKeyStore } from './e2e/local-spool';
 
@@ -21,6 +21,7 @@ export class BridgeStateStore {
     this.spool = new LocalEncryptedSpool(spoolPathForState(this.filePath), hostId,
       keyStore ?? createRuntimeSpoolKeyStore(identityPath, platform));
     const legacy = this.state.pendingEvents ?? [];
+    this.failClosedOnObsoleteInflightEvents();
     if (legacy.length || this.state.spoolMigration) {
       if (!this.state.spoolMigration) {
         this.state.spoolMigration = { version: 1, remainingEventIds: legacy.map((event) => event.eventId), startedAt: new Date().toISOString() };
@@ -30,7 +31,7 @@ export class BridgeStateStore {
       for (const eventId of [...this.state.spoolMigration.remainingEventIds]) {
         const event = legacy.find((candidate) => candidate.eventId === eventId);
         if (!event) throw new Error('legacy spool migration journal is inconsistent');
-        this.enqueuePendingEvent(event);
+        this.enqueuePendingEvent(canonicalizePendingEvent(event));
         migrationStep?.('item-encrypted', eventId);
         this.state.spoolMigration.remainingEventIds = this.state.spoolMigration.remainingEventIds.filter((id) => id !== eventId);
         this.persist();
@@ -43,8 +44,43 @@ export class BridgeStateStore {
       if (markers.some((marker) => marker && stateText.includes(marker))) throw new Error('legacy pending event migration marker remains in state');
     } else if ('pendingEvents' in this.state) { delete this.state.pendingEvents; this.persist(); }
     const recovery = this.spool.recoverUnreadable();
+    this.canonicalizeEncryptedPendingEvents();
     this.resumeEventUploadCompletions();
     return recovery;
+  }
+
+  private failClosedOnObsoleteInflightEvents(): void {
+    if (!this.spool) return;
+    for (const item of this.spool.list('event-upload-v1')) {
+      const bytes = this.spool.open(item);
+      try {
+        const upload = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as { event?: { type?: unknown; status?: unknown } };
+        if (!validateEventTypeStatusPair(upload.event?.type, upload.event?.status)) {
+          throw new Error('obsolete inflight event upload requires explicit recovery');
+        }
+      } finally { bytes.fill(0); }
+    }
+  }
+
+  private canonicalizeEncryptedPendingEvents(): void {
+    if (!this.spool) return;
+    for (const item of this.spool.list('event-source-v1')) {
+      const bytes = this.spool.open(item);
+      try {
+        const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as { event: CanonicalEvent; session?: CanonicalSessionState };
+        const event = canonicalizePendingEvent(parsed.event);
+        if (event === parsed.event) continue;
+        const plaintext = new TextEncoder().encode(JSON.stringify({ ...parsed, event }));
+        this.spool.replace([item.spoolItemId], [{
+          spoolItemId: item.spoolItemId,
+          sessionId: item.sessionId,
+          eventId: item.eventId,
+          payloadKind: item.payloadKind,
+          createdAt: item.createdAt,
+          plaintext,
+        }]);
+      } finally { bytes.fill(0); }
+    }
   }
 
   private load(): PersistedBridgeState {
@@ -401,4 +437,17 @@ function safeRevision(value: unknown): number {
 function inferLegacyReconciledDrivers(sessionDrivers: Record<string, string> | undefined): Record<string, true> {
   const driverNames = new Set(Object.values(sessionDrivers ?? {}));
   return Object.fromEntries([...driverNames].map((driverName) => [driverName, true]));
+}
+function canonicalizePendingEvent(event: CanonicalEvent): CanonicalEvent {
+  if (event.type === 'done') {
+    if (event.status !== 'done') throw new Error('legacy pending done event has invalid status');
+    return event.typeLabel === 'Task complete' ? event : { ...event, typeLabel: 'Task complete' };
+  }
+  if ((event.type as string) === 'blocked' || (event.type as string) === 'question_requested') {
+    return { ...event, type: 'need_human', status: 'blocked', typeLabel: 'Needs attention' };
+  }
+  if (event.type === 'need_human' && event.status === 'blocked') {
+    return event.typeLabel === 'Needs attention' ? event : { ...event, typeLabel: 'Needs attention' };
+  }
+  throw new Error('obsolete pending event requires explicit recovery');
 }

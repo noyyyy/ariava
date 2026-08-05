@@ -35,18 +35,13 @@ function recipient(index: number) {
 describe('notification preview selection', () => {
   test.each([
     ['done', 'done', 'done'],
-    ['blocked', 'blocked', 'block'],
-    ['question_requested', 'blocked', 'block'],
-    ['driver_error', 'unknown', 'error'],
-    ['host_unavailable', 'unknown', 'error'],
-  ] as const)('maps push-worthy %s events to %s', (type, status, expected) => {
+    ['need_human', 'blocked', 'need_human'],
+  ] as const)('maps canonical %s events to %s', (type, status, expected) => {
     expect(buildNotificationPreview(event({ type, status }), session)?.state).toBe(expected);
   });
 
-  test('omits non-push-worthy events and prioritizes agent, explicit error, then bounded fallback text', () => {
-    expect(buildNotificationPreview(event({ type: 'working', status: 'working' }), session)).toBeUndefined();
-    expect(buildNotificationPreview(event({ type: 'driver_error', status: 'unknown', agentText: ' agent detail ', contextText: 'error detail' }), session)).toMatchObject({ bodyText: 'agent detail', source: 'agentText' });
-    expect(buildNotificationPreview(event({ type: 'driver_error', status: 'unknown', agentText: '  ', contextText: ' error detail ' }), session)).toMatchObject({ bodyText: 'error detail', source: 'error' });
+  test('uses agent text before the bounded fallback text', () => {
+    expect(buildNotificationPreview(event({ type: 'done', status: 'done', agentText: ' agent detail ' }), session)).toMatchObject({ bodyText: 'agent detail', source: 'agentText' });
     expect(buildNotificationPreview(event({ type: 'done', status: 'done', agentText: '  ', contextText: 'private context' }), session)).toMatchObject({ bodyText: 'Task completed.', source: 'fallback' });
   });
 

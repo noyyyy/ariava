@@ -90,7 +90,7 @@ function createHarness(options: {
       await handlers.get('session_shutdown')?.({ reason: 'quit' }, ctx);
     },
     terminalEvents: () => pushedEvents.filter((event) =>
-      event.type === 'done' || event.type === 'blocked' || event.type === 'question_requested'),
+      event.type === 'done' || event.type === 'need_human'),
   };
 }
 
@@ -209,7 +209,7 @@ describe('ariavaPiExtension settled lifecycle', () => {
     ['error fallback', { stopReason: 'error' }, 'Pi stopped after an unrecovered error.'],
     ['final length', { stopReason: 'length', text: 'Incomplete response.' }, 'Pi stopped after reaching the response length limit.'],
     ['final tool use', { stopReason: 'toolUse' }, 'Pi stopped while waiting to use a tool.'],
-  ])('%s becomes blocked only after settled and quiet flush', async (_name, result, preview) => {
+  ])('%s becomes need_human only after settled and quiet flush', async (_name, result, preview) => {
     const harness = createHarness();
     await harness.start();
     await end(harness, result);
@@ -219,12 +219,12 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await Bun.sleep(QUIET_WAIT_MS);
 
     expect(harness.terminalEvents()).toHaveLength(1);
-    expect(lastTerminal(harness)).toMatchObject({ type: 'blocked', agentText: preview });
+    expect(lastTerminal(harness)).toMatchObject({ type: 'need_human', status: 'blocked', agentText: preview });
     expect(harness.terminalEvents().some((event) => event.type === 'done')).toBe(false);
     await harness.shutdown();
   });
 
-  test('unknown non-empty reason removes C0/C1 and Unicode format controls before blocked delivery', async () => {
+  test('unknown non-empty reason removes C0/C1 and Unicode format controls before need_human delivery', async () => {
     const harness = createHarness();
     await harness.start();
     const unsafeReason = ` future\u0000\u0085\n\t re\u202Eas\u2066on\uFEFF ${'x'.repeat(160)} `;
@@ -232,7 +232,7 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await settleAndWait(harness);
 
     const terminal = lastTerminal(harness);
-    expect(terminal?.type).toBe('blocked');
+    expect(terminal?.type).toBe('need_human');
     expect(terminal?.agentText).toStartWith('Pi stopped for an unsupported reason: future reason ');
     expect(terminal?.agentText).not.toMatch(/[\u0000-\u001F\u007F-\u009F\p{Cf}]/u);
     expect(terminal?.agentText?.length).toBeLessThanOrEqual(122);
@@ -246,15 +246,15 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await end(harness, { stopReason: '\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069\uFEFF' });
     await settleAndWait(harness);
     expect(lastTerminal(harness)).toMatchObject({
-      type: 'blocked',
+      type: 'need_human',
       agentText: 'Pi stopped for an unsupported reason.',
     });
     await harness.shutdown();
   });
 
   test.each([
-    ['question', 'Can you confirm the deployment target?', 'question_requested'],
-    ['explicit blocker', 'I need your credentials before continuing.', 'blocked'],
+    ['question', 'Can you confirm the deployment target?', 'need_human'],
+    ['explicit blocker', 'I need your credentials before continuing.', 'need_human'],
     ['ordinary completion', 'All requested changes are complete.', 'done'],
   ])('stable stop text retains %s classification', async (_name, text, expectedType) => {
     const harness = createHarness({ userText: 'Please complete the task.' });
@@ -264,6 +264,7 @@ describe('ariavaPiExtension settled lifecycle', () => {
 
     expect(lastTerminal(harness)).toMatchObject({
       type: expectedType,
+      status: expectedType === 'done' ? 'done' : 'blocked',
       agentText: text,
       humanText: 'Please complete the task.',
     });

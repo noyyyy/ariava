@@ -47,18 +47,14 @@ export function normalizeNotificationPreviewBody(value: string): { bodyText: str
 function previewState(event: CanonicalEvent): EncryptedNotificationPreviewPlaintextV1['state'] | undefined {
   switch (event.type) {
     case 'done': return 'done';
-    case 'blocked':
-    case 'question_requested': return 'block';
-    case 'driver_error':
-    case 'host_unavailable': return 'error';
-    case 'working': return undefined;
+    case 'need_human': return 'need_human';
   }
 }
 
 function fallbackFor(state: EncryptedNotificationPreviewPlaintextV1['state']): string {
   switch (state) {
     case 'done': return 'Task completed.';
-    case 'block': return 'Ariava needs your attention.';
+    case 'need_human': return 'Ariava needs your attention.';
     case 'error': return 'The agent encountered an error.';
   }
 }

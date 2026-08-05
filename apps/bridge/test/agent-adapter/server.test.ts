@@ -79,19 +79,24 @@ describe('AgentAdapterServer', () => {
     expect(registry.listSessions()).toHaveLength(0);
   });
 
-  test('pushes an event for a registered session', async () => {
+  test('accepts canonical events and rejects working as an event type', async () => {
     registry.register({ sessionId: 'sess-1', provider: 'pi', project: 'p', cwd: '/' });
 
-    const response = await fetch(url('/v1/agent/sessions/sess-1/events'), {
+    const accepted = await fetch(url('/v1/agent/sessions/sess-1/events'), {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ type: 'done', status: 'done', agentText: 'Finished' }),
+    });
+    expect(accepted.status).toBe(200);
+    expect(store.peekPendingEvents()[0]?.type).toBe('done');
+
+    const rejected = await fetch(url('/v1/agent/sessions/sess-1/events'), {
       method: 'POST',
       headers: headers(),
       body: JSON.stringify({ type: 'working', status: 'working', agentText: 'Running' }),
     });
-
-    expect(response.status).toBe(200);
-    const pending = store.peekPendingEvents();
-    expect(pending).toHaveLength(1);
-    expect(pending[0]?.type).toBe('working');
+    expect(rejected.status).toBe(500);
+    expect(store.peekPendingEvents()).toHaveLength(1);
   });
 
   test('handles a session and keeps read as a bounded trusted-source alias', async () => {

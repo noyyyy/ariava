@@ -68,8 +68,9 @@ describe('E2E protocol v1', () => {
     expect(base64UrlEncode(buildSafetyCodeInput(fixed.transcript.digest, fixed.link.linkGeneration, fixed.link.epoch))).toBe(fixed.transcript.safetyCodeInput);
     expect(base64UrlEncode(buildEventContentAAD({
       hostId: fixed.link.hostId, sessionId: 'session_vector_01', provider: 'pi', eventId: 'event_vector_01',
-      type: 'question_requested', status: 'blocked', createdAt: '2026-07-20T00:00:00.000Z', contentId: fixed.event.contentId,
+      type: 'need_human', status: 'blocked', createdAt: '2026-07-20T00:00:00.000Z', contentId: fixed.event.contentId,
     }))).toBe(fixed.event.contentAAD);
+    expect(base64UrlEncode(openChaChaPoly(base64UrlDecode(fixed.event.dek), fixed.event.contentNonce, fixed.event.ciphertext, base64UrlDecode(fixed.event.contentAAD)))).toBe(fixed.event.plaintext);
     expect(base64UrlEncode(buildSessionContentAAD({
       hostId: fixed.link.hostId, sessionId: 'session_vector_01', provider: 'pi', status: 'blocked',
       updatedAt: '2026-07-20T00:00:01.000Z', revision: 4, contentId: fixed.session.contentId,
@@ -218,7 +219,7 @@ describe('E2E protocol v1', () => {
     expect(recipientDek).toEqual(senderDek);
     expect(base64UrlEncode(recipientDek)).toBe(preview.dek);
     const plaintext = {
-      version: 1, projectName: 'ariava', state: 'block', bodyText: 'Choose a deployment target.',
+      version: 1, projectName: 'ariava', state: 'need_human', bodyText: 'Choose a deployment target.',
       source: 'agentText', truncated: false,
     } as const;
     expect(base64UrlEncode(buildNotificationPreviewPlaintextBytes(plaintext))).toBe(preview.plaintext);
@@ -260,7 +261,10 @@ describe('E2E protocol v1', () => {
 
   test('strictly bounds preview plaintext and opaque recipient envelope', () => {
     const valid = { version: 1, projectName: 'ariava', state: 'done', bodyText: 'Finished.', source: 'fallback', truncated: false } as const;
-    expect(validateNotificationPreviewPlaintextV1(valid)).toBe(true);
+    for (const state of ['done', 'need_human', 'error'] as const) {
+      expect(validateNotificationPreviewPlaintextV1({ ...valid, state })).toBe(true);
+    }
+    expect(validateNotificationPreviewPlaintextV1({ ...valid, state: 'block' })).toBe(false);
     expect(validateNotificationPreviewPlaintextV1({ ...valid, version: 2 })).toBe(false);
     expect(validateNotificationPreviewPlaintextV1({ ...valid, state: 'working' })).toBe(false);
     expect(validateNotificationPreviewPlaintextV1({ ...valid, source: 'relay' })).toBe(false);

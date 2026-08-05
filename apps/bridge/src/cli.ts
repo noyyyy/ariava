@@ -50,7 +50,7 @@ async function main(): Promise<void> {
 
   if (command === 'simulate') {
     const config = loadBridgeConfig();
-    const scenario = (process.argv[3] as SimulationScenario | undefined) ?? 'blocked';
+    const scenario = parseSimulationScenario(process.argv[3]);
     const session = buildSimulatedSession(config.hostId, scenario);
     const event = buildSimulatedEvent(session, scenario);
     printJson({ scenario, session, event });
@@ -65,9 +65,15 @@ async function main(): Promise<void> {
       '  bun run ./apps/bridge/src/cli.ts daemon --once              Run one sync against the relay',
       '  bun run ./apps/bridge/src/cli.ts daemon                     Run the long-lived bridge loop',
       '  bun run ./apps/bridge/src/cli.ts pair <PAIRING_CODE>        Pair this host with a watch using its pairing code',
-      '  bun run ./apps/bridge/src/cli.ts simulate [kind]            Emit a sample blocked/question/done payload',
+      '  bun run ./apps/bridge/src/cli.ts simulate [kind]            Emit a sample done/need_human payload',
     ].join('\n'),
   );
+}
+
+function parseSimulationScenario(value: string | undefined): SimulationScenario {
+  if (value === undefined) return 'need_human';
+  if (value === 'done' || value === 'need_human') return value;
+  throw new Error('Usage: ariava simulate [done|need_human]');
 }
 
 main().catch((error) => {

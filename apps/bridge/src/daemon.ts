@@ -76,6 +76,7 @@ const DEFAULT_RECONCILIATION_SCHEDULER: ReconciliationScheduler = {
   schedule: (callback, delayMs) => setTimeout(callback, delayMs),
   cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
+const HOST_PRESENCE_HEARTBEAT_INTERVAL_MS = 30_000;
 
 export class EncryptedEventFailureLogger {
   private lastLogAt = 0;
@@ -119,6 +120,8 @@ export class BridgeDaemon {
   private startupValidated = false;
   private syncFlight?: Promise<BridgeSyncResult>;
   private reconciliationTimer?: unknown;
+  private presenceHeartbeatTimer?: unknown;
+  private presenceFlight?: Promise<void>;
   private reconciliationRequested = true;
   private currentSessionsSnapshotFailureCount = 0;
   private lastCurrentSessionsSnapshotFailureLogAt = 0;
@@ -150,6 +153,7 @@ export class BridgeDaemon {
     await this.validateStartup();
     await this.adapterServer.start();
     writeAgentAdapterConfig(this.config.agentAdapter.configPath, { url: this.adapterServer.url, secret: this.config.agentAdapter.secret });
+    this.schedulePresenceHeartbeat();
   }
 
   private verifyFilesystem(): void {
@@ -211,11 +215,33 @@ export class BridgeDaemon {
     }, 300);
   }
 
+  private schedulePresenceHeartbeat(): void {
+    if (this.stopped || this.presenceHeartbeatTimer !== undefined) return;
+    this.presenceHeartbeatTimer = this.reconciliationScheduler.schedule(() => {
+      this.presenceHeartbeatTimer = undefined;
+      this.runPresenceHeartbeat();
+    }, HOST_PRESENCE_HEARTBEAT_INTERVAL_MS);
+  }
+
+  private runPresenceHeartbeat(): void {
+    if (this.stopped) return;
+    void this.ensureHostPresence()
+      .catch(() => {
+        const prior = this.stateStore.getHost();
+        if (prior) this.stateStore.setHost({ ...prior, bridgeStatus: 'degraded' });
+      })
+      .finally(() => this.schedulePresenceHeartbeat());
+  }
+
   stop(): void {
     this.stopped = true;
     if (this.reconciliationTimer !== undefined) {
       this.reconciliationScheduler.cancel(this.reconciliationTimer);
       this.reconciliationTimer = undefined;
+    }
+    if (this.presenceHeartbeatTimer !== undefined) {
+      this.reconciliationScheduler.cancel(this.presenceHeartbeatTimer);
+      this.presenceHeartbeatTimer = undefined;
     }
     this.relayAbortController.abort();
     this.adapterServer.stop(true);
@@ -240,7 +266,7 @@ export class BridgeDaemon {
     this.reconciliationRequested = false;
     let offline = false;
     try {
-      await this.registerHostPresence();
+      await this.ensureHostPresence();
     } catch {
       const prior = this.stateStore.getHost();
       if (prior) this.stateStore.setHost({ ...prior, bridgeStatus: 'degraded' });
@@ -261,16 +287,14 @@ export class BridgeDaemon {
         this.stateStore.replaceDriverSessions(driver.name, sessions);
       } catch (error) {
         if (!this.stateStore.hasReconciledDriver(driver.name)) authoritativeSetComplete = false;
-        const event = this.buildDriverErrorEvent(driver.name, error);
-        this.stateStore.queuePendingEvent(event);
-        newEvents.push(event);
+        process.stderr.write(`Ariava driver ${driver.name} failed: ${this.formatError(error)}\n`);
       }
     }
     // A driver failure must never turn a partial list into an authoritative replacement.
     // Successful drivers have been reconciled above, while failed drivers retain their last
     // complete persisted set. Build the Host snapshot only from that reconciled store.
     const nextSessions = this.stateStore.listSessions();
-    const activeSessions = nextSessions.filter((session) => !isDiagnosticSession(session));
+    const activeSessions = nextSessions;
     if (authoritativeSetComplete && !offline) {
       try { await this.flushCurrentSessionsSnapshot(activeSessions); }
       catch (error) {
@@ -339,7 +363,7 @@ export class BridgeDaemon {
 
   async pairWatch(pairingCode: string): Promise<BridgePairWatchResponse> {
     await this.validateStartup();
-    await this.registerHostPresence();
+    await this.ensureHostPresence();
     return this.client().pairWatch(pairingCode);
   }
 
@@ -351,8 +375,7 @@ export class BridgeDaemon {
       try { await this.syncOnce(); }
       catch (error) {
         if (this.stopped || isAbortError(error)) break;
-        this.stateStore.queuePendingEvent(this.buildBridgeFailureEvent(error));
-        await this.flushPendingEvents();
+        process.stderr.write(`Ariava Bridge loop recovered from an error: ${this.formatError(error)}\n`);
       }
       if (this.reconciliationRequested) continue;
       if (!this.stopped) await this.waitForNextPoll();
@@ -378,6 +401,16 @@ export class BridgeDaemon {
 
   private buildHostMetadata(): HostMetadataUpdateRequest {
     return { hostName: this.config.hostName, platform: this.config.hostPlatform, bridgeVersion: this.config.bridgeVersion };
+  }
+
+  private ensureHostPresence(): Promise<void> {
+    if (this.presenceFlight) return this.presenceFlight;
+    const flight = this.registerHostPresence();
+    this.presenceFlight = flight;
+    void flight.finally(() => {
+      if (this.presenceFlight === flight) this.presenceFlight = undefined;
+    }).catch(() => {});
+    return flight;
   }
 
   private async registerHostPresence(): Promise<void> {
@@ -500,17 +533,6 @@ export class BridgeDaemon {
   }
 
 
-  private buildDriverErrorEvent(driverName: string, error: unknown): CanonicalEvent {
-    return { eventId: createId('evt'), hostId: this.config.hostId, sessionId: `driver:${driverName}`, provider: driverName,
-      type: 'driver_error', status: 'unknown', typeLabel: deriveEventTypeLabel('driver_error'),
-      agentText: `Driver ${driverName} failed: ${this.formatError(error)}`, contextText: `driver:${driverName}`, createdAt: isoNow() };
-  }
-
-  private buildBridgeFailureEvent(error: unknown): CanonicalEvent {
-    return { eventId: createId('evt'), hostId: this.config.hostId, sessionId: `host:${this.config.hostId}`, provider: 'bridge',
-      type: 'host_unavailable', status: 'unknown', typeLabel: deriveEventTypeLabel('host_unavailable'),
-      agentText: `Bridge loop recovered from an error: ${this.formatError(error)}`, contextText: this.config.hostName, createdAt: isoNow() };
-  }
 
   private formatError(error: unknown): string {
     const raw = error instanceof Error ? error.message : String(error);
@@ -532,16 +554,6 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
 }
 
-function deriveEventTypeLabel(type: CanonicalEvent['type']): string {
-  switch (type) {
-    case 'question_requested': return 'Agent question';
-    case 'blocked': return 'Session blocked';
-    case 'done': return 'Task complete';
-    case 'working': return 'In progress';
-    case 'driver_error': return 'Driver error';
-    case 'host_unavailable': return 'Host unavailable';
-  }
-}
 
 function samePersistedIdentity(
   configured: import('./identity').HostIdentityMetadata,
@@ -564,9 +576,6 @@ function samePersistedIdentity(
     && storageMatches;
 }
 
-function isDiagnosticSession(session: CanonicalSessionState): boolean {
-  return session.sessionId.startsWith('driver:') || session.sessionId.startsWith('host:');
-}
 
 function snapshotError(
   error: unknown,

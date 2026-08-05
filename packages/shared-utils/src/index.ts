@@ -34,14 +34,6 @@ export function eventTypeToLabel(type: string): string {
       return 'Session blocked';
     case 'done':
       return 'Task complete';
-    case 'working':
-      return 'In progress';
-    case 'summary_updated':
-      return 'Summary updated';
-    case 'driver_error':
-      return 'Driver error';
-    case 'host_unavailable':
-      return 'Host unavailable';
     default:
       return 'Agent update';
   }

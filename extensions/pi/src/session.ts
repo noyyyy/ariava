@@ -146,12 +146,7 @@ export function deriveLatestActivityText(ctx: ExtensionContext, options: ActiveM
 export function fallbackAssistantForEventType(type: EventType, session: Pick<PiSessionInfo, 'nameText'>): string {
   switch (type) {
     case 'done': return 'Task complete';
-    case 'blocked': return 'Review needed on desktop';
-    case 'question_requested': return 'Agent needs input';
-    case 'working': return `${session.nameText} is running`;
-    case 'driver_error': return 'Driver error';
-    case 'host_unavailable': return 'Host unavailable';
-    default: return 'Agent update';
+    case 'need_human': return 'Needs attention';
   }
 }
 

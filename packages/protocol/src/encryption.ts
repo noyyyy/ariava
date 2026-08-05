@@ -184,7 +184,7 @@ export interface ProtectedReplyContentV1 { version: 1; text: string }
 export interface EncryptedNotificationPreviewPlaintextV1 {
   version: 1;
   projectName: string;
-  state: 'done' | 'block' | 'error';
+  state: 'done' | 'need_human' | 'error';
   bodyText: string;
   source: 'agentText' | 'error' | 'fallback';
   truncated: boolean;
@@ -530,7 +530,7 @@ export function validateEncryptedContentV1(value: unknown): value is EncryptedCo
 
 export function validateNotificationPreviewPlaintextV1(value: unknown): value is EncryptedNotificationPreviewPlaintextV1 {
   if (!isExactRecord(value, ['version', 'projectName', 'state', 'bodyText', 'source', 'truncated'])) return false;
-  const hasValidState = value.state === 'done' || value.state === 'block' || value.state === 'error';
+  const hasValidState = value.state === 'done' || value.state === 'need_human' || value.state === 'error';
   const hasValidSource = value.source === 'agentText' || value.source === 'error' || value.source === 'fallback';
   return value.version === 1
     && isBoundedWellFormedString(value.projectName, E2E_LIMITS.notificationPreviewProjectNameBytes)

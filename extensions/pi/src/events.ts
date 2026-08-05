@@ -53,28 +53,19 @@ export function buildDoneEvent(session: PiSessionInfo, agentText?: string, human
   });
 }
 
-export function buildBlockedEvent(session: PiSessionInfo, agentText?: string, humanText?: string): Partial<CanonicalEvent> {
+export function buildNeedHumanEvent(
+  session: PiSessionInfo,
+  agentText?: string,
+  humanText?: string,
+  actionablePrompt?: EventBuilderInput['actionablePrompt'],
+): Partial<CanonicalEvent> {
   return buildEvent(session, {
-    type: 'blocked',
+    type: 'need_human',
     status: 'blocked',
     agentText,
     humanText,
     contextText: buildContextText(session),
-  });
-}
-
-export function buildQuestionEvent(session: PiSessionInfo, question: string, humanText?: string): Partial<CanonicalEvent> {
-  return buildEvent(session, {
-    type: 'question_requested',
-    status: 'blocked',
-    agentText: question,
-    humanText,
-    contextText: buildContextText(session),
-    actionablePrompt: {
-      promptId: `question-${Date.now()}`,
-      type: 'question',
-      label: 'Reply',
-    },
+    actionablePrompt,
   });
 }
 
@@ -107,11 +98,7 @@ function buildContextText(session: Pick<PiSessionInfo, 'nameText' | 'projectName
 
 function deriveEventTypeLabel(type: EventType): string {
   switch (type) {
-    case 'question_requested': return 'Human';
-    case 'blocked':
-    case 'done':
-    case 'working': return 'Agent';
-    case 'driver_error': return 'Driver error';
-    case 'host_unavailable': return 'Host unavailable';
+    case 'done': return 'Task complete';
+    case 'need_human': return 'Needs attention';
   }
 }

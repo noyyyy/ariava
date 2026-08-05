@@ -75,6 +75,7 @@ const INTENDED_RUNTIME_EXPORTS = [
   'statusToStateLabel',
   'validateEncryptedContentV1',
   'validateEncryptionKeyBindingV1',
+  'validateEventTypeStatusPair',
   'validateCommandType',
   'validateHostEnrollmentRequest',
   'validateHostEnrollmentRequestSyntax',

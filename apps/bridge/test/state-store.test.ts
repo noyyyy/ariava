@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BridgeStateStore } from '../src/state-store';
 import type { CanonicalSessionState, HostProjection } from '@ariava/protocol';
+
+mock.module('../src/e2e/node-crypto', () => ({
+  chachaPolySeal: (_key: Uint8Array, plaintext: Uint8Array) => ({ nonce: new Uint8Array(12).fill(1), ciphertext: new Uint8Array([...plaintext, ...new Uint8Array(16)]) }),
+  chachaPolyOpen: (_key: Uint8Array, _nonce: Uint8Array, ciphertext: Uint8Array) => ciphertext.slice(0, -16),
+}));
 
 const paths: string[] = [];
 
@@ -170,7 +175,7 @@ describe('BridgeStateStore', () => {
       sessions: { 'sess-1': { sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'p', nameText: 'n', stateLabel: 'Ready', status: 'idle', updatedAt: '2026-07-20T00:00:00.000Z' } },
       sessionDrivers: { 'sess-1': 'pi' },
       recentEvents: [{ eventId: 'evt-recent', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'done', typeLabel: 'Done', createdAt: '2026-07-20T00:00:01.000Z' }],
-      pendingEvents: [{ eventId: 'evt-pending', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'working', status: 'working', typeLabel: 'Working', createdAt: '2026-07-20T00:00:02.000Z' }],
+      pendingEvents: [{ eventId: 'evt-pending', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'need_human', status: 'blocked', typeLabel: 'Needs attention', createdAt: '2026-07-20T00:00:02.000Z' }],
       pendingHandles: { 'host-1:sess-1': { hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-recent', handledAt: '2026-07-20T00:00:03.000Z', action: 'pi_input', updatedAt: '2026-07-20T00:00:03.000Z' } },
       commandResults: { 'cmd-1': { commandId: 'cmd-1', hostId: 'host-1', sessionId: 'sess-1', accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-07-20T00:00:04.000Z' } },
       seenCommands: { 'cmd-1': '2026-07-20T00:00:04.000Z' },
@@ -226,6 +231,40 @@ describe('BridgeStateStore', () => {
       handledThroughEventCreatedAt: undefined, handledAt: '2026-07-16T00:00:05Z',
       action: 'bridge_recovery', updatedAt: '2026-07-16T00:00:05Z',
     }]);
+  });
+
+  test('canonicalizes rebuildable three-event plaintext pending state during encrypted spool upgrade', () => {
+    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json');
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const base = { hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', status: 'blocked', typeLabel: 'Legacy', agentText: 'preserved', createdAt: '2026-07-20T00:00:00.000Z' };
+    writeFileSync(statePath, JSON.stringify({ pendingEvents: [
+      { ...base, eventId: 'legacy-blocked', type: 'blocked' },
+      { ...base, eventId: 'legacy-question', type: 'question_requested', actionablePrompt: { promptId: 'p1', type: 'question', label: 'Choose deployment target', options: ['staging-target'] } },
+      { ...base, eventId: 'canonical-done', type: 'done', status: 'done', typeLabel: 'Old done label' },
+    ] }));
+    chmodSync(statePath, 0o600);
+    const store = new BridgeStateStore(statePath);
+    const report = store.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
+    expect(report).toEqual({ droppedUnreadableItems: 0 });
+    expect(store.peekPendingEvents()).toEqual([
+      expect.objectContaining({ eventId: 'legacy-blocked', type: 'need_human', status: 'blocked', typeLabel: 'Needs attention', agentText: 'preserved' }),
+      expect.objectContaining({ eventId: 'legacy-question', type: 'need_human', status: 'blocked', typeLabel: 'Needs attention', actionablePrompt: { promptId: 'p1', type: 'question', label: 'Choose deployment target', options: ['staging-target'] } }),
+      expect.objectContaining({ eventId: 'canonical-done', type: 'done', status: 'done', typeLabel: 'Task complete' }),
+    ]);
+  });
+
+  test('fails closed on old inflight wire state without deleting encrypted evidence', () => {
+    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json');
+    const keyStore = { loadOrCreate: () => new Uint8Array(32).fill(7) };
+    const store = new BridgeStateStore(statePath);
+    store.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', keyStore);
+    store.queuePendingEvent({ eventId: 'legacy-blocked', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'blocked', status: 'blocked', typeLabel: 'Legacy', agentText: 'old', createdAt: '2026-07-20T00:00:00.000Z' } as any);
+    store.persistInflightEventUpload('legacy-blocked', 'sess-1', { event: { type: 'blocked', status: 'blocked' }, session: {} });
+    const restarted = new BridgeStateStore(statePath);
+    expect(() => restarted.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', keyStore)).toThrow(/obsolete inflight event upload requires explicit recovery/);
+    expect(restarted.getInflightEventUpload('legacy-blocked')).toEqual({ event: { type: 'blocked', status: 'blocked' }, session: {} });
   });
 
   test('fails closed on legacy plaintext pending lifecycle state without rewriting its revision lower bound', () => {
