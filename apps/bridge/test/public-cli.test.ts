@@ -535,6 +535,30 @@ describe('public ariava CLI', () => {
     expect(json.data.commands).toContain('ariava upgrade [pi]');
   });
 
+  test('renders a concise human status card with only product-facing fields', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'ariava-cli-status-home-'));
+    roots.push(home);
+
+    const proc = Bun.spawn({
+      cmd: [bunPath, cliPath, 'status'],
+      cwd: process.cwd(),
+      env: isolatedEnv(home),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+
+    expect(exitCode, stderr).toBe(0);
+    expect(stderr).toBe('');
+    expect(stdout).toMatch(/^Ariava\n\n  Version\s{2,}\S/);
+    expect(stdout).toMatch(/\n  Bridge\s{2,}offline\n/);
+    expect(stdout).toMatch(/\n  Host\s{2,}\S/);
+    expect(stdout).toMatch(/\n  Identity\s{2,}not-initialized\n/);
+    expect(stdout).toMatch(/\n  Relay\s{2,}https:\/\/ariava-relay\.noyx\.io\n/);
+    expect(stdout).toMatch(/\n  Agent\s{2,}Pi · not installed\n/);
+    expect(stdout).not.toMatch(/Config complete|Service backend|Service supported|Process running|Bridge source|pi extension:/);
+  });
+
   test('reports the package version in status and upgrade output', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     roots.push(home);

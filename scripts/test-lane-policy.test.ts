@@ -129,24 +129,30 @@ describe('Public Core test lane collection policy', () => {
   });
 
   test('package scripts preserve the shared release closure and additive host gates', () => {
-    expect(packageJson.scripts['test:shared']).toBe(
+    expect(packageJson.scripts.test).toBe(
       'bun run build && bun run ./scripts/run-test-lane.mjs shared && bun run --cwd extensions/pi test',
     );
+    expect(packageJson.scripts['test:shared']).toBeUndefined();
     expect(packageJson.scripts['test:macos']).toBe('bun run ./scripts/run-test-lane.mjs macos');
     expect(packageJson.scripts['test:linux']).toBe('bun run ./scripts/run-test-lane.mjs linux');
-    expect(packageJson.scripts['verify:shared']).toBe(
-      'bun run test:shared && bun run --cwd extensions/pi typecheck && bun run package:assert',
+    expect(packageJson.scripts.verify).toBe(
+      'bun run test && bun run --cwd extensions/pi typecheck && bun run package:assert',
     );
-    expect(packageJson.scripts['verify:macos']).toBe('bun run verify:shared && bun run test:macos');
-    expect(packageJson.scripts['verify:linux']).toBe('bun run verify:shared && bun run test:linux');
-    expect(packageJson.scripts.verify).toBe('bun run verify:shared');
+    expect(packageJson.scripts['verify:shared']).toBeUndefined();
+    expect(packageJson.scripts['verify:macos']).toBe('bun run verify && bun run test:macos');
+    expect(packageJson.scripts['verify:linux']).toBe('bun run verify && bun run test:linux');
     expect(packageJson.scripts['verify:host']).toBe('bun run ./scripts/verify-host.mjs');
 
-    const closure = scriptClosure('verify:shared');
+    const closure = scriptClosure('verify');
     const closureNames = closure.map((entry) => entry.name);
     const closureCommands = closure.map((entry) => entry.command).join('\n');
-    for (const buildScript of ['build:protocol', 'build:shared-utils', 'build:bridge', 'build:pi-bundle']) {
-      expect(closureNames, buildScript).toContain(buildScript);
+    expect(closureNames).toContain('build');
+    expect(closureNames).toContain('build:pi-bundle');
+    expect(closureCommands).toContain('bun run ./scripts/build-public-package.mjs protocol');
+    expect(closureCommands).toContain('bun run ./scripts/build-public-package.mjs shared-utils');
+    expect(closureCommands).toContain('node ./scripts/build-bridge.mjs');
+    for (const removedBuildScript of ['build:protocol', 'build:shared-utils', 'build:bridge']) {
+      expect(packageJson.scripts[removedBuildScript]).toBeUndefined();
     }
     expect(closureCommands).toContain('bun run --cwd extensions/pi test');
     expect(closureCommands).toContain('bun run --cwd extensions/pi typecheck');

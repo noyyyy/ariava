@@ -90,27 +90,25 @@ bun run verify
 Use the fixed `dev` profile when an installed Ariava Bridge is already running. It keeps source-development configuration, identity, state, discovery, and logs under `~/.config/ariava-dev`, and uses the loopback Agent Adapter on `127.0.0.1:7273`; the installed profile remains under `~/.config/ariava` on port `7272`.
 
 ```bash
-# Create or reuse the isolated dev configuration and Host identity
-bun run dev:init
+# Build the source Bridge and open the unified dev CLI
+npm run dev:cli -- init
 
 # Run the source Bridge in the foreground
-bun run dev:bridge
+npm run dev:cli -- bridge
 
 # In another terminal, run Pi with only the source Ariava extension
-bun run dev:pi -- <pi args...>
+npm run dev:cli -- pi <pi args...>
 
 # Pair this isolated dev Host with a Watch pairing code, then confirm Safety Code
-bun run dev:pair -- <PAIRING_CODE>
+npm run dev:cli -- pair <PAIRING_CODE>
 # Noninteractive: after verifying the Watch shows the same Safety Code
-# bun run dev:pair -- <PAIRING_CODE> --codes-match
+# npm run dev:cli -- pair <PAIRING_CODE> --codes-match
 
 # Inspect paths, Host ID, Relay URL, and Adapter status (secret redacted)
-bun run dev:status
+npm run dev:cli -- status
 ```
 
-After a successful pair, the CLI prints a 6-symbol **Safety Code**. Confirm only when the Watch **Verify Safety Code** screen shows the same code (`y`/`N` interactively, or pass `--codes-match`). The Host then submits confirmation and waits for the Watch proof before activating the encrypted link.
-
-`dev:pi` launches `pi --no-extensions -e <source-extension>`, so other automatically discovered Pi extensions are intentionally disabled in that process. These commands do not install or modify a launchd/systemd service, do not replace the globally installed Ariava Pi extension, and do not read or write the installed Ariava profile.
+For a guided one-command setup that initializes the dev profile and starts the source Bridge, run `npm run dev:setup`. The `pi` command launches `pi --no-extensions -e <source-extension>`, so other automatically discovered Pi extensions are intentionally disabled in that process. These commands do not install or modify a launchd/systemd service, do not replace the globally installed Ariava Pi extension, and do not read or write the installed Ariava profile.
 
 ## Contributing
 

@@ -142,7 +142,7 @@ describe("optional Linux systemd integration-test orchestrator", () => {
     expect(calls).toContain(String.raw`systemd\ --version`);
     expect(calls).not.toMatch(/orbctl run -m [^\n]+ \/home\/ariava-test\/linux-systemd-real-upgrade-test\.sh\n/);
     expect(calls).toContain("orbctl delete -f");
-    expect(calls).not.toContain("bun run build:bridge");
+    expect(calls).not.toContain("bun run ./scripts/build-bridge.mjs");
     expect(calls).not.toContain("npm pack");
 
     const summary = readFileSync(join(current.outputDir, "summary.txt"), "utf8");
@@ -160,7 +160,7 @@ describe("optional Linux systemd integration-test orchestrator", () => {
     expect(result.exitCode, result.stderr.toString()).toBe(0);
 
     const calls = readFileSync(current.commandLog, "utf8");
-    expect(calls).toContain("bun run build:bridge");
+    expect(calls).toContain("bun run ./scripts/build-bridge.mjs");
     expect(calls).toContain("npm pack --pack-destination");
     expect(calls).toContain("orbctl create --isolated");
   });

@@ -137,7 +137,7 @@ if [[ -z "$TARBALL" ]]; then
   PACK_DIR="$OUTPUT_DIR/artifact"
   mkdir -p "$PACK_DIR"
   echo "Building Ariava Bridge..."
-  bun run build:bridge 2>&1 | tee "$OUTPUT_DIR/build.log"
+  bun run ./scripts/build-bridge.mjs 2>&1 | tee "$OUTPUT_DIR/build.log"
   echo "Packing Ariava npm artifact..."
   npm pack --pack-destination "$PACK_DIR" 2>&1 | tee "$OUTPUT_DIR/pack.log"
   TARBALL="$(find "$PACK_DIR" -maxdepth 1 -type f -name '*.tgz' -print -quit)"

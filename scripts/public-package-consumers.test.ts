@@ -33,8 +33,8 @@ describe('packed public package consumers', () => {
     mkdirSync(consumer);
 
     try {
-      requireSuccess(run('bun', ['run', 'build:protocol'], repositoryRoot), 'build protocol');
-      requireSuccess(run('bun', ['run', 'build:shared-utils'], repositoryRoot), 'build shared utils');
+      requireSuccess(run('bun', ['run', './scripts/build-public-package.mjs', 'protocol'], repositoryRoot), 'build protocol');
+      requireSuccess(run('bun', ['run', './scripts/build-public-package.mjs', 'shared-utils'], repositoryRoot), 'build shared utils');
 
       const protocolTarball = pack(join(repositoryRoot, 'packages', 'protocol'), tarballs);
       const sharedUtilsTarball = pack(join(repositoryRoot, 'packages', 'shared-utils'), tarballs);

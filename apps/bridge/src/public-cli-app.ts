@@ -779,7 +779,7 @@ async function runDev(deps: PublicCliDependencies, argv: string[], json: boolean
   if (command === 'bridge' && target === 'use') {
     const sourcePath = from ? resolve(from) : resolve(process.cwd(), 'apps/bridge/dist/cli.js');
     if (!existsSync(sourcePath)) {
-      throw new Error(`Dev bridge entry not found: ${sourcePath}. Run bun run build:bridge first or pass --from.`);
+      throw new Error(`Dev bridge entry not found: ${sourcePath}. Run node ./scripts/build-bridge.mjs first or pass --from.`);
     }
     const source = { kind: from ? 'explicit-path' : 'dev-repo', path: sourcePath, updatedAt: new Date().toISOString() } as AriavaAssetSource;
     mergeInstallMetadata({ bridgeSource: source });
@@ -1549,21 +1549,24 @@ function redactResolvedConfig(config: ResolvedAriavaConfig): ResolvedAriavaConfi
 }
 
 function formatStatus(status: ReturnType<typeof buildHostManagerStatus>): string {
+  const hostId = status.hostId || status.identity.hostId;
+  const fields = [
+    { label: 'Version', value: status.cliVersion },
+    { label: 'Bridge', value: status.bridgeHealth },
+    { label: 'Host', value: status.hostName, detail: hostId },
+    { label: 'Identity', value: status.identity.status, detail: status.identity.keyId },
+    { label: 'Relay', value: status.relayBaseUrl },
+    { label: 'Agent', value: `Pi · ${status.piExtension.installed ? 'installed' : 'not installed'}` },
+  ];
+  const labelWidth = Math.max(...fields.map(({ label }) => label.length));
+
   return [
-    `CLI version: ${status.cliVersion}`,
-    `Config complete: ${status.configComplete ? 'yes' : 'no'}`,
-    `Service backend: ${status.service.backend ?? '(unavailable)'}`,
-    `Service supported: ${status.service.supported ? 'yes' : 'no'}`,
-    `Service: ${status.service.installed ? 'installed' : 'not installed'}`,
-    `Service enabled: ${status.service.enabled ? 'yes' : 'no'}`,
-    `Service loaded: ${status.service.loaded ? 'yes' : 'no'}`,
-    `Process running: ${status.service.processRunning ? 'yes' : 'no'}`,
-    `Bridge health: ${status.bridgeHealth}`,
-    `Bridge source: ${status.bridgeSourceKind ?? 'release-bundle'}`,
-    `Host: ${status.hostName} (${status.hostId || status.identity.hostId || '(not initialized)'})`,
-    `Identity: ${status.identity.status}${status.identity.keyId ? ` (${status.identity.keyId})` : ''}`,
-    `Relay: ${status.relayBaseUrl}`,
-    `pi extension: ${status.piExtension.installed ? 'installed' : 'not installed'}`,
+    'Ariava',
+    '',
+    ...fields.flatMap(({ label, value, detail }) => [
+      `  ${label.padEnd(labelWidth)}  ${value}`,
+      ...(detail ? [`  ${' '.repeat(labelWidth)}  ${detail}`] : []),
+    ]),
   ].join('\n');
 }
 

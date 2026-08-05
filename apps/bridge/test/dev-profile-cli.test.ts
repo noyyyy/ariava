@@ -119,7 +119,7 @@ describe('source dev profile commands', () => {
 
     expect(await runDevProfileCommand(['setup', '--extension', 'pi'], harness.deps)).toBe(0);
     expect(piSpawns).toBe(0);
-    expect(harness.output()).toContain('bun run --cwd open-source/ariava dev:pi');
+    expect(harness.output()).toContain('npm run dev:cli -- pi');
     expect(bridgeStopped).toBe(true);
     expect(readFileSync(defaultConfig, 'utf8')).toBe('{"production":true}\n');
     expect(JSON.parse(readFileSync(harness.deps.paths.configPath, 'utf8'))).toMatchObject({

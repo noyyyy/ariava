@@ -36,15 +36,14 @@ Copyable gates:
 
 ```bash
 bun install --frozen-lockfile
-bun run verify:shared
+bun run verify              # authoritative shared npm release-compatible closure
 bun run verify:macos        # native macOS
 bun run verify:host         # local Darwin dispatcher
 bun run verify:linux        # native Linux / Public CI
 bun run verify:linux:docker # explicit Docker pre-acceptance, normally from macOS
-bun run verify              # authoritative npm release-compatible closure
 ```
 
-`verify:linux:docker` must stay explicit and must not be added to `verify`, `verify:shared`, `verify:macos`, or `verify:host`. It must run the complete `bun run verify:linux` closure as the image's non-root user, with no Docker socket, host home/config/credential mount, privileged mode, or systemd simulation. The reviewed base is `node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d`; update the digest, exact Node/npm/Bun pins, CI, tests, and docs together.
+`verify:linux:docker` must stay explicit and must not be added to `verify`, `verify:macos`, or `verify:host`. It must run the complete `bun run verify:linux` closure as the image's non-root user, with no Docker socket, host home/config/credential mount, privileged mode, or systemd simulation. The reviewed base is `node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d`; update the digest, exact Node/npm/Bun pins, CI, tests, and docs together.
 
 Report Docker evidence with its architecture. Apple Silicon defaults to Docker Linux arm64. Docker does not prove GitHub Ubuntu, a real systemd user manager, journald lifecycle, VM restart, physical logout/login, or WSL.
 

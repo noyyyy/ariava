@@ -95,7 +95,7 @@ describe('Docker Linux pre-acceptance policy', () => {
       readFileSync(dockerignorePath, 'utf8'),
     );
     expect(packageJson.scripts['verify:linux:docker']).toBe('./scripts/verify-linux-docker.sh');
-    for (const ordinaryGate of ['verify', 'verify:shared', 'verify:macos', 'verify:host']) {
+    for (const ordinaryGate of ['verify', 'verify:macos', 'verify:host']) {
       expect(packageJson.scripts[ordinaryGate], ordinaryGate).not.toMatch(/verify:linux:docker|docker/iu);
     }
   });
@@ -148,7 +148,7 @@ describe('Docker Linux pre-acceptance policy', () => {
       { dockerfile: `# syntax=docker/dockerfile:1\n${dockerfile}`, entrypoint, wrapper, dockerignore },
       { dockerfile, entrypoint, wrapper: wrapper.replace('--cap-drop ALL', '--privileged'), dockerignore },
       { dockerfile, entrypoint, wrapper: `${wrapper}\n# --volume /var/run/docker.sock:/var/run/docker.sock\n`, dockerignore },
-      { dockerfile, entrypoint: entrypoint.replace('verify:linux', 'verify:shared'), wrapper: wrapper.replace('bun run verify:linux', 'bun run verify:shared'), dockerignore },
+      { dockerfile, entrypoint: entrypoint.replace('verify:linux', 'verify'), wrapper: wrapper.replace('bun run verify:linux', 'bun run verify'), dockerignore },
       { dockerfile, entrypoint, wrapper, dockerignore: `${dockerignore}\ndocs\n` },
     ]) {
       expect(() => validateDockerPolicy(mutation.dockerfile, mutation.entrypoint, mutation.wrapper, mutation.dockerignore)).toThrow();

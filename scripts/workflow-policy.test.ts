@@ -120,7 +120,7 @@ describe('GitHub workflow least-privilege policy', () => {
 
   test('negative mutation: swapping runners, weakening commands, or drifting toolchains is rejected', () => {
     expect(() => assertWorkflowPolicy(ci.replace('runs-on: macos-latest', 'runs-on: ubuntu-latest'), publish)).toThrow();
-    expect(() => assertWorkflowPolicy(ci.replace('bun run verify:linux', 'bun run verify:shared'), publish)).toThrow();
+    expect(() => assertWorkflowPolicy(ci.replace('bun run verify:linux', 'bun run verify'), publish)).toThrow();
     expect(() => assertWorkflowPolicy(ci.replace('node-version: 24.18.0', 'node-version: 24'), publish)).toThrow();
     expect(() => assertWorkflowPolicy(ci.replace('bun install --frozen-lockfile', 'bun install'), publish)).toThrow();
   });

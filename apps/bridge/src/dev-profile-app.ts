@@ -127,7 +127,7 @@ async function runDevSetup(args: string[], deps: DevProfileDependencies): Promis
     if (usePi) {
       requireSourcePiExtension(deps);
       deps.stdout.write('Pi source adapter ready. Start Pi in another terminal with:\n');
-      deps.stdout.write('  bun run --cwd open-source/ariava dev:pi\n');
+      deps.stdout.write('  npm run dev:cli -- pi\n');
     } else {
       deps.stdout.write('Dev profile ready without agent extensions.\n');
     }
@@ -235,7 +235,7 @@ function runDevPi(args: string[], deps: DevProfileDependencies): number {
 
 function requireDevPiFiles(deps: DevProfileDependencies): void {
   if (!deps.pathExists(deps.paths.agentAdapterConfigPath)) {
-    throw new Error(`Dev Agent Adapter discovery is missing at ${deps.paths.agentAdapterConfigPath}; start dev:bridge first`);
+    throw new Error(`Dev Agent Adapter discovery is missing at ${deps.paths.agentAdapterConfigPath}; run npm run dev:cli -- bridge first`);
   }
   requireSourcePiExtension(deps);
 }
@@ -284,7 +284,7 @@ async function runDevPair(args: string[], deps: DevProfileDependencies): Promise
   if (!identity) {
     throw new HostIdentityError(
       'ERR_IDENTITY_NOT_INITIALIZED',
-      `Dev identity is not initialized at ${deps.paths.identityPath}; run dev:init first`,
+      `Dev identity is not initialized at ${deps.paths.identityPath}; run npm run dev:cli -- init first`,
     );
   }
   const encryptionIdentity = createRuntimeHostEncryptionIdentityStore(
@@ -344,7 +344,7 @@ function parseDevPairArgs(args: string[]): { pairingCode: string; codesMatch: bo
       continue;
     }
     if (arg.startsWith('-')) {
-      throw new Error(`Unknown dev:pair option: ${arg}`);
+      throw new Error(`Unknown pair option: ${arg}`);
     }
     if (pairingCode) throw new Error('Usage: dev-profile-cli pair <PAIRING_CODE> [--codes-match]');
     pairingCode = arg;
@@ -364,11 +364,11 @@ function readPackageVersion(root: string): string {
 
 function requireInitializedConfig(deps: DevProfileDependencies): void {
   if (!deps.pathExists(deps.paths.configPath)) {
-    throw new Error(`Dev profile is not initialized at ${deps.paths.configPath}; run dev:init first`);
+    throw new Error(`Dev profile is not initialized at ${deps.paths.configPath}; run npm run dev:cli -- init first`);
   }
   const config = resolvePersistedAriavaConfig(deps.paths.configPath);
   assertFixedDevConfig(config, deps.paths);
-  if (!config.identity) throw new Error(`Dev identity is not initialized at ${deps.paths.identityPath}; run dev:init first`);
+  if (!config.identity) throw new Error(`Dev identity is not initialized at ${deps.paths.identityPath}; run npm run dev:cli -- init first`);
 }
 
 function assertFixedDevConfig(
