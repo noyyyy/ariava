@@ -27,6 +27,8 @@ import type { PiExtensionStatus } from '../src/host-manager/pi-extension';
 import type { HostServiceStatusInput } from '../src/host-manager/status';
 
 const roots: string[] = [];
+const isolatedHome = process.env.HOME;
+const isolatedPiCodingAgentDirectory = process.env.PI_CODING_AGENT_DIR;
 let homeOverride = '';
 
 beforeEach(() => {
@@ -41,6 +43,10 @@ afterEach(() => {
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
+  if (isolatedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = isolatedHome;
+  if (isolatedPiCodingAgentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = isolatedPiCodingAgentDirectory;
 });
 
 describe('host-manager helpers', () => {

@@ -2,7 +2,42 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
 const configuredRoot = process.env.XDG_CONFIG_HOME?.trim();
-export const ARIAVA_CONFIG_ROOT = resolve(configuredRoot && isAbsolute(configuredRoot) ? configuredRoot : join(homedir(), '.config'), 'ariava');
+
+export interface AriavaDefaultProfilePathOptions {
+  homeDirectory?: string;
+  xdgConfigHome?: string;
+}
+
+export interface AriavaDefaultProfilePaths {
+  root: string;
+  configPath: string;
+  identityPath: string;
+  agentAdapterConfigPath: string;
+  statePath: string;
+  piExtensionLogPath: string;
+  agentAdapterPort: 7272;
+}
+
+export function resolveAriavaDefaultProfilePaths(
+  options: AriavaDefaultProfilePathOptions = {},
+): AriavaDefaultProfilePaths {
+  const homeDirectory = options.homeDirectory ?? homedir();
+  if (!isAbsolute(homeDirectory)) throw new Error('Ariava default profile home directory must be absolute');
+  const xdgConfigHome = options.xdgConfigHome?.trim();
+  const configBase = xdgConfigHome && isAbsolute(xdgConfigHome) ? xdgConfigHome : join(homeDirectory, '.config');
+  const root = resolve(configBase, 'ariava');
+  return {
+    root,
+    configPath: join(root, 'config.json'),
+    identityPath: join(root, 'host-identity.json'),
+    agentAdapterConfigPath: join(root, 'agent-adapter.json'),
+    statePath: join(root, 'state', 'bridge-state.json'),
+    piExtensionLogPath: join(root, 'pi-extension.log'),
+    agentAdapterPort: 7272,
+  };
+}
+
+export const ARIAVA_CONFIG_ROOT = resolveAriavaDefaultProfilePaths({ xdgConfigHome: configuredRoot }).root;
 export const ARIAVA_CONFIG_PATH = join(ARIAVA_CONFIG_ROOT, 'config.json');
 export const ARIAVA_INSTALL_PATH = join(ARIAVA_CONFIG_ROOT, 'install.json');
 export const ARIAVA_ONBOARDING_LOCK_PATH = join(ARIAVA_CONFIG_ROOT, 'onboarding.lock');

@@ -113,7 +113,9 @@ describe('stable Ariava CLI errors', () => {
       'ERR_EXTENSION_UNMANAGED',
       'ERR_AGENT_ADAPTER_DISCOVERY',
       'ERR_AGENT_ADAPTER_NOT_LOOPBACK',
+      'ERR_PAIR_CANCELLED',
       'ERR_ONBOARDING_NOT_READY',
+      'ERR_COMMAND_UNAVAILABLE_FOR_PROFILE',
     ]);
   });
 

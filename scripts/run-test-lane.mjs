@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
-import { readdirSync } from 'node:fs';
+import { readdirSync, rmSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolveBunExecutable } from './bun-executable.mjs';
+import { createIsolatedTestEnvironment, createIsolatedTestHome } from './test-environment.mjs';
 
 export const TEST_LANES = ['shared', 'macos', 'linux'];
 export const REVIEWED_TEST_ROOTS = [
@@ -64,7 +65,6 @@ export function collectTestLane(lane, options = {}) {
   if (paths.length === 0) throw new Error(`Test lane ${lane} collected no files.`);
   return paths;
 }
-
 export function runTestLane(lane, options = {}) {
   const root = resolve(options.repositoryRoot ?? repositoryRoot);
   const reviewedRoots = options.reviewedRoots ?? REVIEWED_TEST_ROOTS;
@@ -75,15 +75,21 @@ export function runTestLane(lane, options = {}) {
     .map((reviewedRoot) => paths.filter((path) => path === reviewedRoot || path.startsWith(`${reviewedRoot}/`)))
     .filter((group) => group.length > 0);
   for (const group of groups) {
-    const result = spawn(bunPath, ['test', ...group.map((path) => `./${path}`)], {
-      cwd: root,
-      env: options.env ?? process.env,
-      encoding: 'utf8',
-      shell: false,
-      stdio: options.stdio ?? 'inherit',
-    });
-    if (result.error) throw result.error;
-    if (result.status !== 0) return result.status ?? 1;
+    const testHome = createIsolatedTestHome();
+    const environment = createIsolatedTestEnvironment(options.env ?? process.env, testHome);
+    try {
+      const result = spawn(bunPath, ['test', ...group.map((path) => `./${path}`)], {
+        cwd: root,
+        env: environment,
+        encoding: 'utf8',
+        shell: false,
+        stdio: options.stdio ?? 'inherit',
+      });
+      if (result.error) throw result.error;
+      if (result.status !== 0) return result.status ?? 1;
+    } finally {
+      rmSync(testHome, { recursive: true, force: true });
+    }
   }
   return 0;
 }

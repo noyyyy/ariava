@@ -106,6 +106,22 @@ describe('strict onboarding readiness', () => {
     await expect(pollForDiscoveryAndHealth(timed.input, timed.deps)).rejects.toMatchObject({ code: 'ERR_AGENT_ADAPTER_DISCOVERY' });
   });
 
+  test('dev discovery cannot satisfy production strict readiness', async () => {
+    const candidate = fixture({}, {
+      readDiscovery: () => ({ url: 'http://127.0.0.1:7273', secret: 'dev-secret' }),
+    });
+
+    const result = await checkStrictOnboardingReadiness(candidate.input, candidate.deps);
+
+    expect(result).toMatchObject({ ready: false, readiness: 'failed' });
+    expect(result.checks.find((check) => check.id === 'agent-adapter-discovery')).toMatchObject({
+      ready: false,
+      code: 'ERR_AGENT_ADAPTER_DISCOVERY',
+      message: 'Agent Adapter discovery port does not match persisted configuration.',
+    });
+    expect(result.checks.find((check) => check.id === 'agent-adapter-health')?.ready).toBe(false);
+  });
+
   test('requires every Host condition independently and never consults bridge state', async () => {
     const healthy = fixture();
     const result = await checkStrictOnboardingReadiness(healthy.input, healthy.deps);

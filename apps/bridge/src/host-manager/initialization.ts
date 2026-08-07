@@ -2,8 +2,8 @@ import { hostname } from 'node:os';
 import { resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import {
-  ensureFirstRunIdentity,
-  publicIdentityMetadata,
+  createRuntimeHostEncryptionIdentityStore,
+  type HostEncryptionIdentityStore,
   type HostIdentityStore,
 } from '../identity';
 import {
@@ -15,6 +15,10 @@ import {
   ARIAVA_PRODUCTION_RELAY_BASE_URL,
   type AriavaUserConfig,
 } from './config';
+import { createDefaultProfile } from '../cli/profiles/default';
+import { createProfileCliContext } from '../cli/context';
+import { initializeProfile } from '../cli/operations/initialize';
+import type { AriavaProfileDescriptor } from '../cli/profile';
 
 export interface HostInitializationOptions {
   relayBaseUrl?: string;
@@ -26,9 +30,12 @@ export interface HostInitializationDependencies {
   loadUserConfig(): AriavaUserConfig;
   saveUserConfig(config: AriavaUserConfig): void;
   createIdentityStore(identityPath: string): HostIdentityStore;
+  createEncryptionIdentityStore?(identityPath: string): HostEncryptionIdentityStore;
   hostName(): string;
   generateSecret(): string;
   environment: NodeJS.ProcessEnv;
+  profile?: AriavaProfileDescriptor;
+  platform?: NodeJS.Platform | string;
 }
 
 export interface HostInitializationResult {
@@ -71,12 +78,31 @@ export async function initializeHost(
   options: HostInitializationOptions,
   dependencies: HostInitializationDependencies,
 ): Promise<HostInitializationResult> {
-  const base = buildInitializedConfig(dependencies.loadUserConfig(), options, dependencies);
-  dependencies.saveUserConfig(base);
-  const identityPath = base.identityPath;
-  if (!identityPath) throw new Error('Host identity path was not initialized');
-  const ensured = await ensureFirstRunIdentity(dependencies.createIdentityStore(identityPath));
-  const config = { ...base, identity: publicIdentityMetadata(ensured.identity) };
-  dependencies.saveUserConfig(config);
-  return { config, identityCreated: ensured.created };
+  const profile = dependencies.profile ?? createDefaultProfile();
+  const result = await initializeProfile(createProfileCliContext({
+    profile,
+    platform: dependencies.platform ?? process.platform,
+    hostName: dependencies.hostName,
+    generateSecret: dependencies.generateSecret,
+    environment: dependencies.environment,
+    allowProductionEnvironmentDefaults: profile.id === 'default',
+    saveBaseBeforeIdentity: profile.id === 'default',
+    config: {
+      load: () => dependencies.loadUserConfig(),
+      save: (config) => dependencies.saveUserConfig(config),
+    },
+    identity: {
+      create: (resources) => dependencies.createIdentityStore(resources.identityMetadataPath),
+    },
+    encryptionIdentity: {
+      create: (resources) => dependencies.createEncryptionIdentityStore
+        ? dependencies.createEncryptionIdentityStore(resources.identityMetadataPath)
+        : createRuntimeHostEncryptionIdentityStore(
+          resources.identityMetadataPath,
+          dependencies.platform ?? process.platform,
+          resources.identityProfile,
+        ),
+    },
+  }), options);
+  return { config: result.config, identityCreated: result.identityCreated };
 }

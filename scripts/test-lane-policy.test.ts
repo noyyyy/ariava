@@ -189,7 +189,14 @@ describe('Public Core test lane collection policy', () => {
     const laneStatus = runTestLane('shared', {
       repositoryRoot: laneRoot,
       reviewedRoots: ['scripts'],
-      env: { ARIAVA_BUN_EXECUTABLE: '/fake/lane-bun' },
+      env: {
+        ARIAVA_BUN_EXECUTABLE: '/fake/lane-bun',
+        HOME: '/Users/real-user',
+        XDG_CONFIG_HOME: '/Users/real-user/.config',
+        ARIAVA_HOST_IDENTITY_PATH: '/Users/real-user/.config/ariava/host-identity.json',
+        ARIAVA_AGENT_ADAPTER_CONFIG_PATH: '/Users/real-user/.config/ariava/agent-adapter.json',
+        ARIAVA_STATE_PATH: '/Users/real-user/.config/ariava/state/bridge-state.json',
+      },
       stdio: 'pipe',
       spawnSync: (command: string, args: string[], options: Record<string, unknown>) => {
         laneLaunches.push({ command, args, options });
@@ -197,11 +204,19 @@ describe('Public Core test lane collection policy', () => {
       },
     });
     expect(laneStatus).toBe(0);
-    expect(laneLaunches).toEqual([{
+    expect(laneLaunches).toHaveLength(1);
+    expect(laneLaunches[0]).toMatchObject({
       command: '/fake/lane-bun',
       args: ['test', './scripts/shared.test.ts'],
-      options: expect.objectContaining({ cwd: laneRoot, shell: false, stdio: 'pipe' }),
-    }]);
+      options: { cwd: laneRoot, shell: false, stdio: 'pipe' },
+    });
+    const laneEnvironment = laneLaunches[0]!.options.env as NodeJS.ProcessEnv;
+    expect(laneEnvironment.HOME).toStartWith(join(tmpdir(), 'ariava-test-lane-'));
+    expect(laneEnvironment.XDG_CONFIG_HOME).toBe(join(laneEnvironment.HOME!, '.config'));
+    expect(laneEnvironment.PI_CODING_AGENT_DIR).toBe(join(laneEnvironment.HOME!, '.pi', 'agent'));
+    expect(laneEnvironment.ARIAVA_HOST_IDENTITY_PATH).toBeUndefined();
+    expect(laneEnvironment.ARIAVA_AGENT_ADAPTER_CONFIG_PATH).toBeUndefined();
+    expect(laneEnvironment.ARIAVA_STATE_PATH).toBeUndefined();
 
     const hostLaunches: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
     const hostStatus = runHostVerification({

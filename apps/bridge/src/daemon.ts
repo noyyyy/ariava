@@ -20,7 +20,7 @@ import { AgentAdapterServer } from './agent-adapter/server';
 import { CommandRouter } from './command-router';
 import { PaiDriver } from './drivers/pi';
 import { probeHostPlatform } from './host-platform';
-import { loadUserConfig, resolveAriavaConfig, resolvePersistedAriavaConfig } from './host-manager';
+import { loadUserConfig, resolveAriavaConfig, resolvePersistedAriavaConfig } from './host-manager/config';
 import { ensureAriavaSecureDirectories, pathHasFilesystemEvidence, readSecureJson, redactSensitive } from './host-manager/secure-files';
 import { createHostEncryptionBinding, createRuntimeHostEncryptionIdentityStore, HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostEncryptionIdentity, type HostIdentity, type HostIdentityStore } from './identity';
 import { RelayClient, RelayClientError } from './relay-client';

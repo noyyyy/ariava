@@ -12,7 +12,15 @@ import {
 } from '../src/dev-profile-app';
 import { resolveAriavaDevProfilePaths } from '../src/host-manager';
 import { createRuntimeHostIdentityStore } from '../src/identity';
+import {
+  MACOS_IDENTITY_EVIDENCE_ACCOUNTS,
+  MacOSKeychainHostIdentityStore,
+} from '../src/identity/macos-keychain-store';
+import { MacOSEncryptionKeyStore } from '../src/identity/macos-encryption-key-store';
 import type { BridgeConfig } from '../src/types';
+import { createDefaultProfile } from '../src/cli/profiles/default';
+import { createDevProfile } from '../src/cli/profiles/dev';
+import { FakeKeychain } from './fixtures/fake-keychain';
 
 const roots: string[] = [];
 
@@ -26,6 +34,7 @@ function createHarness(): {
   stdout: PassThrough;
   stderr: PassThrough;
   output(): string;
+  errorOutput(): string;
 } {
   const root = mkdtempSync(join(tmpdir(), 'ariava-dev-cli-'));
   roots.push(root);
@@ -36,6 +45,7 @@ function createHarness(): {
   const deps: DevProfileDependencies = {
     ...defaults,
     paths: resolveAriavaDevProfilePaths(root),
+    profile: withHome(root, createDevProfile),
     platform: 'linux',
     stdout,
     stderr,
@@ -50,8 +60,25 @@ function createHarness(): {
     },
   };
   let text = '';
+  let errorText = '';
   stdout.on('data', (chunk) => { text += chunk.toString(); });
-  return { root, deps, stdout, stderr, output: () => text };
+  stderr.on('data', (chunk) => { errorText += chunk.toString(); });
+  return { root, deps, stdout, stderr, output: () => text, errorOutput: () => errorText };
+}
+
+function withHome<T>(home: string, run: () => T): T {
+  const previousHome = process.env.HOME;
+  const previousXdg = process.env.XDG_CONFIG_HOME;
+  process.env.HOME = home;
+  delete process.env.XDG_CONFIG_HOME;
+  try {
+    return run();
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousXdg;
+  }
 }
 
 describe('source dev profile commands', () => {
@@ -89,6 +116,200 @@ describe('source dev profile commands', () => {
     expect(secondBytes).toBe(firstBytes);
     expect(saves).toBe(1);
     expect(readFileSync(defaultConfig, 'utf8')).toBe(original);
+  });
+
+  test('config uses the dev file, ignores ambient Ariava values, and redacts secrets', async () => {
+    const harness = createHarness();
+    await runDevProfileCommand(['init'], harness.deps);
+    const defaultRoot = join(harness.root, '.config', 'ariava');
+    mkdirSync(defaultRoot, { recursive: true, mode: 0o700 });
+    const defaultConfig = join(defaultRoot, 'config.json');
+    const defaultBytes = Buffer.from('{"production":"sentinel"}\n\u0000', 'utf8');
+    writeFileSync(defaultConfig, defaultBytes, { mode: 0o600 });
+    const outputOffset = harness.output().length;
+
+    expect(await runDevProfileCommand(['config', 'set', 'hostName', 'configured-dev'], harness.deps)).toBe(0);
+    expect(await runDevProfileCommand(['config', 'show', '--json'], harness.deps)).toBe(0);
+
+    const envelope = JSON.parse(harness.output().slice(outputOffset).split('\n').slice(1).join('\n'));
+    expect(envelope.data.config.hostName).toBe('configured-dev');
+    expect(envelope.data.resolved.relayBaseUrl).toBe('http://127.0.0.1:8787');
+    expect(envelope.data.config.agentAdapterSecret).toBeUndefined();
+    expect(envelope.data.resolved.agentAdapterSecret).toBe('<redacted>');
+    expect(harness.output().slice(outputOffset)).not.toContain('dev-secret');
+    expect(harness.output().slice(outputOffset)).not.toContain('https://stale.invalid');
+    expect(readFileSync(defaultConfig)).toEqual(defaultBytes);
+  });
+
+  test('identity status is adapter-only presentation over the shared dev inspection', async () => {
+    const harness = createHarness();
+    await runDevProfileCommand(['init'], harness.deps);
+    const outputBefore = harness.output().length;
+    const defaultRoot = join(harness.root, '.config', 'ariava');
+    mkdirSync(defaultRoot, { recursive: true, mode: 0o700 });
+    const defaultConfig = join(defaultRoot, 'config.json');
+    const sentinel = Buffer.from('default-identity-status-sentinel\u0000', 'utf8');
+    writeFileSync(defaultConfig, sentinel, { mode: 0o600 });
+
+    expect(await runDevProfileCommand(['identity', 'status'], harness.deps)).toBe(0);
+    const inspection = JSON.parse(harness.output().slice(outputBefore));
+    expect(inspection).toMatchObject({
+      profile: 'dev',
+      status: 'ready',
+      path: harness.deps.paths.identityPath,
+    });
+    expect(readFileSync(defaultConfig)).toEqual(sentinel);
+  });
+
+  test.each([
+    { mode: 'human', json: false },
+    { mode: 'JSON', json: true },
+  ])('invalid identity usage uses the universal $mode boundary', async ({ json }) => {
+    const harness = createHarness();
+    expect(await runDevProfileCommand([
+      'identity',
+      'invalid',
+      ...(json ? ['--json'] : []),
+    ], harness.deps)).toBe(1);
+    expect(harness.output()).toBe('');
+    const expectedMessage = 'Usage: dev-profile-cli identity status';
+    if (json) {
+      expect(JSON.parse(harness.errorOutput())).toEqual({
+        ok: false,
+        code: 'ERR_CLI',
+        message: expectedMessage,
+        data: {},
+      });
+    } else {
+      expect(harness.errorOutput()).toBe(`ariava: ${expectedMessage}\n`);
+    }
+  });
+
+  test('incomplete macOS dev identity recovers only through confirmed dev reset and reuses replacement', async () => {
+    const harness = createHarness();
+    const keychain = new FakeKeychain();
+    const defaultProfile = withHome(harness.root, createDefaultProfile);
+    const defaultIdentityPath = defaultProfile.resources.identityMetadataPath;
+    mkdirSync(defaultProfile.resources.root, { recursive: true, mode: 0o700 });
+    const defaultStore = new MacOSKeychainHostIdentityStore(defaultIdentityPath, keychain, {}, 'default');
+    const defaultIdentity = await defaultStore.createFirstRun();
+    const defaultEncryption = new MacOSEncryptionKeyStore(`${defaultIdentityPath}.e2e.json`, keychain);
+    const defaultEncryptionIdentity = defaultEncryption.loadOrCreate(defaultIdentity.hostId);
+    const defaultEncryptionAccount = `host-e2e:${defaultEncryptionIdentity.encryptionKeyId}`;
+    const defaultConfigPath = defaultProfile.resources.configPath;
+    const defaultConfig = Buffer.from('{"production":"sentinel"}\n\u0000', 'utf8');
+    writeFileSync(defaultConfigPath, defaultConfig, { mode: 0o600 });
+
+    harness.deps.platform = 'darwin';
+    harness.deps.createIdentityStore = (path, _platform, profile) => new MacOSKeychainHostIdentityStore(path, keychain, {}, profile);
+    harness.deps.createEncryptionIdentityStore = (path) => new MacOSEncryptionKeyStore(`${path}.e2e.json`, keychain);
+    const orphanDevHostId = `host_${'I'.repeat(43)}`;
+    const orphanDevKeyId = `key_${'I'.repeat(43)}`;
+    mkdirSync(harness.deps.paths.root, { recursive: true, mode: 0o700 });
+    writeFileSync(`${harness.deps.paths.identityPath}.creating`, JSON.stringify({
+      schema: 'ariava-macos-identity-creation-v1',
+      phase: 'creating',
+      hostId: orphanDevHostId,
+      keyId: orphanDevKeyId,
+    }), { mode: 0o600 });
+    keychain.items.set(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev, Buffer.from('incomplete-dev-evidence'));
+    keychain.items.set(orphanDevHostId, Buffer.from('incomplete-dev-private-account'));
+
+    const defaultMetadataBefore = readFileSync(defaultIdentityPath);
+    const defaultEncryptionBefore = readFileSync(`${defaultIdentityPath}.e2e.json`);
+    const defaultEvidenceBefore = keychain.snapshot(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default);
+    const defaultAccountBefore = keychain.snapshot(defaultIdentity.hostId);
+    const defaultEncryptionAccountBefore = keychain.snapshot(defaultEncryptionAccount);
+    const devEvidenceBefore = keychain.snapshot(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev);
+    const unconfirmedItemsBefore = snapshotItems(keychain);
+    keychain.resetCalls();
+    const sentinelBefore = readFileSync(`${harness.deps.paths.identityPath}.creating`);
+    let encryptionFactoryCalls = 0;
+    let spawnCalls = 0;
+    let bridgeCalls = 0;
+    const createEncryptionIdentityStore = harness.deps.createEncryptionIdentityStore;
+    harness.deps.createEncryptionIdentityStore = (...args) => {
+      encryptionFactoryCalls += 1;
+      return createEncryptionIdentityStore(...args);
+    };
+    harness.deps.spawn = () => { spawnCalls += 1; return { status: 0 }; };
+    harness.deps.createBridge = () => { bridgeCalls += 1; throw new Error('bridge effect'); };
+
+    expect(await runDevProfileCommand(['init', '--json'], harness.deps)).toBe(1);
+    expect(JSON.parse(harness.errorOutput())).toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    const callsAfterInit = keychain.calls.length;
+    expect(await runDevProfileCommand(['host', 'reset', '--json'], harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toContain('ERR_IDENTITY_RESET_REQUIRED');
+    expect(harness.errorOutput()).toContain('Usage: dev-profile-cli host reset --confirm');
+    expect(keychain.calls).toHaveLength(callsAfterInit);
+    expect(harness.deps.pathExists(harness.deps.paths.configPath)).toBe(false);
+    expect(snapshotItems(keychain)).toEqual(unconfirmedItemsBefore);
+    expect(readFileSync(`${harness.deps.paths.identityPath}.creating`)).toEqual(sentinelBefore);
+    expect(encryptionFactoryCalls).toBe(0);
+    expect(spawnCalls).toBe(0);
+    expect(bridgeCalls).toBe(0);
+
+    const relayRequests: Array<{ path: string; hostId: string; keyId: string | null }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const body = await request.json() as { hostId: string };
+      relayRequests.push({
+        path: new URL(request.url).pathname,
+        hostId: body.hostId,
+        keyId: request.headers.get('x-ariava-key-id'),
+      });
+      return Response.json({ host: hostProjection(body.hostId) });
+    }) as typeof fetch;
+    let replacementHostId: string;
+    try {
+      expect(await runDevProfileCommand(['host', 'reset', '--confirm'], harness.deps)).toBe(0);
+      const devConfig = JSON.parse(readFileSync(harness.deps.paths.configPath, 'utf8'));
+      replacementHostId = devConfig.identity.hostId;
+      expect(replacementHostId).not.toBe(defaultIdentity.hostId);
+      expect(relayRequests).toEqual([{
+        path: '/v2/bridge/enroll',
+        hostId: replacementHostId,
+        keyId: devConfig.identity.keyId,
+      }]);
+      expect(harness.output()).toContain('links: 0');
+      expect(readFileSync(harness.deps.paths.identityPath, 'utf8')).toContain(replacementHostId);
+      expect(keychain.items.has(orphanDevHostId)).toBe(false);
+      expect(keychain.callsFor(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev).some((call) => call.action === 'write')).toBe(true);
+      expect(keychain.callsFor(orphanDevHostId).some((call) => call.action === 'delete')).toBe(true);
+      const replacementEncryptionMetadata = JSON.parse(
+        readFileSync(`${harness.deps.paths.identityPath}.e2e.json`, 'utf8'),
+      ) as { hostId: string; encryptionKeyId: string; account: string };
+      const replacementEncryptionAccount = `host-e2e:${replacementEncryptionMetadata.encryptionKeyId}`;
+      expect(replacementEncryptionMetadata.hostId).toBe(replacementHostId);
+      expect(replacementEncryptionMetadata.account).toBe(replacementEncryptionAccount);
+      expect(keychain.snapshot(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev)).not.toEqual(devEvidenceBefore);
+      expect(keychain.snapshot(replacementHostId)).toBeDefined();
+      expect(keychain.snapshot(replacementEncryptionAccount)).toBeDefined();
+      expect(keychain.callsFor(replacementEncryptionAccount).some((call) => call.action === 'write')).toBe(true);
+
+      const configBeforeReuse = readFileSync(harness.deps.paths.configPath);
+      const devMetadataBeforeReuse = readFileSync(harness.deps.paths.identityPath);
+      const callsBeforeReuse = keychain.calls.length;
+      expect(await runDevProfileCommand(['init'], harness.deps)).toBe(0);
+      expect(readFileSync(harness.deps.paths.configPath)).toEqual(configBeforeReuse);
+      expect(readFileSync(harness.deps.paths.identityPath)).toEqual(devMetadataBeforeReuse);
+      expect(keychain.calls.slice(callsBeforeReuse).some((call) => call.action === 'write')).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(readFileSync(defaultConfigPath)).toEqual(defaultConfig);
+    expect(readFileSync(defaultIdentityPath)).toEqual(defaultMetadataBefore);
+    expect(readFileSync(`${defaultIdentityPath}.e2e.json`)).toEqual(defaultEncryptionBefore);
+    expect(keychain.snapshot(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default)).toEqual(defaultEvidenceBefore);
+    expect(keychain.snapshot(defaultIdentity.hostId)).toEqual(defaultAccountBefore);
+    expect(keychain.snapshot(defaultEncryptionAccount)).toEqual(defaultEncryptionAccountBefore);
+    expect(keychain.callsFor(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default).filter((call) => call.action !== 'read')).toEqual([]);
+    expect(keychain.callsFor(defaultIdentity.hostId).filter((call) => call.action !== 'read')).toEqual([]);
+    expect(keychain.callsFor(defaultEncryptionAccount).filter(
+      (call) => call.action === 'write' || call.action === 'delete',
+    )).toEqual([]);
   });
 
   test('setup initializes the isolated profile, prepares Pi, and leaves Pi startup to the user', async () => {
@@ -130,7 +351,8 @@ describe('source dev profile commands', () => {
   test('setup requires an explicit adapter when noninteractive', async () => {
     const harness = createHarness();
     harness.deps.interactive = false;
-    await expect(runDevProfileCommand(['setup'], harness.deps)).rejects.toThrow('requires --extension pi or --no-extensions');
+    expect(await runDevProfileCommand(['setup'], harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toContain('requires --extension pi or --no-extensions');
     expect(harness.deps.pathExists(harness.deps.paths.configPath)).toBe(false);
   });
 
@@ -177,7 +399,8 @@ describe('source dev profile commands', () => {
     });
     harness.deps.waitForShutdown = async () => {};
     const startedAt = Date.now();
-    await expect(runDevProfileCommand(['bridge'], harness.deps)).rejects.toThrow('did not stop within 2000ms');
+    expect(await runDevProfileCommand(['bridge'], harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toContain('did not stop within 2000ms');
     expect(Date.now() - startedAt).toBeLessThan(3_000);
   });
 
@@ -194,8 +417,10 @@ describe('source dev profile commands', () => {
     writeFileSync(harness.deps.paths.configPath, JSON.stringify(config), { mode: 0o600 });
     let bridges = 0;
     harness.deps.createBridge = () => { bridges += 1; throw new Error('must not create bridge'); };
-    await expect(runDevProfileCommand(['bridge'], harness.deps)).rejects.toThrow(`invalid: ${field}`);
-    await expect(runDevProfileCommand(['status'], harness.deps)).rejects.toThrow(`invalid: ${field}`);
+    expect(await runDevProfileCommand(['bridge'], harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toContain(`invalid: ${field}`);
+    expect(await runDevProfileCommand(['status'], harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toContain(`invalid: ${field}`);
     expect(bridges).toBe(0);
   });
 
@@ -233,7 +458,8 @@ describe('source dev profile commands', () => {
     });
     harness.deps.spawn = () => { spawnCalls += 1; return { status: 0 }; };
     try {
-      await expect(runDevProfileCommand(['bridge'], harness.deps)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+      expect(await runDevProfileCommand(['bridge'], harness.deps)).toBe(1);
+      expect(harness.errorOutput()).toContain('Failed to listen at 127.0.0.1');
       expect(occupiedDev.server?.listening ?? true).toBe(true);
       expect(spawnCalls).toBe(0);
       expect(attemptedPorts).toEqual([7273]);
@@ -246,12 +472,14 @@ describe('source dev profile commands', () => {
     const harness = createHarness();
     let spawns = 0;
     harness.deps.spawn = () => { spawns += 1; return { status: 0 }; };
-    await expect(runDevProfileCommand(['pi'], harness.deps)).rejects.toThrow('discovery is missing');
+    expect(await runDevProfileCommand(['pi'], harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toContain('discovery is missing');
     expect(spawns).toBe(0);
 
     writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, { url: 'http://127.0.0.1:7273', secret: 'secret' });
     harness.deps.sourcePiExtensionPath = join(harness.root, 'missing-index.ts');
-    await expect(runDevProfileCommand(['pi'], harness.deps)).rejects.toThrow('Source pi extension is missing');
+    expect(await runDevProfileCommand(['pi'], harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toContain('Source pi extension is missing');
     expect(spawns).toBe(0);
   });
 
@@ -304,6 +532,108 @@ describe('source dev profile commands', () => {
     expect(readFileSync(join(defaultRoot, 'config.json'), 'utf8')).toBe('{not-json');
   });
 
+  test('dev status and doctor expose source-only lifecycle evidence with independent readiness', async () => {
+    const harness = createHarness();
+    await runDevProfileCommand(['init'], harness.deps);
+    writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
+      url: 'http://127.0.0.1:7273',
+      secret: 'source-only-secret',
+    });
+    mkdirSync(join(harness.deps.paths.statePath, '..'), { recursive: true, mode: 0o700 });
+    writeFileSync(harness.deps.paths.statePath, '{}', { mode: 0o600 });
+    harness.deps.sourcePiExtensionPath = join(harness.root, 'source-pi-index.ts');
+    writeFileSync(harness.deps.sourcePiExtensionPath, 'export default {}', { mode: 0o600 });
+    const offset = harness.output().length;
+    expect(await runDevProfileCommand(['status', '--json'], harness.deps)).toBe(0);
+    const status = JSON.parse(harness.output().slice(offset));
+    expect(status.data).toMatchObject({
+      profile: 'dev',
+      configPath: harness.deps.paths.configPath,
+      identityPath: harness.deps.paths.identityPath,
+      relayUrl: 'http://127.0.0.1:8787',
+      adapterUrl: 'http://127.0.0.1:7273',
+      adapterPort: 7273,
+      piLogPath: harness.deps.paths.piExtensionLogPath,
+      source: {
+        bridge: { mode: 'foreground', ready: true },
+        pi: { mode: 'source-extension', discoveryRequired: true },
+      },
+    });
+    expect(JSON.stringify(status)).not.toContain('source-only-secret');
+    expect(status.data).not.toHaveProperty('service');
+    expect(status.data).not.toHaveProperty('strictReadiness');
+    expect(status.data).not.toHaveProperty('managedPiPackage');
+
+    const doctorOffset = harness.output().length;
+    expect(await runDevProfileCommand(['doctor', '--json'], harness.deps)).toBe(0);
+    const doctor = JSON.parse(harness.output().slice(doctorOffset));
+    expect(doctor).toMatchObject({
+      ok: true,
+      code: 'ok',
+      data: {
+        profile: 'dev',
+        sourceBridge: { mode: 'foreground', ready: true },
+        sourcePi: { mode: 'source-extension', discoveryRequired: true },
+      },
+    });
+    expect(doctor.data).not.toHaveProperty('serviceRunning');
+    expect(doctor.data).not.toHaveProperty('piExtensionManaged');
+    expect(doctor.data).not.toHaveProperty('strictReadiness');
+  });
+
+  test.each([false, true])('unhealthy dev doctor writes %s mode to stdout and exits 1', async (json) => {
+    const harness = createHarness();
+    await runDevProfileCommand(['init'], harness.deps);
+    const offset = harness.output().length;
+    expect(await runDevProfileCommand(['doctor', ...(json ? ['--json'] : [])], harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toBe('');
+    const output = harness.output().slice(offset);
+    expect(output).not.toBe('');
+    if (json) expect(JSON.parse(output)).toMatchObject({ ok: false, code: 'ERR_DOCTOR' });
+    else expect(output).toContain('sourceBridge:');
+  });
+
+  test('dev discovery on production port is invalid and not ready', async () => {
+    const harness = createHarness();
+    await runDevProfileCommand(['init'], harness.deps);
+    writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
+      url: 'http://127.0.0.1:7272',
+      secret: 'dev-wrong-port-secret',
+    });
+    mkdirSync(join(harness.deps.paths.statePath, '..'), { recursive: true, mode: 0o700 });
+    writeFileSync(harness.deps.paths.statePath, '{}', { mode: 0o600 });
+
+    const offset = harness.output().length;
+    expect(await runDevProfileCommand(['status', '--json'], harness.deps)).toBe(0);
+    const status = JSON.parse(harness.output().slice(offset));
+    expect(status.data.source.bridge).toEqual({
+      mode: 'foreground',
+      statePresent: true,
+      discoveryPresent: true,
+      discoveryValid: false,
+      ready: false,
+    });
+    expect(status.data.adapterUrl).toBeNull();
+    expect(JSON.stringify(status)).not.toContain('dev-wrong-port-secret');
+  });
+
+  test('production service evidence cannot make dev source status ready', async () => {
+    const harness = createHarness();
+    await runDevProfileCommand(['init'], harness.deps);
+    const defaultRoot = join(harness.root, '.config', 'ariava');
+    mkdirSync(defaultRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(join(defaultRoot, 'install.json'), JSON.stringify({
+      service: { installed: true, enabled: true, loaded: true, processRunning: true },
+      strictReadiness: true,
+    }), { mode: 0o600 });
+    const offset = harness.output().length;
+    expect(await runDevProfileCommand(['status', '--json'], harness.deps)).toBe(0);
+    const status = JSON.parse(harness.output().slice(offset));
+    expect(status.data.source.bridge.ready).toBe(false);
+    expect(status.data).not.toHaveProperty('service');
+    expect(status.data).not.toHaveProperty('strictReadiness');
+  });
+
   test('pair enrolls the dev Host then pairs the Watch using only the isolated profile', async () => {
     const harness = createHarness();
     await runDevProfileCommand(['init'], harness.deps);
@@ -344,6 +674,8 @@ describe('source dev profile commands', () => {
       }
       if (url.pathname === '/v2/bridge/pair-watch') {
         expect(await request.json()).toEqual({ pairingCode: 'PEYX7K' });
+        const now = new Date().toISOString();
+        const watchDeviceId = `watch_${'C'.repeat(43)}`;
         return Response.json({
           host: {
             hostId: identity!.hostId,
@@ -351,10 +683,25 @@ describe('source dev profile commands', () => {
             platform: 'linux',
             bridgeVersion: '0.0.0-test',
             status: 'active',
-            enrolledAt: new Date().toISOString(),
-            lastSeenAt: new Date().toISOString(),
+            registeredAt: now,
+            lastSeenAt: now,
+            bridgeStatus: 'online',
           },
-          watchDevice: { watchDeviceId: `watch_${'C'.repeat(43)}` },
+          watchDevice: {
+            watchDeviceId,
+            selectedHostIds: [identity!.hostId],
+            registeredAt: now,
+            lastSeenAt: now,
+            pairingStatus: 'paired',
+          },
+          link: {
+            hostId: identity!.hostId,
+            watchDeviceId,
+            pairedAt: now,
+            generation: 1,
+            updatedAt: now,
+          },
+          alreadyPaired: false,
         });
       }
       throw new Error(`unexpected path ${url.pathname}`);
@@ -370,19 +717,128 @@ describe('source dev profile commands', () => {
     expect(harness.output()).toContain(`watch_${'C'.repeat(43)}`);
     expect(harness.output()).toContain(identity!.hostId);
     expect(harness.output()).toContain('test-host (Dev)');
+    expect(harness.output()).toContain(
+      `Pairing code accepted for watch watch_${'C'.repeat(43)} with host test-host (Dev) (${identity!.hostId}).\n`
+      + 'Pairing is not complete until both sides confirm the Safety Code.\n',
+    );
     expect(harness.output()).toContain('Safety Code activation was skipped');
     expect(readFileSync(defaultConfig, 'utf8')).toBe('{"production":true}\n');
   });
 
   test('pair requires a pairing code and fails closed when the profile is not initialized', async () => {
     const harness = createHarness();
-    await expect(runDevProfileCommand(['pair'], harness.deps)).rejects.toThrow(
-      'Usage: dev-profile-cli pair <PAIRING_CODE> [--codes-match]',
-    );
-    await expect(runDevProfileCommand(['pair', 'peyx7k'], harness.deps)).rejects.toThrow('Dev profile is not initialized');
+    expect(await runDevProfileCommand(['pair'], harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toContain('Usage: dev-profile-cli pair <PAIRING_CODE> [--codes-match]');
+    expect(await runDevProfileCommand(['pair', 'peyx7k'], harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toContain('Dev profile is not initialized');
     expect(harness.deps.pathExists(harness.deps.paths.configPath)).toBe(false);
   });
+  test.each([
+    { name: 'noninteractive', environment: {}, json: false, interactive: false },
+    { name: 'CI', environment: { CI: '1' }, json: false, interactive: true },
+    { name: 'TERM=dumb', environment: { TERM: 'dumb' }, json: false, interactive: true },
+    { name: 'JSON', environment: {}, json: true, interactive: true },
+  ])('pair refuses implicit confirmation in $name mode and --codes-match is explicit', async ({ environment, json, interactive }) => {
+    const harness = createHarness();
+    await runDevProfileCommand(['init'], harness.deps);
+    harness.deps.interactive = interactive;
+    harness.deps.environment = { ...harness.deps.environment, ...environment };
+    let confirmCalls = 0;
+    delete harness.deps.confirmSafetyCodeMatch;
+    harness.deps.createPairDependencies = () => fakePairDependencies(harness, async (input) => {
+      confirmCalls += 1;
+      return await input.confirmMatch() ? 'activated' : 'cancelled';
+    });
+    const args = ['pair', 'peyx7k', ...(json ? ['--json'] : [])];
+    expect(await runDevProfileCommand(args, harness.deps)).toBe(1);
+    expect(harness.errorOutput()).toContain('Noninteractive Safety Code confirmation requires --codes-match');
+    expect(confirmCalls).toBe(1);
+
+    confirmCalls = 0;
+    expect(await runDevProfileCommand([...args, '--codes-match'], harness.deps)).toBe(0);
+    expect(confirmCalls).toBe(1);
+  });
+
+  test.each([false, true])('pair cancellation maps once to the stable %s JSON contract', async (json) => {
+    const harness = createHarness();
+    await runDevProfileCommand(['init'], harness.deps);
+    harness.deps.confirmSafetyCodeMatch = async () => false;
+    harness.deps.createPairDependencies = () => fakePairDependencies(harness, async (input) => {
+      const matched = await input.confirmMatch();
+      input.write('Safety Code confirmation cancelled. Re-pair if the codes differed.');
+      return matched ? 'activated' : 'cancelled';
+    });
+    expect(await runDevProfileCommand(['pair', 'peyx7k', ...(json ? ['--json'] : [])], harness.deps)).toBe(1);
+    if (json) {
+      expect(harness.output()).toBe('Initialized dev Host identity ' + JSON.parse(
+        readFileSync(harness.deps.paths.configPath, 'utf8'),
+      ).identity.hostId + '\n');
+      expect(JSON.parse(harness.errorOutput())).toEqual({
+        ok: false,
+        code: 'ERR_PAIR_CANCELLED',
+        message: 'Safety Code confirmation cancelled.',
+        data: {},
+      });
+    } else {
+      expect(harness.errorOutput()).toBe('ariava: Safety Code confirmation cancelled.\n');
+    }
+  });
+
 });
+
+function fakePairDependencies(
+  harness: ReturnType<typeof createHarness>,
+  activate: ReturnType<DevProfileDependencies['createPairDependencies']>['activate'],
+): ReturnType<DevProfileDependencies['createPairDependencies']> {
+  return {
+    bridgeVersion: '0.0.0-test',
+    normalizePairingCode: (value) => value.toUpperCase(),
+    enroll: async () => {},
+    createRelay: () => ({} as never),
+    pairWatch: async () => {
+      const identity = await harness.deps.createIdentityStore(
+        harness.deps.paths.identityPath,
+        harness.deps.platform,
+        'dev',
+      ).load();
+      const now = new Date().toISOString();
+      const watchDeviceId = `watch_${'C'.repeat(43)}`;
+      return {
+        host: { ...hostProjection(identity!.hostId), hostName: 'test-host (Dev)' },
+        watchDevice: {
+          watchDeviceId,
+          selectedHostIds: [identity!.hostId],
+          registeredAt: now,
+          lastSeenAt: now,
+          pairingStatus: 'paired',
+        },
+        link: { hostId: identity!.hostId, watchDeviceId, pairedAt: now, generation: 1, updatedAt: now },
+        alreadyPaired: false,
+      };
+    },
+    createKeyring: () => ({} as never),
+    createHostBinding: async () => ({} as never),
+    activate,
+  };
+}
+
+function snapshotItems(keychain: FakeKeychain): Array<[string, string]> {
+  return [...keychain.items.entries()]
+    .map(([account, value]) => [account, Buffer.from(value).toString('hex')] as [string, string])
+    .sort(([left], [right]) => left.localeCompare(right));
+}
+
+function hostProjection(hostId: string) {
+  return {
+    hostId,
+    hostName: 'test-host (Dev)',
+    platform: 'macos',
+    bridgeVersion: '0.0.0-test',
+    registeredAt: new Date().toISOString(),
+    lastSeenAt: new Date().toISOString(),
+    bridgeStatus: 'online',
+  };
+}
 
 function listen(port: number): Promise<Server> {
   return new Promise((resolveServer, rejectServer) => {

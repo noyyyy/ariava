@@ -27,6 +27,10 @@ export function hostEncryptionIdentityPath(identityPath: string): string {
   return `${identityPath}.e2e.json`;
 }
 
+export function hostLinkKeyringPath(identityPath: string): string {
+  return `${identityPath}.e2e-keyring.json`;
+}
+
 export function createRuntimeHostEncryptionIdentityStore(
   identityPath: string,
   platform: NodeJS.Platform | string = process.platform,

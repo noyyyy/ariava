@@ -10,38 +10,8 @@ import {
   MACOS_SECURITY_PATH,
   MacOSKeychainHostIdentityStore,
   type KeychainCommandRunner,
-  type KeychainCommandResult,
 } from '../src/identity/macos-keychain-store';
-
-class FakeKeychain implements KeychainCommandRunner {
-  readonly calls: Array<{ command: string; args: readonly string[]; stdin?: Uint8Array }> = [];
-  readonly items = new Map<string, Uint8Array>();
-
-  run(command: string, args: readonly string[], stdin?: Uint8Array): KeychainCommandResult {
-    this.calls.push({ command, args, stdin });
-    if (args.length === 1 && args[0] === '-i' && stdin) {
-      const script = Buffer.from(stdin).toString('utf8');
-      const account = /-a "([^"]+)"/u.exec(script)?.[1];
-      const hex = /-X ([0-9a-f]+)/u.exec(script)?.[1];
-      if (!account || !hex) return { status: 1, stdout: new Uint8Array(), stderr: 'invalid stdin' };
-      if (!script.includes(' -U ') && this.items.has(account)) return { status: 45, stdout: new Uint8Array(), stderr: 'item already exists' };
-      this.items.set(account, Buffer.from(hex, 'hex'));
-      return { status: 0, stdout: new Uint8Array(), stderr: '' };
-    }
-    const account = args[args.indexOf('-a') + 1];
-    if (args[0] === 'find-generic-password') {
-      const value = this.items.get(account);
-      return value
-        ? { status: 0, stdout: Buffer.from(`${Buffer.from(value).toString('hex')}\n`, 'utf8'), stderr: '' }
-        : { status: 44, stdout: new Uint8Array(), stderr: 'could not be found' };
-    }
-    if (args[0] === 'delete-generic-password') {
-      this.items.delete(account);
-      return { status: 0, stdout: new Uint8Array(), stderr: '' };
-    }
-    return { status: 1, stdout: new Uint8Array(), stderr: 'unsupported' };
-  }
-}
+import { FakeKeychain } from './fixtures/fake-keychain';
 
 const roots: string[] = [];
 function metadataPath(): string { const root = mkdtempSync(join(tmpdir(), 'ariava-macos-')); chmodSync(root, 0o700); roots.push(root); return join(root, 'identity-metadata.json'); }

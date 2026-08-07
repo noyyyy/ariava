@@ -1,3 +1,9 @@
+import {
+  assertProfileDescriptorForEffects,
+  assertResolvedProfileResources,
+  assertSelectedProfileResourcesForEffects,
+  type AriavaProfileDescriptor,
+} from '../cli/profile';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import type { HostIdentityMetadata } from '../identity/types';
 import {
@@ -187,6 +193,43 @@ export function resolveAriavaConfig(
 
 export function resolvePersistedAriavaConfig(configPath: string): ResolvedAriavaConfig {
   return resolveAriavaConfig({}, configPath, false);
+}
+
+export function resolveProfileUserConfig(
+  profile: AriavaProfileDescriptor,
+  fileConfig: AriavaUserConfig,
+): ResolvedAriavaConfig {
+  const resources = profile.resources;
+  return {
+    ...fileConfig,
+    relayBaseUrl: fileConfig.relayBaseUrl ?? profile.defaultRelayBaseUrl,
+    hostName: fileConfig.hostName ?? '',
+    agentAdapterPort: fileConfig.agentAdapterPort ?? resources.agentAdapterPort,
+    agentAdapterConfigPath: resolveRequiredPersistedPath(
+      fileConfig.agentAdapterConfigPath ?? resources.agentAdapterConfigPath,
+      'Agent Adapter config path',
+    ),
+    statePath: resolveRequiredPersistedPath(fileConfig.statePath ?? resources.statePath, 'Bridge state path'),
+    identityPath: resolveRequiredPersistedPath(
+      fileConfig.identityPath ?? resources.identityMetadataPath,
+      'Host identity path',
+    ),
+    configPath: resources.configPath,
+    installPath: resolve(resources.root, 'install.json'),
+    logDir: resolve(resources.root, 'logs'),
+    stdoutLogPath: resolve(resources.root, 'logs', 'bridge.stdout.log'),
+    stderrLogPath: resolve(resources.root, 'logs', 'bridge.stderr.log'),
+    tmpDir: resolve(resources.root, 'tmp'),
+    environmentOverrides: [],
+  };
+}
+
+export function resolveProfileAriavaConfig(profile: AriavaProfileDescriptor): ResolvedAriavaConfig {
+  assertProfileDescriptorForEffects(profile);
+  assertSelectedProfileResourcesForEffects(profile);
+  const config = resolveProfileUserConfig(profile, loadUserConfig(profile.resources.configPath));
+  assertResolvedProfileResources(profile, config);
+  return config;
 }
 
 export function ensureParentDir(path: string): void {

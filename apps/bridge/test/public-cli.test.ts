@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AriavaCliError, type OnboardingDetection, type OnboardingResult, type ServiceManager } from '../src/host-manager';
 import { HostIdentityError } from '../src/identity';
 import { RelayClientError } from '../src/relay-client';
 import { formatHumanCliFailure, normalizeCliFailure, runPublicCli } from '../src/public-cli-app';
 import { createIsolatedPublicCliEnvironment } from './fixtures/isolated-public-cli-env';
+import { createProfileCliHarness } from './fixtures/profile-cli-harness';
 
 const publicCoreRoot = join(import.meta.dir, '..', '..', '..');
 const roots: string[] = [];
@@ -159,16 +160,34 @@ describe('public ariava CLI', () => {
         logsAvailable() { return false; },
         logs() { return { source: 'files' as const, text: '' }; },
       };
+      const harness = createProfileCliHarness();
+      roots.push(harness.root);
+      const profile = harness.profiles.default;
+      const profileRoot = profile.resources.root;
+      const userConfig = {
+        relayBaseUrl: profile.defaultRelayBaseUrl,
+        hostName: profile.defaultHostName('test-host'),
+        agentAdapterPort: profile.resources.agentAdapterPort,
+        agentAdapterConfigPath: profile.resources.agentAdapterConfigPath,
+        agentAdapterSecret: 'test-secret',
+        statePath: profile.resources.statePath,
+        identityPath: profile.resources.identityMetadataPath,
+      };
       const deps = {
         createServiceManager: () => manager,
         createHostIdentityStore: () => store,
+        createProfile: () => profile,
+        loadUserConfig: () => userConfig,
         resolveAriavaConfig: () => ({
-          configPath: '/tmp/ariava-config.json',
-          identityPath: '/tmp/ariava-host-identity.json',
-          logDir: '/tmp/ariava-logs',
-          relayBaseUrl: 'http://127.0.0.1:8787',
-          agentAdapter: { port: 7272, configPath: '/tmp/agent-adapter.json', secret: 'test-secret' },
-        } as any),
+          ...userConfig,
+          configPath: profile.resources.configPath,
+          installPath: join(profileRoot, 'install.json'),
+          logDir: join(profileRoot, 'logs'),
+          stdoutLogPath: join(profileRoot, 'logs', 'bridge.stdout.log'),
+          stderrLogPath: join(profileRoot, 'logs', 'bridge.stderr.log'),
+          tmpDir: join(profileRoot, 'tmp'),
+          environmentOverrides: [],
+        }),
       };
 
 
@@ -531,8 +550,30 @@ describe('public ariava CLI', () => {
 
     const json = JSON.parse(await run('--help', '--json'));
     expect(json).toMatchObject({ ok: true, code: 'ok', message: 'Ariava CLI' });
-    expect(json.data.commands).toContain('ariava watches remove <WATCH_DEVICE_ID>');
-    expect(json.data.commands).toContain('ariava upgrade [pi]');
+    expect(json.data.commands).toEqual([
+      'ariava setup [--extension pi ... | --no-extensions] [--resume] [--json] [--yes] [--relay-base-url <URL>]',
+      'ariava init',
+      'ariava status [pi]',
+      'ariava pair <PAIRING_CODE> [--codes-match]',
+      'ariava watches list',
+      'ariava watches remove <WATCH_DEVICE_ID>',
+      'ariava identity status',
+      'ariava host rotate-key',
+      'ariava host reset --confirm',
+      'ariava doctor',
+      'ariava logs',
+      'ariava upgrade [pi]',
+      'ariava uninstall [--purge] [--remove-pi]',
+      'ariava config path|show|get|set',
+      'ariava config agent-secret ensure|rotate',
+      'ariava service install|reinstall|status|start|stop|restart|uninstall',
+      'ariava install pi',
+      'ariava remove pi',
+      'ariava dev install pi [--from <path>]',
+      'ariava dev upgrade pi [--from <path>]',
+      'ariava dev bridge use [--from <path>]',
+      'ariava dev status',
+    ]);
   });
 
   test('renders a concise human status card with only product-facing fields', async () => {
@@ -1042,6 +1083,71 @@ describe('public ariava CLI', () => {
       expect(existsSync(join(home, '.config', 'ariava', 'install.json'))).toBe(false);
     });
 
+    test('production status preserves the exact JSON baseline and ignores dev Bridge evidence', async () => {
+      const home = mkdtempSync(join(tmpdir(), 'ariava-cli-status-baseline-'));
+      roots.push(home);
+      const devRoot = join(home, '.config', 'ariava-dev');
+      secureJsonFixture(join(devRoot, 'bridge-state.json'), { sourceBridge: 'ready' });
+      secureJsonFixture(join(devRoot, 'agent-adapter.json'), {
+        url: 'http://127.0.0.1:7273',
+        secret: 'dev-only-secret',
+      });
+      const cliVersion = JSON.parse(readFileSync(join(publicCoreRoot, 'package.json'), 'utf8')).version;
+
+      const status = await runHarness(home, 'linux-supported', 'status');
+
+      expect(status).toEqual({
+        exitCode: 0,
+        stderr: undefined,
+        stdout: {
+          ok: true,
+          code: 'ok',
+          message: 'Ariava host status.',
+          data: {
+            cliVersion,
+            configComplete: false,
+            bridgeHealth: 'offline',
+            hostId: 'host_fixture',
+            hostName: hostname(),
+            relayBaseUrl: 'https://ariava-relay.noyx.io',
+            service: {
+              backend: 'systemd-user',
+              supported: true,
+              supportReason: 'supported',
+              installed: false,
+              enabled: false,
+              loaded: false,
+              processRunning: false,
+              runtimeCryptoSelfTestPassed: true,
+            },
+            piExtension: {
+              installed: false,
+              installPath: join(home, '.pi', 'agent', 'extensions', 'ariava-pi'),
+              expectedManagedPath: join(home, '.pi', 'agent', 'npm', 'node_modules', '@ariava', 'pi-extension'),
+              managed: false,
+              managedMetadataPath: join(home, '.pi', 'agent', 'extensions', 'ariava-pi', '.ariava-managed.json'),
+              expectedSource: `npm:@ariava/pi-extension@${cliVersion}`,
+              sourceOwnership: 'absent',
+              mismatchReasons: [],
+              bundledVersion: cliVersion,
+            },
+            environmentOverrides: [],
+            identity: {
+              status: 'not-initialized',
+              storageType: 'linux-json',
+              storageReference: { type: 'linux-json', path: join(home, '.config', 'ariava', 'host-identity.json') },
+              path: join(home, '.config', 'ariava', 'host-identity.json'),
+              ownerIntegrity: false,
+              permissionIntegrity: false,
+              metadataIntegrity: false,
+              pendingRotation: false,
+            },
+          },
+        },
+      });
+      expect(JSON.stringify(status)).not.toContain('dev-only-secret');
+    });
+
     test.each([
       ['Linux', 'linux-supported'],
       ['WSL', 'wsl-supported'],
@@ -1139,6 +1245,32 @@ describe('public ariava CLI', () => {
         serviceSupported: false,
         serviceSupportReason: 'unsupported-platform',
       });
+    });
+
+    test('unhealthy human doctor stays on stdout with exit 1', async () => {
+      const home = mkdtempSync(join(tmpdir(), 'ariava-cli-doctor-human-'));
+      roots.push(home);
+      const isolated = createIsolatedPublicCliEnvironment(home);
+      const proc = Bun.spawn({
+        cmd: [bunPath, harnessPath, 'doctor'],
+        cwd: process.cwd(),
+        env: {
+          ...isolated.env,
+          HOME: home,
+          ARIAVA_TEST_SCENARIO: 'linux-supported',
+          ARIAVA_TEST_MANAGER_CALLS_PATH: retainedManagerCallsPath(home),
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stdout).toContain('configComplete: false');
+      expect(stderr).toBe('');
     });
 
     test('unsupported platform rejects all service writes with structured stable errors', async () => {
@@ -1723,4 +1855,20 @@ describe('public ariava CLI', () => {
     });
   });
 
+});
+
+describe('default lifecycle adapter structure', () => {
+  test('keeps public-cli-app as a compatibility wrapper over the default adapter', () => {
+    const wrapper = readFileSync(join(publicCoreRoot, 'apps', 'bridge', 'src', 'public-cli-app.ts'), 'utf8');
+    const adapter = readFileSync(join(publicCoreRoot, 'apps', 'bridge', 'src', 'cli', 'lifecycle', 'default.ts'), 'utf8');
+
+    expect(wrapper).toContain('runAriavaCli(argv, createDefaultCliApplicationContext(overrides, onboardingOverrides))');
+    expect(wrapper).not.toContain('runDefaultCli');
+    expect(wrapper).not.toContain('dispatchPublicCli');
+    expect(wrapper).not.toContain('switch (command)');
+    expect(adapter).toContain('createDefaultLifecycleAdapter');
+    expect(adapter).toContain('runSetup');
+    expect(adapter).toContain('runService');
+    expect(adapter).toContain('runInternal');
+  });
 });

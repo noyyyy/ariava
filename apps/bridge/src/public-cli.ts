@@ -1,4 +1,5 @@
 #!/usr/bin/env node
-import { runPublicCli } from './public-cli-app';
+import { runAriavaCli } from './cli/app';
+import { createDefaultCliApplicationContext } from './cli/lifecycle/default';
 
-process.exitCode = await runPublicCli(process.argv.slice(2));
+process.exitCode = await runAriavaCli(process.argv.slice(2), createDefaultCliApplicationContext());

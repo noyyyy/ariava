@@ -72,12 +72,17 @@ export function buildHostManagerStatus(args: {
   piStatus: PiExtensionStatus;
   cliVersion: string;
   identityInspection?: HostManagerStatus['identity'];
+  statePresent?: boolean;
 }): HostManagerStatus {
   const { config, bridgeConfig, installMetadata, serviceStatus, piStatus, cliVersion, identityInspection } = args;
   return {
     cliVersion,
     configComplete: isConfigComplete(config),
-    bridgeHealth: deriveBridgeHealth(bridgeConfig.statePath, serviceStatus.installed),
+    bridgeHealth: deriveBridgeHealth(
+      bridgeConfig.statePath,
+      serviceStatus.installed,
+      args.statePresent,
+    ),
     hostId: config.identity?.hostId ?? bridgeConfig.hostId,
     hostName: config.hostName || bridgeConfig.hostName,
     relayBaseUrl: bridgeConfig.relayBaseUrl,
@@ -123,7 +128,11 @@ export function isConfigComplete(config: ResolvedAriavaConfig): boolean {
   return Boolean(config.relayBaseUrl && config.hostName && config.identity?.hostId && config.identity?.keyId);
 }
 
-function deriveBridgeHealth(statePath: string, serviceInstalled: boolean): 'online' | 'degraded' | 'offline' {
-  if (existsSync(statePath)) return 'online';
+function deriveBridgeHealth(
+  statePath: string,
+  serviceInstalled: boolean,
+  statePresent = existsSync(statePath),
+): 'online' | 'degraded' | 'offline' {
+  if (statePresent) return 'online';
   return serviceInstalled ? 'degraded' : 'offline';
 }

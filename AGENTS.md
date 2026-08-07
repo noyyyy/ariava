@@ -8,6 +8,7 @@ This repository contains the Ariava Bridge, pi extension, protocol, and shared u
 - Keep the Agent Adapter loopback-only and authenticated.
 - Do not add Relay, watchOS, APNs, Cloudflare deployment, TestFlight, screenshots, private product documentation, or production credentials.
 - Use Bun workspaces and do not add another package-manager lockfile.
+- Profile-safe shared commands belong only to the shared command layer; never reimplement them in dev lifecycle/adapter code, and reject unavailable capabilities before any profile-state access or effect.
 
 ## Guided onboarding invariants
 
@@ -31,6 +32,7 @@ Reviewed test roots classify files by suffix:
 - `*.integration.test.*` — explicit opt-in integration, excluded from ordinary lanes.
 
 Keep launchd/systemd renderers, fake or injected command runners, and portable fixtures in the shared lane. Put genuine host runtime behavior in the matching suffix-specific lane. Do not hide host ownership behind `skipIf` in shared tests.
+Bun tests must preload an isolated temporary `HOME`, `XDG_CONFIG_HOME`, Pi directory, and cleared Ariava path overrides before importing application modules. Test helpers that temporarily mutate process-global environment values must restore them after every test; never allow a test process to resolve production paths under the developer's real home.
 
 Copyable gates:
 

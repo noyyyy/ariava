@@ -1,11 +1,5 @@
 #!/usr/bin/env node
-import { runDevProfileCommand } from './dev-profile-app';
+import { runAriavaCli } from './cli/app';
+import { createDevCliApplicationContext } from './cli/lifecycle/dev';
 
-try {
-  const exitCode = await runDevProfileCommand(process.argv.slice(2));
-  process.exitCode = exitCode;
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(message);
-  process.exitCode = 1;
-}
+process.exitCode = await runAriavaCli(process.argv.slice(2), createDevCliApplicationContext());

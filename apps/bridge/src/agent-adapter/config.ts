@@ -5,13 +5,13 @@ export interface AgentAdapterDiscoveryFile {
   secret: string;
 }
 
-export function readAgentAdapterConfig(path: string): AgentAdapterDiscoveryFile | null {
+export function readAgentAdapterConfig(path: string, expectedPort?: number): AgentAdapterDiscoveryFile | null {
   if (!pathHasFilesystemEvidence(path)) {
     return null;
   }
 
   const parsed = readSecureJson<unknown>(path);
-  return validateAgentAdapterDiscovery(parsed);
+  return validateAgentAdapterDiscovery(parsed, expectedPort);
 }
 
 export function writeAgentAdapterConfig(path: string, config: AgentAdapterDiscoveryFile): void {
