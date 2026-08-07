@@ -16,49 +16,57 @@ function makeSession(status: CanonicalSessionState['status'] = 'idle'): Canonica
 }
 
 describe('Bridge current session snapshot state', () => {
-  test('persists immutable pending request and monotonic revision across restart', async () => {
+  test('persists only the revision cursor while publication data stays in memory', async () => {
     const root = mkdtempSync(join(tmpdir(), 'bridge-snapshot-state-')); roots.push(root);
     const path = join(root, 'state.json');
     const store = new BridgeStateStore(path);
-    const first = await store.stageCurrentSessionsSnapshot('host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z');
+    const first = await store.createCurrentSessionsPublication('host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z');
     expect(first?.request.revision).toBe(1);
+    expect(first?.contentDigest).toBeString();
+    expect(JSON.parse(readFileSync(path, 'utf8')).currentSessionsSnapshot).toEqual({
+      version: 1, lastAllocatedRevision: 1, lastAcceptedRevision: 0,
+    });
 
     const reloaded = new BridgeStateStore(path);
-    expect(reloaded.getPendingCurrentSessionsSnapshot()).toEqual(first);
-    expect(JSON.parse(readFileSync(path, 'utf8')).currentSessionsSnapshot.pending.request).toEqual(first?.request);
-
-    const second = await reloaded.stageCurrentSessionsSnapshot('host-1', [makeSession('working')], 1, '2026-07-20T00:00:02.000Z');
+    const second = await reloaded.createCurrentSessionsPublication('host-1', [makeSession('working')], 1, '2026-07-20T00:00:02.000Z');
     expect(second?.request.revision).toBe(2);
-    expect(new BridgeStateStore(path).getPendingCurrentSessionsSnapshot()).toEqual(second);
+    const persisted = JSON.parse(readFileSync(path, 'utf8')).currentSessionsSnapshot;
+    expect(persisted).toEqual({ version: 1, lastAllocatedRevision: 2, lastAcceptedRevision: 0 });
+    expect(persisted).not.toHaveProperty('pending');
+    expect(persisted).not.toHaveProperty('request');
   });
 
   test('does not allocate for accepted identical semantic content and honors stale lower bounds', async () => {
     const root = mkdtempSync(join(tmpdir(), 'bridge-snapshot-state-')); roots.push(root);
     const store = new BridgeStateStore(join(root, 'state.json'));
-    const first = (await store.stageCurrentSessionsSnapshot('host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z'))!;
-    expect(store.acceptCurrentSessionsSnapshot(first.request.revision, first.digest)).toBe(true);
-    expect(await store.stageCurrentSessionsSnapshot('host-1', [makeSession()], 1, '2026-07-20T00:00:10.000Z')).toBeUndefined();
+    const first = (await store.createCurrentSessionsPublication('host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z'))!;
+    expect(store.acceptCurrentSessionsPublication(first.request, 'digest-1', first.contentDigest)).toBe(true);
+    expect(await store.createCurrentSessionsPublication('host-1', [makeSession()], 1, '2026-07-20T00:00:10.000Z')).toBeUndefined();
 
     store.noteCurrentSessionsSnapshotRevisionLowerBound(8);
-    const next = await store.stageCurrentSessionsSnapshot('host-1', [makeSession('working')], 1, '2026-07-20T00:00:11.000Z', 8);
+    const next = await store.createCurrentSessionsPublication('host-1', [makeSession('working')], 1, '2026-07-20T00:00:11.000Z', 8);
     expect(next?.request.revision).toBe(9);
   });
 
-  test('matching acceptance cannot clear a newer coalesced pending snapshot', async () => {
+  test('a lost publication result allocates a higher revision after restart', async () => {
     const root = mkdtempSync(join(tmpdir(), 'bridge-snapshot-state-')); roots.push(root);
-    const store = new BridgeStateStore(join(root, 'state.json'));
-    const first = (await store.stageCurrentSessionsSnapshot('host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z'))!;
-    const latest = (await store.stageCurrentSessionsSnapshot('host-1', [makeSession('working')], 1, '2026-07-20T00:00:02.000Z'))!;
-    expect(store.acceptCurrentSessionsSnapshot(first.request.revision, first.digest)).toBe(false);
-    expect(store.getPendingCurrentSessionsSnapshot()).toEqual(latest);
+    const path = join(root, 'state.json');
+    const first = (await new BridgeStateStore(path).createCurrentSessionsPublication(
+      'host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z',
+    ))!;
+    const retried = await new BridgeStateStore(path).createCurrentSessionsPublication(
+      'host-1', [makeSession()], 1, '2026-07-20T00:00:02.000Z',
+    );
+    expect(retried?.request.revision).toBe(first.request.revision + 1);
+    expect(retried?.contentDigest).toBe(first.contentDigest);
   });
 
   test('recipient version alone allocates a higher lifecycle revision', async () => {
     const root = mkdtempSync(join(tmpdir(), 'bridge-snapshot-state-')); roots.push(root);
     const store = new BridgeStateStore(join(root, 'state.json'));
-    const first = (await store.stageCurrentSessionsSnapshot('host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z'))!;
-    expect(store.acceptCurrentSessionsSnapshot(first.request.revision, first.digest)).toBe(true);
-    const changed = await store.stageCurrentSessionsSnapshot('host-1', [makeSession()], 2, '2026-07-20T00:00:02.000Z');
+    const first = (await store.createCurrentSessionsPublication('host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z'))!;
+    expect(store.acceptCurrentSessionsPublication(first.request, 'digest-1', first.contentDigest)).toBe(true);
+    const changed = await store.createCurrentSessionsPublication('host-1', [makeSession()], 2, '2026-07-20T00:00:02.000Z');
     expect(changed?.request).toMatchObject({ revision: 2, recipientSetVersion: 2 });
   });
 });

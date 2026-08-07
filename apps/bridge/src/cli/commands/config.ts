@@ -88,7 +88,9 @@ function runAgentSecretConfig(
     const next = { ...fileConfig, agentAdapterSecret: context.generateSecret() };
     validateMutationCandidate(context, next);
     saveConfig(context, next);
-    const message = 'Rotated Agent Adapter secret. Restart the Ariava service and reload pi sessions.';
+    const message = context.profile.id === 'dev'
+      ? 'Rotated Agent Adapter secret. Restart the source Bridge and reload pi sessions.'
+      : 'Rotated Agent Adapter secret. Restart the Ariava service and reload pi sessions.';
     return success(message, { generated: true, rotated: true }, message);
   }
 

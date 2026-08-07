@@ -31,3 +31,9 @@ export async function runDoctorCommand(
     exitCode: healthy ? 0 : 1,
   };
 }
+
+export function formatDoctorChecks(checks: Record<string, unknown>): string {
+  return Object.entries(checks)
+    .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(', ') : typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value)}`)
+    .join('\n');
+}

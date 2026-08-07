@@ -76,7 +76,6 @@ const DEFAULT_RECONCILIATION_SCHEDULER: ReconciliationScheduler = {
   schedule: (callback, delayMs) => setTimeout(callback, delayMs),
   cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
-const HOST_PRESENCE_HEARTBEAT_INTERVAL_MS = 30_000;
 
 export class EncryptedEventFailureLogger {
   private lastLogAt = 0;
@@ -120,8 +119,6 @@ export class BridgeDaemon {
   private startupValidated = false;
   private syncFlight?: Promise<BridgeSyncResult>;
   private reconciliationTimer?: unknown;
-  private presenceHeartbeatTimer?: unknown;
-  private presenceFlight?: Promise<void>;
   private reconciliationRequested = true;
   private currentSessionsSnapshotFailureCount = 0;
   private lastCurrentSessionsSnapshotFailureLogAt = 0;
@@ -153,7 +150,6 @@ export class BridgeDaemon {
     await this.validateStartup();
     await this.adapterServer.start();
     writeAgentAdapterConfig(this.config.agentAdapter.configPath, { url: this.adapterServer.url, secret: this.config.agentAdapter.secret });
-    this.schedulePresenceHeartbeat();
   }
 
   private verifyFilesystem(): void {
@@ -207,30 +203,12 @@ export class BridgeDaemon {
   }
 
   private scheduleRegistryReconciliation(): void {
-    this.reconciliationRequested = true;
     if (this.stopped || this.reconciliationTimer) return;
     this.reconciliationTimer = this.reconciliationScheduler.schedule(() => {
       this.reconciliationTimer = undefined;
+      this.reconciliationRequested = true;
       this.wakeRunLoop?.();
     }, 300);
-  }
-
-  private schedulePresenceHeartbeat(): void {
-    if (this.stopped || this.presenceHeartbeatTimer !== undefined) return;
-    this.presenceHeartbeatTimer = this.reconciliationScheduler.schedule(() => {
-      this.presenceHeartbeatTimer = undefined;
-      this.runPresenceHeartbeat();
-    }, HOST_PRESENCE_HEARTBEAT_INTERVAL_MS);
-  }
-
-  private runPresenceHeartbeat(): void {
-    if (this.stopped) return;
-    void this.ensureHostPresence()
-      .catch(() => {
-        const prior = this.stateStore.getHost();
-        if (prior) this.stateStore.setHost({ ...prior, bridgeStatus: 'degraded' });
-      })
-      .finally(() => this.schedulePresenceHeartbeat());
   }
 
   stop(): void {
@@ -238,10 +216,6 @@ export class BridgeDaemon {
     if (this.reconciliationTimer !== undefined) {
       this.reconciliationScheduler.cancel(this.reconciliationTimer);
       this.reconciliationTimer = undefined;
-    }
-    if (this.presenceHeartbeatTimer !== undefined) {
-      this.reconciliationScheduler.cancel(this.presenceHeartbeatTimer);
-      this.presenceHeartbeatTimer = undefined;
     }
     this.relayAbortController.abort();
     this.adapterServer.stop(true);
@@ -266,7 +240,7 @@ export class BridgeDaemon {
     this.reconciliationRequested = false;
     let offline = false;
     try {
-      await this.ensureHostPresence();
+      await this.registerHostPresence();
     } catch {
       const prior = this.stateStore.getHost();
       if (prior) this.stateStore.setHost({ ...prior, bridgeStatus: 'degraded' });
@@ -287,22 +261,27 @@ export class BridgeDaemon {
         this.stateStore.replaceDriverSessions(driver.name, sessions);
       } catch (error) {
         if (!this.stateStore.hasReconciledDriver(driver.name)) authoritativeSetComplete = false;
-        process.stderr.write(`Ariava driver ${driver.name} failed: ${this.formatError(error)}\n`);
+        const event = this.buildDriverErrorEvent(driver.name, error);
+        this.stateStore.queuePendingEvent(event);
+        newEvents.push(event);
       }
     }
     // A driver failure must never turn a partial list into an authoritative replacement.
     // Successful drivers have been reconciled above, while failed drivers retain their last
     // complete persisted set. Build the Host snapshot only from that reconciled store.
     const nextSessions = this.stateStore.listSessions();
-    const activeSessions = nextSessions;
+    const activeSessions = nextSessions.filter((session) => !isDiagnosticSession(session));
+    let encryptedPublishingReady = true;
     if (authoritativeSetComplete && !offline) {
-      try { await this.flushCurrentSessionsSnapshot(activeSessions); }
+      try { encryptedPublishingReady = await this.flushCurrentSessionsSnapshot(activeSessions); }
       catch (error) {
         if (snapshotError(error, 'session_snapshot_conflict')) throw new Error('Relay rejected the persisted E2E lifecycle revision as conflicting', { cause: error });
-        offline = !(await this.handleCurrentSessionsSnapshotFailure(error, activeSessions));
+        const recovery = await this.handleCurrentSessionsSnapshotFailure(error, activeSessions);
+        offline = !recovery.online;
+        encryptedPublishingReady = recovery.encryptedPublishingReady;
       }
     }
-    const flushedEvents = offline ? 0 : await this.flushPendingEvents();
+    const flushedEvents = offline || !encryptedPublishingReady ? 0 : await this.flushPendingEvents();
     const flushedReads = offline ? 0 : await this.flushPendingHandles();
     const handledCommands = offline ? [] : await this.pullAndHandleCommands();
     return { host: this.stateStore.getHost(), sessions: nextSessions, emittedEvents: newEvents, flushedEvents, flushedReads, handledCommands, offline };
@@ -310,28 +289,34 @@ export class BridgeDaemon {
 
   private resetCurrentSessionsSnapshotFailures(): void { this.currentSessionsSnapshotFailureCount = 0; }
 
-  private async handleCurrentSessionsSnapshotFailure(error: unknown, activeSessions: CanonicalSessionState[]): Promise<boolean> {
+  private async handleCurrentSessionsSnapshotFailure(error: unknown, activeSessions: CanonicalSessionState[]): Promise<{ online: boolean; encryptedPublishingReady: boolean }> {
     this.currentSessionsSnapshotFailureCount += 1;
     this.logCurrentSessionsSnapshotFailure(error, activeSessions);
     this.scheduleRegistryReconciliation();
-    if (this.currentSessionsSnapshotFailureCount < 2) return false;
+    if (this.currentSessionsSnapshotFailureCount < 2) return { online: false, encryptedPublishingReady: false };
     try {
       await this.recoverCurrentSessionsSnapshotPipeline(activeSessions);
       const recoveredAfter = this.currentSessionsSnapshotFailureCount;
-      await this.flushCurrentSessionsSnapshot(activeSessions);
+      const encryptedPublishingReady = await this.flushCurrentSessionsSnapshot(activeSessions);
       this.resetCurrentSessionsSnapshotFailures();
+      if (!encryptedPublishingReady) {
+        if (this.reconciliationTimer !== undefined) {
+          this.reconciliationScheduler.cancel(this.reconciliationTimer);
+          this.reconciliationTimer = undefined;
+        }
+        return { online: true, encryptedPublishingReady: false };
+      }
       process.stderr.write(`Ariava recovered current-session snapshot publication after ${recoveredAfter} failure(s).\n`);
-      return true;
+      return { online: true, encryptedPublishingReady: true };
     } catch (recoveryError) {
       this.logCurrentSessionsSnapshotFailure(recoveryError, activeSessions, 'recovery');
       this.scheduleRegistryReconciliation();
-      return false;
+      return { online: false, encryptedPublishingReady: false };
     }
   }
 
   private async recoverCurrentSessionsSnapshotPipeline(activeSessions: CanonicalSessionState[]): Promise<void> {
     if (this.encryptionIdentity) this.keyring = new LocalLinkKeyring(`${this.config.identityPath}.e2e-keyring.json`, this.encryptionIdentity);
-    this.stateStore.clearCurrentSessionsSnapshotPending();
     this.stateStore.clearInflightSessionUploads(activeSessions.map((session) => session.sessionId));
   }
 
@@ -351,8 +336,6 @@ export class BridgeDaemon {
       lastAcceptedRevision: snapshot.lastAcceptedRevision,
       lastAllocatedRevision: snapshot.lastAllocatedRevision,
       lastAcceptedRecipientSetVersion: snapshot.lastAcceptedRecipientSetVersion,
-      pendingRevision: snapshot.pending?.request.revision,
-      pendingRecipientSetVersion: snapshot.pending?.request.recipientSetVersion,
       localRecipientSetVersion: this.stateStore.getRecipientSetVersion(),
       error: this.formatError(error),
       relayStatus: error instanceof RelayClientError ? error.status : undefined,
@@ -363,7 +346,7 @@ export class BridgeDaemon {
 
   async pairWatch(pairingCode: string): Promise<BridgePairWatchResponse> {
     await this.validateStartup();
-    await this.ensureHostPresence();
+    await this.registerHostPresence();
     return this.client().pairWatch(pairingCode);
   }
 
@@ -375,7 +358,8 @@ export class BridgeDaemon {
       try { await this.syncOnce(); }
       catch (error) {
         if (this.stopped || isAbortError(error)) break;
-        process.stderr.write(`Ariava Bridge loop recovered from an error: ${this.formatError(error)}\n`);
+        this.stateStore.queuePendingEvent(this.buildBridgeFailureEvent(error));
+        await this.flushPendingEvents();
       }
       if (this.reconciliationRequested) continue;
       if (!this.stopped) await this.waitForNextPoll();
@@ -403,16 +387,6 @@ export class BridgeDaemon {
     return { hostName: this.config.hostName, platform: this.config.hostPlatform, bridgeVersion: this.config.bridgeVersion };
   }
 
-  private ensureHostPresence(): Promise<void> {
-    if (this.presenceFlight) return this.presenceFlight;
-    const flight = this.registerHostPresence();
-    this.presenceFlight = flight;
-    void flight.finally(() => {
-      if (this.presenceFlight === flight) this.presenceFlight = undefined;
-    }).catch(() => {});
-    return flight;
-  }
-
   private async registerHostPresence(): Promise<void> {
     const identity = await this.resolveIdentityStore().load();
     if (!identity || !this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
@@ -422,47 +396,62 @@ export class BridgeDaemon {
     this.stateStore.setHost(response.host);
   }
 
-  private async sendCurrentSessionsSnapshot(pending: { request: ReplaceE2ECurrentSessionsRequestV1; digest: string }): Promise<void> {
-    const response = await this.client().replaceE2ECurrentSessions(pending.request);
-    if (response.hostId !== pending.request.hostId || response.revision !== pending.request.revision) throw new Error('Relay returned a mismatched current session snapshot response');
-    this.stateStore.acceptCurrentSessionsSnapshot(pending.request.revision, pending.digest);
+  private async sendCurrentSessionsPublication(
+    publication: { request: ReplaceE2ECurrentSessionsRequestV1; digest: string; contentDigest: string },
+  ): Promise<void> {
+    const response = await this.client().replaceE2ECurrentSessions(publication.request);
+    if (response.hostId !== publication.request.hostId || response.revision !== publication.request.revision) throw new Error('Relay returned a mismatched current session snapshot response');
+    this.stateStore.acceptCurrentSessionsPublication(publication.request, publication.digest, publication.contentDigest);
     this.resetCurrentSessionsSnapshotFailures();
   }
 
-  private async flushCurrentSessionsSnapshot(currentSessions: CanonicalSessionState[]): Promise<void> {
+  private async flushCurrentSessionsSnapshot(currentSessions: CanonicalSessionState[]): Promise<boolean> {
     for (let attempt = 0; attempt < 4; attempt += 1) {
-      let pending = this.stateStore.getPendingCurrentSessionsSnapshot();
-      if (pending?.digest) {
-        try { await this.sendCurrentSessionsSnapshot(pending); return; } catch (error) {
-          const stale = snapshotError(error, 'session_snapshot_stale');
-          const recipientsChanged = snapshotError(error, 'e2e_recipient_set_changed');
-          const invalidReference = snapshotError(error, 'e2e_session_reference_invalid');
-          if (!stale && !recipientsChanged && !invalidReference) throw error;
-          if (stale?.acceptedRevision !== undefined) this.stateStore.noteCurrentSessionsSnapshotRevisionLowerBound(stale.acceptedRevision);
-          // Recipient/reference conflicts invalidate the finalized member evidence. Keep
-          // the Host revision lower bound, then re-upload every active Session and
-          // supersede this manifest with the next Host revision.
-          this.stateStore.clearPendingCurrentSessionsSnapshot(pending.request.revision, pending.digest);
-          continue;
+      let recipientSnapshot: Awaited<ReturnType<RelayClient['recipientSnapshot']>>;
+      try {
+        recipientSnapshot = await this.client().recipientSnapshot();
+      } catch (error) {
+        if (snapshotError(error, 'e2e_recipient_not_ready')) {
+          this.resetCurrentSessionsSnapshotFailures();
+          return false;
         }
+        throw error;
       }
-      const recipientSnapshot = await this.client().recipientSnapshot();
       if (!this.keyring || !this.encryptionIdentity) throw new Error('E2E lifecycle encryption is unavailable');
       const recipients = this.keyring.reconcileRecipients(recipientSnapshot);
-      pending = await this.stateStore.stageCurrentSessionsSnapshot(this.config.hostId, currentSessions, recipientSnapshot.recipientSetVersion, isoNow());
-      if (!pending) return;
-      const committed = await this.uploadOrchestrator().publishAuthoritativeSnapshots(recipientSnapshot, recipients, currentSessions.map((session) => session.sessionId));
+      let publication = await this.stateStore.createCurrentSessionsPublication(
+        this.config.hostId, currentSessions, recipientSnapshot.recipientSetVersion, isoNow(),
+      );
+      if (!publication) return true;
+      const committed = await this.uploadOrchestrator().publishAuthoritativeSnapshots(
+        recipientSnapshot, recipients, currentSessions.map((session) => session.sessionId),
+      );
       if (!committed) throw new Error('authoritative encrypted Session snapshot publication failed');
-      if (committed.recipientSetVersion !== pending.request.recipientSetVersion) {
-        // Recipient churn during upload supersedes this unfinalized Host revision.
-        this.stateStore.clearPendingCurrentSessionsSnapshot(pending.request.revision, pending.digest);
-        pending = await this.stateStore.stageCurrentSessionsSnapshot(this.config.hostId, currentSessions, committed.recipientSetVersion, isoNow());
-        if (!pending) throw new Error('recipient change did not allocate a replacement lifecycle manifest');
+      if (committed.recipientSetVersion !== publication.request.recipientSetVersion) {
+        publication = await this.stateStore.createCurrentSessionsPublication(
+          this.config.hostId, currentSessions, committed.recipientSetVersion, isoNow(),
+        );
+        if (!publication) throw new Error('recipient change did not allocate a replacement lifecycle manifest');
       }
-      const request: ReplaceE2ECurrentSessionsRequestV1 = { ...pending.request,
-        sessions: currentSessions.map((session) => ({ sessionId: session.sessionId, sessionRevision: committed.revisions.get(session.sessionId)! })) };
-      pending = this.stateStore.finalizeCurrentSessionsSnapshot(request, await canonicalE2ECurrentSessionsDigestV1(request), pending.contentDigest);
-      // Submit through the pending branch so restored and fresh manifests share recovery.
+      const request: ReplaceE2ECurrentSessionsRequestV1 = {
+        ...publication.request,
+        sessions: currentSessions.map((session) => ({ sessionId: session.sessionId, sessionRevision: committed.revisions.get(session.sessionId)! })),
+      };
+      const finalized = { request, contentDigest: publication.contentDigest, digest: await canonicalE2ECurrentSessionsDigestV1(request) };
+      try {
+        await this.sendCurrentSessionsPublication(finalized);
+        return true;
+      } catch (error) {
+        if (snapshotError(error, 'e2e_recipient_not_ready')) {
+          this.resetCurrentSessionsSnapshotFailures();
+          return false;
+        }
+        const stale = snapshotError(error, 'session_snapshot_stale');
+        const recipientsChanged = snapshotError(error, 'e2e_recipient_set_changed');
+        const invalidReference = snapshotError(error, 'e2e_session_reference_invalid');
+        if (!stale && !recipientsChanged && !invalidReference) throw error;
+        if (stale?.acceptedRevision !== undefined) this.stateStore.noteCurrentSessionsSnapshotRevisionLowerBound(stale.acceptedRevision);
+      }
     }
     throw new Error('E2E lifecycle publication did not converge after recipient/revision conflicts');
   }
@@ -533,6 +522,17 @@ export class BridgeDaemon {
   }
 
 
+  private buildDriverErrorEvent(driverName: string, error: unknown): CanonicalEvent {
+    return { eventId: createId('evt'), hostId: this.config.hostId, sessionId: `driver:${driverName}`, provider: driverName,
+      type: 'driver_error', status: 'unknown', typeLabel: deriveEventTypeLabel('driver_error'),
+      agentText: `Driver ${driverName} failed: ${this.formatError(error)}`, contextText: `driver:${driverName}`, createdAt: isoNow() };
+  }
+
+  private buildBridgeFailureEvent(error: unknown): CanonicalEvent {
+    return { eventId: createId('evt'), hostId: this.config.hostId, sessionId: `host:${this.config.hostId}`, provider: 'bridge',
+      type: 'host_unavailable', status: 'unknown', typeLabel: deriveEventTypeLabel('host_unavailable'),
+      agentText: `Bridge loop recovered from an error: ${this.formatError(error)}`, contextText: this.config.hostName, createdAt: isoNow() };
+  }
 
   private formatError(error: unknown): string {
     const raw = error instanceof Error ? error.message : String(error);
@@ -554,6 +554,16 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
 }
 
+function deriveEventTypeLabel(type: CanonicalEvent['type']): string {
+  switch (type) {
+    case 'question_requested': return 'Agent question';
+    case 'blocked': return 'Session blocked';
+    case 'done': return 'Task complete';
+    case 'working': return 'In progress';
+    case 'driver_error': return 'Driver error';
+    case 'host_unavailable': return 'Host unavailable';
+  }
+}
 
 function samePersistedIdentity(
   configured: import('./identity').HostIdentityMetadata,
@@ -576,14 +586,20 @@ function samePersistedIdentity(
     && storageMatches;
 }
 
+function isDiagnosticSession(session: CanonicalSessionState): boolean {
+  return session.sessionId.startsWith('driver:') || session.sessionId.startsWith('host:');
+}
 
 function snapshotError(
   error: unknown,
-  code: 'session_snapshot_stale' | 'session_snapshot_conflict' | 'e2e_recipient_set_changed' | 'e2e_session_reference_invalid',
+  code: 'session_snapshot_stale' | 'session_snapshot_conflict' | 'e2e_recipient_not_ready' | 'e2e_recipient_set_changed' | 'e2e_session_reference_invalid',
 ): { acceptedRevision?: number } | undefined {
   if (!(error instanceof RelayClientError) || error.status !== 409 || !error.body || typeof error.body !== 'object') return undefined;
   const body = error.body as Record<string, unknown>;
-  if (body.code !== code) return undefined;
+  const reason = typeof body.code === 'string' ? body.code
+    : typeof body.error === 'string' ? body.error
+      : typeof body.reason === 'string' ? body.reason : error.reason;
+  if (reason !== code) return undefined;
   if (code === 'session_snapshot_stale' && (typeof body.acceptedRevision !== 'number' || !Number.isSafeInteger(body.acceptedRevision))) return undefined;
   return typeof body.acceptedRevision === 'number' ? { acceptedRevision: body.acceptedRevision } : {};
 }

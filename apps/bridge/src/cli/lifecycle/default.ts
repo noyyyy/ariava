@@ -80,6 +80,7 @@ import { createDefaultProfileIdentityResetDependencies } from '../operations/ide
 import { createDefaultPairProfileDependencies } from '../operations/pair';
 import { normalizeCliFailure, type CliFailure } from '../failure';
 import { runSharedHostCommand } from '../commands';
+import { formatDoctorChecks } from '../commands/doctor';
 import { createDefaultWatchesProfileDependencies } from '../operations/watches';
 import { runAriavaCli, resolveCliVersion } from '../app';
 import { renderCliFailure } from '../output';
@@ -383,7 +384,7 @@ function createDefaultDoctorDependencies(deps: PublicCliDependencies) {
         && checks.serviceMetadataValid && checks.installerMetadataValid && checks.documentMetadataValid
         && checks.identityReady
       ),
-      formatDoctor,
+      formatDoctor: formatDoctorChecks,
     },
   };
 }
@@ -690,7 +691,7 @@ async function runDev(deps: PublicCliDependencies, argv: string[], json: boolean
       bridgeSource: installMetadata.bridgeSource ?? { kind: 'release-bundle' },
       piSource: installMetadata.piSource ?? { kind: 'release-bundle' },
     };
-    print(deps, json, okEnvelope('ok', 'Ariava dev source status.', data), JSON.stringify(data, null, 2));
+    print(deps, json, okEnvelope('ok', 'Ariava dev source status.', data), formatDevSourceStatus(data));
     return;
   }
 
@@ -1229,10 +1230,22 @@ function formatStatus(status: ReturnType<typeof buildHostManagerStatus>): string
   ].join('\n');
 }
 
-function formatDoctor(checks: Record<string, unknown>): string {
-  return Object.entries(checks)
-    .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(', ') : typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value)}`)
-    .join('\n');
+function formatDevSourceStatus(data: { bridgeSource: { kind: string; path?: string; package?: string }; piSource: { kind: string; path?: string; package?: string } }): string {
+  const fields = [
+    { label: 'Bridge source', value: describeDevSource(data.bridgeSource) },
+    { label: 'Pi source', value: describeDevSource(data.piSource) },
+  ];
+  const labelWidth = Math.max(...fields.map(({ label }) => label.length));
+  return [
+    'Ariava dev sources',
+    '',
+    ...fields.map(({ label, value }) => `  ${label.padEnd(labelWidth)}  ${value}`),
+  ].join('\n');
+}
+
+function describeDevSource(source: { kind: string; path?: string; package?: string }): string {
+  const kind = source.kind === 'release-bundle' ? 'release bundle' : source.kind.replaceAll('-', ' ');
+  return source.path || source.package ? `${kind} (${source.path ?? source.package})` : kind;
 }
 
 function formatServiceStatus(status: ServiceStatus & { relayBaseUrl?: string; logDir?: string }): string {

@@ -45,7 +45,6 @@ export async function runHostCommand(
     const usage = dependencies.profileId === 'dev'
       ? 'Usage: dev-profile-cli host reset --confirm'
       : 'Usage: ariava host reset --confirm';
-    if (dependencies.profileId === 'dev') throw new Error(usage);
     throw new AriavaCliError('ERR_CONFIRMATION_REQUIRED', usage);
   }
   const context = dependencies.context();

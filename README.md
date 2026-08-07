@@ -87,7 +87,7 @@ bun run verify
 
 ### Isolated source development profile
 
-Use the fixed `dev` profile when an installed Ariava Bridge is already running. It keeps source-development configuration, identity, state, discovery, and logs under `~/.config/ariava-dev`, and uses the loopback Agent Adapter on `127.0.0.1:7273`; the installed profile remains under `~/.config/ariava` on port `7272`.
+Use the fixed `dev` profile when an installed Ariava Bridge is already running. It keeps source-development configuration, identity, state, discovery, and logs under `~/.config/ariava-dev`, uses the local Relay at `http://127.0.0.1:8790`, and exposes the loopback Agent Adapter on `127.0.0.1:7273`; the installed profile remains under `~/.config/ariava` on Adapter port `7272`. Existing persisted Relay values remain explicit overrides.
 
 ```bash
 # Build the source Bridge and open the unified dev CLI

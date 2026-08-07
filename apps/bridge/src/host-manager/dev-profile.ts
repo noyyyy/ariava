@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
 export const ARIAVA_DEV_AGENT_ADAPTER_PORT = 7273 as const;
+export const ARIAVA_DEV_RELAY_BASE_URL = 'http://127.0.0.1:8790' as const;
 
 export interface AriavaDevProfilePaths {
   root: string;

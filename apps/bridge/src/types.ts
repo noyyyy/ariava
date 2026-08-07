@@ -67,11 +67,6 @@ export interface PendingSessionHandle {
   updatedAt: string;
 }
 
-export interface PendingCurrentSessionsSnapshot {
-  digest: string;
-  contentDigest: string;
-  request: ReplaceE2ECurrentSessionsRequestV1;
-}
 
 /** Host-wide active-set revisions; never reuse these as per-session content revisions. */
 export interface PersistedCurrentSessionsSnapshotState {
@@ -81,7 +76,6 @@ export interface PersistedCurrentSessionsSnapshotState {
   lastAcceptedDigest?: string;
   lastAcceptedContentDigest?: string;
   lastAcceptedRecipientSetVersion?: number;
-  pending?: PendingCurrentSessionsSnapshot;
 }
 
 export interface EventUploadCompletionV1 {

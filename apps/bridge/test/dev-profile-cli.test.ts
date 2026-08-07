@@ -96,7 +96,7 @@ describe('source dev profile commands', () => {
     expect(await runDevProfileCommand(['init'], harness.deps)).toBe(0);
     const first = JSON.parse(readFileSync(harness.deps.paths.configPath, 'utf8'));
     expect(first).toMatchObject({
-      relayBaseUrl: 'http://127.0.0.1:8787',
+      relayBaseUrl: 'http://127.0.0.1:8790',
       hostName: 'test-host (Dev)',
       agentAdapterPort: 7273,
       agentAdapterSecret: 'dev-secret',
@@ -133,7 +133,7 @@ describe('source dev profile commands', () => {
 
     const envelope = JSON.parse(harness.output().slice(outputOffset).split('\n').slice(1).join('\n'));
     expect(envelope.data.config.hostName).toBe('configured-dev');
-    expect(envelope.data.resolved.relayBaseUrl).toBe('http://127.0.0.1:8787');
+    expect(envelope.data.resolved.relayBaseUrl).toBe('http://127.0.0.1:8790');
     expect(envelope.data.config.agentAdapterSecret).toBeUndefined();
     expect(envelope.data.resolved.agentAdapterSecret).toBe('<redacted>');
     expect(harness.output().slice(outputOffset)).not.toContain('dev-secret');
@@ -344,7 +344,7 @@ describe('source dev profile commands', () => {
     expect(bridgeStopped).toBe(true);
     expect(readFileSync(defaultConfig, 'utf8')).toBe('{"production":true}\n');
     expect(JSON.parse(readFileSync(harness.deps.paths.configPath, 'utf8'))).toMatchObject({
-      relayBaseUrl: 'http://127.0.0.1:8787', agentAdapterPort: 7273,
+      relayBaseUrl: 'http://127.0.0.1:8790', agentAdapterPort: 7273,
     });
   });
 
@@ -383,9 +383,11 @@ describe('source dev profile commands', () => {
       if (previousPort === undefined) delete process.env.ARIAVA_AGENT_ADAPTER_PORT;
       else process.env.ARIAVA_AGENT_ADAPTER_PORT = previousPort;
     }
-    expect(captured?.relayBaseUrl).toBe('http://127.0.0.1:8787');
+    expect(captured?.relayBaseUrl).toBe('http://127.0.0.1:8790');
     expect(captured?.agentAdapter.port).toBe(7273);
     expect(captured?.identityPath).toBe(harness.deps.paths.identityPath);
+    expect(harness.output()).toContain('Adapter http://127.0.0.1:7273');
+    expect(harness.output()).toContain('Relay http://127.0.0.1:8790');
     expect(stopped).toBe(true);
   });
 
@@ -525,10 +527,15 @@ describe('source dev profile commands', () => {
       url: 'http://127.0.0.1:7273',
       secret: 'must-not-appear',
     });
+    const offset = harness.output().length;
     expect(await runDevProfileCommand(['status'], harness.deps)).toBe(0);
-    expect(harness.output()).toContain('http://127.0.0.1:7273');
-    expect(harness.output()).toContain(harness.deps.paths.configPath);
-    expect(harness.output()).not.toContain('must-not-appear');
+    const statusOutput = harness.output().slice(offset);
+    expect(statusOutput).toMatch(/^Ariava\n\n  Profile\s{2,}dev\n/);
+    expect(statusOutput).not.toMatch(/^\{/);
+    expect(() => JSON.parse(statusOutput)).toThrow();
+    expect(statusOutput).toContain('http://127.0.0.1:7273');
+    expect(statusOutput).toContain(harness.deps.paths.configPath);
+    expect(statusOutput).not.toContain('must-not-appear');
     expect(readFileSync(join(defaultRoot, 'config.json'), 'utf8')).toBe('{not-json');
   });
 
@@ -550,7 +557,7 @@ describe('source dev profile commands', () => {
       profile: 'dev',
       configPath: harness.deps.paths.configPath,
       identityPath: harness.deps.paths.identityPath,
-      relayUrl: 'http://127.0.0.1:8787',
+      relayUrl: 'http://127.0.0.1:8790',
       adapterUrl: 'http://127.0.0.1:7273',
       adapterPort: 7273,
       piLogPath: harness.deps.paths.piExtensionLogPath,
@@ -654,7 +661,7 @@ describe('source dev profile commands', () => {
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       const url = new URL(request.url);
-      expect(url.origin).toBe('http://127.0.0.1:8787');
+      expect(url.origin).toBe('http://127.0.0.1:8790');
       paths.push(url.pathname);
       if (url.pathname === '/v2/bridge/enroll') {
         const body = await request.json() as { hostId: string; hostName: string };

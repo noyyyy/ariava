@@ -53,19 +53,58 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     expect(JSON.stringify(body)).not.toMatch(/projectName|nameText|openingText|latestActivityText|actionablePrompt/);
   });
 
-  test('process-style restart restores and retries the exact signed manifest after a network failure', async () => {
+  test('process-style restart recomputes a higher revision after a network failure', async () => {
     const bodies: any[] = []; let online = false; let hostId = '';
     const fx = await fixture((request) => relay(hostId, (body) => { bodies.push(body); return online
       ? Response.json({ ok: true, hostId: body.hostId, revision: body.revision, activeSessionCount: 0 })
       : new Response('offline', { status: 503 }); })(request));
     hostId = fx.identity.hostId;
     expect((await fx.daemon.syncOnce()).offline).toBe(true);
-    const persisted = JSON.parse(readFileSync(fx.config.statePath, 'utf8')).currentSessionsSnapshot.pending.request;
+    const afterFailure = JSON.parse(readFileSync(fx.config.statePath, 'utf8')).currentSessionsSnapshot;
+    expect(afterFailure).toEqual({ version: 1, lastAllocatedRevision: 1, lastAcceptedRevision: 0 });
     online = true;
     const restartedIdentityStore = new LinuxJsonHostIdentityStore(fx.config.identityPath);
     const restarted = new BridgeDaemon(fx.config, [{ name: 'test', listSessions: async () => [], executeCommand: async () => { throw new Error('unused'); } }], restartedIdentityStore);
     expect((await restarted.syncOnce()).offline).toBe(false);
-    expect(bodies.at(-1)).toEqual(persisted);
+    expect(bodies.map((body) => body.revision)).toEqual([1, 2]);
+    expect(bodies[1]).toMatchObject({ hostId, recipientSetVersion: 1, sessions: [] });
+  });
+
+  test('skips encrypted publication without a recipient and publishes after readiness appears', async () => {
+    let hostId = ''; let recipientReady = false; let recipientReads = 0; const manifests: any[] = [];
+    const fx = await fixture(async (request) => {
+      const path = new URL(request.url).pathname;
+      if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
+      if (path === '/v2/bridge/e2e/recipients') {
+        recipientReads += 1;
+        return recipientReady
+          ? Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] })
+          : Response.json({ error: 'e2e_recipient_not_ready' }, { status: 409 });
+      }
+      if (path === '/v2/bridge/e2e/sessions/current') {
+        const body = await request.json() as any; manifests.push(body);
+        return Response.json({ ok: true, hostId, revision: body.revision, activeSessionCount: 0 });
+      }
+      if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] });
+      return Response.json({ ok: true });
+    });
+    hostId = fx.identity.hostId;
+
+    expect((await fx.daemon.syncOnce()).offline).toBe(false);
+    const waitingState = JSON.parse(readFileSync(fx.config.statePath, 'utf8')).currentSessionsSnapshot;
+    expect(waitingState).toEqual({ version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0 });
+    expect(manifests).toEqual([]);
+    expect((fx.daemon as any).reconciliationTimer).toBeUndefined();
+    expect(recipientReads).toBe(1);
+
+    recipientReady = true;
+    expect((await fx.daemon.syncOnce()).offline).toBe(false);
+    const publishedState = JSON.parse(readFileSync(fx.config.statePath, 'utf8')).currentSessionsSnapshot;
+    expect(recipientReads).toBeGreaterThan(1);
+    expect(manifests).toHaveLength(1);
+    expect(manifests[0]).toEqual({ hostId, revision: 1, observedAt: expect.any(String), recipientSetVersion: 1, sessions: [] });
+    expect(publishedState).toMatchObject({ version: 1, lastAllocatedRevision: 1, lastAcceptedRevision: 1 });
+    expect((fx.daemon as any).currentSessionsSnapshotFailureCount).toBe(0);
   });
 
   test('stale Host revision rebuilds only the Host revision domain', async () => {

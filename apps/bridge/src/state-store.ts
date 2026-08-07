@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { pathHasFilesystemEvidence, readSecureJson, writeSecureJson } from './host-manager/secure-files';
 import type { CanonicalEvent, CanonicalSessionState, CommandResult, HostProjection, ReplaceE2ECurrentSessionsRequestV1 } from '@ariava/protocol';
-import { e2eCurrentSessionsSemanticDigestV1, validateEventTypeStatusPair } from '@ariava/protocol';
-import type { EventUploadCompletionV1, PendingCurrentSessionsSnapshot, PendingSessionHandle, PersistedBridgeState, PersistedCurrentSessionsSnapshotState } from './types';
+import { e2eCurrentSessionsSemanticDigestV1 } from '@ariava/protocol';
+import type { EventUploadCompletionV1, PendingSessionHandle, PersistedBridgeState, PersistedCurrentSessionsSnapshotState } from './types';
 import { LocalEncryptedSpool, createRuntimeSpoolKeyStore, spoolPathForState, type SpoolKeyStore } from './e2e/local-spool';
 
 const EMPTY_STATE: PersistedBridgeState = {
@@ -21,7 +21,6 @@ export class BridgeStateStore {
     this.spool = new LocalEncryptedSpool(spoolPathForState(this.filePath), hostId,
       keyStore ?? createRuntimeSpoolKeyStore(identityPath, platform));
     const legacy = this.state.pendingEvents ?? [];
-    this.failClosedOnObsoleteInflightEvents();
     if (legacy.length || this.state.spoolMigration) {
       if (!this.state.spoolMigration) {
         this.state.spoolMigration = { version: 1, remainingEventIds: legacy.map((event) => event.eventId), startedAt: new Date().toISOString() };
@@ -31,7 +30,7 @@ export class BridgeStateStore {
       for (const eventId of [...this.state.spoolMigration.remainingEventIds]) {
         const event = legacy.find((candidate) => candidate.eventId === eventId);
         if (!event) throw new Error('legacy spool migration journal is inconsistent');
-        this.enqueuePendingEvent(canonicalizePendingEvent(event));
+        this.enqueuePendingEvent(event);
         migrationStep?.('item-encrypted', eventId);
         this.state.spoolMigration.remainingEventIds = this.state.spoolMigration.remainingEventIds.filter((id) => id !== eventId);
         this.persist();
@@ -44,49 +43,15 @@ export class BridgeStateStore {
       if (markers.some((marker) => marker && stateText.includes(marker))) throw new Error('legacy pending event migration marker remains in state');
     } else if ('pendingEvents' in this.state) { delete this.state.pendingEvents; this.persist(); }
     const recovery = this.spool.recoverUnreadable();
-    this.canonicalizeEncryptedPendingEvents();
     this.resumeEventUploadCompletions();
     return recovery;
-  }
-
-  private failClosedOnObsoleteInflightEvents(): void {
-    if (!this.spool) return;
-    for (const item of this.spool.list('event-upload-v1')) {
-      const bytes = this.spool.open(item);
-      try {
-        const upload = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as { event?: { type?: unknown; status?: unknown } };
-        if (!validateEventTypeStatusPair(upload.event?.type, upload.event?.status)) {
-          throw new Error('obsolete inflight event upload requires explicit recovery');
-        }
-      } finally { bytes.fill(0); }
-    }
-  }
-
-  private canonicalizeEncryptedPendingEvents(): void {
-    if (!this.spool) return;
-    for (const item of this.spool.list('event-source-v1')) {
-      const bytes = this.spool.open(item);
-      try {
-        const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as { event: CanonicalEvent; session?: CanonicalSessionState };
-        const event = canonicalizePendingEvent(parsed.event);
-        if (event === parsed.event) continue;
-        const plaintext = new TextEncoder().encode(JSON.stringify({ ...parsed, event }));
-        this.spool.replace([item.spoolItemId], [{
-          spoolItemId: item.spoolItemId,
-          sessionId: item.sessionId,
-          eventId: item.eventId,
-          payloadKind: item.payloadKind,
-          createdAt: item.createdAt,
-          plaintext,
-        }]);
-      } finally { bytes.fill(0); }
-    }
   }
 
   private load(): PersistedBridgeState {
     if (!pathHasFilesystemEvidence(this.filePath)) return structuredClone(EMPTY_STATE);
     try {
-      const parsed = readSecureJson<PersistedBridgeState & { pendingReads?: Record<string, LegacyPendingSessionRead> }>(this.filePath);
+      const parsed = readSecureJson<PersistedBridgeState & { pendingReads?: Record<string, LegacyPendingSessionRead>;
+        currentSessionsSnapshot?: PersistedCurrentSessionsSnapshotState & { pending?: unknown } }>(this.filePath);
       const nextState: PersistedBridgeState = {
         ...structuredClone(EMPTY_STATE), ...withoutLegacyPendingReads(parsed),
         host: sanitizePersistedHost(parsed.host ?? null), sessions: parsed.sessions ?? {},
@@ -97,7 +62,8 @@ export class BridgeStateStore {
         pendingHandles: parsed.pendingHandles ?? migratePendingReads(parsed), commandResults: parsed.commandResults ?? {},
         seenCommands: parsed.seenCommands ?? {}, currentSessionsSnapshot: sanitizeSnapshotState(parsed.currentSessionsSnapshot),
       };
-      if ((parsed.host && hasLegacyClaimCodeFields(parsed.host)) || parsed.pendingReads || !parsed.currentSessionsSnapshot) {
+      if ((parsed.host && hasLegacyClaimCodeFields(parsed.host)) || parsed.pendingReads || !parsed.currentSessionsSnapshot
+        || (typeof parsed.currentSessionsSnapshot === 'object' && parsed.currentSessionsSnapshot !== null && 'pending' in parsed.currentSessionsSnapshot)) {
         writeSecureJson(this.filePath, nextState);
       }
       return nextState;
@@ -136,36 +102,24 @@ export class BridgeStateStore {
     const next = { ...current, ...patch }; this.state.sessions[sessionId] = next; this.persist(); return next;
   }
 
-  async stageCurrentSessionsSnapshot(hostId: string, sessions: CanonicalSessionState[], recipientSetVersion: number, observedAt: string, minimumRevision = 0): Promise<PendingCurrentSessionsSnapshot | undefined> {
+  async createCurrentSessionsPublication(hostId: string, sessions: CanonicalSessionState[], recipientSetVersion: number, observedAt: string, minimumRevision = 0): Promise<{ request: ReplaceE2ECurrentSessionsRequestV1; contentDigest: string } | undefined> {
     const contentDigest = await e2eCurrentSessionsSemanticDigestV1(hostId, sessions);
     const current = this.state.currentSessionsSnapshot;
-    if (current.pending?.contentDigest === contentDigest && current.pending.request.hostId === hostId
-      && current.pending.request.recipientSetVersion === recipientSetVersion) return structuredClone(current.pending);
-    if (!current.pending && current.lastAcceptedContentDigest === contentDigest
+    if (current.lastAcceptedContentDigest === contentDigest
       && current.lastAcceptedRecipientSetVersion === recipientSetVersion && current.lastAcceptedRevision >= minimumRevision) return undefined;
     const revision = Math.max(current.lastAllocatedRevision, current.lastAcceptedRevision, minimumRevision) + 1;
     const request: ReplaceE2ECurrentSessionsRequestV1 = { hostId, revision, observedAt, recipientSetVersion, sessions: [] };
-    const pending: PendingCurrentSessionsSnapshot = { request, digest: '', contentDigest };
-    this.state.currentSessionsSnapshot = { ...current, version: 1, lastAllocatedRevision: revision, pending };
+    this.state.currentSessionsSnapshot = { ...current, version: 1, lastAllocatedRevision: revision };
     this.persist();
-    return structuredClone(pending);
-  }
-  finalizeCurrentSessionsSnapshot(request: ReplaceE2ECurrentSessionsRequestV1, digest: string, contentDigest: string): PendingCurrentSessionsSnapshot {
-    const current = this.state.currentSessionsSnapshot;
-    if (current.pending?.contentDigest !== contentDigest || current.pending.request.revision !== request.revision) throw new TypeError('pending lifecycle manifest changed before finalization');
-    const pending = { request, contentDigest, digest };
-    this.state.currentSessionsSnapshot = { ...current, pending }; this.persist(); return structuredClone(pending);
-  }
-  getPendingCurrentSessionsSnapshot(): PendingCurrentSessionsSnapshot | undefined {
-    const pending = this.state.currentSessionsSnapshot.pending; return pending ? structuredClone(pending) : undefined;
+    return { request, contentDigest };
   }
   getCurrentSessionsSnapshotState(): PersistedCurrentSessionsSnapshotState { return structuredClone(this.state.currentSessionsSnapshot); }
-  acceptCurrentSessionsSnapshot(revision: number, digest: string): boolean {
-    const current = this.state.currentSessionsSnapshot; const pending = current.pending;
-    if (!pending || pending.request.revision !== revision || pending.digest !== digest) return false;
-    this.state.currentSessionsSnapshot = { version: 1, lastAllocatedRevision: Math.max(current.lastAllocatedRevision, revision),
-      lastAcceptedRevision: Math.max(current.lastAcceptedRevision, revision), lastAcceptedDigest: digest,
-      lastAcceptedContentDigest: pending.contentDigest, lastAcceptedRecipientSetVersion: pending.request.recipientSetVersion };
+  acceptCurrentSessionsPublication(request: ReplaceE2ECurrentSessionsRequestV1, digest: string, contentDigest: string): boolean {
+    const current = this.state.currentSessionsSnapshot;
+    if (request.revision < current.lastAcceptedRevision) return false;
+    this.state.currentSessionsSnapshot = { version: 1, lastAllocatedRevision: Math.max(current.lastAllocatedRevision, request.revision),
+      lastAcceptedRevision: Math.max(current.lastAcceptedRevision, request.revision), lastAcceptedDigest: digest,
+      lastAcceptedContentDigest: contentDigest, lastAcceptedRecipientSetVersion: request.recipientSetVersion };
     this.persist(); return true;
   }
   noteCurrentSessionsSnapshotRevisionLowerBound(revision: number): void {
@@ -173,16 +127,6 @@ export class BridgeStateStore {
     const nextAllocated = Math.max(current.lastAllocatedRevision, revision); const nextAccepted = Math.max(current.lastAcceptedRevision, revision);
     if (nextAllocated === current.lastAllocatedRevision && nextAccepted === current.lastAcceptedRevision) return;
     this.state.currentSessionsSnapshot = { ...current, lastAllocatedRevision: nextAllocated, lastAcceptedRevision: nextAccepted }; this.persist();
-  }
-  clearPendingCurrentSessionsSnapshot(revision: number, digest: string): boolean {
-    const pending = this.state.currentSessionsSnapshot.pending;
-    if (!pending || pending.request.revision !== revision || pending.digest !== digest) return false;
-    const { pending: _pending, ...current } = this.state.currentSessionsSnapshot; this.state.currentSessionsSnapshot = current; this.persist(); return true;
-  }
-  clearCurrentSessionsSnapshotPending(): boolean {
-    const pending = this.state.currentSessionsSnapshot.pending;
-    if (!pending) return false;
-    return this.clearPendingCurrentSessionsSnapshot(pending.request.revision, pending.digest);
   }
   appendRecentEvent(event: CanonicalEvent): void { this.state.recentEvents = [event, ...this.state.recentEvents].slice(0, 200); this.persist(); }
   queuePendingEvent(event: CanonicalEvent): void {
@@ -381,29 +325,27 @@ function sameEventCompletion(left: EventUploadCompletionV1, right: EventUploadCo
 }
 
 
-function sanitizeSnapshotState(value: PersistedCurrentSessionsSnapshotState | undefined): PersistedCurrentSessionsSnapshotState {
+function sanitizeSnapshotState(value: (PersistedCurrentSessionsSnapshotState & { pending?: unknown }) | undefined): PersistedCurrentSessionsSnapshotState {
   if (!value || value.version !== 1) return structuredClone(EMPTY_STATE.currentSessionsSnapshot);
   const lastAllocatedRevision = safeRevision(value.lastAllocatedRevision);
   const lastAcceptedRevision = safeRevision(value.lastAcceptedRevision);
   const lastAcceptedRecipientSetVersion = safeRevision(value.lastAcceptedRecipientSetVersion);
-  const pending = sanitizePendingSnapshot(value.pending);
+  const legacyInflightRevision = validateLegacyPendingPublication(value.pending);
   return {
     version: 1,
-    lastAllocatedRevision: Math.max(lastAllocatedRevision, lastAcceptedRevision, pending?.request.revision ?? 0),
+    lastAllocatedRevision: Math.max(lastAllocatedRevision, lastAcceptedRevision, legacyInflightRevision),
     lastAcceptedRevision,
     ...(typeof value.lastAcceptedDigest === 'string' ? { lastAcceptedDigest: value.lastAcceptedDigest } : {}),
     ...(typeof value.lastAcceptedContentDigest === 'string' ? { lastAcceptedContentDigest: value.lastAcceptedContentDigest } : {}),
     ...(lastAcceptedRecipientSetVersion > 0 ? { lastAcceptedRecipientSetVersion } : {}),
-    ...(pending ? { pending } : {}),
   };
 }
 
-function sanitizePendingSnapshot(value: PendingCurrentSessionsSnapshot | undefined): PendingCurrentSessionsSnapshot | undefined {
-  if (value === undefined) return undefined;
-  // Any persisted pending object must prove the complete metadata-only v1 shape
-  // before individual digest fields are considered. Unknown/legacy shapes are not
-  // silently dropped because doing so could erase protected plaintext evidence.
-  const candidate = value as unknown as Record<string, unknown>;
+function validateLegacyPendingPublication(value: unknown): number {
+  if (value === undefined) return 0;
+  // A legacy persisted publication may only be discarded after proving its exact
+  // metadata-only v1 shape. Unknown shapes fail closed to preserve protected bytes.
+  const candidate = value as Record<string, unknown>;
   const request = candidate.request as Record<string, unknown> | undefined;
   const sessions = request?.sessions;
   const metadataOnly = exactKeys(candidate, ['request', 'digest', 'contentDigest'])
@@ -418,10 +360,8 @@ function sanitizePendingSnapshot(value: PendingCurrentSessionsSnapshot | undefin
       return exactKeys(member, ['sessionId', 'sessionRevision']) && typeof member.sessionId === 'string'
         && Number.isSafeInteger(member.sessionRevision) && (member.sessionRevision as number) > 0;
     });
-  if (!metadataOnly) {
-    throw new Error('legacy plaintext current-session pending state requires explicit recovery');
-  }
-  return value;
+  if (!metadataOnly) throw new Error('legacy plaintext current-session pending state requires explicit recovery');
+  return request.revision as number;
 }
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -437,17 +377,4 @@ function safeRevision(value: unknown): number {
 function inferLegacyReconciledDrivers(sessionDrivers: Record<string, string> | undefined): Record<string, true> {
   const driverNames = new Set(Object.values(sessionDrivers ?? {}));
   return Object.fromEntries([...driverNames].map((driverName) => [driverName, true]));
-}
-function canonicalizePendingEvent(event: CanonicalEvent): CanonicalEvent {
-  if (event.type === 'done') {
-    if (event.status !== 'done') throw new Error('legacy pending done event has invalid status');
-    return event.typeLabel === 'Task complete' ? event : { ...event, typeLabel: 'Task complete' };
-  }
-  if ((event.type as string) === 'blocked' || (event.type as string) === 'question_requested') {
-    return { ...event, type: 'need_human', status: 'blocked', typeLabel: 'Needs attention' };
-  }
-  if (event.type === 'need_human' && event.status === 'blocked') {
-    return event.typeLabel === 'Needs attention' ? event : { ...event, typeLabel: 'Needs attention' };
-  }
-  throw new Error('obsolete pending event requires explicit recovery');
 }

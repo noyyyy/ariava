@@ -28,6 +28,7 @@ import type { AriavaProfileDescriptor } from '../profile';
 import { createDefaultPairProfileDependencies } from '../operations/pair';
 import { createDefaultWatchesProfileDependencies } from '../operations/watches';
 import { runSharedHostCommand } from '../commands';
+import { formatDoctorChecks } from '../commands/doctor';
 import { runAriavaCli, resolveCliVersion } from '../app';
 import { inspectCurrentNodeRuntime } from '../../runtime/node-runtime';
 import { runNodeCryptoSelfTest } from '../../e2e/node-crypto-self-test';
@@ -261,7 +262,9 @@ async function startDevBridge(deps: DevProfileDependencies): Promise<{ daemon: D
   const identityStore = deps.createIdentityStore(deps.paths.identityPath, deps.platform, 'dev');
   const daemon = deps.createBridge(config, identityStore);
   await daemon.start();
-  deps.stdout.write(`Ariava source Bridge listening on ${config.agentAdapter.port} using ${deps.paths.configPath}\n`);
+  deps.stdout.write(
+    `Ariava source Bridge ready; Adapter http://127.0.0.1:${config.agentAdapter.port}; Relay ${config.relayBaseUrl}; config ${deps.paths.configPath}\n`,
+  );
   return { daemon, runPromise: daemon.runForever() };
 }
 
@@ -349,7 +352,7 @@ function createDevStatusDependencies(deps: DevProfileDependencies) {
           },
         },
       }),
-      formatStatus: (status: unknown) => JSON.stringify(status, null, 2),
+      formatStatus: (status: unknown) => formatDevStatus(status as DevStatusSnapshot),
     },
   };
 }
@@ -394,7 +397,7 @@ function createDevDoctorDependencies(deps: DevProfileDependencies) {
           && checks.runtimeNameIsNode && checks.runtimeVersionSupported
           && checks.runtimeCryptoSelfTestPassed && sourceBridge.ready && sourcePi.extensionPresent);
       },
-      formatDoctor: formatDevDoctor,
+      formatDoctor: formatDoctorChecks,
     },
   };
 }
@@ -409,11 +412,64 @@ function devRuntimeProbe(): ProfileRuntimeProbe {
   };
 }
 
-function formatDevDoctor(checks: Record<string, unknown>): string {
-  return Object.entries(checks)
-    .map(([key, value]) => `${key}: ${typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value)}`)
-    .join('\n');
+type DevStatusSnapshot = {
+  profile: 'dev';
+  configPath: string;
+  identityPath: string;
+  hostId: string | null;
+  statePath: string;
+  discoveryPath: string;
+  adapterUrl: string | null;
+  adapterPort: number | null;
+  piLogPath: string;
+  relayUrl: string | null;
+  runtime: ProfileRuntimeProbe;
+  source: {
+    bridge: {
+      mode: 'foreground';
+      statePresent: boolean;
+      discoveryPresent: boolean;
+      discoveryValid: boolean;
+      ready: boolean;
+    };
+    pi: {
+      mode: 'source-extension';
+      command: string;
+      extensionPath: string;
+      extensionPresent: boolean;
+      discoveryRequired: boolean;
+    };
+  };
+};
+
+function formatDevStatus(status: DevStatusSnapshot): string {
+  const bridge = status.source.bridge.ready
+    ? 'ready'
+    : status.source.bridge.statePresent
+      ? 'degraded'
+      : 'offline';
+  const pi = status.source.pi.extensionPresent ? 'source · present' : 'source · missing';
+  const fields: Array<{ label: string; value: string; detail?: string }> = [
+    { label: 'Profile', value: 'dev' },
+    { label: 'Bridge', value: bridge },
+    { label: 'Host', value: status.hostId ?? '(not initialized)' },
+    { label: 'Relay', value: status.relayUrl ?? '(not configured)' },
+    { label: 'Adapter', value: status.adapterUrl ?? '(unavailable)' },
+    { label: 'Config', value: status.configPath },
+    { label: 'Pi', value: pi, detail: status.source.pi.extensionPath },
+  ];
+  const labelWidth = Math.max(...fields.map(({ label }) => label.length));
+
+  return [
+    'Ariava',
+    '',
+    ...fields.flatMap(({ label, value, detail }) => [
+      `  ${label.padEnd(labelWidth)}  ${value}`,
+      ...(detail ? [`  ${' '.repeat(labelWidth)}  ${detail}`] : []),
+    ]),
+  ].join('\n');
 }
+
 
 function requireInitializedConfig(deps: DevProfileDependencies): void {
   if (!deps.pathExists(deps.paths.configPath)) {

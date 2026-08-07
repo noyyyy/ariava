@@ -55,7 +55,7 @@ describe('trusted profile descriptors', () => {
     expect(devProfile).toMatchObject({
       id: 'dev',
       displayName: 'Development',
-      defaultRelayBaseUrl: 'http://127.0.0.1:8787',
+      defaultRelayBaseUrl: 'http://127.0.0.1:8790',
       resources: {
         root: resolve(home, '.config', 'ariava-dev'),
         configPath: resolve(home, '.config', 'ariava-dev', 'config.json'),
@@ -212,8 +212,16 @@ describe('trusted profile descriptors', () => {
 
     const outside = temporaryHome('outside');
     mkdirSync(outside, { recursive: true, mode: 0o700 });
-    symlinkSync(outside, join(profile.resources.root, 'state'));
+    const stateDirectory = join(profile.resources.root, 'state');
+    symlinkSync(outside, stateDirectory);
     expect(() => profile.assertResolvedResources(valid)).toThrow(/symlink|escape|root/i);
+
+    rmSync(stateDirectory);
+    rmSync(outside, { recursive: true, force: true });
+    symlinkSync(outside, stateDirectory);
+    expect(() => profile.assertResolvedResources(valid)).toThrow(
+      /Ariava profile resource symlink traversal is not allowed/,
+    );
   });
 
   test('derives complete safe custom default state, discovery, and port resources', () => {

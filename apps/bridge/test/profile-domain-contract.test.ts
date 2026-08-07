@@ -249,7 +249,9 @@ describe('profile-aware config mutation policy', () => {
     const rotated = await runConfigCommand(['agent-secret', 'rotate'], context);
     const rotateAfter = readFileSync(profile.resources.configPath);
     expect(rotated.envelope.data).toEqual({ generated: true, rotated: true });
-    expect(rotated.human).toBe('Rotated Agent Adapter secret. Restart the Ariava service and reload pi sessions.');
+    expect(rotated.human).toBe(profileId === 'dev'
+      ? 'Rotated Agent Adapter secret. Restart the source Bridge and reload pi sessions.'
+      : 'Rotated Agent Adapter secret. Restart the Ariava service and reload pi sessions.');
     expect(JSON.stringify(rotated)).not.toContain(ensuredSecret);
     expect(JSON.stringify(rotated)).not.toContain(rotatedSecret);
     expect(harness.config(profileId).agentAdapterSecret).toBe(rotatedSecret);
@@ -439,7 +441,7 @@ describe('profile-aware initialization and identity inspection', () => {
     const result = await initializeProfile(harness.contexts[profileId]);
 
     expect(result.config).toMatchObject({
-      relayBaseUrl: profileId === 'default' ? 'https://ariava-relay.noyx.io' : 'http://127.0.0.1:8787',
+      relayBaseUrl: profileId === 'default' ? 'https://ariava-relay.noyx.io' : 'http://127.0.0.1:8790',
       hostName: profileId === 'default' ? 'fixture-host' : 'fixture-host (Dev)',
       agentAdapterPort: profileId === 'default' ? 7272 : 7273,
       agentAdapterSecret: `${profileId}-secret`,
@@ -517,7 +519,7 @@ describe('profile-aware identity rotation and reset', () => {
       },
     });
 
-    expect(observedRelay).toBe(profileId === 'default' ? 'https://ariava-relay.noyx.io' : 'http://127.0.0.1:8787');
+    expect(observedRelay).toBe(profileId === 'default' ? 'https://ariava-relay.noyx.io' : 'http://127.0.0.1:8790');
     expect(observedEntityId).toBe(result.entityId);
     expect(harness.config(profileId).identity).toMatchObject({ hostId: result.entityId, keyId: result.newKeyId });
     expect(harness.events.some((event) => event.profile === profileId && event.action === 'keychainWrites')).toBe(true);
@@ -553,7 +555,7 @@ describe('profile-aware identity rotation and reset', () => {
 
     expect(result.links).toEqual([]);
     expect(enrollment).toMatchObject({
-      relayBaseUrl: profileId === 'default' ? 'https://ariava-relay.noyx.io' : 'http://127.0.0.1:8787',
+      relayBaseUrl: profileId === 'default' ? 'https://ariava-relay.noyx.io' : 'http://127.0.0.1:8790',
       signerEntityId: result.hostId,
       hostName: profileId === 'default' ? 'fixture-host' : 'fixture-host (Dev)',
       platform: 'macos',
@@ -724,7 +726,7 @@ describe('profile-aware pairing security transaction', () => {
     expect(keyringPaths).toEqual([harness.profiles[profileId].resources.linkKeyringPath]);
     const suffix = profileId === 'default' ? 'D' : 'V';
     expect(relaySelections).toEqual([{
-      relayBaseUrl: profileId === 'default' ? 'https://ariava-relay.noyx.io' : 'http://127.0.0.1:8787',
+      relayBaseUrl: profileId === 'default' ? 'https://ariava-relay.noyx.io' : 'http://127.0.0.1:8790',
       signerEntityId: `host_${suffix.repeat(43)}`,
       signerKeyId: `key_${suffix.repeat(43)}`,
     }]);

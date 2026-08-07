@@ -13,7 +13,7 @@ This repository contains the Ariava Bridge, pi extension, protocol, and shared u
 ## Guided onboarding invariants
 
 - The documented shortest first run is `npx --yes ariava@latest setup`; retain manual `init`, config, service, Pi install, doctor, and recovery commands.
-- Fresh production configuration defaults to `https://ariava-relay.noyx.io`. Existing persisted values win. Keep source development explicitly on `http://127.0.0.1:8787`; ambient Relay environment overrides must not silently become service configuration.
+- Fresh production configuration defaults to `https://ariava-relay.noyx.io`. Existing persisted values win. Keep source development explicitly on `http://127.0.0.1:8790`; ambient Relay environment overrides must not silently become service configuration.
 - Before any production Host-state write, npx onboarding must install the exact executing `ariava` version into a positively verified, user-writable global npm prefix and re-enter its stable absolute CLI path. Never add sudo, a hidden prefix, or a shim manager.
 - Keep bootstrap serialization outside `~/.config/ariava`; acquire `~/.config/ariava/onboarding.lock` only after stable re-entry. Locks are owner-only, token-owned, and process-start-aware. Stale recovery fails closed when liveness/start identity cannot be proven, especially on macOS.
 - The production adapter catalog is closed: Pi or no agent extensions. Pi installation must use Pi's official package manager with exactly `npm:@ariava/pi-extension@<exact-cli-version>`; no latest/local/Git/URL/bundled fallback.

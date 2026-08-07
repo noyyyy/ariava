@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import type { ResolvedAriavaConfig } from '../host-manager/config';
 import { pathHasFilesystemEvidence } from '../host-manager/secure-files';
 import { resolveAriavaDefaultProfilePaths } from '../host-manager/paths';
-import { resolveAriavaDevProfilePaths } from '../host-manager/dev-profile';
+import { ARIAVA_DEV_RELAY_BASE_URL, resolveAriavaDevProfilePaths } from '../host-manager/dev-profile';
 import { hostEncryptionIdentityPath, hostLinkKeyringPath } from '../identity/runtime-store';
 import {
   MACOS_IDENTITY_EVIDENCE_ACCOUNTS,
@@ -88,7 +88,7 @@ export function createDevProfile(): AriavaProfileDescriptor {
     id: 'dev',
     displayName: 'Development',
     resources: resourceSet('dev', paths),
-    defaultRelayBaseUrl: 'http://127.0.0.1:8787',
+    defaultRelayBaseUrl: ARIAVA_DEV_RELAY_BASE_URL,
     defaultHostName: (hostname: string) => `${hostname} (Dev)`,
     counterpartResources: resourceSet('default', defaultPaths),
   });
@@ -419,8 +419,20 @@ function canonicalizeExistingAncestor(
     missing.unshift(basename(cursor));
     cursor = parent;
   }
-  observeFilesystemProbe?.(cursor);
-  return resolve(realpathSync(cursor), ...missing);
+  let symlink: boolean;
+  try {
+    symlink = lstatSync(cursor).isSymbolicLink();
+  } catch (error) {
+    throw new TypeError(`Ariava profile resource could not be canonicalized: ${path}`, { cause: error });
+  }
+  if (symlink) {
+    throw new TypeError(`Ariava profile resource symlink traversal is not allowed: ${path}`);
+  }
+  try {
+    return resolve(realpathSync(cursor), ...missing);
+  } catch (error) {
+    throw new TypeError(`Ariava profile resource could not be canonicalized: ${path}`, { cause: error });
+  }
 }
 
 function hasFilesystemEvidence(path: string, observeFilesystemProbe?: ProfileFilesystemProbeObserver): boolean {

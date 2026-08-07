@@ -22,8 +22,9 @@ export async function runStatusCommand(
   }
   if (argv.length !== 0) throw new Error('Usage: ariava status [pi]');
   const status = dependencies.lifecycle.buildStatus(await probeProfile(dependencies));
+  const profileId = dependencies.context().profile.id;
   return {
-    envelope: { ok: true, code: 'ok', message: 'Ariava host status.', data: status },
+    envelope: { ok: true, code: 'ok', message: profileId === 'dev' ? 'Ariava dev host status.' : 'Ariava host status.', data: status },
     human: dependencies.lifecycle.formatStatus(status),
   };
 }
