@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import {
   chmodSync,
+  closeSync,
   existsSync,
   lstatSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -237,9 +239,16 @@ describe('secure runtime lock', () => {
     );
     const replacement = join(lockPath, '..', 'replacement-lock');
     writeRecord(replacement, lock.record);
-    unlinkSync(lockPath);
-    writeFileSync(lockPath, readFileSync(replacement), { mode: 0o600 });
-    expect(() => lock.release()).toThrow(/runtime lock/i);
-    expect(existsSync(lockPath)).toBe(true);
+    const ownedInode = lstatSync(lockPath).ino;
+    const retainedDescriptor = openSync(lockPath, 'r');
+    try {
+      unlinkSync(lockPath);
+      writeFileSync(lockPath, readFileSync(replacement), { mode: 0o600 });
+      expect(lstatSync(lockPath).ino).not.toBe(ownedInode);
+      expect(() => lock.release()).toThrow(/runtime lock/i);
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      closeSync(retainedDescriptor);
+    }
   });
 });
