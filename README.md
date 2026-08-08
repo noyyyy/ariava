@@ -74,6 +74,19 @@ ariava logs
 
 The command surface is intentionally narrow. Ariava does not expose arbitrary shell execution, unrestricted input, a remote terminal, or a transcript browser.
 
+## Canonical Runtime Model
+
+Ariava uses one encrypted, versioned runtime model:
+
+- Event type is exactly `done | need_human`.
+- Session status is exactly `idle | working | need_human`.
+- Normal completion atomically produces one `done` Event and an `idle` Session.
+- Driver failures are Bridge health/log/retry concerns, not user-facing Events.
+- Host availability is a Relay-presence concern, not a Session status.
+- Encrypted runtime payloads use `event-content-v2`, `session-content-v2`, and `notification-preview-v2`.
+- Notification categories are exactly `agent.done` and `agent.need_human`.
+- There is no compatibility decoder, negotiation, dual read/write, or fallback for prior runtime payload versions.
+
 ## Build from Source
 
 Requirements: [Bun](https://bun.sh/) for workspace/build orchestration and Node.js 22+ for the production Bridge crypto/runtime gate.
