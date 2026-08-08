@@ -42,7 +42,12 @@ if (declarations.status !== 0) process.exit(declarations.status ?? 1);
 if (packageName === 'protocol') {
   const fixtureDir = resolve(dist, 'fixtures');
   mkdirSync(fixtureDir, { recursive: true });
-  for (const fixture of ['ed25519-request-vectors.json', 'e2e-v1-vectors.json', 'notification-preview-v1-vector.json']) {
+  for (const fixture of [
+    'ed25519-request-vectors.json',
+    'e2e-v2-vectors.json',
+    'notification-preview-v2-vector.json',
+    'need-human-error-validation-v2.json',
+  ]) {
     cpSync(resolve(packageRoot, 'test', 'fixtures', fixture), resolve(fixtureDir, fixture));
   }
 }

@@ -328,7 +328,7 @@ describe('source dev profile commands', () => {
     harness.deps.createBridge = (config) => ({
       start: async () => {
         writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
-          url: `http://127.0.0.1:${config.agentAdapter.port}`, secret: 'dev-secret',
+          url: `http://127.0.0.1:${config.agentAdapter.port}`, secret: 'dev-secret', protocolVersion: 2,
         });
       },
       runForever: () => new Promise<void>((resolveRun) => { finishBridge = resolveRun; }),
@@ -478,7 +478,7 @@ describe('source dev profile commands', () => {
     expect(harness.errorOutput()).toContain('discovery is missing');
     expect(spawns).toBe(0);
 
-    writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, { url: 'http://127.0.0.1:7273', secret: 'secret' });
+    writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, { url: 'http://127.0.0.1:7273', secret: 'secret', protocolVersion: 2 });
     harness.deps.sourcePiExtensionPath = join(harness.root, 'missing-index.ts');
     expect(await runDevProfileCommand(['pi'], harness.deps)).toBe(1);
     expect(harness.errorOutput()).toContain('Source pi extension is missing');
@@ -487,7 +487,7 @@ describe('source dev profile commands', () => {
 
   test('pi launches the source extension with only dev Ariava overrides', async () => {
     const harness = createHarness();
-    writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, { url: 'http://127.0.0.1:7273', secret: 'secret' });
+    writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, { url: 'http://127.0.0.1:7273', secret: 'secret', protocolVersion: 2 });
     const extensionPath = join(harness.root, 'index.ts');
     writeFileSync(extensionPath, 'export default {}', { mode: 0o600 });
     harness.deps.sourcePiExtensionPath = extensionPath;
@@ -525,7 +525,7 @@ describe('source dev profile commands', () => {
     writeFileSync(join(defaultRoot, 'config.json'), '{not-json', { mode: 0o600 });
     writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
       url: 'http://127.0.0.1:7273',
-      secret: 'must-not-appear',
+      secret: 'must-not-appear', protocolVersion: 2,
     });
     const offset = harness.output().length;
     expect(await runDevProfileCommand(['status'], harness.deps)).toBe(0);
@@ -534,6 +534,10 @@ describe('source dev profile commands', () => {
     expect(statusOutput).not.toMatch(/^\{/);
     expect(() => JSON.parse(statusOutput)).toThrow();
     expect(statusOutput).toContain('http://127.0.0.1:7273');
+    expect(statusOutput).toContain('Bridge');
+    expect(statusOutput).toContain('local API · http://127.0.0.1:7273');
+    expect(statusOutput).not.toContain('Adapter');
+    expect(statusOutput).toContain('Pi extension');
     expect(statusOutput).toContain(harness.deps.paths.configPath);
     expect(statusOutput).not.toContain('must-not-appear');
     expect(readFileSync(join(defaultRoot, 'config.json'), 'utf8')).toBe('{not-json');
@@ -544,7 +548,7 @@ describe('source dev profile commands', () => {
     await runDevProfileCommand(['init'], harness.deps);
     writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
       url: 'http://127.0.0.1:7273',
-      secret: 'source-only-secret',
+      secret: 'source-only-secret', protocolVersion: 2,
     });
     mkdirSync(join(harness.deps.paths.statePath, '..'), { recursive: true, mode: 0o700 });
     writeFileSync(harness.deps.paths.statePath, '{}', { mode: 0o600 });
@@ -605,7 +609,7 @@ describe('source dev profile commands', () => {
     await runDevProfileCommand(['init'], harness.deps);
     writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
       url: 'http://127.0.0.1:7272',
-      secret: 'dev-wrong-port-secret',
+      secret: 'dev-wrong-port-secret', protocolVersion: 2,
     });
     mkdirSync(join(harness.deps.paths.statePath, '..'), { recursive: true, mode: 0o700 });
     writeFileSync(harness.deps.paths.statePath, '{}', { mode: 0o600 });

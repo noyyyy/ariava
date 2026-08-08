@@ -65,15 +65,15 @@ async function main(): Promise<void> {
       '  bun run ./apps/bridge/src/cli.ts daemon --once              Run one sync against the relay',
       '  bun run ./apps/bridge/src/cli.ts daemon                     Run the long-lived bridge loop',
       '  bun run ./apps/bridge/src/cli.ts pair <PAIRING_CODE>        Pair this host with a watch using its pairing code',
-      '  bun run ./apps/bridge/src/cli.ts simulate [kind]            Emit a sample done/need_human payload',
+      '  bun run ./apps/bridge/src/cli.ts simulate [kind]            Emit a sample blocked/question/done payload',
     ].join('\n'),
   );
 }
 
 function parseSimulationScenario(value: string | undefined): SimulationScenario {
-  if (value === undefined) return 'need_human';
-  if (value === 'done' || value === 'need_human') return value;
-  throw new Error('Usage: ariava simulate [done|need_human]');
+  if (value === undefined) return 'blocked';
+  if (value === 'blocked' || value === 'question' || value === 'done') return value;
+  throw new Error('Usage: ariava simulate [blocked|question|done]');
 }
 
 main().catch((error) => {

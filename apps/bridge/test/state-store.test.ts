@@ -1,11 +1,50 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BridgeStateStore } from '../src/state-store';
-import type { CanonicalSessionState, HostProjection } from '@ariava/protocol';
+import { spoolPathForState } from '../src/e2e/local-spool';
+import type { CanonicalEvent, CanonicalSessionState, HostProjection } from '@ariava/protocol';
 
 const paths: string[] = [];
+const LEGACY_AT = '2026-08-07T00:00:00.000Z';
+
+function exactLegacyState() {
+  const session = {
+    sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'project', nameText: 'name',
+    stateLabel: 'Done', status: 'done', updatedAt: LEGACY_AT, lastEventId: 'evt-1',
+  };
+  const event = {
+    eventId: 'evt-1', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'done',
+    typeLabel: 'Done', agentText: 'legacy event', createdAt: LEGACY_AT,
+  };
+  return {
+    host: { hostId: 'host-1', hostName: 'Legacy', platform: 'linux', bridgeVersion: '0.1.0',
+      registeredAt: LEGACY_AT, lastSeenAt: LEGACY_AT, bridgeStatus: 'online', claimCode: 'LEGACY1' },
+    sessions: { 'sess-1': session }, sessionDrivers: { 'sess-1': 'pi' }, reconciledDrivers: { pi: true },
+    recentEvents: [event], pendingEvents: [event], sessionRevisions: { 'sess-1': 4 }, recipientSetVersion: 3,
+    eventUploadCompletions: { 'evt-1': { version: 1, eventId: 'evt-1', sessionId: 'sess-1', revision: 4,
+      eventContentId: 'event-content', sessionContentId: 'session-content', committedAt: LEGACY_AT } },
+    producerEventReservations: { ['sess-1\nfingerprint']: { version: 1, eventId: 'evt-1', sessionId: 'sess-1',
+      fingerprint: 'fingerprint', createdAt: LEGACY_AT } },
+    terminalCancellations: { 'evt-1': { version: 1, eventId: 'evt-1', sessionId: 'sess-1',
+      fingerprint: 'fingerprint', removeSession: false, createdAt: LEGACY_AT } },
+    pendingHandles: { 'host-1:sess-1': { hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-1',
+      handledAt: LEGACY_AT, action: 'pi_input', updatedAt: LEGACY_AT } },
+    commandResults: { command: { commandId: 'command', hostId: 'host-1', sessionId: 'sess-1', accepted: true,
+      status: 'executed', message: 'done', updatedAt: LEGACY_AT } }, seenCommands: { command: LEGACY_AT },
+    currentSessionsSnapshot: { version: 1, lastAllocatedRevision: 8, lastAcceptedRevision: 7,
+      lastAcceptedDigest: 'digest', lastAcceptedContentDigest: 'content', lastAcceptedRecipientSetVersion: 3 },
+  };
+}
+
+
+mock.module('../src/e2e/node-crypto', () => ({
+  chachaPolySeal: (_key: Uint8Array, plaintext: Uint8Array) => ({
+    nonce: new Uint8Array(12).fill(1), ciphertext: new Uint8Array([...plaintext, ...new Uint8Array(16)]),
+  }),
+  chachaPolyOpen: (_key: Uint8Array, _nonce: Uint8Array, ciphertext: Uint8Array) => ciphertext.slice(0, -16),
+}));
 
 afterEach(() => {
   for (const path of paths.splice(0)) {
@@ -54,50 +93,30 @@ describe('BridgeStateStore', () => {
     });
   });
 
-  test('migrates legacy persisted hosts by removing claim-code fields on load', () => {
-    const root = join(tmpdir(), `bridge-store-${Date.now()}`);
-    paths.push(root);
+  test('resets recognized schema-less state instead of preserving legacy Host fields', () => {
+    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
     const statePath = join(root, 'state.json');
-
     mkdirSync(root, { recursive: true, mode: 0o700 });
-    writeFileSync(
-      statePath,
-      JSON.stringify({
-        host: {
-          hostId: 'host-legacy',
-          hostName: 'Legacy Mac',
-          platform: 'macos',
-          bridgeVersion: '0.1.2',
-              registeredAt: '2026-07-04T09:00:00Z',
-          lastSeenAt: '2026-07-04T09:00:01Z',
-          bridgeStatus: 'online',
-          claimCode: 'LEGACY1',
-          claimCodeExpiresAt: '2026-07-04T09:10:00Z',
-        },
-      }),
-    );
+    const legacy = { ...exactLegacyState(), host: { ...exactLegacyState().host, claimCode: 'LEGACY1' } };
+    writeFileSync(statePath, JSON.stringify(legacy), { mode: 0o600 });
     chmodSync(statePath, 0o600);
 
-    const store = new BridgeStateStore(statePath);
+    expect(() => new BridgeStateStore(statePath)).toThrow('Bridge state file is invalid or insecure');
+    const store = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    store.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', {
+      loadOrCreate: () => new Uint8Array(32).fill(7),
+    });
 
-    expect(store.getHost()).toEqual({
-      hostId: 'host-legacy',
-      hostName: 'Legacy Mac',
-      platform: 'macos',
-      bridgeVersion: '0.1.2',
-      registeredAt: '2026-07-04T09:00:00Z',
-      lastSeenAt: '2026-07-04T09:00:01Z',
-      bridgeStatus: 'online',
-    });
-    expect(JSON.parse(readFileSync(statePath, 'utf8')).host).toEqual({
-      hostId: 'host-legacy',
-      hostName: 'Legacy Mac',
-      platform: 'macos',
-      bridgeVersion: '0.1.2',
-      registeredAt: '2026-07-04T09:00:00Z',
-      lastSeenAt: '2026-07-04T09:00:01Z',
-      bridgeStatus: 'online',
-    });
+    expect(store.getHost()).toBeNull();
+    expect(store.listSessions()).toEqual([]);
+    expect(store.peekPendingEvents()).toEqual([]);
+    expect(store.peekPendingSessionHandles()).toEqual([]);
+    const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(persisted.schemaVersion).toBe(2);
+    expect(persisted).not.toHaveProperty('pendingEvents');
+    expect(persisted).not.toHaveProperty('pendingReads');
+    expect(store.getRuntimeHealth()).toEqual({ status: 'healthy', drivers: [] });
+    expect(persisted.runtimeHealth).toEqual({ status: 'healthy', drivers: [] });
   });
 
   test('fails closed on insecure legacy state permissions', () => {
@@ -161,111 +180,277 @@ describe('BridgeStateStore', () => {
     store.replaceDriverSessions('pi', []);
     expect(store.listSessions()).toHaveLength(0);
   });
-  test('initializes snapshot state without discarding a complete legacy state file', () => {
+  test('breaking preflight clears every recognized legacy runtime family', () => {
     const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
     const statePath = join(root, 'state.json');
     mkdirSync(root, { recursive: true, mode: 0o700 });
-    const legacy = {
-      host: null,
-      sessions: { 'sess-1': { sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'p', nameText: 'n', stateLabel: 'Ready', status: 'idle', updatedAt: '2026-07-20T00:00:00.000Z' } },
-      sessionDrivers: { 'sess-1': 'pi' },
-      recentEvents: [{ eventId: 'evt-recent', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'done', typeLabel: 'Done', createdAt: '2026-07-20T00:00:01.000Z' }],
-      pendingEvents: [{ eventId: 'evt-pending', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'working', status: 'working', typeLabel: 'Working', createdAt: '2026-07-20T00:00:02.000Z' }],
-      pendingHandles: { 'host-1:sess-1': { hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-recent', handledAt: '2026-07-20T00:00:03.000Z', action: 'pi_input', updatedAt: '2026-07-20T00:00:03.000Z' } },
-      commandResults: { 'cmd-1': { commandId: 'cmd-1', hostId: 'host-1', sessionId: 'sess-1', accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-07-20T00:00:04.000Z' } },
-      seenCommands: { 'cmd-1': '2026-07-20T00:00:04.000Z' },
-    };
-    writeFileSync(statePath, JSON.stringify(legacy)); chmodSync(statePath, 0o600);
-    const store = new BridgeStateStore(statePath);
-    expect(store.listSessions()).toEqual(Object.values(legacy.sessions));
-    expect(store.peekPendingEvents()).toEqual(legacy.pendingEvents);
-    expect(store.peekPendingSessionHandles()).toEqual(Object.values(legacy.pendingHandles));
-    expect(store.getCommandResult('cmd-1')).toEqual(legacy.commandResults['cmd-1']);
-    expect(store.hasSeenCommand('cmd-1')).toBe(true);
+    const legacy = exactLegacyState();
+    writeFileSync(statePath, JSON.stringify(legacy), { mode: 0o600 });
+    const store = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    store.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', {
+      loadOrCreate: () => new Uint8Array(32).fill(7),
+    });
+
+    expect(store.listSessions()).toEqual([]);
+    expect(store.peekPendingEvents()).toEqual([]);
+    expect(store.peekPendingSessionHandles()).toEqual([]);
+    expect(store.getCommandResult('command')).toBeUndefined();
+    expect(store.hasSeenCommand('command')).toBe(false);
+    expect(store.getRecipientSetVersion()).toBeUndefined();
     expect(store.getCurrentSessionsSnapshotState()).toEqual({ version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0 });
-    const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
-    expect(persisted.recentEvents).toEqual(legacy.recentEvents);
-    expect(persisted.currentSessionsSnapshot).toEqual({ version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0 });
   });
 
-  test('persists pending handles monotonically and migrates legacy pending reads', () => {
-    const root = join(tmpdir(), `bridge-store-${Date.now()}`);
-    paths.push(root);
+  test('persists current pending handles monotonically and resets legacy pending reads', () => {
+    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
     const statePath = join(root, 'state.json');
     const store = new BridgeStateStore(statePath);
 
+    store.replaceDriverSessions('pi', [{
+      sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'project', nameText: 'Task',
+      status: 'idle', updatedAt: '2026-07-16T00:00:02Z', lastEventId: 'evt-2',
+    }]);
+    store.appendRecentEvent({
+      eventId: 'evt-1', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
+      typeLabel: 'Task complete', agentText: 'First', createdAt: '2026-07-16T00:00:01Z',
+    });
+    store.appendRecentEvent({
+      eventId: 'evt-2', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
+      typeLabel: 'Task complete', agentText: 'Second', createdAt: '2026-07-16T00:00:02Z',
+    });
     store.queuePendingSessionHandle({
       hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-2',
       handledThroughEventCreatedAt: '2026-07-16T00:00:02Z', handledAt: '2026-07-16T00:00:03Z',
       action: 'pi_input', updatedAt: '2026-07-16T00:00:03Z',
     });
-    store.queuePendingSessionHandle({
+    expect(() => store.queuePendingSessionHandle({
       hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-1',
       handledThroughEventCreatedAt: '2026-07-16T00:00:01Z', handledAt: '2026-07-16T00:00:04Z',
       action: 'pi_input', updatedAt: '2026-07-16T00:00:04Z',
-    });
+    })).toThrow(/older than/u);
     expect(store.peekPendingSessionHandles()[0]?.handledThroughEventId).toBe('evt-2');
 
+    store.dispose();
     const reloaded = new BridgeStateStore(statePath);
     expect(reloaded.peekPendingSessionHandles()[0]?.handledThroughEventId).toBe('evt-2');
     reloaded.removePendingSessionHandle('host-1', 'sess-1', 'evt-1');
     expect(reloaded.peekPendingSessionHandles()).toHaveLength(1);
     reloaded.removePendingSessionHandle('host-1', 'sess-1', 'evt-2');
     expect(reloaded.peekPendingSessionHandles()).toHaveLength(0);
+    reloaded.dispose();
 
-    writeFileSync(statePath, JSON.stringify({
-      pendingReads: {
-        'host-1:sess-2': { hostId: 'host-1', sessionId: 'sess-2', latestReadEventId: 'evt-legacy',
-          readAt: '2026-07-16T00:00:05Z', source: 'bridge_recovery', updatedAt: '2026-07-16T00:00:05Z' },
+    const orphanBytes = JSON.stringify({ pendingReads: {
+      'host-1:sess-2': { hostId: 'host-1', sessionId: 'sess-2', latestReadEventId: 'evt-legacy',
+        readAt: LEGACY_AT, source: 'pi_local_interaction', updatedAt: LEGACY_AT },
+    } });
+    writeFileSync(statePath, orphanBytes, { mode: 0o600 });
+    let keyAccessed = false;
+    const reset = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    expect(() => reset.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', {
+      loadOrCreate: () => { keyAccessed = true; return new Uint8Array(32).fill(7); },
+    })).toThrow('Bridge runtime preflight failed closed');
+    expect(keyAccessed).toBe(false);
+    expect(readFileSync(statePath, 'utf8')).toBe(orphanBytes);
+  });
+
+  test('rejects an orphan legacy pending publication byte-identically', () => {
+    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json'); mkdirSync(root, { recursive: true, mode: 0o700 });
+    const bytes = JSON.stringify({ currentSessionsSnapshot: {
+      version: 1, lastAllocatedRevision: 3, lastAcceptedRevision: 2, pending: {
+        request: { hostId: 'host-1', revision: 3, observedAt: LEGACY_AT, recipientSetVersion: 1,
+          sessions: [{ sessionId: 'sess-1', sessionRevision: 1 }] },
+        digest: 'digest', contentDigest: 'content',
       },
-    }));
-    chmodSync(statePath, 0o600);
-    const migrated = new BridgeStateStore(statePath);
-    expect(migrated.peekPendingSessionHandles()).toEqual([{
-      hostId: 'host-1', sessionId: 'sess-2', handledThroughEventId: 'evt-legacy',
-      handledThroughEventCreatedAt: undefined, handledAt: '2026-07-16T00:00:05Z',
-      action: 'bridge_recovery', updatedAt: '2026-07-16T00:00:05Z',
-    }]);
-  });
-
-  test('migrates a valid metadata-only pending publication into the revision cursor', () => {
-    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
-    const statePath = join(root, 'state.json'); mkdirSync(root, { recursive: true, mode: 0o700 });
-    writeFileSync(statePath, JSON.stringify({ currentSessionsSnapshot: { version: 1, lastAllocatedRevision: 3, lastAcceptedRevision: 2, pending: {
-      digest: 'digest', contentDigest: 'content', request: { hostId: 'host-1', revision: 7, observedAt: '2026-07-20T00:00:00.000Z',
-        recipientSetVersion: 1, sessions: [{ sessionId: 'sess-1', sessionRevision: 4 }] },
-    } } }));
-    chmodSync(statePath, 0o600);
-
-    expect(new BridgeStateStore(statePath).getCurrentSessionsSnapshotState()).toEqual({
-      version: 1, lastAllocatedRevision: 7, lastAcceptedRevision: 2,
-    });
-    expect(JSON.parse(readFileSync(statePath, 'utf8')).currentSessionsSnapshot).toEqual({
-      version: 1, lastAllocatedRevision: 7, lastAcceptedRevision: 2,
-    });
-  });
-
-  test('fails closed on legacy plaintext pending lifecycle state without rewriting its revision lower bound', () => {
-    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
-    const statePath = join(root, 'state.json');
-    mkdirSync(root, { recursive: true, mode: 0o700 });
-    const legacy = { currentSessionsSnapshot: { version: 1, lastAllocatedRevision: 3, lastAcceptedRevision: 2, pending: {
-      digest: 'legacy', contentDigest: 'legacy-content', request: { hostId: 'host-1', revision: 7, observedAt: '2026-07-20T00:00:00.000Z',
-        sessions: [{ sessionId: 'sess-1', projectName: 'protected-marker' }] } } } };
-    writeFileSync(statePath, JSON.stringify(legacy)); chmodSync(statePath, 0o600);
-    expect(() => new BridgeStateStore(statePath)).toThrow('Bridge state file is invalid or insecure');
-    expect(JSON.parse(readFileSync(statePath, 'utf8'))).toEqual(legacy);
-  });
-
-  test('fails closed without digest proof and leaves protected pending bytes untouched', () => {
-    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
-    const statePath = join(root, 'state.json'); mkdirSync(root, { recursive: true, mode: 0o700 });
-    const bytes = JSON.stringify({ currentSessionsSnapshot: { version: 1, lastAllocatedRevision: 9, lastAcceptedRevision: 4, pending: {
-      request: { hostId: 'host-1', revision: 9, observedAt: '2026-07-20T00:00:00.000Z', recipientSetVersion: 1,
-        sessions: [{ sessionId: 'sess-1', sessionRevision: 1, nameText: 'protected-marker' }] } } } });
-    writeFileSync(statePath, bytes); chmodSync(statePath, 0o600);
-    expect(() => new BridgeStateStore(statePath)).toThrow('Bridge state file is invalid or insecure');
+    } });
+    writeFileSync(statePath, bytes, { mode: 0o600 });
+    let keyAccessed = false;
+    const store = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    expect(() => store.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', {
+      loadOrCreate: () => { keyAccessed = true; return new Uint8Array(32).fill(7); },
+    })).toThrow('Bridge runtime preflight failed closed');
+    expect(keyAccessed).toBe(false);
     expect(readFileSync(statePath, 'utf8')).toBe(bytes);
+  });
+
+  test('fails closed on unprovable legacy input and preserves exact bytes', () => {
+    const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json'); mkdirSync(root, { recursive: true, mode: 0o700 });
+    const bytes = '{"pendingEvents":[],"unknownProtectedFamily":{"marker":"protected"}}\n';
+    writeFileSync(statePath, bytes, { mode: 0o600 });
+    let keyAccessed = false;
+    const store = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    expect(() => store.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', {
+      loadOrCreate: () => { keyAccessed = true; return new Uint8Array(32).fill(7); },
+    })).toThrow();
+    expect(keyAccessed).toBe(false);
+    expect(readFileSync(statePath, 'utf8')).toBe(bytes);
+  });
+
+
+  test('keeps event tuple atomic across key-store, spool-file, and state-file failures', () => {
+    const root = join(tmpdir(), `bridge-store-atomic-${Date.now()}`); paths.push(root);
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const statePath = join(root, 'state.json');
+    const keyStore = { loadOrCreate: () => new Uint8Array(32).fill(7) };
+    const event = {
+      eventId: 'evt-atomic', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
+      typeLabel: 'Task complete', agentText: 'Finished', projectName: 'project', contextText: 'Task · project',
+      workingDirectory: '/project', hbaseSessionKey: 'sess-1', harnessProvider: 'pi', createdAt: '2026-08-07T00:00:01.000Z',
+    } satisfies CanonicalEvent;
+    const session = {
+      sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'project', nameText: 'Task',
+      latestActivityText: 'Finished', workingDirectory: '/project', hbaseSessionKey: 'sess-1', harnessProvider: 'pi',
+      status: 'idle', updatedAt: event.createdAt, lastEventId: event.eventId,
+    } satisfies CanonicalSessionState;
+
+    const keyFailure = new BridgeStateStore(statePath);
+    expect(() => keyFailure.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', {
+      loadOrCreate: () => { throw new Error('key failure'); },
+    })).toThrow();
+    expect(keyFailure.peekPendingUploads()).toEqual([]);
+    expect(keyFailure.listSessions()).toEqual([]);
+
+    keyFailure.dispose();
+    const spoolFailurePath = spoolPathForState(statePath);
+    const spoolFailure = new BridgeStateStore(statePath);
+    spoolFailure.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', keyStore);
+    rmSync(spoolFailurePath);
+    mkdirSync(spoolFailurePath, { mode: 0o700 });
+    expect(() => spoolFailure.queuePendingEvent(event, session)).toThrow();
+    expect(spoolFailure.peekPendingUploads()).toEqual([]);
+    expect(spoolFailure.listSessions()).toEqual([]);
+    spoolFailure.dispose();
+    rmSync(spoolFailurePath, { recursive: true, force: true });
+    rmSync(statePath);
+
+    const writes = { fail: true };
+    const journaled = new BridgeStateStore(statePath, (path, value) => {
+      if (writes.fail) throw new Error('state write failure');
+      writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+    });
+    journaled.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', keyStore);
+    expect(() => journaled.queuePendingEvent(event, session)).toThrow('state write failure');
+    expect(journaled.peekPendingUploads()).toEqual([{ event, session }]);
+    expect(journaled.listSessions()).toEqual([]);
+    writes.fail = false;
+
+    journaled.dispose();
+    const restarted = new BridgeStateStore(statePath);
+    restarted.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', keyStore);
+    expect(restarted.peekPendingUploads()).toEqual([{ event, session }]);
+    expect(restarted.listSessions()).toEqual([session]);
+    const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(persisted.recentEvents).toEqual([event]);
+    expect(persisted.sessions['sess-1']).toEqual(session);
+  });
+
+  test('rejects orphan and foreign handle cursors without mutation', () => {
+    const root = join(tmpdir(), `bridge-store-handle-binding-${Date.now()}`); paths.push(root);
+    const store = new BridgeStateStore(join(root, 'state.json'));
+    store.replaceDriverSessions('pi', [{
+      sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'project', nameText: 'Task',
+      status: 'idle', updatedAt: LEGACY_AT, lastEventId: 'evt-1',
+    }]);
+    store.appendRecentEvent({
+      eventId: 'evt-1', hostId: 'host-1', sessionId: 'sess-other', provider: 'pi', type: 'done', status: 'idle',
+      typeLabel: 'Task complete', agentText: 'Foreign', createdAt: LEGACY_AT,
+    });
+    const handle = { hostId: 'host-1', sessionId: 'sess-1', handledAt: LEGACY_AT, action: 'pi_input' as const, updatedAt: LEGACY_AT };
+    expect(() => store.queuePendingSessionHandle({ ...handle, handledThroughEventId: 'missing' })).toThrow(/durable Event/u);
+    expect(() => store.queuePendingSessionHandle({ ...handle, handledThroughEventId: 'evt-1' })).toThrow(/same Host and Session/u);
+    expect(store.peekPendingSessionHandles()).toEqual([]);
+  });
+
+  test('retains handle Event evidence after Session removal and through restart', () => {
+    const root = join(tmpdir(), `bridge-store-handle-history-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json');
+    const store = new BridgeStateStore(statePath);
+    store.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', {
+      loadOrCreate: () => new Uint8Array(32).fill(7),
+    });
+    store.replaceDriverSessions('pi', [{
+      sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'project', nameText: 'Task',
+      status: 'idle', updatedAt: LEGACY_AT, lastEventId: 'evt-bound',
+    }]);
+    store.appendRecentEvent({
+      eventId: 'evt-bound', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
+      typeLabel: 'Task complete', agentText: 'Done', createdAt: LEGACY_AT,
+    });
+    store.queuePendingSessionHandle({
+      hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-bound', handledAt: LEGACY_AT,
+      action: 'pi_input', updatedAt: LEGACY_AT,
+    });
+    store.replaceDriverSessions('pi', []);
+    store.dispose();
+    const restarted = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    restarted.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', {
+      loadOrCreate: () => new Uint8Array(32).fill(7),
+    });
+    expect(restarted.listSessions()).toEqual([]);
+    expect(restarted.peekPendingSessionHandles()).toEqual([expect.objectContaining({
+      handledThroughEventId: 'evt-bound', handledThroughEventCreatedAt: LEGACY_AT,
+    })]);
+  });
+
+  test('releases handle Event evidence for normal bounded eviction after delivery', () => {
+    const root = join(tmpdir(), `bridge-store-handle-eviction-${Date.now()}`); paths.push(root);
+    const store = new BridgeStateStore(join(root, 'state.json'));
+    store.replaceDriverSessions('pi', [{
+      sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'project', nameText: 'Task',
+      status: 'idle', updatedAt: LEGACY_AT, lastEventId: 'evt-bound',
+    }]);
+    store.appendRecentEvent({
+      eventId: 'evt-bound', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
+      typeLabel: 'Task complete', agentText: 'Done', createdAt: LEGACY_AT,
+    });
+    store.queuePendingSessionHandle({
+      hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-bound', handledAt: LEGACY_AT,
+      action: 'pi_input', updatedAt: LEGACY_AT,
+    });
+    for (let index = 0; index < 200; index += 1) {
+      store.appendRecentEvent({
+        eventId: `evt-new-${index}`, hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
+        typeLabel: 'Task complete', agentText: 'New', createdAt: `2026-08-08T00:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z`,
+      });
+    }
+    expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).recentEvents.some((event: { eventId: string }) => event.eventId === 'evt-bound')).toBe(true);
+    store.removePendingSessionHandle('host-1', 'sess-1', 'evt-bound');
+    store.appendRecentEvent({
+      eventId: 'evt-new-final', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
+      typeLabel: 'Task complete', agentText: 'Newest', createdAt: '2026-08-09T00:00:00.000Z',
+    });
+    expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).recentEvents.some((event: { eventId: string }) => event.eventId === 'evt-bound')).toBe(false);
+  });
+
+  test('preserves bounded command history after Session removal and restart', () => {
+    const root = join(tmpdir(), `bridge-store-command-history-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json');
+    const store = new BridgeStateStore(statePath);
+    store.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', {
+      loadOrCreate: () => new Uint8Array(32).fill(7),
+    });
+    store.replaceDriverSessions('pi', [{
+      sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'project', nameText: 'Task',
+      status: 'idle', updatedAt: LEGACY_AT,
+    }]);
+    for (let index = 0; index < 201; index += 1) {
+      const commandId = `cmd-${index}`;
+      const result = { commandId, hostId: 'host-1', sessionId: 'sess-1', accepted: index % 2 === 0,
+        status: index % 2 === 0 ? 'executed' as const : 'rejected' as const, message: 'recorded',
+        updatedAt: `2026-08-07T00:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z` };
+      store.rememberCommandResult(result, result);
+    }
+    store.replaceDriverSessions('pi', []);
+    expect(store.getCommandResult('cmd-0')).toBeUndefined();
+    expect(store.getCommandResult('cmd-200')).toMatchObject({ status: 'executed' });
+    store.dispose();
+    const restarted = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    restarted.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', {
+      loadOrCreate: () => new Uint8Array(32).fill(7),
+    });
+    expect(restarted.listSessions()).toEqual([]);
+    expect(restarted.getCommandResult('cmd-1')).toMatchObject({ status: 'rejected' });
+    expect(restarted.getCommandResult('cmd-200')).toMatchObject({ status: 'executed' });
   });
 
   test('fails closed on non-positive persisted member session revisions', () => {

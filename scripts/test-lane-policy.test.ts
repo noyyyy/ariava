@@ -130,7 +130,7 @@ describe('Public Core test lane collection policy', () => {
 
   test('package scripts preserve the shared release closure and additive host gates', () => {
     expect(packageJson.scripts.test).toBe(
-      'bun run build && bun run ./scripts/run-test-lane.mjs shared && bun run --cwd extensions/pi test',
+      'bun run build && bun run ./scripts/run-test-lane.mjs shared && node ./scripts/run-node-bridge-tests.mjs && bun run --cwd extensions/pi test',
     );
     expect(packageJson.scripts['test:shared']).toBeUndefined();
     expect(packageJson.scripts['test:macos']).toBe('bun run ./scripts/run-test-lane.mjs macos');
@@ -151,6 +151,7 @@ describe('Public Core test lane collection policy', () => {
     expect(closureCommands).toContain('bun run ./scripts/build-public-package.mjs protocol');
     expect(closureCommands).toContain('bun run ./scripts/build-public-package.mjs shared-utils');
     expect(closureCommands).toContain('node ./scripts/build-bridge.mjs');
+    expect(closureCommands).toContain('node ./scripts/run-node-bridge-tests.mjs');
     for (const removedBuildScript of ['build:protocol', 'build:shared-utils', 'build:bridge']) {
       expect(packageJson.scripts[removedBuildScript]).toBeUndefined();
     }
@@ -243,6 +244,16 @@ describe('Public Core test lane collection policy', () => {
     expect(source).toContain("spawn(bunPath, ['test', ...group.map");
     expect(source).toContain('shell: false');
     expect(source).not.toContain('process.execPath');
+    expect(source).not.toMatch(/execSync|\bshell:\s*true/u);
+  });
+
+  test('authoritative Node Bridge lane includes every portable production suite without shell execution', () => {
+    const source = readFileSync(join(repositoryRoot, 'scripts', 'run-node-bridge-tests.mjs'), 'utf8');
+    const nodeTests = [...new Bun.Glob('apps/bridge/test-node/*.test.mjs').scanSync({ cwd: repositoryRoot })].sort();
+    expect(nodeTests).toHaveLength(7);
+    expect(source).toContain("entry.name.endsWith('.test.mjs')");
+    expect(source).toContain("spawn(process.execPath, ['--test'");
+    expect(source).toContain('shell: false');
     expect(source).not.toMatch(/execSync|\bshell:\s*true/u);
   });
 });

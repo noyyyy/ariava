@@ -1,6 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import type { HostPlatform, HostEnrollmentResponse } from '@ariava/protocol';
-import { base64UrlEncode, isCanonicalTimestamp } from '@ariava/protocol';
+import {
+  AGENT_ADAPTER_PROTOCOL_HEADER,
+  AGENT_ADAPTER_PROTOCOL_VERSION,
+  base64UrlEncode,
+  isCanonicalTimestamp,
+} from '@ariava/protocol';
 import { readAgentAdapterConfig, type AgentAdapterDiscoveryFile } from '../../agent-adapter/config';
 import type { HostIdentity, HostIdentityInspection, HostPrivateKeyStorage } from '../../identity/types';
 import { RelayClient, RelayClientError } from '../../relay-client';
@@ -9,6 +14,7 @@ import type { PiExtensionStatus } from '../pi-extension';
 import { AriavaCliError } from '../service/errors';
 import type { AriavaServiceInstallRecord, ServiceStatus } from '../service/types';
 import type { HostReadinessCheck, OnboardingCliEvidence, OnboardingTarget, StrictReadinessResult } from './types';
+import type { BridgeRuntimeHealth } from '../../types';
 
 export interface ReadinessClock {
   now(): number;
@@ -118,14 +124,21 @@ export async function checkStrictOnboardingReadiness(
   );
 
   try {
-    await pollForDiscoveryAndHealth(input, deps);
+    const evidence = await pollForDiscoveryAndHealth(input, deps);
     add('agent-adapter-discovery', true);
     add('agent-adapter-health', true);
+    add(
+      'bridge-runtime-health',
+      evidence.health.status === 'healthy',
+      'ERR_BRIDGE_DEGRADED',
+      'Bridge is reachable but Driver or Relay presence reconciliation is degraded.',
+    );
   } catch (error) {
     const code = errorCode(error, 'ERR_AGENT_ADAPTER_DISCOVERY');
     const message = errorMessage(error, 'Agent Adapter discovery or authenticated health failed.');
     add('agent-adapter-discovery', false, code, message);
     add('agent-adapter-health', false, code, message);
+    add('bridge-runtime-health', false, code, message);
   }
 
   // Keep health and enrollment independent so an enrollment-only failure does not
@@ -184,7 +197,7 @@ export async function checkStrictOnboardingReadiness(
 export async function pollForDiscoveryAndHealth(
   input: Pick<StrictReadinessInput, 'config' | 'identity' | 'timeoutMs' | 'pollIntervalMs' | 'requestTimeoutMs' | 'signal'>,
   overrides: Partial<StrictReadinessDependencies> = {},
-): Promise<AgentAdapterDiscoveryFile> {
+): Promise<{ discovery: AgentAdapterDiscoveryFile; health: BridgeRuntimeHealth }> {
   const deps = { ...defaultDependencies, ...overrides };
   const timeoutMs = boundedPositive(input.timeoutMs, 10_000);
   const intervalMs = boundedPositive(input.pollIntervalMs, 100);
@@ -206,17 +219,21 @@ export async function pollForDiscoveryAndHealth(
           throw readinessError('ERR_AGENT_ADAPTER_DISCOVERY', 'Agent Adapter discovery port does not match persisted configuration.');
         }
         const response = await fetchBounded(new URL('/v1/health', parsed.origin), {
-          headers: { authorization: `Bearer ${discovery.secret}` },
+          headers: {
+            authorization: `Bearer ${discovery.secret}`,
+            [AGENT_ADAPTER_PROTOCOL_HEADER]: String(AGENT_ADAPTER_PROTOCOL_VERSION),
+          },
         }, boundedPositive(input.requestTimeoutMs, Math.min(timeoutMs, 2_000)), deps);
         if (response.status === 401 || response.status === 403) {
           throw readinessError('ERR_AGENT_ADAPTER_DISCOVERY', 'Agent Adapter authentication failed.');
         }
         if (!response.ok) throw readinessError('ERR_AGENT_ADAPTER_DISCOVERY', 'Agent Adapter health probe failed.');
         const body = await response.json() as unknown;
-        if (!isAgentAdapterHealth(body, input.identity.hostId)) {
+        const health = parseAgentAdapterHealth(body, input.identity.hostId);
+        if (!health) {
           throw readinessError('ERR_AGENT_ADAPTER_DISCOVERY', 'Agent Adapter returned mismatched health evidence.');
         }
-        return discovery;
+        return { discovery, health };
       }
     } catch (error) {
       const code = errorCode(error, 'ERR_AGENT_ADAPTER_DISCOVERY');
@@ -363,10 +380,48 @@ function exactPiPackageReady(status: PiExtensionStatus | undefined, version: str
     && status.installPath === status.expectedManagedPath && status.mismatchReasons.length === 0);
 }
 
-function isAgentAdapterHealth(value: unknown, hostId: string): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+function parseAgentAdapterHealth(value: unknown, hostId: string): BridgeRuntimeHealth | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  return Object.keys(record).sort().join(',') === 'hostId,ok' && record.ok === true && record.hostId === hostId;
+  if (Object.keys(record).sort().join(',') !== 'health,hostId,ok' || record.ok !== true || record.hostId !== hostId
+    || !isBridgeRuntimeHealth(record.health)) return undefined;
+  return record.health as BridgeRuntimeHealth;
+}
+function isBridgeRuntimeHealth(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const health = value as Record<string, unknown>;
+  if (!hasExactOptionalKeys(health, ['status', 'drivers'], ['relayPresence']) || !Array.isArray(health.drivers)) return false;
+  const drivers = health.drivers as unknown[];
+  if (drivers.length > 32 || !drivers.every(isDriverHealth)) return false;
+  const driverIds = drivers.map((item) => (item as { driver: string }).driver);
+  if (new Set(driverIds).size !== driverIds.length || driverIds.some((driver, index) => index > 0 && driverIds[index - 1]! > driver)) return false;
+  const degraded = drivers.length > 0 || health.relayPresence !== undefined;
+  return health.status === (degraded ? 'degraded' : 'healthy')
+    && (health.relayPresence === undefined || isRelayPresenceHealth(health.relayPresence));
+}
+function isDriverHealth(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return hasExactOptionalKeys(item, ['driver', 'code', 'count', 'firstSeenAt', 'lastSeenAt', 'nextRetryAt'], ['lastSuccessAt'])
+    && typeof item.driver === 'string' && /^[A-Za-z0-9._-]{1,64}$/u.test(item.driver)
+    && item.code === 'driver_reconciliation_failed'
+    && isPositiveSafeInteger(item.count) && healthTimesAreCanonical(item);
+}
+function isRelayPresenceHealth(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return hasExactOptionalKeys(item, ['code', 'count', 'firstSeenAt', 'lastSeenAt', 'nextRetryAt'], ['lastSuccessAt'])
+    && item.code === 'relay_presence_refresh_failed' && isPositiveSafeInteger(item.count) && healthTimesAreCanonical(item);
+}
+function healthTimesAreCanonical(value: Record<string, unknown>): boolean {
+  return ['firstSeenAt', 'lastSeenAt', 'nextRetryAt'].every((key) => isCanonicalTimestamp(value[key]))
+    && (value.lastSuccessAt === undefined || isCanonicalTimestamp(value.lastSuccessAt));
+}
+function isPositiveSafeInteger(value: unknown): boolean {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+function hasExactOptionalKeys(value: Record<string, unknown>, required: string[], optional: string[]): boolean {
+  return required.every((key) => key in value) && Object.keys(value).every((key) => required.includes(key) || optional.includes(key));
 }
 
 function isExactOk(value: unknown): boolean {
@@ -462,6 +517,9 @@ function defaultReadinessRemediation(code: string | undefined, message: string):
   }
   if (code === 'ERR_AGENT_ADAPTER_DISCOVERY' || code === 'ERR_AGENT_ADAPTER_NOT_LOOPBACK') {
     return { message, command: 'ariava service restart' };
+  }
+  if (code === 'ERR_BRIDGE_DEGRADED') {
+    return { message, command: 'ariava doctor' };
   }
   if (code === 'ERR_RELAY_UNREACHABLE' || code === 'ERR_RELAY_AUTH_FAILED' || code === 'ERR_RELAY_CONFIG_REQUIRED') {
     return { message, command: 'ariava doctor' };

@@ -1,3 +1,4 @@
+export * from './agent-adapter.js';
 export * from './commands.js';
 export * from './events.js';
 export * from './encryption.js';

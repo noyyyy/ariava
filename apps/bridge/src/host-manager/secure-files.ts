@@ -129,16 +129,29 @@ export function readSecureJson<T>(path: string, uid = currentUid()): T {
   return JSON.parse(readSecureFile(path, uid).toString('utf8')) as T;
 }
 
-export function writeSecureJson(path: string, value: unknown, uid = currentUid()): void {
-  writeSecureFile(path, Buffer.from(`${JSON.stringify(value, null, 2)}\n`), uid);
+export function writeSecureJson(
+  path: string, value: unknown, uid = currentUid(), hooks: SecureFileWriteHooks = {},
+): void {
+  writeSecureFile(path, Buffer.from(`${JSON.stringify(value, null, 2)}\n`), uid, false, hooks);
 }
 
-export function writeSecureJsonExclusive(path: string, value: unknown, uid = currentUid()): void {
-  writeSecureFile(path, Buffer.from(`${JSON.stringify(value, null, 2)}\n`), uid, true);
+export function writeSecureJsonExclusive(
+  path: string, value: unknown, uid = currentUid(), hooks: SecureFileWriteHooks = {},
+): void {
+  writeSecureFile(path, Buffer.from(`${JSON.stringify(value, null, 2)}\n`), uid, true, hooks);
 }
 
 export interface SecureFileWriteHooks {
+  afterTemporaryWrite?(path: string): void;
+  afterFileSync?(path: string): void;
   beforePromotion?(): void;
+  afterPromotion?(path: string): void;
+  afterDirectorySync?(path: string): void;
+}
+
+export interface SecureFileRemoveHooks {
+  afterUnlink?(path: string): void;
+  afterDirectorySync?(path: string): void;
 }
 
 export function writeSecureFile(
@@ -169,7 +182,9 @@ export function writeSecureFile(
     fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(), 0o600);
     fchmodSync(fd, 0o600);
     writeFileSync(fd, contents);
+    hooks.afterTemporaryWrite?.(absolute);
     fsyncSync(fd);
+    hooks.afterFileSync?.(absolute);
     const stat = fstatSync(fd);
     if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o177) !== 0 || (stat.mode & 0o600) !== 0o600) {
       throw new SecureFileError(`Secure temporary file check failed: ${absolute}`);
@@ -187,10 +202,12 @@ export function writeSecureFile(
     } else {
       renameSync(temporary, absolute);
     }
+    hooks.afterPromotion?.(absolute);
 
     // Revalidate the retained directory immediately before syncing its entry update.
     assertRetainedParent(parent, parentFd, uid);
     fsyncSync(parentFd);
+    hooks.afterDirectorySync?.(absolute);
   } catch (error) {
     if (fd !== undefined) closeSync(fd);
     try { unlinkSync(temporary); } catch {}
@@ -353,7 +370,9 @@ export function removeOwnerControlledFile(path: string, controlledRoot: string, 
   }
 }
 
-export function removeSecureFile(path: string, uid = currentUid()): void {
+export function removeSecureFile(
+  path: string, uid = currentUid(), hooks: SecureFileRemoveHooks = {},
+): void {
   const absolute = requireAbsolute(path);
   const parent = dirname(absolute);
   assertSecureFile(absolute, uid);
@@ -362,8 +381,10 @@ export function removeSecureFile(path: string, uid = currentUid()): void {
     parentFd = openSync(parent, constants.O_RDONLY | directoryFlag() | noFollowFlag());
     assertRetainedParent(parent, parentFd, uid);
     unlinkSync(absolute);
+    hooks.afterUnlink?.(absolute);
     assertRetainedParent(parent, parentFd, uid);
     fsyncSync(parentFd);
+    hooks.afterDirectorySync?.(absolute);
   } catch (error) {
     throw error instanceof SecureFileError ? error : new SecureFileError(`Secure file removal failed: ${absolute}`, error);
   } finally {

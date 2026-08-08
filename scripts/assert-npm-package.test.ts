@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const helper = join(process.cwd(), 'scripts', 'assert-npm-package.mjs');
+import { fileURLToPath } from 'node:url';
+
+const helper = fileURLToPath(new URL('assert-npm-package.mjs', import.meta.url));
 const required = [
   'package.json', 'apps/bridge/dist/cli.js', 'apps/bridge/dist/public-cli.js',
   'apps/bridge/dist/ui/assets/ariava-success-wide.txt',
@@ -14,14 +16,26 @@ const required = [
   'packages/protocol/dist/events.js', 'packages/protocol/dist/events.d.ts',
   'packages/protocol/dist/encryption.js', 'packages/protocol/dist/encryption.d.ts',
   'packages/protocol/dist/fixtures/ed25519-request-vectors.json',
-  'packages/protocol/dist/fixtures/e2e-v1-vectors.json',
-  'packages/protocol/dist/fixtures/notification-preview-v1-vector.json',
+  'packages/protocol/dist/fixtures/e2e-v2-vectors.json',
+  'packages/protocol/dist/fixtures/notification-preview-v2-vector.json',
+  'packages/protocol/dist/fixtures/need-human-error-validation-v2.json',
   'packages/shared-utils/dist/index.js', 'packages/shared-utils/dist/index.d.ts',
   'extensions/pi/bundle/index.js', 'extensions/pi/bundle/package.json',
   'extensions/pi/bundle/.ariava-release-bundle.json',
 ];
 
 const validRootManifest = JSON.stringify({ name: 'ariava', version: '1.2.3' });
+const validRuntimeFixtures: Record<string, string> = {
+  'packages/protocol/dist/fixtures/e2e-v2-vectors.json': JSON.stringify({
+    version: 2, event: { contentId: 'event', contentAAD: 'aad' }, session: { contentId: 'session', contentAAD: 'aad' },
+  }),
+  'packages/protocol/dist/fixtures/notification-preview-v2-vector.json': JSON.stringify({
+    version: 2, preview: { contentId: 'preview', contentAAD: 'aad' },
+  }),
+  'packages/protocol/dist/fixtures/need-human-error-validation-v2.json': JSON.stringify({
+    version: 2, cases: [{ name: 'valid', expected: true }],
+  }),
+};
 
 function run(paths: string[], version: string | null = '1.2.3') {
   const root = mkdtempSync(join(tmpdir(), 'ariava-package-assert-'));
@@ -43,7 +57,9 @@ function runTarball(paths: string[], kind: 'root' | 'pi' = 'root', contents: Rec
   for (const path of paths) {
     const target = join(packageRoot, path);
     mkdirSync(join(target, '..'), { recursive: true });
-    const defaultContent = path === 'package.json' && kind === 'root' ? validRootManifest : 'fixture';
+    const defaultContent = path === 'package.json' && kind === 'root'
+      ? validRootManifest
+      : validRuntimeFixtures[path] ?? 'fixture';
     writeFileSync(target, contents[path] ?? defaultContent);
   }
   const tarball = join(root, 'fixture.tgz');
@@ -77,6 +93,8 @@ describe('npm package artifact assertion', () => {
       'apps/bridge/dist/ui/assets/unreviewed.txt',
       'Users/example/private.txt',
       'ariava-private/README.md',
+      'packages/protocol/dist/fixtures/e2e-v1-vectors.json',
+      'packages/protocol/dist/fixtures/notification-preview-v1-vector.json',
     ]) {
       const result = run([...required, forbidden]);
       expect(result.exitCode, `${forbidden}: ${result.stderr.toString()}`).toBe(1);
@@ -87,6 +105,42 @@ describe('npm package artifact assertion', () => {
     expect(runTarball(required).exitCode).toBe(0);
     expect(runTarball(required.slice(1)).exitCode).toBe(1);
     expect(runTarball([...required, 'unexpected/runtime.js']).exitCode).toBe(1);
+  });
+
+  test('validates packaged runtime v2 and parity fixture contents', () => {
+    const legacyEvent = runTarball(required, 'root', {
+      'packages/protocol/dist/fixtures/e2e-v2-vectors.json': JSON.stringify({
+        version: 2, event: { contentId: 'event', contentAAD: 'event-content-v1' },
+        session: { contentId: 'session', contentAAD: 'aad' },
+      }),
+    });
+    expect(legacyEvent.exitCode).toBe(1);
+    expect(legacyEvent.stderr.toString()).toContain('event-content-v1');
+
+    const emptyParity = runTarball(required, 'root', {
+      'packages/protocol/dist/fixtures/need-human-error-validation-v2.json': JSON.stringify({ version: 2, cases: [] }),
+    });
+    expect(emptyParity.exitCode).toBe(1);
+    expect(emptyParity.stderr.toString()).toContain('parity fixture');
+  });
+
+  test('scans all packaged runtime bytes and permits only the recognized-prior reset decoder', () => {
+    const legacyPi = runTarball(required, 'root', {
+      'extensions/pi/bundle/index.js': "export const category = 'agent.blocked';",
+    });
+    expect(legacyPi.exitCode).toBe(1);
+    expect(legacyPi.stderr.toString()).toContain('extensions/pi/bundle/index.js contains agent.blocked');
+
+    const resetDecoder = [
+      'var PRIOR_SESSION_REQUIRED_KEYS = [...SESSION_REQUIRED_KEYS, "stateLabel"];',
+      'function isRecognizedPriorSession(value, hostId) { return value.status === "blocked"; }',
+      'function isRecognizedPriorEvent(value, hostId) { return value.type === "question_requested"; }',
+      'function isRecognizedPriorSpoolMigration(value) { return value.version === 1; }',
+    ].join('\n');
+    const recognizedPrior = runTarball(required, 'root', {
+      'apps/bridge/dist/cli.js': resetDecoder,
+    });
+    expect(recognizedPrior.exitCode).toBe(0);
   });
 
   test('accepts only the generated scoped package public files and validates its metadata', () => {
@@ -102,6 +156,9 @@ describe('npm package artifact assertion', () => {
       }),
     };
     expect(runTarball(piFiles, 'pi', valid).exitCode).toBe(0);
+    const legacy = runTarball(piFiles, 'pi', { ...valid, 'index.js': "export const category = 'agent.question';" });
+    expect(legacy.exitCode).toBe(1);
+    expect(legacy.stderr.toString()).toContain('index.js contains agent.question');
     expect(runTarball([...piFiles, 'src/private.ts'], 'pi', valid).exitCode).toBe(1);
     expect(runTarball(piFiles, 'pi', { ...valid, 'package.json': JSON.stringify({ name: '@ariava/pi-extension', version: '1.2.3', private: true }) }).exitCode).toBe(1);
   });

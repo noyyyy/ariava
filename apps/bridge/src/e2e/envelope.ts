@@ -16,15 +16,15 @@ import {
   type E2ERecipientV1,
   type EncryptedCommandEnvelopeV1,
   type EncryptedContentV1,
-  type EncryptedEventUploadV1,
-  type EncryptedNotificationPreviewPlaintextV1,
-  type EncryptedSessionSnapshotUploadV1,
-  type NotificationPreviewEnvelopeV1,
-  type ProtectedEventContentV1,
-  type ProtectedSessionContentV1,
+  type EncryptedEventUploadV2,
+  type EncryptedNotificationPreviewPlaintextV2,
+  type EncryptedSessionSnapshotUploadV2,
+  type NotificationPreviewEnvelopeV2,
+  type ProtectedEventContentV2,
+  type ProtectedSessionContentV2,
   type RecipientKeyWrapV1,
-  type RelayEventMetadataV1,
-  type RelaySessionMetadataV1,
+  type RelayEventMetadataV2,
+  type RelaySessionMetadataV2,
 } from '@ariava/protocol';
 import { chachaPolyOpen, chachaPolySeal, hkdfSha256, x25519SharedSecret } from './node-crypto';
 import type { HostEncryptionIdentity } from '../identity';
@@ -32,139 +32,107 @@ import type { HostEncryptionIdentity } from '../identity';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 
-export interface ActiveRecipientMaterial extends E2ERecipientV1 {
-  transcriptDigest: string;
-}
+export interface ActiveRecipientMaterial extends E2ERecipientV1 { transcriptDigest: string }
 
 export function encryptEventUpload(input: {
-  event: RelayEventMetadataV1;
-  protectedEvent: ProtectedEventContentV1;
-  session: RelaySessionMetadataV1;
-  protectedSession: ProtectedSessionContentV1;
+  event: RelayEventMetadataV2;
+  protectedEvent: ProtectedEventContentV2;
+  session: RelaySessionMetadataV2;
+  protectedSession: ProtectedSessionContentV2;
   revision: number;
   recipientSetVersion: number;
   recipients: ActiveRecipientMaterial[];
   hostIdentity: HostEncryptionIdentity;
-}): { event: EncryptedEventUploadV1; session: EncryptedSessionSnapshotUploadV1 } {
+}): { event: EncryptedEventUploadV2; session: EncryptedSessionSnapshotUploadV2 } {
   const eventContentId = crypto.randomUUID();
   const sessionContentId = crypto.randomUUID();
-  const eventContent = sealContent('event-content-v1', eventContentId,
+  const eventContent = sealContent('event-content-v2', eventContentId,
     buildProtectedEventContentBytes(input.protectedEvent), buildEventContentAAD({ ...input.event, contentId: eventContentId }));
-  const sessionContent = sealContent('session-content-v1', sessionContentId,
+  const sessionContent = sealContent('session-content-v2', sessionContentId,
     buildProtectedSessionContentBytes(input.protectedSession), buildSessionContentAAD({ ...input.session, revision: input.revision, contentId: sessionContentId }));
   try {
     return {
-      event: { ...input.event, recipientSetVersion: input.recipientSetVersion, content: eventContent.content,
-        keyWraps: wrapDekForRecipients(eventContent.dek, eventContentId, 'event-content-v1', input.recipients, input.hostIdentity) },
-      session: { ...input.session, revision: input.revision, recipientSetVersion: input.recipientSetVersion, content: sessionContent.content,
-        keyWraps: wrapDekForRecipients(sessionContent.dek, sessionContentId, 'session-content-v1', input.recipients, input.hostIdentity) },
+      event: { ...input.event, recipientSetVersion: input.recipientSetVersion,
+        content: eventContent.content as EncryptedEventUploadV2['content'],
+        keyWraps: wrapDekForRecipients(eventContent.dek, eventContentId, 'event-content-v2', input.recipients, input.hostIdentity) },
+      session: { ...input.session, revision: input.revision, recipientSetVersion: input.recipientSetVersion,
+        content: sessionContent.content as EncryptedSessionSnapshotUploadV2['content'],
+        keyWraps: wrapDekForRecipients(sessionContent.dek, sessionContentId, 'session-content-v2', input.recipients, input.hostIdentity) },
     };
-  } finally {
-    eventContent.dek.fill(0);
-    sessionContent.dek.fill(0);
-  }
+  } finally { eventContent.dek.fill(0); sessionContent.dek.fill(0); }
 }
 
-export function encryptNotificationPreviews({
-  event,
-  plaintext,
-  recipients,
-  hostIdentity,
-}: {
-  event: RelayEventMetadataV1;
-  plaintext: EncryptedNotificationPreviewPlaintextV1;
+export function encryptNotificationPreviews({ event, plaintext, recipients, hostIdentity }: {
+  event: RelayEventMetadataV2;
+  plaintext: EncryptedNotificationPreviewPlaintextV2;
   recipients: ActiveRecipientMaterial[];
   hostIdentity: HostEncryptionIdentity;
-}): NotificationPreviewEnvelopeV1[] {
+}): NotificationPreviewEnvelopeV2[] {
+  if (plaintext.eventType !== event.type) throw new TypeError('notification preview eventType does not match Event metadata');
   return recipients.map((recipient) => {
     const contentId = crypto.randomUUID();
-    const sealed = sealContent(
-      'notification-preview-v1',
-      contentId,
-      buildNotificationPreviewPlaintextBytes(plaintext),
-      buildNotificationPreviewAAD({
-        hostId: event.hostId,
-        watchDeviceId: recipient.watchDeviceId,
-        eventId: event.eventId,
-        sessionId: event.sessionId,
-        linkId: recipient.linkId,
-        linkGeneration: recipient.linkGeneration,
-        epoch: recipient.epoch,
+    const sealed = sealContent('notification-preview-v2', contentId, buildNotificationPreviewPlaintextBytes(plaintext),
+      buildNotificationPreviewAAD({ hostId: event.hostId, watchDeviceId: recipient.watchDeviceId,
+        eventId: event.eventId, sessionId: event.sessionId, eventType: event.type,
+        linkId: recipient.linkId, linkGeneration: recipient.linkGeneration, epoch: recipient.epoch,
         senderEncryptionKeyId: hostIdentity.encryptionKeyId,
-        recipientEncryptionKeyId: recipient.watchBinding.encryptionKeyId,
-        contentId,
-        payloadKind: 'notification-preview-v1',
-      }),
-    );
+        recipientEncryptionKeyId: recipient.watchBinding.encryptionKeyId, contentId,
+        payloadKind: 'notification-preview-v2' }));
     try {
-      const [keyWrap] = wrapDekForRecipients(
-        sealed.dek,
-        contentId,
-        'notification-preview-v1',
-        [recipient],
-        hostIdentity,
-      );
-      return {
-        eventId: event.eventId,
-        sessionId: event.sessionId,
+      const [keyWrap] = wrapDekForRecipients(sealed.dek, contentId, 'notification-preview-v2', [recipient], hostIdentity);
+      return { eventId: event.eventId, sessionId: event.sessionId, eventType: event.type,
         watchDeviceId: recipient.watchDeviceId,
-        content: sealed.content as NotificationPreviewEnvelopeV1['content'],
-        keyWrap: keyWrap!,
-      };
-    } finally {
-      sealed.dek.fill(0);
-    }
+        content: sealed.content as NotificationPreviewEnvelopeV2['content'], keyWrap: keyWrap! };
+    } finally { sealed.dek.fill(0); }
   });
 }
 
-export function encryptSessionSnapshot(input: { session: RelaySessionMetadataV1; protectedSession: ProtectedSessionContentV1;
-  revision: number; recipientSetVersion: number; recipients: ActiveRecipientMaterial[]; hostIdentity: HostEncryptionIdentity
-}): EncryptedSessionSnapshotUploadV1 {
+export function encryptSessionSnapshot(input: {
+  session: RelaySessionMetadataV2;
+  protectedSession: ProtectedSessionContentV2;
+  revision: number;
+  recipientSetVersion: number;
+  recipients: ActiveRecipientMaterial[];
+  hostIdentity: HostEncryptionIdentity;
+}): EncryptedSessionSnapshotUploadV2 {
   const contentId = crypto.randomUUID();
-  const sealed = sealContent('session-content-v1', contentId, buildProtectedSessionContentBytes(input.protectedSession),
+  const sealed = sealContent('session-content-v2', contentId, buildProtectedSessionContentBytes(input.protectedSession),
     buildSessionContentAAD({ ...input.session, revision: input.revision, contentId }));
   try {
-    return { ...input.session, revision: input.revision, recipientSetVersion: input.recipientSetVersion, content: sealed.content,
-      keyWraps: wrapDekForRecipients(sealed.dek, contentId, 'session-content-v1', input.recipients, input.hostIdentity) };
+    return { ...input.session, revision: input.revision, recipientSetVersion: input.recipientSetVersion,
+      content: sealed.content as EncryptedSessionSnapshotUploadV2['content'],
+      keyWraps: wrapDekForRecipients(sealed.dek, contentId, 'session-content-v2', input.recipients, input.hostIdentity) };
   } finally { sealed.dek.fill(0); }
 }
 
 export function decryptReplyForPin(command: Extract<EncryptedCommandEnvelopeV1, { type: 'reply' }>, input: {
-  hostIdentity: HostEncryptionIdentity;
-  watchPublicKey: string;
-  transcriptDigest: string;
+  hostIdentity: HostEncryptionIdentity; watchPublicKey: string; transcriptDigest: string;
 }): string {
   assertReplyEnvelopeTuple(command);
   const { content, keyWrap } = command.payload;
   const wrapKey = deriveDirectionKey(input.hostIdentity, input.watchPublicKey, input.transcriptDigest,
     command.linkId, command.linkGeneration, command.epoch, 'watch-to-bridge');
-  let dek: Uint8Array | undefined;
-  let plaintext: Uint8Array | undefined;
+  let dek: Uint8Array | undefined; let plaintext: Uint8Array | undefined;
   try {
     dek = chachaPolyOpen(wrapKey, base64UrlDecode(keyWrap.nonce, 12, 'reply wrap nonce'),
       base64UrlDecode(keyWrap.ciphertext, 48, 'wrapped reply DEK'), buildWrapAAD({
         direction: 'watch-to-bridge', linkId: command.linkId, linkGeneration: command.linkGeneration, epoch: command.epoch,
         hostId: command.hostId, watchDeviceId: command.watchDeviceId,
         senderEncryptionKeyId: keyWrap.senderEncryptionKeyId, recipientEncryptionKeyId: keyWrap.recipientEncryptionKeyId,
-        contentId: content.contentId, payloadKind: 'reply-content-v1',
-      }));
+        contentId: content.contentId, payloadKind: 'reply-content-v1' }));
     plaintext = chachaPolyOpen(dek, base64UrlDecode(content.nonce, 12, 'reply content nonce'),
       base64UrlDecode(content.ciphertext, undefined, 'reply ciphertext'), buildReplyContentAAD({
         hostId: command.hostId, watchDeviceId: command.watchDeviceId, sessionId: command.sessionId,
         commandId: command.commandId, targetAlertEventId: command.targetAlertEventId, issuedAt: command.issuedAt,
-        expiresAt: command.expiresAt, nonce: command.nonce, contentId: content.contentId,
-      }));
+        expiresAt: command.expiresAt, nonce: command.nonce, contentId: content.contentId }));
     const parsed = JSON.parse(decoder.decode(plaintext)) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
-      || Object.keys(parsed).length !== 2 || (parsed as { version?: unknown }).version !== 1
-      || typeof (parsed as { text?: unknown }).text !== 'string') throw new TypeError('decrypted reply is invalid');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).length !== 2
+      || (parsed as { version?: unknown }).version !== 1 || typeof (parsed as { text?: unknown }).text !== 'string') {
+      throw new TypeError('decrypted reply is invalid');
+    }
     buildProtectedReplyContentBytes(parsed as { version: 1; text: string });
     return (parsed as { text: string }).text;
-  } finally {
-    wrapKey.fill(0);
-    dek?.fill(0);
-    plaintext?.fill(0);
-  }
+  } finally { wrapKey.fill(0); dek?.fill(0); plaintext?.fill(0); }
 }
 
 function assertReplyEnvelopeTuple(command: Extract<EncryptedCommandEnvelopeV1, { type: 'reply' }>): void {
@@ -183,12 +151,7 @@ function sealContent(payloadKind: EncryptedContentV1['payloadKind'], contentId: 
     const sealed = chachaPolySeal(dek, plaintext, aad);
     return { dek, content: { version: 1, suite: E2E_SUITE_V1, contentId, payloadKind,
       nonce: base64UrlEncode(sealed.nonce), ciphertext: base64UrlEncode(sealed.ciphertext) } satisfies EncryptedContentV1 };
-  } catch (error) {
-    dek.fill(0);
-    throw error;
-  } finally {
-    plaintext.fill(0);
-  }
+  } catch (error) { dek.fill(0); throw error; } finally { plaintext.fill(0); }
 }
 
 function wrapDekForRecipients(dek: Uint8Array, contentId: string, payloadKind: EncryptedContentV1['payloadKind'],
@@ -206,8 +169,7 @@ function wrapDekForRecipients(dek: Uint8Array, contentId: string, payloadKind: E
       const sealed = chachaPolySeal(key, dek, aad);
       return { version: 1, suite: E2E_SUITE_V1, contentId, linkId: recipient.linkId,
         linkGeneration: recipient.linkGeneration, epoch: recipient.epoch,
-        senderEncryptionKeyId: hostIdentity.encryptionKeyId,
-        recipientEncryptionKeyId: recipient.watchBinding.encryptionKeyId,
+        senderEncryptionKeyId: hostIdentity.encryptionKeyId, recipientEncryptionKeyId: recipient.watchBinding.encryptionKeyId,
         nonce: base64UrlEncode(sealed.nonce), ciphertext: base64UrlEncode(sealed.ciphertext) };
     } finally { key.fill(0); }
   });
@@ -216,14 +178,9 @@ function wrapDekForRecipients(dek: Uint8Array, contentId: string, payloadKind: E
 function deriveDirectionKey(identity: HostEncryptionIdentity, peerPublicKey: string, transcriptDigest: string,
   linkId: string, generation: number, epoch: number, direction: 'bridge-to-watch' | 'watch-to-bridge'): Uint8Array {
   const shared = x25519SharedSecret(identity.privateKeyPkcs8, base64UrlDecode(peerPublicKey, 32, 'peer X25519 public key'));
-  const salt = base64UrlDecode(transcriptDigest, 32, 'transcript digest');
-  let root: Uint8Array | undefined;
+  const salt = base64UrlDecode(transcriptDigest, 32, 'transcript digest'); let root: Uint8Array | undefined;
   try {
     root = hkdfSha256(shared, salt, pairRootInfo(linkId, generation, epoch));
     return hkdfSha256(root, salt, encoder.encode(`ariava:e2e:v1:wrap:${direction}`));
-  } finally {
-    shared.fill(0);
-    root?.fill(0);
-    salt.fill(0);
-  }
+  } finally { shared.fill(0); root?.fill(0); salt.fill(0); }
 }

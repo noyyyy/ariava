@@ -1,8 +1,14 @@
 import { once } from 'node:events';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import type { CommandResult, SessionStatus } from '@ariava/protocol';
-import { SESSION_STATUSES } from '@ariava/protocol';
+import {
+  AGENT_ADAPTER_PROTOCOL_HEADER,
+  AGENT_ADAPTER_PROTOCOL_VERSION,
+  SESSION_STATUSES,
+  type CommandResult,
+  type SessionStatus,
+} from '@ariava/protocol';
 import type { AgentAdapterRegistry, RegisterSessionInput } from './registry';
+import type { BridgeRuntimeHealth } from '../types';
 
 export interface AgentAdapterServerConfig {
   port: number;
@@ -17,6 +23,7 @@ export class AgentAdapterServer {
   constructor(
     private readonly config: AgentAdapterServerConfig,
     private readonly registry: AgentAdapterRegistry,
+    private readonly health: () => BridgeRuntimeHealth = () => ({ status: 'healthy', drivers: [] }),
   ) {
     this.activePort = config.port;
   }
@@ -59,6 +66,10 @@ export class AgentAdapterServer {
       this.writeJson(response, 401, { error: 'Unauthorized' });
       return;
     }
+    if (request.headers[AGENT_ADAPTER_PROTOCOL_HEADER] !== String(AGENT_ADAPTER_PROTOCOL_VERSION)) {
+      this.writeJson(response, 426, { error: 'Agent Adapter protocol version mismatch' });
+      return;
+    }
 
     const url = new URL(request.url ?? '/', this.url);
     const pathname = url.pathname;
@@ -66,7 +77,7 @@ export class AgentAdapterServer {
 
     try {
       if (pathname === '/v1/health' && method === 'GET') {
-        this.writeJson(response, 200, { ok: true, hostId: this.config.hostId });
+        this.writeJson(response, 200, { ok: true, hostId: this.config.hostId, health: this.health() });
         return;
       }
 
@@ -93,22 +104,21 @@ export class AgentAdapterServer {
 
       const handleMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/handle$/);
       if (handleMatch && method === 'POST') {
-        const result = this.registry.handleSession(handleMatch[1], await this.readJson(request));
+        const result = this.registry.handleSession(
+          handleMatch[1],
+          parseHandleInput(await this.readJson(request)),
+        );
         this.writeJson(response, 200, result);
         return;
       }
 
-      const readMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/read$/);
-      if (readMatch && method === 'POST') {
-        const result = this.registry.handleSessionReadAlias(readMatch[1], await this.readJson(request));
-        this.writeJson(response, 200, result);
-        return;
-      }
 
       const heartbeatMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/heartbeat$/);
       if (heartbeatMatch && method === 'POST') {
-        const { status, latestActivityText, openingText, projectName, nameText } = parseHeartbeatInput(await this.readJson(request));
-        const session = this.registry.heartbeat(heartbeatMatch[1], status, latestActivityText, { openingText, projectName, nameText });
+        const { status, latestActivityText, openingText, projectName, nameText, hbaseSessionKey, harnessProvider } = parseHeartbeatInput(await this.readJson(request));
+        const session = this.registry.heartbeat(heartbeatMatch[1], status, latestActivityText, {
+          openingText, projectName, nameText, hbaseSessionKey, harnessProvider,
+        });
         if (!session) {
           this.writeJson(response, 404, { error: 'Session not found' });
           return;
@@ -137,7 +147,7 @@ export class AgentAdapterServer {
       const resultMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/commands\/([^/]+)\/result$/);
       if (resultMatch && method === 'POST') {
         const result = parseResultInput(await this.readJson(request), resultMatch[2]);
-        this.registry.resolveCommand(resultMatch[2], result);
+        this.registry.resolveCommand(resultMatch[2], result, resultMatch[1]);
         this.writeJson(response, 200, { ok: true });
         return;
       }
@@ -145,7 +155,8 @@ export class AgentAdapterServer {
       this.writeJson(response, 404, { error: 'Not found' });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.writeJson(response, 500, { error: message });
+      const status = error instanceof TypeError ? 400 : 500;
+      this.writeJson(response, status, { error: message });
     }
   }
 
@@ -171,21 +182,46 @@ function parseRegisterInput(value: unknown): RegisterSessionInput {
   }
 
   const obj = value as Record<string, unknown>;
-  const sessionId = requireString(obj, 'sessionId');
-  const provider = requireString(obj, 'provider');
-  const projectName = optionalString(obj, 'projectName') ?? optionalString(obj, 'project') ?? 'unknown';
-  const cwd = requireString(obj, 'cwd');
-
+  assertExactKeys(obj,
+    ['sessionId', 'provider', 'projectName', 'cwd', 'nameText'],
+    ['openingText', 'latestActivityText', 'hbaseSessionKey', 'harnessProvider', 'pid', 'status'],
+    'register Session',
+  );
   return {
-    sessionId,
-    provider,
-    projectName,
-    cwd,
-    nameText: optionalString(obj, 'nameText') ?? optionalString(obj, 'title') ?? projectName,
+    sessionId: requireString(obj, 'sessionId'),
+    provider: requireString(obj, 'provider'),
+    projectName: requireString(obj, 'projectName'),
+    cwd: requireString(obj, 'cwd'),
+    nameText: requireString(obj, 'nameText'),
     openingText: optionalString(obj, 'openingText'),
-    latestActivityText: optionalString(obj, 'latestActivityText') ?? optionalString(obj, 'summary'),
+    latestActivityText: optionalString(obj, 'latestActivityText'),
+    hbaseSessionKey: optionalString(obj, 'hbaseSessionKey'),
+    harnessProvider: optionalString(obj, 'harnessProvider'),
     pid: optionalNumber(obj, 'pid'),
     status: optionalStatus(obj, 'status'),
+  };
+}
+
+function parseHandleInput(value: unknown): import('@ariava/protocol').HandleSessionRequest {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('handle body must be an object');
+  }
+  const obj = value as Record<string, unknown>;
+  assertExactKeys(
+    obj,
+    ['handledThroughEventId'],
+    ['handledThroughEventCreatedAt', 'handledAt', 'action'],
+    'handle',
+  );
+  const action = optionalString(obj, 'action');
+  if (action !== undefined && action !== 'pi_input' && action !== 'bridge_recovery') {
+    throw new TypeError('handle.action is invalid');
+  }
+  return {
+    handledThroughEventId: requireString(obj, 'handledThroughEventId'),
+    handledThroughEventCreatedAt: optionalString(obj, 'handledThroughEventCreatedAt'),
+    handledAt: optionalString(obj, 'handledAt'),
+    action,
   };
 }
 
@@ -195,12 +231,17 @@ function parseHeartbeatInput(value: unknown): {
   openingText?: string | null;
   projectName?: string;
   nameText?: string;
+  hbaseSessionKey?: string;
+  harnessProvider?: string;
 } {
   if (typeof value !== 'object' || value === null) {
     throw new Error('Request body must be an object');
   }
 
   const obj = value as Record<string, unknown>;
+  assertExactKeys(obj, ['status'], [
+    'latestActivityText', 'openingText', 'projectName', 'nameText', 'hbaseSessionKey', 'harnessProvider',
+  ], 'heartbeat');
   const statusValue = requireString(obj, 'status');
   if (!SESSION_STATUSES.includes(statusValue as SessionStatus)) {
     throw new Error(`Invalid status: ${statusValue}`);
@@ -208,13 +249,28 @@ function parseHeartbeatInput(value: unknown): {
 
   return {
     status: statusValue as SessionStatus,
-    latestActivityText: hasOwn(obj, 'latestActivityText')
-      ? optionalNullableString(obj, 'latestActivityText')
-      : optionalNullableString(obj, 'summary'),
+    latestActivityText: optionalNullableString(obj, 'latestActivityText'),
     openingText: optionalNullableString(obj, 'openingText'),
     projectName: optionalString(obj, 'projectName'),
     nameText: optionalString(obj, 'nameText'),
+    hbaseSessionKey: optionalString(obj, 'hbaseSessionKey'),
+    harnessProvider: optionalString(obj, 'harnessProvider'),
   };
+}
+
+function assertExactKeys(
+  obj: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[],
+  label: string,
+): void {
+  const allowed = new Set([...required, ...optional]);
+  for (const key of Object.keys(obj)) {
+    if (!allowed.has(key)) throw new TypeError(`${label}.${key} is unsupported`);
+  }
+  for (const key of required) {
+    if (!hasOwn(obj, key)) throw new TypeError(`${label}.${key} is required`);
+  }
 }
 
 function optionalStatus(obj: Record<string, unknown>, key: string): SessionStatus | undefined {
@@ -232,7 +288,7 @@ function parseResultInput(value: unknown, expectedCommandId: string): CommandRes
   const obj = value as Record<string, unknown>;
   const commandId = requireString(obj, 'commandId');
   if (commandId !== expectedCommandId) {
-    throw new Error('commandId in result does not match URL');
+    throw new TypeError('commandId in result does not match URL');
   }
 
   return {

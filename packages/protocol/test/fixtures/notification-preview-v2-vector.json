@@ -1,0 +1,65 @@
+{
+  "version": 2,
+  "suite": "x25519-hkdf-sha256-chachapoly-v1",
+  "provenance": "Deterministic public test-only X25519 material, ceremony-consistent binding/transcript bytes, and fixed nonces for notification preview v2. Identity/pair-root derivation remains v1; runtime preview payload and AAD are v2. Consumed, never regenerated, by product tests.",
+  "link": {
+    "linkId": "link_vector_01",
+    "hostId": "host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+    "watchDeviceId": "watch_FnhtTl73RBEvGsRcl33_5U1nzJ3mRe-M_tPep5jwwE4",
+    "linkGeneration": 7,
+    "epoch": 3
+  },
+  "keys": {
+    "hostPrivateKeyPkcs8": "MC4CAQAwBQYDK2VuBCIEIEi0REi8oJtImBOTJXWrozBXx6UYnuV9c6io8uP1czdQ",
+    "hostPublicKey": "Gal7qMoataJtQyEIuNwHo5NLutXDKjY_63Tf7ovq7TM",
+    "watchPublicKey": "Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8",
+    "sharedSecret": "JknczbJ9ISxQsxgHnBrig065cazNhhzEo2TBZOBlPBg",
+    "watchPrivateKeyPkcs8": "MC4CAQAwBQYDK2VuBCIEIGBhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5_"
+  },
+  "bindings": {
+    "host": {
+      "version": 1,
+      "entityType": "host",
+      "entityId": "host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "identityKeyId": "key_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "encryptionKeyId": "ekey_CYl2qZ_WVBpJ3yUjhyJV39dm_YVsJJTDGInbKOGGz5M",
+      "suite": "x25519-hkdf-sha256-chachapoly-v1",
+      "publicKey": "Gal7qMoataJtQyEIuNwHo5NLutXDKjY_63Tf7ovq7TM",
+      "sequence": 1,
+      "createdAt": "2026-07-20T00:00:00.000Z"
+    },
+    "watch": {
+      "version": 1,
+      "entityType": "watch",
+      "entityId": "watch_FnhtTl73RBEvGsRcl33_5U1nzJ3mRe-M_tPep5jwwE4",
+      "identityKeyId": "key_FnhtTl73RBEvGsRcl33_5U1nzJ3mRe-M_tPep5jwwE4",
+      "encryptionKeyId": "ekey_FnhtTl73RBEvGsRcl33_5U1nzJ3mRe-M_tPep5jwwE4",
+      "suite": "x25519-hkdf-sha256-chachapoly-v1",
+      "publicKey": "Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8",
+      "sequence": 1,
+      "createdAt": "2026-07-20T00:00:00.000Z"
+    }
+  },
+  "transcript": {
+    "hostBindingDigest": "QOTuY3SxZ7_cwL7_quaX6gS-vVP8VMf9ddHlyNV_pfs",
+    "watchBindingDigest": "NryVJf6wP0UqBpQ6nd8gdb_HB2GZ--s_C2PanJ6tFf4",
+    "bytes": "Mjk6YXJpYXZhLWUyZS1saW5rLXRyYW5zY3JpcHQtdjEKMTQ6bGlua192ZWN0b3JfMDEKNDg6aG9zdF9JZjR4MzZGVW9tRmlhX2hVQkdfU0p4dDc3VXRxdmtXcVdJZC05SC1YSWJrCjQ5OndhdGNoX0ZuaHRUbDczUkJFdkdzUmNsMzNfNVUxbnpKM21SZS1NX3RQZXA1and3RTQKMTo3CjE6Mwo0MzpRT1R1WTNTeFo3X2N3TDdfcXVhWDZnUy12VlA4Vk1mOWRkSGx5TlZfcGZzCjQzOk5yeVZKZjZ3UDBVcUJwUTZuZDhnZGJfSEIyR1otLXNfQzJQYW5KNnRGZjQKMzI6eDI1NTE5LWhrZGYtc2hhMjU2LWNoYWNoYXBvbHktdjEK",
+    "digest": "FcJxuWFJbBHI86luEZvOWlVfkxGmN9J33gUyYT2PCjM",
+    "pairRootInfo": "YXJpYXZhOmUyZTp2MTpwYWlyLXJvb3Q6bGlua192ZWN0b3JfMDE6Nzoz"
+  },
+  "derived": {
+    "pairRoot": "T6L_jCpZuT495c1y8mS1622pg6g1y6EBn8HTK1fCv_w",
+    "bridgeToWatchWrapKey": "Ihmgav8E3JGWMfoxTKfB_fNSEt8bB0k_XXohm3yyEcQ"
+  },
+  "preview": {
+    "contentId": "content_vector_preview_01",
+    "plaintext": "eyJ2ZXJzaW9uIjoyLCJwcm9qZWN0TmFtZSI6ImFyaWF2YSIsImV2ZW50VHlwZSI6Im5lZWRfaHVtYW4iLCJib2R5VGV4dCI6IkNob29zZSBhIGRlcGxveW1lbnQgdGFyZ2V0LiIsInRydW5jYXRlZCI6ZmFsc2V9",
+    "contentAAD": "MzQ6YXJpYXZhLW5vdGlmaWNhdGlvbi1wcmV2aWV3LWFhZC12MgoxNTpicmlkZ2UtdG8td2F0Y2gKNDg6aG9zdF9JZjR4MzZGVW9tRmlhX2hVQkdfU0p4dDc3VXRxdmtXcVdJZC05SC1YSWJrCjQ5OndhdGNoX0ZuaHRUbDczUkJFdkdzUmNsMzNfNVUxbnpKM21SZS1NX3RQZXA1and3RTQKMTU6ZXZlbnRfdmVjdG9yXzAxCjE3OnNlc3Npb25fdmVjdG9yXzAxCjEwOm5lZWRfaHVtYW4KMTQ6bGlua192ZWN0b3JfMDEKMTo3CjE6Mwo0ODpla2V5X0NZbDJxWl9XVkJwSjN5VWpoeUpWMzlkbV9ZVnNKSlRER0luYktPR0d6NU0KNDg6ZWtleV9Gbmh0VGw3M1JCRXZHc1JjbDMzXzVVMW56SjNtUmUtTV90UGVwNWp3d0U0CjI1OmNvbnRlbnRfdmVjdG9yX3ByZXZpZXdfMDEKMjM6bm90aWZpY2F0aW9uLXByZXZpZXctdjIK",
+    "wrapAAD": "MTg6YXJpYXZhLXdyYXAtYWFkLXYyCjE1OmJyaWRnZS10by13YXRjaAoxNDpsaW5rX3ZlY3Rvcl8wMQoxOjcKMTozCjQ4Omhvc3RfSWY0eDM2RlVvbUZpYV9oVUJHX1NKeHQ3N1V0cXZrV3FXSWQtOUgtWEliawo0OTp3YXRjaF9Gbmh0VGw3M1JCRXZHc1JjbDMzXzVVMW56SjNtUmUtTV90UGVwNWp3d0U0CjQ4OmVrZXlfQ1lsMnFaX1dWQnBKM3lVamh5SlYzOWRtX1lWc0pKVERHSW5iS09HR3o1TQo0ODpla2V5X0ZuaHRUbDczUkJFdkdzUmNsMzNfNVUxbnpKM21SZS1NX3RQZXA1and3RTQKMjU6Y29udGVudF92ZWN0b3JfcHJldmlld18wMQoyMzpub3RpZmljYXRpb24tcHJldmlldy12Mgo",
+    "dek": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "contentNonce": "QEFCQ0RFRkdISUpL",
+    "wrapNonce": "UFFSU1RVVldYWVpb",
+    "ciphertext": "g3YK5AA5h2427cwyl80dv9umBnswsiACmy7oeYtVUwuG0rtcBC4Uk2Qbez4aMcykwz0JrJop5Vq2o2EZJElRDq9JfTgrZ8URYE0F5qxdQEq8e_RLjNGPF9AUwlksKOMG-V36dA6oNwNwrv6nas0D3YDD05m47PowHtneenRmWI2YV6D2kmPR0Q",
+    "wrappedDek": "47uIn0Zm9YqwD2DCquGRyrBRDKsanqS3BCtiAjpvn66r-AtRkkH5VxL-S7wkjpiX"
+  }
+}

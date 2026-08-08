@@ -14,6 +14,9 @@ export class CommandRouter {
   async handle(command: CommandEnvelope): Promise<CommandHandlingOutcome> {
     const previous = this.stateStore.getCommandResult(command.commandId);
     if (previous) {
+      if (previous.hostId !== command.hostId || previous.sessionId !== command.sessionId) {
+        throw new TypeError('command ID conflicts with a historical Host or Session binding');
+      }
       return { result: previous, followUpEvents: [] };
     }
 
@@ -46,7 +49,7 @@ export class CommandRouter {
     }
 
     const result = await driver.executeCommand({ command, session });
-    this.stateStore.rememberCommandResult(result);
+    this.stateStore.rememberCommandResult(result, command);
     return { result, followUpEvents: [] };
   }
 
@@ -58,14 +61,16 @@ export class CommandRouter {
   ): CommandResult {
     const result: CommandResult = {
       commandId: command.commandId,
-      hostId: command.hostId,
+      hostId: this.hostId,
       sessionId: command.sessionId,
       accepted,
       status,
       message,
       updatedAt: isoNow(),
     };
-    this.stateStore.rememberCommandResult(result);
+    this.stateStore.rememberCommandResult(result, {
+      commandId: command.commandId, hostId: this.hostId, sessionId: command.sessionId,
+    });
     return result;
   }
 }

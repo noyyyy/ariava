@@ -14,7 +14,6 @@ export interface CanonicalSessionState {
   workingDirectory?: string;
   hbaseSessionKey?: string;
   harnessProvider?: string;
-  stateLabel: string;
   status: SessionStatus;
   actionablePrompt?: ActionablePrompt;
   updatedAt: string;
@@ -44,7 +43,6 @@ export interface SessionSummaryAssistant {
   workingDirectory?: string;
   hbaseSessionKey?: string;
   harnessProvider?: string;
-  stateLabel: string;
   status: SessionStatus;
   updatedAt: string;
 }

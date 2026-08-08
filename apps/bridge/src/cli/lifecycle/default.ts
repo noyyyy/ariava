@@ -11,6 +11,8 @@ import {
   inspectPublicIdentity,
   type HostIdentityStore,
 } from '../../identity';
+import type { BridgeRuntimeHealth } from '../../types';
+import { readCurrentRuntimeHealth } from '../../state-store';
 import { probeHostPlatform } from '../../host-platform';
 import {
   createReadlineOnboardingPrompt,
@@ -304,6 +306,7 @@ function createDefaultStatusDependencies(deps: PublicCliDependencies) {
           cliVersion: CLI_VERSION,
           identityInspection: shared.identity,
           statePresent: shared.paths.statePresent,
+          runtimeHealth: readRuntimeHealth(shared.paths.statePath),
         });
       },
       formatStatus: (status: unknown) => formatStatus(status as ReturnType<typeof buildHostManagerStatus>),
@@ -358,6 +361,7 @@ function createDefaultDoctorDependencies(deps: PublicCliDependencies) {
           documentMetadataValid: metadataResult.diagnostics.documentMetadataValid !== false,
           logsAvailable: manager.logsAvailable(),
           statePathParentExists: shared.paths.statePathParentExists,
+          bridgeRuntimeHealth: readRuntimeHealth(shared.paths.statePath),
           relayConfigured: shared.relay.configured,
           identity: shared.identity,
           agentAdapterConfigPath: shared.adapter.configPath,
@@ -1208,11 +1212,26 @@ function redactUserConfig(config: AriavaUserConfig): AriavaUserConfig {
 }
 
 
+function readRuntimeHealth(statePath: string): BridgeRuntimeHealth | undefined {
+  return readCurrentRuntimeHealth(statePath);
+}
+
+function runtimeHealthDetail(health: BridgeRuntimeHealth): string | undefined {
+  if (health.status === 'healthy') return undefined;
+  const codes = [...health.drivers.map((item) => `${item.driver}:${item.code}`),
+    ...(health.relayPresence ? [health.relayPresence.code] : [])];
+  return codes.join(', ');
+}
+
+
 function formatStatus(status: ReturnType<typeof buildHostManagerStatus>): string {
   const hostId = status.hostId || status.identity.hostId;
   const fields = [
     { label: 'Version', value: status.cliVersion },
     { label: 'Bridge', value: status.bridgeHealth },
+    ...(status.runtimeHealth ? [{
+      label: 'Runtime', value: status.runtimeHealth.status, detail: runtimeHealthDetail(status.runtimeHealth),
+    }] : []),
     { label: 'Host', value: status.hostName, detail: hostId },
     { label: 'Identity', value: status.identity.status, detail: status.identity.keyId },
     { label: 'Relay', value: status.relayBaseUrl },

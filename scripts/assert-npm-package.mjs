@@ -2,6 +2,8 @@
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
+const forbiddenRuntime = /event-content-v1|session-content-v1|notification-preview-v1|agent\.(?:working|question|blocked)|question_requested|driver_error|host_unavailable|event\.diagnostic_ingested|statusToStateLabel|\bstateLabel\b/gu;
+
 const args = process.argv.slice(2);
 let kind = 'root';
 let inputPath;
@@ -40,6 +42,53 @@ function readTarEntry(tarball, entry) {
   return result.stdout;
 }
 
+function stripRecognizedPriorResetDecoder(source, entry) {
+  if (!entry.match(/^apps\/bridge\/dist\/(?:cli|daemon|dev-profile-cli|public-cli|state-store)\.js$/u) || !source.match(forbiddenRuntime)) return source;
+  const priorSessionKeys = source.match(/var PRIOR_SESSION_REQUIRED_KEYS = \[\.\.\.SESSION_REQUIRED_KEYS, "stateLabel"\];/u)?.[0];
+  const decoder = source.match(/function isRecognizedPriorSession[^]*?function isRecognizedPriorSpoolMigration\(value\) \{[^]*?\}(?=\s*(?:function|$))/u)?.[0];
+  if (!priorSessionKeys || !decoder) fail(`cannot isolate recognized-prior reset decoder in ${entry}`);
+  return source.replace(priorSessionKeys, '').replace(decoder, '');
+}
+
+function assertCanonicalRuntimePackageContents(tarball, entries) {
+  for (const entry of entries.filter((path) => /\.(?:js|json)$/u.test(path))) {
+    const active = stripRecognizedPriorResetDecoder(readTarEntry(tarball, entry), entry);
+    const match = active.match(forbiddenRuntime)?.[0];
+    if (match) fail(`runtime package artifact ${entry} contains ${match}`);
+  }
+}
+
+const runtimeFixturePaths = {
+  vectors: 'packages/protocol/dist/fixtures/e2e-v2-vectors.json',
+  preview: 'packages/protocol/dist/fixtures/notification-preview-v2-vector.json',
+  parity: 'packages/protocol/dist/fixtures/need-human-error-validation-v2.json',
+};
+
+function assertRuntimeFixtureContents(tarball) {
+  let vectors;
+  let preview;
+  let parity;
+  try {
+    vectors = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.vectors));
+    preview = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.preview));
+    parity = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.parity));
+  } catch { fail('runtime v2 and parity fixtures must be valid JSON'); }
+  if (vectors.version !== 2 || vectors.event?.contentId === undefined || vectors.session?.contentId === undefined
+    || !String(vectors.event?.contentAAD ?? '').trim() || !String(vectors.session?.contentAAD ?? '').trim()) {
+    fail('runtime v2 interoperability fixture is invalid');
+  }
+  if (preview.version !== 2 || preview.preview?.contentId === undefined || !String(preview.preview?.contentAAD ?? '').trim()) {
+    fail('notification preview v2 fixture is invalid');
+  }
+  if (parity.version !== 2 || !Array.isArray(parity.cases) || parity.cases.length === 0) {
+    fail('NeedHuman error parity fixture is invalid');
+  }
+  const runtimeFixtureBytes = JSON.stringify({ vectors, preview });
+  for (const legacy of ['event-content-v1', 'session-content-v1', 'notification-preview-v1']) {
+    if (runtimeFixtureBytes.includes(legacy)) fail(`runtime fixture contains ${legacy}`);
+  }
+}
+
 let filePaths;
 let packVersion;
 if (inputPath.endsWith('.tgz')) {
@@ -73,6 +122,7 @@ const forbiddenPatterns = [
   /macos-helper/iu,
   /runtime-image/iu,
   /\.(?:png|jpe?g|gif|webp|heic|svg)$/iu,
+  /packages\/protocol\/dist\/fixtures\/(?:e2e-v1-vectors|notification-preview-v1-vector)\.json$/u,
 ];
 
 if (kind === 'pi') {
@@ -98,6 +148,7 @@ if (kind === 'pi') {
       || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(marker.createdAt ?? '')) {
       fail('pi release bundle marker is invalid');
     }
+    assertCanonicalRuntimePackageContents(inputPath, filePaths);
   } else {
     assertPublishedVersion(packVersion, 'pack metadata version');
   }
@@ -124,8 +175,7 @@ const required = [
   'packages/protocol/dist/encryption.js',
   'packages/protocol/dist/encryption.d.ts',
   'packages/protocol/dist/fixtures/ed25519-request-vectors.json',
-  'packages/protocol/dist/fixtures/e2e-v1-vectors.json',
-  'packages/protocol/dist/fixtures/notification-preview-v1-vector.json',
+  ...Object.values(runtimeFixturePaths),
   'packages/shared-utils/dist/index.js',
   'packages/shared-utils/dist/index.d.ts',
   'extensions/pi/bundle/index.js',
@@ -151,6 +201,8 @@ if (inputPath.endsWith('.tgz')) {
   } catch { fail('root package.json must be valid JSON'); }
   assertPublishedVersion(manifest.version);
   if (manifest.name !== 'ariava') fail(`root package name must be ariava, got: ${JSON.stringify(manifest.name ?? null)}`);
+  assertRuntimeFixtureContents(inputPath);
+  assertCanonicalRuntimePackageContents(inputPath, filePaths);
 } else {
   assertPublishedVersion(packVersion, 'pack metadata version');
 }

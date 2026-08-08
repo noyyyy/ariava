@@ -29,6 +29,7 @@ const built = spawnSync('bun', [
   resolve(bridgeRoot, 'src', 'e2e', 'upload-orchestrator.ts'),
   resolve(bridgeRoot, 'src', 'relay-client.ts'),
   resolve(bridgeRoot, 'src', 'state-store.ts'),
+  resolve(bridgeRoot, 'src', 'runtime-lock.ts'),
   '--root', resolve(bridgeRoot, 'src'),
   '--outdir', outputDirectory,
   '--target', 'node',

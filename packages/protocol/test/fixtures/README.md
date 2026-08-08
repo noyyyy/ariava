@@ -1,28 +1,27 @@
-# E2E v1 golden vectors
+# Runtime v2 golden vectors
 
-`e2e-v1-vectors.json` freezes the production interoperability bytes for
-X25519 + HKDF-SHA256 + ChaCha20-Poly1305. It was produced once from fixed
-PKCS#8 inputs by an independent Node 22 script, then checked in. Product tests
-consume the fixture; they do not regenerate expected values through the helper
-under test.
+`e2e-v2-vectors.json` freezes deterministic interoperability bytes for the
+breaking event/session runtime v2 cutover. `notification-preview-v2-vector.json`
+separately freezes preview v2 canonical plaintext, recipient-bound AAD, content
+encryption, and key-wrap output. Active runtime fixture/package surfaces contain no
+event/session/preview v1 fixture or decoder.
 
-The production acceptance matrix is **Swift CryptoKit ↔ Node 22 `node:crypto`**.
-Bun runs protocol/state-machine tests only. Changing any byte in this fixture is
-a protocol-breaking change and requires explicit review of Node and CryptoKit
-results. Phase 0 checks in the Node consumer now; the matching CryptoKit consumer
-and real-device evidence remain explicitly deferred to the watchOS phase.
+The runtime payload kinds are exactly `event-content-v2`, `session-content-v2`, and
+`notification-preview-v2`. Event, Session, preview, and wrap AAD use reviewed v2
+domains; reply content remains the unrelated `reply-content-v1` command contract.
+Identity bindings, link transcripts, pair-root derivation, and the crypto suite also
+remain v1 key-ceremony contracts rather than runtime compatibility decoders.
 
-Binary values are canonical unpadded RFC 4648 base64url. ChaChaPoly ciphertext
-is `ciphertext || 16-byte tag`; nonce is a separate 12-byte field. The fixture's
-transcript and wrap AAD include `linkGeneration`.
+`need-human-error-validation-v2.json` freezes Node/Swift protected-error validation
+parity. The package must publish both runtime v2 vectors plus this parity fixture and
+must never contain an event/session/preview runtime v1 fixture.
 
-The initial reviewed fixture omitted binding canonical/signature bytes even though the
-frozen convergence contract requires them. The `binding` object was added during this
-pre-freeze review completion without changing any previously frozen value. Its Ed25519
-signature uses the existing public RFC 8032 test seed from the request-signing fixture.
+The interoperability fixtures use fixed public test-only PKCS#8 inputs, DEKs, and nonces. Product tests
+consume the checked-in expected bytes and never regenerate them through the helper
+under test. Binary values are canonical unpadded RFC 4648 base64url; ChaChaPoly
+ciphertext is `ciphertext || 16-byte tag`, with a separate 12-byte nonce.
 
-`notification-preview-v1-vector.json` is a separate reviewed additive vector. The
-original `e2e-v1-vectors.json` is frozen byte-for-byte, so preview bytes were not
-inserted into it. The preview fixture freezes canonical plaintext, recipient-bound
-AAD, content encryption, and key-wrap output using fixed keys and nonces. Binary
-encoding and cross-language review rules are the same as for the original fixture.
+The production acceptance matrix is **Swift CryptoKit ↔ Node `node:crypto`**. The
+Node consumer verifies every binding and mutation in this milestone; the matching
+Swift consumer belongs to the watchOS milestone. Any fixture-byte change is a
+protocol-breaking change requiring explicit cross-language review.

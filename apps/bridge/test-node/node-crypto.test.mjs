@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHmac, createPrivateKey, createPublicKey, verify } from 'node:crypto';
+import { createHmac, createPublicKey, verify } from 'node:crypto';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -14,7 +14,7 @@ import {
 } from '../../../packages/protocol/dist/index.js';
 
 const publicCoreRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const vectors = JSON.parse(readFileSync(resolve(publicCoreRoot, 'packages/protocol/test/fixtures/e2e-v1-vectors.json'), 'utf8'));
+const vectors = JSON.parse(readFileSync(resolve(publicCoreRoot, 'packages/protocol/test/fixtures/e2e-v2-vectors.json'), 'utf8'));
 const decode = (value) => new Uint8Array(Buffer.from(value, 'base64url'));
 
 test('Node 22 production crypto matches the frozen X25519/HKDF/ChaChaPoly vector', () => {
@@ -41,11 +41,10 @@ test('Node 22 production crypto matches the frozen X25519/HKDF/ChaChaPoly vector
 });
 
 test('frozen binding canonical bytes and Ed25519 signature verify', () => {
-  const { canonicalBytes, bindingSignature, ...binding } = vectors.binding;
+  const { canonicalBytes, bindingSignature, ...binding } = vectors.bindings.host;
   const bytes = buildEncryptionBindingBytes(binding);
   assert.deepEqual(bytes, decode(canonicalBytes));
-  const seed = Buffer.from('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60', 'hex');
-  const identityKey = createPrivateKeyFromSeed(seed);
+  const identityKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), decode(vectors.keys.hostIdentityPublicKey)]), format: 'der', type: 'spki' });
   assert.equal(verify(null, bytes, identityKey, decode(bindingSignature)), true);
   assert.equal(verify(null, buildEncryptionBindingBytes({ ...binding, sequence: 2 }), identityKey, decode(bindingSignature)), false);
 });
@@ -85,8 +84,9 @@ test('generation and epoch tampering specifically fail content-key unwrap authen
   const baseline = {
     direction: 'bridge-to-watch', linkId: vectors.link.linkId, linkGeneration: vectors.link.linkGeneration,
     epoch: vectors.link.epoch, hostId: vectors.link.hostId, watchDeviceId: vectors.link.watchDeviceId,
-    senderEncryptionKeyId: 'ekey_host_vector', recipientEncryptionKeyId: 'ekey_watch_vector',
-    contentId: vectors.event.contentId, payloadKind: 'event-content-v1',
+    senderEncryptionKeyId: vectors.bindings.host.encryptionKeyId,
+    recipientEncryptionKeyId: vectors.bindings.watch.encryptionKeyId,
+    contentId: vectors.event.contentId, payloadKind: 'event-content-v2',
   };
   assert.deepEqual(buildWrapAAD(baseline), decode(vectors.event.wrapAAD));
   assert.deepEqual(chachaPolyOpen(wrapKey, decode(vectors.event.wrapNonce), decode(vectors.event.wrappedDek), buildWrapAAD(baseline)), decode(vectors.event.dek));
@@ -107,11 +107,3 @@ test('HKDF rejects non-32-byte IKM', () => {
   assert.throws(() => hkdfSha256(Buffer.alloc(31), decode(vectors.transcript.digest), decode(vectors.transcript.pairRootInfo)), /IKM/);
   assert.throws(() => hkdfSha256(Buffer.alloc(33), decode(vectors.transcript.digest), decode(vectors.transcript.pairRootInfo)), /IKM/);
 });
-
-function createPrivateKeyFromSeed(seed) {
-  return createPrivateKey({
-    key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]),
-    type: 'pkcs8',
-    format: 'der',
-  });
-}

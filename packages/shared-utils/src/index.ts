@@ -24,17 +24,11 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function eventTypeToLabel(type: string): string {
+export function eventTypeToLabel(type: 'done' | 'need_human'): string {
   switch (type) {
-    case 'approval_requested':
-      return 'Needs approval';
-    case 'question_requested':
-      return 'Agent question';
-    case 'blocked':
-      return 'Session blocked';
     case 'done':
       return 'Task complete';
-    default:
-      return 'Agent update';
+    case 'need_human':
+      return 'Needs attention';
   }
 }

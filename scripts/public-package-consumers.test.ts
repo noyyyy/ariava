@@ -55,8 +55,11 @@ import { formatPairingCode } from '@ariava/protocol/pairing';
 import { REQUEST_SIGNATURE_DOMAIN } from '@ariava/protocol/request-signing';
 import { SESSION_SNAPSHOT_ERROR_CODES, validateReplaceE2ECurrentSessionsRequestV1 } from '@ariava/protocol/session-snapshots';
 import * as sessions from '@ariava/protocol/sessions';
-import { validateSignedRequestHeaders } from '@ariava/protocol/validation';
+import { isCanonicalNeedHumanErrorMessage, validateNeedHumanError, validateSignedRequestHeaders } from '@ariava/protocol/validation';
 import vectors from '@ariava/protocol/fixtures/ed25519-request-vectors' with { type: 'json' };
+import runtimeVectors from '@ariava/protocol/fixtures/e2e-v2-vectors' with { type: 'json' };
+import previewVector from '@ariava/protocol/fixtures/notification-preview-v2-vector' with { type: 'json' };
+import parity from '@ariava/protocol/fixtures/need-human-error-validation-v2' with { type: 'json' };
 import { createId } from '@ariava/shared-utils';
 
 if (COMMAND_TYPES.join(',') !== 'reply,interrupt') throw new Error('root export failed');
@@ -68,8 +71,15 @@ if (formatPairingCode('012345') !== '012345') throw new Error('pairing export fa
 if (REQUEST_SIGNATURE_DOMAIN !== 'ariava-request-v1') throw new Error('request-signing export failed');
 if (SESSION_SNAPSHOT_ERROR_CODES[0] !== 'session_snapshot_stale' || typeof validateReplaceE2ECurrentSessionsRequestV1 !== 'function') throw new Error('session-snapshots export failed');
 if (typeof sessions !== 'object') throw new Error('sessions export failed');
-if (typeof validateSignedRequestHeaders !== 'function') throw new Error('validation export failed');
+if (
+  typeof validateSignedRequestHeaders !== 'function'
+  || !isCanonicalNeedHumanErrorMessage('Provider failed.')
+  || !validateNeedHumanError({ kind: 'unknown', message: 'Provider failed.', retryExhausted: true }).success
+) throw new Error('validation export failed');
 if (!vectors || !Array.isArray(vectors.vectors) || vectors.vectors.length === 0) throw new Error('fixture export failed');
+if (parity.version !== 2 || !Array.isArray(parity.cases) || parity.cases.length === 0) throw new Error('parity fixture export failed');
+if (runtimeVectors.version !== 2 || !runtimeVectors.event?.contentAAD || !runtimeVectors.session?.contentAAD) throw new Error('runtime v2 fixture export failed');
+if (previewVector.version !== 2 || !previewVector.preview?.contentAAD) throw new Error('preview v2 fixture export failed');
 if (!createId('test', 1, 0).startsWith('test_')) throw new Error('shared-utils export failed');
 `);
       requireSuccess(run('bun', ['run', 'runtime.ts'], consumer), 'Bun packed-package imports');
@@ -84,8 +94,11 @@ import { formatPairingCode, type BridgePairWatchRequest } from '@ariava/protocol
 import { REQUEST_SIGNATURE_DOMAIN, type SignedRequestHeaders } from '@ariava/protocol/request-signing';
 import { SESSION_SNAPSHOT_ERROR_CODES, validateReplaceE2ECurrentSessionsRequestV1, type ReplaceE2ECurrentSessionsRequestV1 } from '@ariava/protocol/session-snapshots';
 import type { CanonicalSessionState } from '@ariava/protocol/sessions';
-import { validateSignedRequestHeaders, type ValidationResult } from '@ariava/protocol/validation';
+import { isCanonicalNeedHumanErrorMessage, validateNeedHumanError, validateSignedRequestHeaders, type ValidationResult } from '@ariava/protocol/validation';
 import vectors from '@ariava/protocol/fixtures/ed25519-request-vectors' with { type: 'json' };
+import runtimeVectors from '@ariava/protocol/fixtures/e2e-v2-vectors' with { type: 'json' };
+import previewVector from '@ariava/protocol/fixtures/notification-preview-v2-vector' with { type: 'json' };
+import parity from '@ariava/protocol/fixtures/need-human-error-validation-v2' with { type: 'json' };
 import { createId } from '@ariava/shared-utils';
 
 const commandType: CommandType = COMMAND_TYPES[0];
@@ -99,7 +112,12 @@ const fixtureCount: number = vectors.vectors.length;
 const id: string = createId('typecheck');
 const snapshotValidator: (value: unknown) => ValidationResult<ReplaceE2ECurrentSessionsRequestV1> = validateReplaceE2ECurrentSessionsRequestV1;
 const snapshotErrorCode = SESSION_SNAPSHOT_ERROR_CODES[0];
-void [commandType, entityType, status, platform, request, validator, validate, snapshotValidator, snapshotErrorCode, fixtureCount, id, REQUEST_SIGNATURE_DOMAIN];
+const messageValidator: (value: unknown) => value is string = isCanonicalNeedHumanErrorMessage;
+const errorValidator = validateNeedHumanError;
+const parityVersion: number = parity.version;
+const runtimeFixtureVersion: number = runtimeVectors.version;
+const previewFixtureVersion: number = previewVector.version;
+void [commandType, entityType, status, platform, request, validator, validate, messageValidator, errorValidator, snapshotValidator, snapshotErrorCode, fixtureCount, runtimeFixtureVersion, previewFixtureVersion, parityVersion, id, REQUEST_SIGNATURE_DOMAIN];
 void (null as unknown as CommandEnvelope | CanonicalEvent | HostProjection | CanonicalSessionState);
 `);
       writeFileSync(join(consumer, 'tsconfig.json'), JSON.stringify({

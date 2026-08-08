@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BridgeDaemon, EncryptedEventFailureLogger, loadBridgeConfig } from '../src/daemon';
+import {
+  BridgeDaemon,
+  EncryptedEventFailureLogger,
+  loadBridgeConfig,
+  type ReconciliationScheduler,
+} from '../src/daemon';
 import { LinuxJsonHostIdentityStore, publicIdentityMetadata } from '../src/identity';
 
 const roots: string[] = [];
@@ -25,6 +30,106 @@ function decode(bytes: Uint8Array | ArrayBuffer | SharedArrayBuffer | null | und
     return '';
   }
   return decoder.decode(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)).trim();
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T | PromiseLike<T>): void;
+}
+
+interface EnrollmentRequest {
+  hostId: string;
+  hostName: string;
+  platform: string;
+  bridgeVersion: string;
+}
+
+interface HostResponseOverrides {
+  hostName?: string;
+  registeredAt?: string;
+  lastSeenAt?: string;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
+async function waitFor(condition: () => boolean, context: string, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${context}`);
+    await Bun.sleep(1);
+  }
+}
+
+async function waitForPromise<T>(promise: Promise<T>, context: string, timeoutMs = 1_000): Promise<T> {
+  return Promise.race([
+    promise,
+    Bun.sleep(timeoutMs).then(() => { throw new Error(`Timed out waiting for ${context}`); }),
+  ]);
+}
+
+function createEnrollmentResponse(body: EnrollmentRequest, overrides: HostResponseOverrides = {}): Response {
+  const now = new Date().toISOString();
+  return Response.json({
+    host: {
+      hostId: body.hostId,
+      hostName: overrides.hostName ?? body.hostName,
+      platform: body.platform,
+      bridgeVersion: body.bridgeVersion,
+      registeredAt: overrides.registeredAt ?? now,
+      lastSeenAt: overrides.lastSeenAt ?? now,
+      bridgeStatus: 'online',
+    },
+  });
+}
+
+class ControllableScheduler implements ReconciliationScheduler {
+  readonly scheduled: Array<{ callback: () => void; delayMs: number; canceled: boolean }> = [];
+
+  schedule(callback: () => void, delayMs: number): unknown {
+    const handle = { callback, delayMs, canceled: false };
+    this.scheduled.push(handle);
+    return handle;
+  }
+
+  cancel(handle: unknown): void {
+    (handle as (typeof this.scheduled)[number]).canceled = true;
+  }
+
+  run(index: number): void {
+    this.scheduled[index]?.callback();
+  }
+}
+
+async function createPresenceDaemon(
+  relayBaseUrl: string,
+  scheduler: ReconciliationScheduler,
+  listSessions: () => Promise<[]>,
+): Promise<{ daemon: BridgeDaemon; statePath: string }> {
+  const root = join(tmpdir(), `bridge-daemon-presence-${Date.now()}-${roots.length}`);
+  roots.push(root);
+  mkdirSync(root, { mode: 0o700 });
+  const identityPath = join(root, 'identity.json');
+  const store = new LinuxJsonHostIdentityStore(identityPath);
+  const identity = await store.createFirstRun();
+  const statePath = join(root, 'state.json');
+  const config = loadBridgeConfig();
+  Object.assign(config, {
+    runtimePlatform: 'linux',
+    hostPlatform: 'linux',
+    hostId: identity.hostId,
+    identity: publicIdentityMetadata(identity),
+    relayBaseUrl,
+    pollIntervalMs: 60_000,
+    configPath: join(root, 'config.json'),
+    statePath,
+    identityPath,
+    agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+  });
+  return { daemon: new BridgeDaemon(config, [{ name: 'test', listSessions }], store, undefined, scheduler), statePath };
 }
 
 async function createLongPollingDaemon(relayBaseUrl: string): Promise<BridgeDaemon> {
@@ -118,7 +223,7 @@ describe('BridgeDaemon', () => {
     expect(relayCalls).toBe(0);
   });
 
-  test('redacts daemon errors before state persistence or Relay publication', async () => {
+  test('logs redacted driver failures without persisting diagnostic Event or state', async () => {
     const root = join(tmpdir(), `bridge-daemon-redaction-${Date.now()}`);
     roots.push(root);
     mkdirSync(root, { mode: 0o700 });
@@ -149,16 +254,208 @@ describe('BridgeDaemon', () => {
         },
         executeCommand: async () => { throw new Error('not used'); },
       };
-      await new BridgeDaemon(config, [failingDriver]).syncOnce();
-      const persisted = String(await Bun.file(statePath).text());
+      const lines: string[] = [];
+      const originalWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = ((chunk: string | Uint8Array) => { lines.push(String(chunk)); return true; }) as typeof process.stderr.write;
+      try {
+        const result = await new BridgeDaemon(config, [failingDriver]).syncOnce();
+        expect(result.emittedEvents).toEqual([]);
+      } finally {
+        process.stderr.write = originalWrite;
+      }
+      const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : { recentEvents: [], sessions: {} };
+      const persisted = existsSync(statePath) ? readFileSync(statePath, 'utf8') : '';
+      expect(state.recentEvents).toEqual([]);
+      expect(state).not.toHaveProperty('pendingEvents');
+      expect(JSON.stringify(state.sessions)).not.toMatch(/driver:|host:/u);
       for (const secret of [envSecret, persistedSecret, adapterSecret, relayRemnant, 'persisted-adapter-secret']) {
         expect(persisted).not.toContain(secret);
+        expect(lines.join('')).not.toContain(secret);
       }
-      expect(persisted).toContain('<redacted>');
+      expect(lines.join('')).toContain('"component":"bridge_runtime_health"');
+      expect(lines.join('')).toContain('"code":"driver_reconciliation_failed"');
+      expect(lines.join('')).not.toContain('failed ');
     } finally {
       if (previousSecret === undefined) delete process.env.ARIAVA_TEST_PRIVATE_KEY;
       else process.env.ARIAVA_TEST_PRIVATE_KEY = previousSecret;
     }
+  });
+
+  test('refreshes Host presence while a full synchronization remains blocked', async () => {
+    let enrollments = 0;
+    const relay = Bun.serve({ port: 0, fetch: async (request) => {
+      if (new URL(request.url).pathname !== '/v2/bridge/enroll') return new Response('unexpected', { status: 500 });
+      const body = await request.json() as EnrollmentRequest;
+      enrollments += 1;
+      return createEnrollmentResponse(body);
+    } });
+    servers.push(relay);
+    const scheduler = new ControllableScheduler();
+    const sessionsStarted = deferred<void>();
+    const sessions = deferred<[]>();
+    const { daemon } = await createPresenceDaemon(`http://127.0.0.1:${relay.port}`, scheduler, () => {
+      sessionsStarted.resolve();
+      return sessions.promise;
+    });
+    let run: Promise<void> | undefined;
+    try {
+      await daemon.start();
+      run = daemon.runForever();
+      await waitForPromise(sessionsStarted.promise, 'initial synchronization to enter blocked session listing');
+      expect(enrollments).toBe(1);
+      scheduler.run(0);
+      await waitFor(() => enrollments >= 2, 'heartbeat enrollment during blocked synchronization');
+      expect(enrollments).toBe(2);
+    } finally {
+      daemon.stop();
+      sessions.resolve([]);
+      if (run) await waitForPromise(run.catch(() => {}), 'blocked synchronization cleanup');
+    }
+  });
+
+  test('joins heartbeat and explicit synchronization into one presence flight', async () => {
+    let enrollments = 0;
+    let enrollment!: EnrollmentRequest;
+    const enrollmentStarted = deferred<void>();
+    const secondEnrollmentStarted = deferred<void>();
+    const enrollmentResponse = deferred<Response>();
+    const sessionsStarted = deferred<void>();
+    const sessions = deferred<[]>();
+    const relay = Bun.serve({ port: 0, fetch: async (request) => {
+      if (new URL(request.url).pathname !== '/v2/bridge/enroll') return new Response('unexpected', { status: 500 });
+      enrollment = await request.json() as EnrollmentRequest;
+      enrollments += 1;
+      if (enrollments === 1) enrollmentStarted.resolve();
+      if (enrollments === 2) secondEnrollmentStarted.resolve();
+      return enrollmentResponse.promise;
+    } });
+    servers.push(relay);
+    const scheduler = new ControllableScheduler();
+    const { daemon } = await createPresenceDaemon(`http://127.0.0.1:${relay.port}`, scheduler, async () => {
+      sessionsStarted.resolve();
+      return sessions.promise;
+    });
+    let sync: Promise<unknown> | undefined;
+    try {
+      await daemon.start();
+      scheduler.run(0);
+      await waitForPromise(enrollmentStarted.promise, 'heartbeat enrollment to start');
+      sync = daemon.syncOnce();
+      expect(await Promise.race([
+        secondEnrollmentStarted.promise.then(() => 'second-enrollment'),
+        Bun.sleep(50).then(() => 'shared-flight'),
+      ])).toBe('shared-flight');
+      expect(enrollments).toBe(1);
+      enrollmentResponse.resolve(createEnrollmentResponse(enrollment, { hostName: 'Heartbeat host' }));
+      await waitForPromise(sessionsStarted.promise, 'joined synchronization to enter session listing');
+    } finally {
+      daemon.stop();
+      enrollmentResponse.resolve(new Response('stopped', { status: 503 }));
+      sessions.resolve([]);
+      if (sync) await waitForPromise(sync.catch(() => {}), 'joined synchronization cleanup');
+    }
+  });
+
+  test('keeps background presence heartbeats single-flight and cancels scheduling on stop', async () => {
+    let enrollments = 0;
+    let enrollment!: EnrollmentRequest;
+    const enrollmentStarted = deferred<void>();
+    const heldEnrollment = deferred<Response>();
+    const relay = Bun.serve({ port: 0, fetch: async (request) => {
+      enrollment = await request.json() as EnrollmentRequest;
+      enrollments += 1;
+      enrollmentStarted.resolve();
+      return heldEnrollment.promise;
+    } });
+    servers.push(relay);
+    const scheduler = new ControllableScheduler();
+    const { daemon } = await createPresenceDaemon(`http://127.0.0.1:${relay.port}`, scheduler, async () => []);
+    try {
+      await daemon.start();
+      expect(scheduler.scheduled[0]?.delayMs).toBe(30_000);
+      scheduler.run(0);
+      await waitForPromise(enrollmentStarted.promise, 'background heartbeat enrollment to start');
+      scheduler.run(0);
+      await Bun.sleep(0);
+      expect(enrollments).toBe(1);
+      heldEnrollment.resolve(createEnrollmentResponse(enrollment, { hostName: 'Heartbeat host' }));
+      await waitFor(() => scheduler.scheduled.length >= 2, 'next presence heartbeat schedule');
+      daemon.stop();
+      expect(scheduler.scheduled[1]?.canceled).toBe(true);
+      scheduler.run(1);
+      await Bun.sleep(0);
+      expect(enrollments).toBe(1);
+    } finally {
+      daemon.stop();
+      heldEnrollment.resolve(new Response('stopped', { status: 503 }));
+    }
+  });
+
+  test('degrades after a failed presence heartbeat and restores the authoritative Host projection on recovery', async () => {
+    const initialLastSeenAt = '2026-08-01T00:00:00.000Z';
+    const recoveredLastSeenAt = '2026-08-01T00:01:00.000Z';
+    let enrollmentAttempt = 0;
+    let enrollment!: EnrollmentRequest;
+    const relay = Bun.serve({ port: 0, fetch: async (request) => {
+      if (new URL(request.url).pathname !== '/v2/bridge/enroll') return new Response('unexpected', { status: 500 });
+      enrollment = await request.json() as EnrollmentRequest;
+      enrollmentAttempt += 1;
+      if (enrollmentAttempt === 2 || enrollmentAttempt === 3) return new Response('offline', { status: 503 });
+      const recovered = enrollmentAttempt === 4;
+      return createEnrollmentResponse(enrollment, {
+        hostName: recovered ? 'Relay authoritative host' : enrollment.hostName,
+        registeredAt: '2026-07-01T00:00:00.000Z',
+        lastSeenAt: recovered ? recoveredLastSeenAt : initialLastSeenAt,
+      });
+    } });
+    servers.push(relay);
+    const scheduler = new ControllableScheduler();
+    const { daemon, statePath } = await createPresenceDaemon(`http://127.0.0.1:${relay.port}`, scheduler, async () => []);
+    try {
+      await daemon.start();
+      scheduler.run(0);
+      await waitFor(() => scheduler.scheduled.length >= 2, 'heartbeat schedule after initial presence');
+      const initialState = await Bun.file(statePath).json() as { host: { hostId: string; bridgeStatus: string; lastSeenAt: string } };
+      expect(initialState.host).toMatchObject({
+        hostId: enrollment.hostId, bridgeStatus: 'online', lastSeenAt: initialLastSeenAt,
+      });
+
+      scheduler.run(1);
+      await waitFor(() => scheduler.scheduled.length >= 3, 'heartbeat schedule after failed presence');
+      const degradedState = await Bun.file(statePath).json() as { host: { bridgeStatus: string; lastSeenAt: string } };
+      expect(degradedState.host).toMatchObject({ bridgeStatus: 'degraded', lastSeenAt: initialLastSeenAt });
+      const operationalSync = await daemon.syncOnce();
+      expect(operationalSync).toMatchObject({ offline: true, host: { bridgeStatus: 'degraded', lastSeenAt: initialLastSeenAt } });
+
+      scheduler.run(2);
+      await waitFor(() => scheduler.scheduled.length >= 4, 'heartbeat schedule after recovered presence');
+      const recoveredState = await Bun.file(statePath).json() as { host: { hostName: string; bridgeStatus: string; lastSeenAt: string } };
+      expect(recoveredState.host).toMatchObject({
+        hostName: 'Relay authoritative host', bridgeStatus: 'online', lastSeenAt: recoveredLastSeenAt,
+      });
+    } finally {
+      daemon.stop();
+    }
+  });
+
+  test('flushes a durably bound handle and removes it only after Relay acknowledgement', async () => {
+    const daemon = await createLongPollingDaemon('http://127.0.0.1:1');
+    const registry = (daemon as any).adapterRegistry;
+    const stateStore = (daemon as any).stateStore;
+    registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/' });
+    stateStore.appendRecentEvent({
+      eventId: 'evt-handle', hostId: (daemon as any).config.hostId, sessionId: 'sess-handle', provider: 'pi',
+      type: 'done', status: 'idle', typeLabel: 'Task complete', agentText: 'Done', createdAt: '2026-08-07T00:00:00.000Z',
+    });
+    registry.handleSession('sess-handle', { handledThroughEventId: 'evt-handle', action: 'pi_input' });
+    const delivered: unknown[] = [];
+    (daemon as any).relayClient = {
+      handleSession: async (sessionId: string, request: unknown) => { delivered.push({ sessionId, request }); return { ok: true }; },
+    };
+    await expect((daemon as any).flushPendingHandles()).resolves.toBe(1);
+    expect(delivered).toEqual([expect.objectContaining({ sessionId: 'sess-handle' })]);
+    expect(stateStore.peekPendingSessionHandles()).toEqual([]);
+    daemon.stop();
   });
 
   test('does not request reconciliation until the scheduled delay elapses', async () => {
@@ -172,10 +469,13 @@ describe('BridgeDaemon', () => {
       cancel: () => {},
     };
     const daemon = await createLongPollingDaemon('http://127.0.0.1:1');
+    const daemonConfig = (daemon as any).config;
+    const daemonIdentityStore = (daemon as any).identityStore;
+    daemon.stop();
     const scheduledDaemon = new BridgeDaemon(
-      (daemon as any).config,
+      daemonConfig,
       [{ name: 'test', listSessions: async () => [] }],
-      (daemon as any).identityStore,
+      daemonIdentityStore,
       undefined,
       scheduler,
     );
@@ -187,6 +487,16 @@ describe('BridgeDaemon', () => {
     expect(scheduledCallback).toBeDefined();
     scheduledCallback!();
     expect((scheduledDaemon as any).reconciliationRequested).toBe(true);
+    scheduledDaemon.stop();
+  });
+
+  test('stop disposes Registry retry lifecycle', async () => {
+    const daemon = await createLongPollingDaemon('http://127.0.0.1:1');
+    let disposed = 0;
+    (daemon as any).adapterRegistry.dispose = () => { disposed += 1; };
+    daemon.stop();
+    daemon.stop();
+    expect(disposed).toBe(2);
   });
 
   test('stop cancels the polling delay and runForever terminates', async () => {
@@ -196,6 +506,43 @@ describe('BridgeDaemon', () => {
     await Bun.sleep(20);
     daemon.stop();
     await expect(Promise.race([run.then(() => 'stopped'), Bun.sleep(500).then(() => 'timeout')])).resolves.toBe('stopped');
+  });
+
+  test('stop cancels the owned long poll timer with an injected scheduler', async () => {
+    const base = await createLongPollingDaemon('http://127.0.0.1:1');
+    const baseConfig = (base as any).config;
+    const baseIdentityStore = (base as any).identityStore;
+    base.stop();
+    const callbacks: Array<() => void> = [];
+    const canceled: symbol[] = [];
+    const pollScheduler = {
+      schedule(callback: () => void, delayMs: number) {
+        expect(delayMs).toBe(60_000);
+        const handle = Symbol('poll');
+        callbacks.push(callback);
+        return handle;
+      },
+      cancel(handle: unknown) { canceled.push(handle as symbol); },
+    };
+    const daemon = new BridgeDaemon(
+      baseConfig,
+      [{ name: 'test', listSessions: async () => [] }],
+      baseIdentityStore,
+      undefined,
+      undefined,
+      pollScheduler,
+    );
+    (daemon as any).startupValidated = true;
+    (daemon as any).performSyncOnce = async () => { (daemon as any).reconciliationRequested = false; return {}; };
+    const run = daemon.runForever();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(callbacks).toHaveLength(1);
+    daemon.stop();
+    await expect(run).resolves.toBeUndefined();
+    expect(canceled).toHaveLength(1);
+    callbacks[0]!();
+    expect((daemon as any).pollWaitTimer).toBeUndefined();
   });
 
   test('stop aborts an in-flight Relay request and terminates the run loop', async () => {

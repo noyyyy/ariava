@@ -28,7 +28,6 @@ function buildSession(): CanonicalSessionState {
     nameText: 'Demo session',
     status: 'working',
     latestActivityText: 'working',
-    stateLabel: 'In progress',
     updatedAt: '2026-06-30T10:00:00Z',
   };
 }

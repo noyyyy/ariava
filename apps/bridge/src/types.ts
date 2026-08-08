@@ -78,6 +78,23 @@ export interface PersistedCurrentSessionsSnapshotState {
   lastAcceptedRecipientSetVersion?: number;
 }
 
+export interface PersistedProducerEventReservationV1 {
+  version: 1;
+  eventId: string;
+  sessionId: string;
+  fingerprint: string;
+  createdAt: string;
+}
+
+export interface PersistedTerminalCancellationV1 {
+  version: 1;
+  sessionId: string;
+  eventId: string;
+  fingerprint: string;
+  removeSession: boolean;
+  createdAt: string;
+}
+
 export interface EventUploadCompletionV1 {
   version: 1;
   eventId: string;
@@ -91,20 +108,47 @@ export interface EventUploadCompletionV1 {
   sourceRemoved?: boolean;
 }
 
+export interface DriverRuntimeHealth {
+  driver: string;
+  code: 'driver_reconciliation_failed';
+  count: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  lastSuccessAt?: string;
+  nextRetryAt: string;
+}
+
+export interface RelayPresenceRuntimeHealth {
+  code: 'relay_presence_refresh_failed';
+  count: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  lastSuccessAt?: string;
+  nextRetryAt: string;
+}
+
+export interface BridgeRuntimeHealth {
+  status: 'healthy' | 'degraded';
+  drivers: DriverRuntimeHealth[];
+  relayPresence?: RelayPresenceRuntimeHealth;
+}
+
 export interface PersistedBridgeState {
+  schemaVersion: 2;
+  runtimeResetEpoch: string;
   host: HostProjection | null;
   sessions: Record<string, CanonicalSessionState>;
   sessionDrivers: Record<string, string>;
   reconciledDrivers: Record<string, true>;
   recentEvents: CanonicalEvent[];
-  /** Legacy load-only plaintext queue. New state writes always remove this field. */
-  pendingEvents?: CanonicalEvent[];
   sessionRevisions: Record<string, number>;
   recipientSetVersion?: number;
-  spoolMigration?: { version: 1; remainingEventIds: string[]; startedAt: string };
   eventUploadCompletions?: Record<string, EventUploadCompletionV1>;
+  producerEventReservations?: Record<string, PersistedProducerEventReservationV1>;
+  terminalCancellations?: Record<string, PersistedTerminalCancellationV1>;
   pendingHandles: Record<string, PendingSessionHandle>;
   commandResults: Record<string, CommandResult>;
   seenCommands: Record<string, string>;
   currentSessionsSnapshot: PersistedCurrentSessionsSnapshotState;
+  runtimeHealth?: BridgeRuntimeHealth;
 }

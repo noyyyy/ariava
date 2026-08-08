@@ -16,8 +16,12 @@ describe('classifyStoredAssistantText', () => {
       activeLeafId: 'leaf-1',
     });
 
-    expect(result.type).toBe('question_requested');
-    expect(result.agentText).toBe('What should I name this file?');
+    expect(result).toMatchObject({
+      type: 'need_human',
+      reason: 'question',
+      suppressed: false,
+      agentText: 'What should I name this file?',
+    });
   });
 
   test('classifies stored explicit blocked evidence', () => {
@@ -25,7 +29,11 @@ describe('classifyStoredAssistantText', () => {
       sessionId: 'session-1',
     });
 
-    expect(result.type).toBe('blocked');
+    expect(result).toMatchObject({
+      type: 'need_human',
+      reason: 'blocked',
+      suppressed: false,
+    });
     expect(result.agentText).toContain('credentials');
   });
 
@@ -36,12 +44,14 @@ describe('classifyStoredAssistantText', () => {
 
     expect(result.type).toBe('done');
     expect(result.agentText).toBe('I have updated the configuration file.');
+    expect(result.suppressed).toBe(false);
   });
 
   test('uses the stable done fallback for empty stored text', () => {
     const result = classifyStoredAssistantText(undefined, { sessionId: 'session-1' });
     expect(result.type).toBe('done');
     expect(result.agentText).toBe('Task complete');
+    expect(result.suppressed).toBe(false);
   });
 
   test('suppresses an emitted fingerprint in the same session and active leaf', () => {
@@ -54,7 +64,11 @@ describe('classifyStoredAssistantText', () => {
     expect(classifyStoredAssistantText('Can you confirm the choice?', {
       sessionId: 'session-1',
       activeLeafId: 'leaf-1',
-    }).type).toBe('suppress_duplicate');
+    })).toMatchObject({
+      type: 'need_human',
+      reason: 'question',
+      suppressed: true,
+    });
   });
 
   test('scopes duplicate fingerprints by session and active leaf', () => {
@@ -67,11 +81,11 @@ describe('classifyStoredAssistantText', () => {
     expect(classifyStoredAssistantText('Can you confirm the choice?', {
       sessionId: 'session-2',
       activeLeafId: 'leaf-1',
-    }).type).toBe('question_requested');
+    })).toMatchObject({ type: 'need_human', reason: 'question', suppressed: false });
     expect(classifyStoredAssistantText('Can you confirm the choice?', {
       sessionId: 'session-1',
       activeLeafId: 'leaf-2',
-    }).type).toBe('question_requested');
+    })).toMatchObject({ type: 'need_human', reason: 'question', suppressed: false });
   });
 });
 

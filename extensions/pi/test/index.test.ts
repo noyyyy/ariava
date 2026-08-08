@@ -1,14 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, setDefaultTimeout, test } from 'bun:test';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import type { AgentAdapter } from '../src/adapter-interface';
+import type { AgentAdapter, AgentAdapterEvent } from '../src/adapter-interface';
 import ariavaPiExtension from '../src/index';
 
 setDefaultTimeout(60_000);
 
 const QUIET_WAIT_MS = 1_650;
 type Handler = (event: any, ctx: ExtensionContext) => Promise<void> | void;
-type PushedEvent = { type?: string; status?: string; agentText?: string; humanText?: string };
+type PushedEvent = AgentAdapterEvent;
 type HeartbeatCall = { sessionId: string; status: string; latestActivityText?: string | null };
 function makeAdapter(pushedEvents: PushedEvent[], overrides: Partial<AgentAdapter> = {}): AgentAdapter {
   let eventSequence = 0;
@@ -89,8 +89,7 @@ function createHarness(options: {
     shutdown: async () => {
       await handlers.get('session_shutdown')?.({ reason: 'quit' }, ctx);
     },
-    terminalEvents: () => pushedEvents.filter((event) =>
-      event.type === 'done' || event.type === 'need_human'),
+    terminalEvents: () => pushedEvents,
   };
 }
 
@@ -98,6 +97,7 @@ function assistantMessage(options: {
   text?: string;
   stopReason?: string;
   errorText?: string;
+  error?: unknown;
 }): Record<string, unknown> {
   const message: Record<string, unknown> = {
     role: 'assistant',
@@ -106,6 +106,7 @@ function assistantMessage(options: {
   };
   if ('stopReason' in options) message.stopReason = options.stopReason;
   if (options.errorText !== undefined) message.errorMessage = options.errorText;
+  if (options.error !== undefined) message.error = options.error;
   return message;
 }
 
@@ -113,8 +114,11 @@ async function end(harness: ReturnType<typeof createHarness>, options: {
   text?: string;
   stopReason?: string;
   errorText?: string;
+  error?: unknown;
   assistantFound?: boolean;
+  withoutStart?: boolean;
 }) {
+  if (!options.withoutStart) await harness.emit('agent_start');
   const messages = options.assistantFound === false
     ? [{ role: 'user', content: [{ type: 'text', text: 'No assistant response yet.' }] }]
     : [assistantMessage(options)];
@@ -128,6 +132,14 @@ async function settleAndWait(harness: ReturnType<typeof createHarness>) {
 
 function lastTerminal(harness: ReturnType<typeof createHarness>): PushedEvent | undefined {
   return harness.terminalEvents().at(-1);
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
 }
 
 describe('ariavaPiExtension settled lifecycle', () => {
@@ -155,7 +167,7 @@ describe('ariavaPiExtension settled lifecycle', () => {
     const harness = createHarness();
     await harness.start();
     await harness.emit('agent_start');
-    await end(harness, { stopReason: 'stop', text: 'Low-level result only.' });
+    await end(harness, { stopReason: 'stop', text: 'Low-level result only.', withoutStart: true });
 
     await Bun.sleep(QUIET_WAIT_MS);
     expect(harness.terminalEvents()).toEqual([]);
@@ -187,12 +199,12 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await harness.start();
     await harness.emit('agent_start');
     await end(harness, earlierError
-      ? { stopReason: 'error', errorText: earlierError }
-      : { stopReason: 'length', text: 'Partial output that must not leak.' });
+      ? { stopReason: 'error', errorText: earlierError, withoutStart: true }
+      : { stopReason: 'length', text: 'Partial output that must not leak.', withoutStart: true });
     expect(harness.terminalEvents()).toEqual([]);
 
     await harness.emit('agent_start');
-    await end(harness, { stopReason: 'stop', text: finalText });
+    await end(harness, { stopReason: 'stop', text: finalText, withoutStart: true });
     await harness.emit('agent_settled');
     expect(harness.terminalEvents()).toEqual([]);
     await Bun.sleep(QUIET_WAIT_MS);
@@ -204,12 +216,39 @@ describe('ariavaPiExtension settled lifecycle', () => {
   });
 
   test.each([
-    ['unrecovered context overflow', { stopReason: 'error', errorText: 'Context overflow remained final.' }, 'Context overflow remained final.'],
-    ['exhausted ordinary retry', { stopReason: 'error', errorText: 'Final provider failure.' }, 'Final provider failure.'],
-    ['error fallback', { stopReason: 'error' }, 'Pi stopped after an unrecovered error.'],
-    ['final length', { stopReason: 'length', text: 'Incomplete response.' }, 'Pi stopped after reaching the response length limit.'],
-    ['final tool use', { stopReason: 'toolUse' }, 'Pi stopped while waiting to use a tool.'],
-  ])('%s becomes need_human only after settled and quiet flush', async (_name, result, preview) => {
+    ['initial idle', async (harness: ReturnType<typeof createHarness>) => {
+      await harness.emit('agent_settled');
+    }],
+    ['end without start', async (harness: ReturnType<typeof createHarness>) => {
+      await end(harness, { stopReason: 'stop', text: 'Unpaired initial end.', withoutStart: true });
+    }],
+    ['recovery idle', async (harness: ReturnType<typeof createHarness>) => {
+      await harness.emit('agent_settled');
+      await end(harness, { stopReason: 'stop', text: 'Unpaired recovery end.', withoutStart: true });
+    }],
+    ['late prior-run end', async (harness: ReturnType<typeof createHarness>) => {
+      await harness.emit('agent_start');
+      await harness.emit('agent_settled');
+      await end(harness, { stopReason: 'stop', text: 'Late prior-run end.', withoutStart: true });
+    }],
+  ])('%s produces no terminal event without a current running generation', async (_name, exercise) => {
+    const harness = createHarness();
+    await harness.start();
+    await exercise(harness);
+    await harness.emit('agent_settled');
+    await Bun.sleep(QUIET_WAIT_MS);
+
+    expect(harness.terminalEvents()).toEqual([]);
+    await harness.shutdown();
+  });
+
+  test.each([
+    ['unrecovered context overflow', { stopReason: 'error', error: { code: 'context_length_exceeded', message: 'Context overflow remained final.' } }, 'context_overflow'],
+    ['exhausted ordinary retry', { stopReason: 'error', errorText: 'Final provider failure.' }, 'provider_failure'],
+    ['error fallback', { stopReason: 'error' }, 'provider_failure'],
+    ['final length', { stopReason: 'length', text: 'Incomplete response.' }, 'response_length'],
+    ['final tool use', { stopReason: 'toolUse' }, 'incomplete_tool_use'],
+  ])('%s emits canonical protected error only after settled and quiet flush', async (_name, result, kind) => {
     const harness = createHarness();
     await harness.start();
     await end(harness, result);
@@ -219,12 +258,15 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await Bun.sleep(QUIET_WAIT_MS);
 
     expect(harness.terminalEvents()).toHaveLength(1);
-    expect(lastTerminal(harness)).toMatchObject({ type: 'need_human', status: 'blocked', agentText: preview });
-    expect(harness.terminalEvents().some((event) => event.type === 'done')).toBe(false);
+    expect(lastTerminal(harness)).toMatchObject({
+      type: 'need_human',
+      status: 'need_human',
+      needHuman: { reason: 'error', error: { kind, retryExhausted: true } },
+    });
     await harness.shutdown();
   });
 
-  test('unknown non-empty reason removes C0/C1 and Unicode format controls before need_human delivery', async () => {
+  test('unknown structured stop reason is sanitized without becoming a legacy blocker', async () => {
     const harness = createHarness();
     await harness.start();
     const unsafeReason = ` future\u0000\u0085\n\t re\u202Eas\u2066on\uFEFF ${'x'.repeat(160)} `;
@@ -232,31 +274,41 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await settleAndWait(harness);
 
     const terminal = lastTerminal(harness);
-    expect(terminal?.type).toBe('need_human');
-    expect(terminal?.agentText).toStartWith('Pi stopped for an unsupported reason: future reason ');
-    expect(terminal?.agentText).not.toMatch(/[\u0000-\u001F\u007F-\u009F\p{Cf}]/u);
-    expect(terminal?.agentText?.length).toBeLessThanOrEqual(122);
+    expect(terminal).toMatchObject({
+      type: 'need_human',
+      status: 'need_human',
+      needHuman: { reason: 'error', error: { kind: 'unknown', retryExhausted: true } },
+    });
+    expect(terminal?.needHuman?.reason === 'error' ? terminal.needHuman.error.message : '').not.toMatch(
+      /[\u0000-\u001F\u007F-\u009F\p{Cf}]/u,
+    );
     expect(terminal?.agentText).not.toContain('Provider partial output');
     await harness.shutdown();
   });
 
-  test('a format-control-only unknown reason uses the generic unsupported-reason fallback', async () => {
+  test('a format-control-only unknown reason uses the generic error fallback', async () => {
     const harness = createHarness();
     await harness.start();
     await end(harness, { stopReason: '\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069\uFEFF' });
     await settleAndWait(harness);
     expect(lastTerminal(harness)).toMatchObject({
       type: 'need_human',
-      agentText: 'Pi stopped for an unsupported reason.',
+      status: 'need_human',
+      needHuman: {
+        reason: 'error',
+        error: { kind: 'unknown', message: 'Pi stopped for an unsupported reason.', retryExhausted: true },
+      },
     });
     await harness.shutdown();
   });
 
   test.each([
-    ['question', 'Can you confirm the deployment target?', 'need_human'],
-    ['explicit blocker', 'I need your credentials before continuing.', 'need_human'],
-    ['ordinary completion', 'All requested changes are complete.', 'done'],
-  ])('stable stop text retains %s classification', async (_name, text, expectedType) => {
+    ['question', 'Can you confirm the deployment target?', 'need_human', 'need_human', 'question'],
+    ['explicit blocker', 'I need your credentials before continuing.', 'need_human', 'need_human', 'blocked'],
+    ['ordinary completion', 'All requested changes are complete.', 'done', 'idle', undefined],
+  ])('stable stop text retains internal %s classification behind canonical output', async (
+    _name, text, expectedType, expectedStatus, expectedReason,
+  ) => {
     const harness = createHarness({ userText: 'Please complete the task.' });
     await harness.start();
     await end(harness, { stopReason: 'stop', text });
@@ -264,10 +316,14 @@ describe('ariavaPiExtension settled lifecycle', () => {
 
     expect(lastTerminal(harness)).toMatchObject({
       type: expectedType,
-      status: expectedType === 'done' ? 'done' : 'blocked',
+      status: expectedStatus,
       agentText: text,
       humanText: 'Please complete the task.',
+      ...(expectedReason ? { needHuman: { reason: expectedReason } } : {}),
     });
+    expect(lastTerminal(harness)).not.toHaveProperty('eventId');
+    expect(lastTerminal(harness)).not.toHaveProperty('hostId');
+    expect(lastTerminal(harness)?.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     await harness.shutdown();
   });
 
@@ -276,7 +332,9 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await harness.start();
     await end(harness, { text: 'Omitted reason completed normally.' });
     await settleAndWait(harness);
-    expect(lastTerminal(harness)).toMatchObject({ type: 'done', agentText: 'Omitted reason completed normally.' });
+    expect(lastTerminal(harness)).toMatchObject({
+      type: 'done', status: 'idle', agentText: 'Omitted reason completed normally.',
+    });
     await harness.shutdown();
   });
 
@@ -301,12 +359,20 @@ describe('ariavaPiExtension settled lifecycle', () => {
     const harness = createHarness();
     await harness.start();
     await harness.emit('agent_start');
-    await end(harness, { stopReason: 'stop', text: 'Intermediate answer before queued follow-up.' });
+    await end(harness, {
+      stopReason: 'stop',
+      text: 'Intermediate answer before queued follow-up.',
+      withoutStart: true,
+    });
     expect(harness.terminalEvents()).toEqual([]);
 
     // The runner withholds agent_settled while its queued follow-up drains.
     await harness.emit('agent_start');
-    await end(harness, { stopReason: 'stop', text: 'Final answer after queued follow-up.' });
+    await end(harness, {
+      stopReason: 'stop',
+      text: 'Final answer after queued follow-up.',
+      withoutStart: true,
+    });
     expect(harness.terminalEvents()).toEqual([]);
     await harness.emit('agent_settled');
     expect(harness.terminalEvents()).toEqual([]);
@@ -328,6 +394,45 @@ describe('ariavaPiExtension settled lifecycle', () => {
     await end(harness, { stopReason: 'stop', text: 'Stale after a new run.' });
     await harness.emit('agent_settled');
     await harness.emit('agent_start');
+    await Bun.sleep(QUIET_WAIT_MS);
+
+    expect(harness.terminalEvents()).toEqual([]);
+    await harness.shutdown();
+  });
+
+  test.each(['steer', 'followUp'] as const)(
+    'streaming %s input preserves the active generation through end and settled',
+    async (streamingBehavior) => {
+      const harness = createHarness();
+      await harness.start();
+      await harness.emit('agent_start');
+      await harness.emit('input', {
+        type: 'input',
+        text: `Queued ${streamingBehavior} input`,
+        source: 'interactive',
+        streamingBehavior,
+      });
+      await end(harness, {
+        stopReason: 'stop',
+        text: `Completed after ${streamingBehavior}.`,
+        withoutStart: true,
+      });
+      await settleAndWait(harness);
+
+      expect(harness.terminalEvents()).toEqual([
+        expect.objectContaining({ type: 'done', agentText: `Completed after ${streamingBehavior}.` }),
+      ]);
+      await harness.shutdown();
+    },
+  );
+
+  test('genuinely idle input invalidates the active generation and terminal result', async () => {
+    const harness = createHarness();
+    await harness.start();
+    await harness.emit('agent_start');
+    await harness.emit('input', { type: 'input', text: 'New idle input', source: 'interactive' });
+    await end(harness, { stopReason: 'stop', text: 'Stale after idle input.', withoutStart: true });
+    await harness.emit('agent_settled');
     await Bun.sleep(QUIET_WAIT_MS);
 
     expect(harness.terminalEvents()).toEqual([]);
@@ -407,6 +512,37 @@ describe('ariavaPiExtension settled lifecycle', () => {
 
     expect(harness.terminalEvents()).toEqual([]);
     await harness.shutdown();
+  });
+
+  test('session_start clears the prior state quiet timer before replacement', async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    let quietTimer: unknown;
+    const clearedTimers: unknown[] = [];
+    globalThis.setTimeout = ((callback: TimerHandler, delay?: number, ...args: unknown[]) => {
+      const timer = originalSetTimeout(callback, delay, ...args);
+      if (delay === 1_500) quietTimer = timer;
+      return timer;
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>) => {
+      clearedTimers.push(timer);
+      originalClearTimeout(timer);
+    }) as typeof clearTimeout;
+
+    const harness = createHarness();
+    try {
+      await harness.start();
+      await end(harness, { stopReason: 'stop', text: 'Pending old session timer.' });
+      await harness.emit('agent_settled');
+      expect(quietTimer).toBeDefined();
+
+      await harness.start();
+      expect(clearedTimers).toContain(quietTimer!);
+    } finally {
+      await harness.shutdown();
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+    }
   });
 });
 
@@ -552,6 +688,154 @@ describe('unchanged extension integration behavior', () => {
     await Bun.sleep(20);
 
     expect(handled).toEqual([{ sessionId: 'sess-1', eventId: 'event-1', action: 'pi_input' }]);
+    await harness.shutdown();
+  });
+
+  test('retries one immutable terminal Event after a non-2xx failure and commits only after ACK', async () => {
+    const attempts: PushedEvent[] = [];
+    const handled: string[] = [];
+    const harness = createHarness({
+      adapter: {
+        pushEvent: async (event) => {
+          attempts.push(structuredClone(event));
+          if (attempts.length === 1) {
+            throw new Error('Agent Adapter POST /events failed: 503 unavailable');
+          }
+          return { eventId: 'durable-event' };
+        },
+        handleSession: async (sessionId, request) => {
+          handled.push(request.handledThroughEventId);
+          return { ok: true, hostId: 'host-1', sessionId, handledThroughEventId: request.handledThroughEventId };
+        },
+      },
+    });
+    await harness.start();
+    await end(harness, { stopReason: 'stop', text: 'Durably delivered once.' });
+    await harness.emit('agent_settled');
+    await Bun.sleep(QUIET_WAIT_MS + 400);
+
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]).toEqual(attempts[0]);
+    expect(attempts[0]).toMatchObject({ type: 'done', status: 'idle', agentText: 'Durably delivered once.' });
+    await harness.emit('input');
+    await Bun.sleep(20);
+    expect(handled).toEqual(['durable-event']);
+    await harness.shutdown();
+  });
+
+  test('late push response cannot restore a branch-cleared candidate', async () => {
+    const pushed = deferred<{ eventId: string }>();
+    const handled: string[] = [];
+    const harness = createHarness({
+      adapter: {
+        pushEvent: () => pushed.promise,
+        handleSession: async (sessionId, request) => {
+          handled.push(request.handledThroughEventId);
+          return { ok: true, hostId: 'host-1', sessionId, handledThroughEventId: request.handledThroughEventId };
+        },
+      },
+    });
+    await harness.start();
+    await end(harness, { stopReason: 'stop', text: 'Old branch event.' });
+    await settleAndWait(harness);
+    harness.setLeafId('leaf-2');
+    await harness.emit('session_tree', { newLeafId: 'leaf-2' });
+    pushed.resolve({ eventId: 'old-branch-event' });
+    await Bun.sleep(20);
+    await harness.emit('input', { type: 'input', text: 'New branch input', source: 'interactive' });
+    await Bun.sleep(20);
+
+    expect(handled).toEqual([]);
+    await harness.shutdown();
+  });
+
+  test('late older push response cannot overwrite a newer event candidate', async () => {
+    const pushes = [deferred<{ eventId: string }>(), deferred<{ eventId: string }>()];
+    const handled: string[] = [];
+    let pushIndex = 0;
+    const harness = createHarness({
+      adapter: {
+        pushEvent: () => pushes[pushIndex++]!.promise,
+        handleSession: async (sessionId, request) => {
+          handled.push(request.handledThroughEventId);
+          return { ok: true, hostId: 'host-1', sessionId, handledThroughEventId: request.handledThroughEventId };
+        },
+      },
+    });
+    await harness.start();
+    await end(harness, { stopReason: 'stop', text: 'First delivered event.' });
+    await settleAndWait(harness);
+    await end(harness, { stopReason: 'stop', text: 'Newer delivered event.' });
+    await settleAndWait(harness);
+    pushes[1]!.resolve({ eventId: 'newer-event' });
+    await Bun.sleep(20);
+    pushes[0]!.resolve({ eventId: 'older-event' });
+    await Bun.sleep(20);
+    await harness.emit('input', { type: 'input', text: 'Acknowledge latest', source: 'interactive' });
+    await Bun.sleep(20);
+
+    expect(handled).toEqual(['newer-event']);
+    await harness.shutdown();
+  });
+
+  test('input during push await reconciles immediately without restoring stale terminal state', async () => {
+    const pushed = deferred<{ eventId: string }>();
+    const handled: string[] = [];
+    const harness = createHarness({
+      adapter: {
+        pushEvent: () => pushed.promise,
+        handleSession: async (sessionId, request) => {
+          handled.push(request.handledThroughEventId);
+          return { ok: true, hostId: 'host-1', sessionId, handledThroughEventId: request.handledThroughEventId };
+        },
+      },
+    });
+    await harness.start();
+    await end(harness, { stopReason: 'stop', text: 'Delivered before local input.' });
+    await settleAndWait(harness);
+    await harness.emit('input', { type: 'input', text: 'Input during delivery', source: 'interactive' });
+    pushed.resolve({ eventId: 'delayed-event' });
+    await Bun.sleep(20);
+
+    expect(handled).toEqual(['delayed-event']);
+    await harness.emit('input', { type: 'input', text: 'Later input', source: 'interactive' });
+    await Bun.sleep(20);
+    expect(handled).toEqual(['delayed-event']);
+    await harness.shutdown();
+  });
+
+  test('input during deferred push retries a failed handle without restoring a stale candidate', async () => {
+    const pushed = deferred<{ eventId: string }>();
+    const handleAttempts: string[] = [];
+    let failFirstHandle = true;
+    const harness = createHarness({
+      adapter: {
+        pushEvent: () => pushed.promise,
+        handleSession: async (sessionId, request) => {
+          handleAttempts.push(request.handledThroughEventId);
+          if (failFirstHandle) {
+            failFirstHandle = false;
+            throw new Error('transient handle failure');
+          }
+          return { ok: true, hostId: 'host-1', sessionId, handledThroughEventId: request.handledThroughEventId };
+        },
+      },
+    });
+    await harness.start();
+    await end(harness, { stopReason: 'stop', text: 'Delivered before retryable local input.' });
+    await settleAndWait(harness);
+    await harness.emit('input', { type: 'input', text: 'Input during delivery', source: 'interactive' });
+    pushed.resolve({ eventId: 'retryable-delayed-event' });
+    await Bun.sleep(20);
+
+    expect(handleAttempts).toEqual(['retryable-delayed-event']);
+    await harness.emit('input', { type: 'input', text: 'Retry local acknowledgement', source: 'interactive' });
+    await Bun.sleep(20);
+    expect(handleAttempts).toEqual(['retryable-delayed-event', 'retryable-delayed-event']);
+
+    await harness.emit('input', { type: 'input', text: 'No stale acknowledgement', source: 'interactive' });
+    await Bun.sleep(20);
+    expect(handleAttempts).toEqual(['retryable-delayed-event', 'retryable-delayed-event']);
     await harness.shutdown();
   });
 

@@ -2,7 +2,7 @@ import { basename } from 'node:path';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { AssistantMessage, TextContent, UserMessage } from '@earendil-works/pi-ai';
-import { statusToStateLabel, type EventType, type SessionStatus } from '@ariava/protocol';
+import type { EventType, SessionStatus } from '@ariava/protocol';
 
 export interface PiSessionInfo {
   sessionId: string;
@@ -15,7 +15,6 @@ export interface PiSessionInfo {
   nameText: string;
   openingText?: string;
   latestActivityText?: string;
-  stateLabel: string;
   status: SessionStatus;
   pid?: number;
 }
@@ -191,7 +190,6 @@ export function deriveSession(ctx: ExtensionContext): PiSessionInfo {
     nameText: deriveNameText(rawSessionName, projectName),
     openingText: clampAssistantText(firstUserText),
     latestActivityText: deriveLatestActivityText(ctx),
-    stateLabel: statusToStateLabel('idle'),
     status: 'idle',
     pid: process.pid,
   };
@@ -201,7 +199,6 @@ export function withSessionStatus(session: PiSessionInfo, status: SessionStatus,
   return {
     ...session,
     status,
-    stateLabel: statusToStateLabel(status),
     latestActivityText: clampAssistantText(latestActivityText) ?? session.latestActivityText,
   };
 }

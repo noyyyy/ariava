@@ -368,4 +368,26 @@ describe('portable host-manager status', () => {
       backend: 'launchd', supported: true, supportReason: 'supported', installed: false, enabled: false, loaded: false, processRunning: false,
     });
   });
+
+  test('projects bounded runtime degradation into status without exposing diagnostics', () => {
+    const statePath = join(homeOverride, 'runtime-health-state.json');
+    const config = resolveAriavaConfig({ relayBaseUrl: 'https://relay.example.test', hostId: 'host-1', hostName: 'Host', statePath }, join(homeOverride, 'config.json'));
+    const bridgeConfig = {
+      hostId: 'host-1', hostName: 'Host', hostPlatform: 'linux', relayBaseUrl: config.relayBaseUrl, statePath,
+      identityPath: config.identityPath, configPath: config.configPath, pollIntervalMs: 1000, bridgeVersion: '0.1.4',
+      agentAdapter: { port: 7272, secret: 'secret', configPath: config.agentAdapterConfigPath },
+    } satisfies BridgeConfig;
+    const status = buildHostManagerStatus({
+      config, bridgeConfig, installMetadata: {},
+      serviceStatus: { support: { supported: true, reason: 'supported' }, installed: true, enabled: true, loaded: true, processRunning: true },
+      piStatus: { installed: false, installPath: '/tmp/pi', managed: false, managedMetadataPath: '/tmp/pi/meta' },
+      cliVersion: '0.1.4', statePresent: true,
+      runtimeHealth: { status: 'degraded', drivers: [{
+        driver: 'pi', code: 'driver_reconciliation_failed', count: 1,
+        firstSeenAt: '2026-08-10T00:00:00.000Z', lastSeenAt: '2026-08-10T00:00:00.000Z', nextRetryAt: '2026-08-10T00:00:15.000Z',
+      }] },
+    });
+    expect(status).toMatchObject({ bridgeHealth: 'degraded', runtimeHealth: { status: 'degraded', drivers: [{ driver: 'pi', count: 1 }] } });
+    expect(JSON.stringify(status.runtimeHealth)).not.toMatch(/error|stack|ciphertext|token|credential|path/iu);
+  });
 });

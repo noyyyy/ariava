@@ -66,6 +66,14 @@ describe('Node-backed dev setup', () => {
     expect(buildScript).toContain("resolve(bridgeRoot, 'src', 'public-cli.ts')");
   });
 
+  test('resolves Public Core assets from the built dev entrypoint', () => {
+    const artifact = readFileSync(resolve(root, 'apps/bridge/dist/dev-profile-cli.js'), 'utf8');
+    expect(artifact).toContain('function resolvePublicCoreRoot(modulePath)');
+    expect(artifact).toContain('SOURCE_PI_EXTENSION_PATH');
+    for (const segment of ['extensions', 'pi', 'index.ts']) expect(artifact).toContain(`"${segment}"`);
+    expect(existsSync(resolve(root, 'extensions', 'pi', 'index.ts'))).toBe(true);
+  });
+
   test('records the exact child actions allowed for each dev lifecycle command', async () => {
     const cases = [
       { command: 'setup', argv: ['setup', '--no-extensions'], expected: [] },
@@ -220,7 +228,7 @@ async function prepareActionCase(command: string, dependencies: DevProfileDepend
     mkdirSync(dependencies.paths.root, { recursive: true, mode: 0o700 });
     writeAgentAdapterConfig(dependencies.paths.agentAdapterConfigPath, {
       url: 'http://127.0.0.1:7273',
-      secret: 'dev-secret',
+      secret: 'dev-secret', protocolVersion: 2,
     });
     dependencies.pathExists = (path) => path === dependencies.paths.agentAdapterConfigPath
       || path === dependencies.sourcePiExtensionPath;
@@ -367,6 +375,7 @@ const SAFE_DEV_LIFECYCLE_MODULES = [
   'identity/types.ts',
   'relay-client.ts',
   'runtime/node-runtime.ts',
+  'runtime-lock.ts',
   'state-store.ts',
   'ui/onboarding-renderer.ts',
 ] as const;

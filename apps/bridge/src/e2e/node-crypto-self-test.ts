@@ -1,4 +1,4 @@
-import vectors from '../../../../packages/protocol/test/fixtures/e2e-v1-vectors.json';
+import vectors from '../../../../packages/protocol/test/fixtures/e2e-v2-vectors.json';
 import { base64UrlDecode } from '@ariava/protocol';
 import { chachaPolyOpen, hkdfSha256, x25519SharedSecret } from './node-crypto';
 

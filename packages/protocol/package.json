@@ -51,7 +51,8 @@
       "default": "./dist/validation.js"
     },
     "./fixtures/ed25519-request-vectors": "./dist/fixtures/ed25519-request-vectors.json",
-    "./fixtures/e2e-v1-vectors": "./dist/fixtures/e2e-v1-vectors.json",
-    "./fixtures/notification-preview-v1-vector": "./dist/fixtures/notification-preview-v1-vector.json"
+    "./fixtures/e2e-v2-vectors": "./dist/fixtures/e2e-v2-vectors.json",
+    "./fixtures/notification-preview-v2-vector": "./dist/fixtures/notification-preview-v2-vector.json",
+    "./fixtures/need-human-error-validation-v2": "./dist/fixtures/need-human-error-validation-v2.json"
   }
 }

@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import vectors from '../../../packages/protocol/test/fixtures/e2e-v1-vectors.json' with { type: 'json' };
+import vectors from '../../../packages/protocol/test/fixtures/e2e-v2-vectors.json' with { type: 'json' };
 import { base64UrlDecode, E2E_SUITE_V1 } from '../../../packages/protocol/dist/index.js';
 import { decryptReplyForPin, encryptEventUpload } from '../dist/e2e/envelope.js';
 
 const hostIdentity = { version: 1, hostId: vectors.link.hostId,
-  encryptionKeyId: 'ekey_host_vector', publicKey: vectors.keys.hostPublicKey,
+  encryptionKeyId: vectors.bindings.host.encryptionKeyId, publicKey: vectors.keys.hostPublicKey,
   privateKeyPkcs8: base64UrlDecode(vectors.keys.hostPrivateKeyPkcs8), sequence: 1,
   createdAt: '2026-07-20T00:00:00.000Z' };
 
@@ -18,7 +18,8 @@ test('decrypts the reviewed encrypted reply vector only with matching AAD and pi
         contentId: vectors.reply.contentId, payloadKind: 'reply-content-v1', nonce: vectors.reply.contentNonce,
         ciphertext: vectors.reply.ciphertext }, keyWrap: { version: 1, suite: E2E_SUITE_V1,
         contentId: vectors.reply.contentId, linkId: vectors.link.linkId, linkGeneration: vectors.link.linkGeneration,
-        epoch: vectors.link.epoch, senderEncryptionKeyId: 'ekey_watch_vector', recipientEncryptionKeyId: 'ekey_host_vector',
+        epoch: vectors.link.epoch, senderEncryptionKeyId: vectors.bindings.watch.encryptionKeyId,
+        recipientEncryptionKeyId: vectors.bindings.host.encryptionKeyId,
         nonce: vectors.reply.wrapNonce, ciphertext: vectors.reply.wrappedDek } } };
     assert.equal(decryptReplyForPin(command, { hostIdentity, watchPublicKey: vectors.keys.watchPublicKey,
       transcriptDigest: vectors.transcript.digest }), 'continue');
@@ -35,16 +36,14 @@ test('decrypts the reviewed encrypted reply vector only with matching AAD and pi
 
 test('uses fresh DEKs/content and wrap nonces for every upload attempt', () => {
     const input = { event: { eventId: 'event', hostId: vectors.link.hostId, sessionId: 'session', provider: 'pi',
-      type: 'blocked', status: 'blocked', createdAt: '2026-07-20T00:00:00.000Z' },
-      protectedEvent: { version: 1, assistantText: 'secret' },
-      session: { hostId: vectors.link.hostId, sessionId: 'session', provider: 'pi', status: 'blocked',
-        updatedAt: '2026-07-20T00:00:01.000Z' }, protectedSession: { version: 1, projectName: 'p', nameText: 'n' },
+      type: 'need_human', status: 'need_human', correlationId: 'correlation', createdAt: '2026-07-20T00:00:00.000Z' },
+      protectedEvent: { version: 2, agentText: 'secret', needHuman: { reason: 'blocked' } },
+      session: { hostId: vectors.link.hostId, sessionId: 'session', provider: 'pi', status: 'need_human',
+        updatedAt: '2026-07-20T00:00:01.000Z', lastEventId: 'event', snoozedUntil: '2026-07-20T00:10:00.000Z' },
+      protectedSession: { version: 2, projectName: 'p', nameText: 'n' },
       revision: 1, recipientSetVersion: 1, hostIdentity, recipients: [{ linkId: vectors.link.linkId,
         linkGeneration: vectors.link.linkGeneration, watchDeviceId: vectors.link.watchDeviceId, epoch: vectors.link.epoch,
-        state: 'active', transcriptDigest: vectors.transcript.digest, watchBinding: { version: 1,
-          entityType: 'watch', entityId: vectors.link.watchDeviceId, identityKeyId: 'identity', encryptionKeyId: 'ekey_watch_vector',
-          suite: E2E_SUITE_V1, publicKey: vectors.keys.watchPublicKey, sequence: 1,
-          createdAt: '2026-07-20T00:00:00.000Z', bindingSignature: 'signature' } }] };
+        state: 'active', transcriptDigest: vectors.transcript.digest, watchBinding: vectors.bindings.watch }] };
     const first = encryptEventUpload(input); const second = encryptEventUpload(input);
     assert.notEqual(first.event.content.ciphertext, second.event.content.ciphertext);
     assert.notEqual(first.event.keyWraps[0].nonce, second.event.keyWraps[0].nonce);

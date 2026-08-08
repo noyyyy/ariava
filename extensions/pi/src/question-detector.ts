@@ -1,10 +1,14 @@
 import { createHash } from 'node:crypto';
 
-export type StoredAgentTextClassification =
-  | { type: 'question_requested'; agentText: string; fingerprint: string }
-  | { type: 'blocked'; agentText: string; fingerprint: string; blockedReason: string }
-  | { type: 'done'; agentText: string; fingerprint: string }
-  | { type: 'suppress_duplicate'; fingerprint: string; agentText?: string; blockedReason?: string };
+export type StoredTerminalCandidate =
+  | { type: 'need_human'; reason: 'question' | 'blocked'; agentText: string; fingerprint: string }
+  | { type: 'done'; reason?: never; agentText: string; fingerprint: string };
+
+type UnfingerprintedStoredTerminalCandidate =
+  | { type: 'need_human'; reason: 'question' | 'blocked'; agentText: string }
+  | { type: 'done'; reason?: never; agentText: string };
+
+export type StoredAgentTextClassification = StoredTerminalCandidate & { suppressed: boolean };
 
 export interface ClassifyStoredAssistantInput {
   sessionId: string;
@@ -42,21 +46,23 @@ export function classifyStoredAssistantText(
   input: ClassifyStoredAssistantInput,
 ): StoredAgentTextClassification {
   const normalizedText = text?.trim() ?? '';
-  const fingerprint = buildFingerprint(input.sessionId, input.activeLeafId, normalizedText);
-
-  if (emittedFingerprints.has(fingerprint)) return { type: 'suppress_duplicate', fingerprint };
-
+  let candidate: UnfingerprintedStoredTerminalCandidate;
   if (looksLikeQuestion(normalizedText)) {
-    return { type: 'question_requested', agentText: normalizedText, fingerprint };
+    candidate = { type: 'need_human', reason: 'question', agentText: normalizedText };
+  } else {
+    const blockedReason = extractBlockedReason(normalizedText);
+    if (blockedReason) {
+      candidate = { type: 'need_human', reason: 'blocked', agentText: blockedReason };
+    } else {
+      candidate = { type: 'done', agentText: normalizedText || 'Task complete' };
+    }
   }
-
-  const blockedReason = extractBlockedReason(normalizedText);
-  if (blockedReason) return { type: 'blocked', agentText: blockedReason, fingerprint, blockedReason };
+  const fingerprint = buildFingerprint(input, candidate, normalizedText);
 
   return {
-    type: 'done',
-    agentText: normalizedText || 'Task complete',
+    ...candidate,
     fingerprint,
+    suppressed: emittedFingerprints.has(fingerprint),
   };
 }
 
@@ -84,9 +90,14 @@ export function extractBlockedReason(text: string): string | undefined {
   return undefined;
 }
 
-function buildFingerprint(sessionId: string, activeLeafId: string | undefined, text: string): string {
+function buildFingerprint(
+  input: ClassifyStoredAssistantInput,
+  candidate: UnfingerprintedStoredTerminalCandidate,
+  text: string,
+): string {
+  const reason = candidate.type === 'need_human' ? candidate.reason : 'none';
   return createHash('sha256')
-    .update(`${sessionId}:${activeLeafId ?? 'no-leaf'}:${text}`)
+    .update(`${input.sessionId}:${input.activeLeafId ?? 'no-leaf'}:${candidate.type}:${reason}:${text}`)
     .digest('hex')
     .slice(0, 16);
 }

@@ -1,8 +1,31 @@
-export const SESSION_STATUSES = ['idle', 'working', 'blocked', 'done', 'unknown'] as const;
+export const SESSION_STATUSES = ['idle', 'working', 'need_human'] as const;
 export type SessionStatus = (typeof SESSION_STATUSES)[number];
 
 export const EVENT_TYPES = ['done', 'need_human'] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
+
+export const NEED_HUMAN_REASONS = ['question', 'blocked', 'error'] as const;
+export type NeedHumanReason = (typeof NEED_HUMAN_REASONS)[number];
+
+export const NEED_HUMAN_ERROR_KINDS = [
+  'context_overflow',
+  'provider_failure',
+  'response_length',
+  'incomplete_tool_use',
+  'unknown',
+] as const;
+export type NeedHumanErrorKind = (typeof NEED_HUMAN_ERROR_KINDS)[number];
+
+export interface NeedHumanError {
+  kind: NeedHumanErrorKind;
+  message: string;
+  providerCode?: string;
+  retryExhausted: true;
+}
+
+export type NeedHumanContext =
+  | { reason: Exclude<NeedHumanReason, 'error'>; error?: never }
+  | { reason: 'error'; error: NeedHumanError };
 
 export interface ActionablePrompt {
   promptId: string;
@@ -12,13 +35,11 @@ export interface ActionablePrompt {
   expiresAt?: string;
 }
 
-export interface CanonicalEvent {
+interface CanonicalEventBase {
   eventId: string;
   hostId: string;
   sessionId: string;
   provider: string;
-  type: EventType;
-  status: SessionStatus;
   typeLabel: string;
   agentText: string;
   humanText?: string;
@@ -32,28 +53,22 @@ export interface CanonicalEvent {
   createdAt: string;
 }
 
+export type CanonicalEvent = CanonicalEventBase & (
+  | { type: 'done'; status: 'idle'; needHuman?: never }
+  | { type: 'need_human'; status: 'need_human'; needHuman: NeedHumanContext }
+);
+
 /** Host-local plaintext model. It must never be used as a Relay persistence/read projection. */
 export type LocalCanonicalEventPlaintext = CanonicalEvent;
-export interface DecryptedWatchEvent extends CanonicalEvent {
+export type DecryptedWatchEvent = CanonicalEvent & {
   seen: boolean;
   handled: boolean;
   actionable: boolean;
-}
+};
 
-/** Legacy shared read model retained only for compatibility aliases/backfill. */
 export type SessionReadSource = 'watch_view' | 'watch_reply' | 'pi_local_interaction' | 'bridge_recovery';
 
 export interface MarkSessionReadRequest {
-  latestReadEventId?: string;
-  readAt?: string;
-  source?: SessionReadSource;
-  /** @deprecated Compatibility for older watch clients. */
-  latestSeenEventId?: string;
-  /** @deprecated Compatibility for older watch clients. */
-  seenAt?: string;
-}
-
-export interface NormalizedMarkSessionReadRequest {
   latestReadEventId: string;
   readAt?: string;
   source?: SessionReadSource;
@@ -64,8 +79,6 @@ export interface MarkSessionReadResponse {
   hostId?: string;
   sessionId: string;
   latestReadEventId: string;
-  /** @deprecated Compatibility for older watch clients. */
-  latestSeenEventId?: string;
 }
 
 export const SESSION_HANDLE_ACTIONS = ['pi_input', 'watch_reply', 'bridge_recovery'] as const;
@@ -79,13 +92,6 @@ export interface HandleSessionRequest {
   action?: Extract<SessionHandleAction, 'pi_input' | 'bridge_recovery'>;
 }
 
-export function normalizeMarkSessionReadRequest(request: MarkSessionReadRequest): NormalizedMarkSessionReadRequest {
-  return {
-    latestReadEventId: request.latestReadEventId ?? request.latestSeenEventId ?? '',
-    readAt: request.readAt ?? request.seenAt,
-    source: request.source,
-  };
-}
 
 export interface EventCursor {
   eventId: string;
@@ -103,25 +109,10 @@ export function eventCursorCovers(cursor: EventCursor | undefined, event: EventC
 }
 
 export function validateEventTypeStatusPair(type: unknown, status: unknown): type is EventType {
-  if (type === 'done') return status === 'done';
-  return type === 'need_human' && status === 'blocked';
+  if (type === 'done') return status === 'idle';
+  return type === 'need_human' && status === 'need_human';
 }
 
 export function isUserVisibleActionableAlert(event: Pick<CanonicalEvent, 'type'>): boolean {
   return EVENT_TYPES.includes(event.type);
-}
-
-export function statusToStateLabel(status: SessionStatus): string {
-  switch (status) {
-    case 'idle':
-      return 'Ready';
-    case 'working':
-      return 'In progress';
-    case 'blocked':
-      return 'Needs attention';
-    case 'done':
-      return 'Done';
-    case 'unknown':
-      return 'Status unavailable';
-  }
 }

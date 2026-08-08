@@ -34,7 +34,24 @@ import { inspectCurrentNodeRuntime } from '../../runtime/node-runtime';
 import { runNodeCryptoSelfTest } from '../../e2e/node-crypto-self-test';
 import type { ProfileProbeEvidence, ProfileRuntimeProbe } from '../probes/profile';
 
-const PUBLIC_CORE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..', '..');
+function resolvePublicCoreRoot(modulePath: string): string {
+  let candidate = dirname(modulePath);
+  while (true) {
+    const packagePath = resolve(candidate, 'package.json');
+    if (existsSync(packagePath)) {
+      try {
+        const manifest = JSON.parse(readFileSync(packagePath, 'utf8')) as { name?: unknown };
+        if (manifest.name === 'ariava' && existsSync(resolve(candidate, 'apps', 'bridge'))) return candidate;
+      } catch {}
+    }
+    const parent = dirname(candidate);
+    if (parent === candidate) break;
+    candidate = parent;
+  }
+  throw new Error(`Unable to locate the Ariava Public Core root from ${modulePath}`);
+}
+
+const PUBLIC_CORE_ROOT = resolvePublicCoreRoot(fileURLToPath(import.meta.url));
 const SOURCE_PI_EXTENSION_PATH = resolve(PUBLIC_CORE_ROOT, 'extensions', 'pi', 'index.ts');
 const DEV_BRIDGE_VERSION = resolveCliVersion('dev', () => (
   JSON.parse(readFileSync(resolve(PUBLIC_CORE_ROOT, 'package.json'), 'utf8')) as { version?: unknown }
@@ -448,15 +465,18 @@ function formatDevStatus(status: DevStatusSnapshot): string {
     : status.source.bridge.statePresent
       ? 'degraded'
       : 'offline';
-  const pi = status.source.pi.extensionPresent ? 'source · present' : 'source · missing';
+  const piExtension = status.source.pi.extensionPresent ? 'source file · present' : 'source file · missing';
   const fields: Array<{ label: string; value: string; detail?: string }> = [
     { label: 'Profile', value: 'dev' },
-    { label: 'Bridge', value: bridge },
+    {
+      label: 'Bridge',
+      value: bridge,
+      detail: status.adapterUrl ? `local API · ${status.adapterUrl}` : 'local API · unavailable',
+    },
     { label: 'Host', value: status.hostId ?? '(not initialized)' },
     { label: 'Relay', value: status.relayUrl ?? '(not configured)' },
-    { label: 'Adapter', value: status.adapterUrl ?? '(unavailable)' },
     { label: 'Config', value: status.configPath },
-    { label: 'Pi', value: pi, detail: status.source.pi.extensionPath },
+    { label: 'Pi extension', value: piExtension, detail: status.source.pi.extensionPath },
   ];
   const labelWidth = Math.max(...fields.map(({ label }) => label.length));
 

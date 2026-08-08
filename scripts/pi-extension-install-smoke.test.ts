@@ -67,8 +67,15 @@ const server = Bun.serve({
   port: 0,
   async fetch(request) {
     const url = new URL(request.url);
-    requests.push({ method: request.method, path: url.pathname, authorization: request.headers.get('authorization') });
+    const protocolVersion = request.headers.get('x-ariava-agent-adapter-version');
+    requests.push({
+      method: request.method,
+      path: url.pathname,
+      authorization: request.headers.get('authorization'),
+      protocolVersion,
+    });
     if (request.headers.get('authorization') !== 'Bearer ' + secret) return new Response('Unauthorized', { status: 401 });
+    if (protocolVersion !== '2') return new Response('Upgrade Required', { status: 426 });
     if (request.method === 'POST' && url.pathname === '/v1/agent/sessions') {
       const session = await request.json();
       return Response.json({ sessionId: session.sessionId, registeredAt: '2026-07-22T00:00:00Z' });
@@ -80,7 +87,11 @@ const server = Bun.serve({
 });
 
 mkdirSync(new URL('.', pathToFileURL(discoveryPath)), { recursive: true, mode: 0o700 });
-writeFileSync(discoveryPath, JSON.stringify({ url: server.url.toString().replace(/\/$/, ''), secret }), { mode: 0o600 });
+writeFileSync(discoveryPath, JSON.stringify({
+  url: server.url.toString().replace(/\/$/, ''),
+  secret,
+  protocolVersion: 2,
+}), { mode: 0o600 });
 chmodSync(discoveryPath, 0o600);
 
 const extensionModule = await import(pathToFileURL(entryPath).href);
@@ -169,6 +180,7 @@ describe('pi extension disposable-home install and discovery smoke', () => {
         method: 'POST',
         path: '/v1/agent/sessions',
         authorization: 'Bearer temporary-loopback-secret',
+        protocolVersion: '2',
       });
       expect(discoveryPath).toStartWith(home);
       expect(installRoot).toStartWith(home);

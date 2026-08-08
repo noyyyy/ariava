@@ -142,6 +142,7 @@ export const HOST_READINESS_CHECK_IDS = [
   'service-references',
   'agent-adapter-discovery',
   'agent-adapter-health',
+  'bridge-runtime-health',
   'relay-health',
   'relay-enrollment',
 ] as const;

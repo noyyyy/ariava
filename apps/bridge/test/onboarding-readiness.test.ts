@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import type { HostEnrollmentResponse, SignedRequestHeaders } from '@ariava/protocol';
+import {
+  AGENT_ADAPTER_PROTOCOL_HEADER,
+  AGENT_ADAPTER_PROTOCOL_VERSION,
+  type HostEnrollmentResponse,
+  type SignedRequestHeaders,
+} from '@ariava/protocol';
 import { validateAgentAdapterDiscovery } from '../src/agent-adapter/config';
 import type { HostIdentity, HostIdentityInspection } from '../src/identity/types';
 import { RelayClientError } from '../src/relay-client';
@@ -70,11 +75,15 @@ function fixture(overrides: Partial<StrictReadinessInput> = {}, depOverrides: Pa
     ...overrides,
   };
   const deps: Partial<StrictReadinessDependencies> = {
-    clock: clock(), readDiscovery: () => ({ url: 'http://127.0.0.1:7272', secret: 'secret-value' }),
+    clock: clock(), readDiscovery: () => ({
+      url: 'http://127.0.0.1:7272', secret: 'secret-value', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+    }),
     serviceStatus: () => ({ backend: 'systemd-user', support: { platform: 'linux', backend: 'systemd-user', supported: true, isWsl: false, reason: 'supported' }, installed: true, enabled: true, loaded: true, processRunning: true, runtimePath: '/usr/bin/node', ariavaBinPath: '/prefix/bin/ariava', runtimePathMatchesCurrent: true, ariavaBinPathMatchesCurrent: true, logBackend: 'journald' }),
     fetch: async (request) => {
       const url = String(request);
-      return Response.json(url.endsWith('/health') && url.includes('127.0.0.1') ? { ok: true, hostId: 'host-1' } : { ok: true });
+      return Response.json(url.endsWith('/health') && url.includes('127.0.0.1')
+        ? { ok: true, hostId: 'host-1', health: { status: 'healthy', drivers: [] } }
+        : { ok: true });
     },
     createRelayClient: () => ({ enrollHost: async () => enrollment() }), nonce: () => 'fresh-nonce',
     ...depOverrides,
@@ -84,31 +93,70 @@ function fixture(overrides: Partial<StrictReadinessInput> = {}, depOverrides: Pa
 
 describe('strict onboarding readiness', () => {
   test('validates exact secure loopback discovery shape', () => {
-    expect(validateAgentAdapterDiscovery({ url: 'http://127.0.0.1:7272', secret: 's' }, 7272)).toEqual({ url: 'http://127.0.0.1:7272', secret: 's' });
-    expect(validateAgentAdapterDiscovery({ url: 'http://[::1]:7272', secret: 's' }, 7272).url).toBe('http://[::1]:7272');
+    const v2 = { url: 'http://127.0.0.1:7272', secret: 's', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION };
+    expect(validateAgentAdapterDiscovery(v2, 7272)).toEqual(v2);
+    expect(validateAgentAdapterDiscovery({ ...v2, url: 'http://[::1]:7272' }, 7272).url).toBe('http://[::1]:7272');
     for (const value of [
-      { url: 'http://localhost:7272', secret: 's' }, { url: 'http://10.0.0.1:7272', secret: 's' },
-      { url: 'https://127.0.0.1:7272', secret: 's' }, { url: 'http://user@127.0.0.1:7272', secret: 's' },
-      { url: 'http://127.0.0.1:7272/path', secret: 's' }, { url: 'http://127.0.0.1:7272', secret: '' },
-      { url: 'http://127.0.0.1:7272', secret: 's', extra: true },
+      { url: 'http://localhost:7272', secret: 's', protocolVersion: 2 },
+      { url: 'http://10.0.0.1:7272', secret: 's', protocolVersion: 2 },
+      { url: 'https://127.0.0.1:7272', secret: 's', protocolVersion: 2 },
+      { url: 'http://user@127.0.0.1:7272', secret: 's', protocolVersion: 2 },
+      { url: 'http://127.0.0.1:7272/path', secret: 's', protocolVersion: 2 },
+      { url: 'http://127.0.0.1:7272', secret: '', protocolVersion: 2 },
+      { url: 'http://127.0.0.1:7272', secret: 's' },
+      { url: 'http://127.0.0.1:7272', secret: 's', protocolVersion: 1 },
+      { url: 'http://127.0.0.1:7272', secret: 's', protocolVersion: 2, extra: true },
     ]) expect(() => validateAgentAdapterDiscovery(value, 7272)).toThrow();
   });
 
   test('polls boundedly and authenticates exact health evidence', async () => {
-    const headers: string[] = [];
+    const observedHeaders: Headers[] = [];
     const { input, deps } = fixture({}, {
-      fetch: async (_url, init) => { headers.push(new Headers(init?.headers).get('authorization') ?? ''); return Response.json({ ok: true, hostId: 'host-1' }); },
+      fetch: async (_url, init) => {
+        observedHeaders.push(new Headers(init?.headers));
+        return Response.json({ ok: true, hostId: 'host-1', health: { status: 'healthy', drivers: [] } });
+      },
     });
-    await expect(pollForDiscoveryAndHealth(input, deps)).resolves.toMatchObject({ url: 'http://127.0.0.1:7272' });
-    expect(headers).toEqual(['Bearer secret-value']);
+    await expect(pollForDiscoveryAndHealth(input, deps)).resolves.toEqual({
+      discovery: {
+        url: 'http://127.0.0.1:7272', secret: 'secret-value', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+      },
+      health: { status: 'healthy', drivers: [] },
+    });
+    expect(observedHeaders[0]?.get('authorization')).toBe('Bearer secret-value');
+    expect(observedHeaders[0]?.get(AGENT_ADAPTER_PROTOCOL_HEADER)).toBe(String(AGENT_ADAPTER_PROTOCOL_VERSION));
 
     const timed = fixture({}, { readDiscovery: () => null });
     await expect(pollForDiscoveryAndHealth(timed.input, timed.deps)).rejects.toMatchObject({ code: 'ERR_AGENT_ADAPTER_DISCOVERY' });
   });
 
+  test('keeps authenticated reachability ready while degraded runtime health blocks strict readiness', async () => {
+    const degraded = fixture({}, {
+      fetch: async (request) => String(request).includes('127.0.0.1')
+        ? Response.json({
+          ok: true, hostId: 'host-1', health: {
+            status: 'degraded',
+            drivers: [{
+              driver: 'pi', code: 'driver_reconciliation_failed', count: 2,
+              firstSeenAt: '2026-08-10T00:00:00.000Z', lastSeenAt: '2026-08-10T00:00:15.000Z',
+              nextRetryAt: '2026-08-10T00:00:30.000Z',
+            }],
+          },
+        })
+        : Response.json({ ok: true }),
+    });
+    const result = await checkStrictOnboardingReadiness(degraded.input, degraded.deps);
+    expect(result.ready).toBe(false);
+    expect(result.checks.find((check) => check.id === 'agent-adapter-health')).toEqual({ id: 'agent-adapter-health', ready: true });
+    expect(result.checks.find((check) => check.id === 'bridge-runtime-health')).toMatchObject({
+      ready: false, code: 'ERR_BRIDGE_DEGRADED', message: expect.stringMatching(/reachable.*degraded/i),
+    });
+    expect(result.nextActions[0]).toMatchObject({ command: 'ariava doctor' });
+  });
+
   test('dev discovery cannot satisfy production strict readiness', async () => {
     const candidate = fixture({}, {
-      readDiscovery: () => ({ url: 'http://127.0.0.1:7273', secret: 'dev-secret' }),
+      readDiscovery: () => ({ url: 'http://127.0.0.1:7273', secret: 'dev-secret', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION }),
     });
 
     const result = await checkStrictOnboardingReadiness(candidate.input, candidate.deps);
@@ -173,7 +221,7 @@ describe('strict onboarding readiness', () => {
     // Omit nonce so defaultDependencies.nonce (base64url of 16 random bytes) is used.
     const depsWithoutNonce: Partial<StrictReadinessDependencies> = {
       clock: clock(),
-      readDiscovery: () => ({ url: 'http://127.0.0.1:7272', secret: 'secret-value' }),
+      readDiscovery: () => ({ url: 'http://127.0.0.1:7272', secret: 'secret-value', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION }),
       serviceStatus: () => ({
         backend: 'systemd-user',
         support: { platform: 'linux', backend: 'systemd-user', supported: true, isWsl: false, reason: 'supported' },
@@ -183,7 +231,9 @@ describe('strict onboarding readiness', () => {
       }),
       fetch: async (request) => {
         const url = String(request);
-        return Response.json(url.endsWith('/health') && url.includes('127.0.0.1') ? { ok: true, hostId: 'host-1' } : { ok: true });
+        return Response.json(url.endsWith('/health') && url.includes('127.0.0.1')
+          ? { ok: true, hostId: 'host-1', health: { status: 'healthy', drivers: [] } }
+          : { ok: true });
       },
       createRelayClient: (options) => {
         capturedNonce = options.nonce?.();
@@ -232,7 +282,7 @@ describe('strict onboarding readiness', () => {
 
   test('adapter discovery failures preserve concrete message on both related checks', async () => {
     const candidate = fixture({}, {
-      readDiscovery: () => ({ url: 'http://10.0.0.1:7272', secret: 'secret-value' }),
+      readDiscovery: () => ({ url: 'http://10.0.0.1:7272', secret: 'secret-value', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION }),
     });
     const failed = await checkStrictOnboardingReadiness(candidate.input, candidate.deps);
     expect(failed.ready).toBe(false);

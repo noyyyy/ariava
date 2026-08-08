@@ -3,12 +3,13 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { AgentAdapterClient } from './adapter';
 import type { AgentAdapter } from './adapter-interface';
 import { executeCommand } from './commands';
-import { buildDoneEvent, buildNeedHumanEvent } from './events';
+import { buildDoneEvent, buildNeedHumanEvent, extractNeedHumanError } from './events';
 import { startHeartbeat, stopHeartbeat, type HeartbeatContext } from './heartbeat';
 import {
   classifyStoredAssistantText,
   markFingerprintEmitted,
   resetEmittedFingerprints,
+  type StoredTerminalCandidate,
 } from './question-detector';
 import { startCommandPoller, type CommandPollerHandle } from './poller';
 import { logExtensionError } from './logger';
@@ -28,29 +29,31 @@ const REGISTRATION_WARNING_MESSAGE =
   'Ariava bridge did not register this pi session within 5s. Check that the selected local bridge profile is running and its Agent Adapter discovery file is available.';
 const REGISTRATION_RETRY_MS = 1_000;
 const TERMINAL_ALERT_QUIET_WINDOW_MS = 1_500;
-const UNKNOWN_STOP_REASON_MAX_LENGTH = 80;
-const ERROR_PREVIEW_MAX_LENGTH = 240;
+const TERMINAL_DELIVERY_RETRY_DELAYS_MS = [250, 1_000, 4_000, 8_000] as const;
 
 type LatestAgentEndResult = {
   assistantFound: boolean;
   stopReason?: string;
   agentText?: string;
-  errorText?: string;
+  errorMessage?: unknown;
+  error?: unknown;
+  runGeneration: number;
 };
 
-type PendingTerminalAlert = {
-  type: 'done' | 'need_human';
+type PendingTerminalAlertBase = {
   agentText: string;
   fingerprint?: string;
   humanText?: string;
-  actionablePrompt?: {
-    promptId: string;
-    type: 'question';
-    label: string;
-  };
   createdAt: string;
   flowRevision: number;
+  runGeneration: number;
 };
+
+type PendingTerminalAlert = PendingTerminalAlertBase & (
+  | { type: 'done'; reason?: never; error?: never }
+  | { type: 'need_human'; reason: 'question' | 'blocked'; error?: never }
+  | { type: 'need_human'; reason: 'error'; error: ReturnType<typeof extractNeedHumanError> }
+);
 
 type PendingHandleCandidate = {
   sessionId: string;
@@ -70,10 +73,15 @@ type PiReducerState = {
   latestPendingAlert?: PendingTerminalAlert;
   pendingHandleCandidate?: PendingHandleCandidate;
   quietTimer?: ReturnType<typeof setTimeout>;
+  terminalDeliveryInFlight?: boolean;
+  terminalDeliveryAttempts?: number;
   lastInputAt?: number;
+  inputCursor: number;
   activeLeafId?: string;
   lastTreeSwitchAt?: number;
-  agentEndConsumedForCurrentRun: boolean;
+  generationSequence: number;
+  currentRunGeneration?: number;
+  settledRunGeneration?: number;
 };
 
 export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentAdapter) {
@@ -83,6 +91,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   let state: PiReducerState | null = null;
   let registrationWarningTimer: ReturnType<typeof setTimeout> | null = null;
   let registrationRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  let deliverySequence = 0;
 
   const heartbeatContext: HeartbeatContext = {
     sessionId: '',
@@ -99,9 +108,16 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   function reportPendingHandleAfterLocalInput(loopState: PiReducerState): void {
     const candidate = loopState.pendingHandleCandidate;
     if (!candidate || candidate.reported || !loopState.lastInputAt) return;
-    if (loopState.lastInputAt <= candidate.observedUserInputCursor) return;
+    if (loopState.inputCursor <= candidate.observedUserInputCursor) return;
 
     candidate.reported = true;
+    reportHandledEvent(loopState, candidate);
+  }
+
+  function reportHandledEvent(
+    loopState: PiReducerState,
+    candidate: PendingHandleCandidate,
+  ): void {
     runAdapterTask('handle session from local input', async () => {
       try {
         await adapter.handleSession(candidate.sessionId, {
@@ -110,7 +126,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
           handledAt: new Date(loopState.lastInputAt ?? Date.now()).toISOString(),
           action: 'pi_input',
         });
-        if (state?.pendingHandleCandidate?.eventId === candidate.eventId) {
+        if (state?.pendingHandleCandidate === candidate) {
           state.pendingHandleCandidate = undefined;
         }
       } catch (error) {
@@ -136,7 +152,10 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     return ctx.isIdle() === false || ctx.hasPendingMessages() === true;
   }
 
-  function extractLatestAssistantEnd(messages: AgentMessage[] | undefined): LatestAgentEndResult {
+  function extractLatestAssistantEnd(
+    messages: AgentMessage[] | undefined,
+    runGeneration: number,
+  ): LatestAgentEndResult {
     for (let index = (messages?.length ?? 0) - 1; index >= 0; index -= 1) {
       const message = messages?.[index] as {
         role?: string;
@@ -150,10 +169,12 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
         assistantFound: true,
         stopReason: typeof message.stopReason === 'string' ? message.stopReason : undefined,
         agentText: extractTextContent(message.content),
-        errorText: stringifyErrorLike(message.errorMessage) ?? stringifyErrorLike(message.error),
+        errorMessage: message.errorMessage,
+        error: message.error,
+        runGeneration,
       };
     }
-    return { assistantFound: false };
+    return { assistantFound: false, runGeneration };
   }
 
   function extractTextContent(content: unknown): string | undefined {
@@ -170,64 +191,100 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       .trim();
     return text || undefined;
   }
-
-  function stringifyErrorLike(value: unknown): string | undefined {
-    if (typeof value === 'string' && value.trim()) return value.trim();
-    if (value instanceof Error && value.message.trim()) return value.message.trim();
-    if (typeof value !== 'object' || value === null) return undefined;
-    const record = value as { message?: unknown; type?: unknown; code?: unknown; error?: unknown };
-    return [record.type, record.code, record.message, record.error]
-      .map((part) => typeof part === 'string' ? part.trim() : undefined)
-      .filter((part): part is string => Boolean(part))
-      .join(': ') || undefined;
-  }
-
-  function sanitizeDisplayText(value: string | undefined, maxLength: number): string | undefined {
-    const normalized = value
-      ?.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ')
-      .replace(/\p{Cf}/gu, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-    if (!normalized) return undefined;
-    if (normalized.length <= maxLength) return normalized;
-    return `${normalized.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…`;
-  }
-
-  function unsupportedReasonPreview(reason: string): string {
-    const sanitized = sanitizeDisplayText(reason, UNKNOWN_STOP_REASON_MAX_LENGTH);
-    return sanitized
-      ? `Pi stopped for an unsupported reason: ${sanitized}.`
-      : 'Pi stopped for an unsupported reason.';
-  }
-
   async function emitTerminalAlert(alert: PendingTerminalAlert) {
-    if (!session || !state?.rootSessionActive || state.flowRevision !== alert.flowRevision) return;
+    if (
+      !session ||
+      !state?.rootSessionActive ||
+      state.latestPendingAlert !== alert ||
+      state.terminalDeliveryInFlight ||
+      state.flowRevision !== alert.flowRevision ||
+      state.settledRunGeneration !== alert.runGeneration
+    ) return;
 
-    const normalizedAgentText = normalizeAssistantTextForEvent(alert.type, session, alert.agentText);
-    const sessionStatus = alert.type === 'done' ? 'done' : 'blocked';
-    session = withSessionStatus(session, sessionStatus, normalizedAgentText);
-    heartbeatContext.status = sessionStatus;
-    heartbeatContext.latestActivityText = session.latestActivityText;
-
+    const eventType = alert.type;
+    const normalizedAgentText = normalizeAssistantTextForEvent(eventType, session, alert.agentText);
+    const sessionStatus = alert.type === 'done' ? 'idle' : 'need_human';
+    const terminalSession = withSessionStatus(session, sessionStatus, normalizedAgentText);
     const event = alert.type === 'done'
-      ? buildDoneEvent(session, normalizedAgentText, alert.humanText)
-      : buildNeedHumanEvent(session, normalizedAgentText, alert.humanText, alert.actionablePrompt);
+      ? buildDoneEvent(terminalSession, normalizedAgentText, alert.humanText, alert.createdAt)
+      : buildNeedHumanEvent(terminalSession, alert.reason === 'error'
+          ? {
+              reason: alert.reason,
+              error: alert.error,
+              agentText: normalizedAgentText,
+              humanText: alert.humanText,
+              createdAt: alert.createdAt,
+            }
+          : {
+              reason: alert.reason,
+              agentText: normalizedAgentText,
+              humanText: alert.humanText,
+              createdAt: alert.createdAt,
+            });
 
-    state.terminalEmittedForCurrentLoop = true;
-    state.latestPendingAlert = undefined;
-    if (alert.fingerprint) markFingerprintEmitted(alert.fingerprint);
+    const deliveryToken = deliverySequence;
+    const deliveredSessionId = state.sessionId;
+    const deliveredLeafId = state.activeLeafId;
+    const deliveredFlowRevision = state.flowRevision;
+    const deliveredRunGeneration = state.settledRunGeneration;
+    const observedUserInputCursor = state.inputCursor;
+    state.terminalDeliveryInFlight = true;
 
-    runAdapterTask(`push ${alert.type} event`, async () => {
+    const alertLabel = alert.type === 'need_human' ? `${alert.type} ${alert.reason}` : alert.type;
+    try {
       const pushed = await adapter.pushEvent(event);
-      if (!state || state.sessionId !== event.sessionId) return;
-      state.pendingHandleCandidate = {
+      const currentState = state;
+      if (
+        !currentState ||
+        deliveryToken !== deliverySequence ||
+        currentState.sessionId !== deliveredSessionId ||
+        currentState.activeLeafId !== deliveredLeafId
+      ) return;
+
+      if (alert.fingerprint) markFingerprintEmitted(alert.fingerprint);
+      const candidate: PendingHandleCandidate = {
         sessionId: event.sessionId,
         eventId: pushed.eventId,
         eventCreatedAt: event.createdAt ?? new Date().toISOString(),
-        observedUserInputCursor: state.lastInputAt ?? 0,
+        observedUserInputCursor,
         reported: false,
       };
-    });
+      if (currentState.inputCursor > observedUserInputCursor) {
+        currentState.pendingHandleCandidate = candidate;
+        candidate.reported = true;
+        reportHandledEvent(currentState, candidate);
+        return;
+      }
+      if (
+        currentState.latestPendingAlert !== alert ||
+        currentState.flowRevision !== deliveredFlowRevision ||
+        currentState.settledRunGeneration !== deliveredRunGeneration
+      ) return;
+      session = terminalSession;
+      heartbeatContext.status = sessionStatus;
+      heartbeatContext.latestActivityText = terminalSession.latestActivityText;
+      currentState.terminalEmittedForCurrentLoop = true;
+      currentState.latestPendingAlert = undefined;
+      currentState.terminalDeliveryAttempts = 0;
+      currentState.pendingHandleCandidate = candidate;
+    } catch (error) {
+      const currentState = state;
+      if (
+        currentState &&
+        deliveryToken === deliverySequence &&
+        currentState.sessionId === deliveredSessionId &&
+        currentState.activeLeafId === deliveredLeafId &&
+        currentState.latestPendingAlert === alert &&
+        currentState.flowRevision === deliveredFlowRevision &&
+        currentState.settledRunGeneration === deliveredRunGeneration
+      ) {
+        currentState.terminalDeliveryAttempts = (currentState.terminalDeliveryAttempts ?? 0) + 1;
+        scheduleTerminalDeliveryRetry(currentState, alert);
+      }
+      logExtensionError(`push ${alertLabel} event`, error);
+    } finally {
+      if (state?.latestPendingAlert === alert) state.terminalDeliveryInFlight = false;
+    }
   }
 
   function clearQuietTimer(loopState: PiReducerState | null = state) {
@@ -236,9 +293,25 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     loopState.quietTimer = undefined;
   }
 
+  function scheduleTerminalDeliveryRetry(loopState: PiReducerState, alert: PendingTerminalAlert): void {
+    clearQuietTimer(loopState);
+    const attempt = loopState.terminalDeliveryAttempts ?? 1;
+    const delayMs = TERMINAL_DELIVERY_RETRY_DELAYS_MS[Math.min(
+      attempt - 1,
+      TERMINAL_DELIVERY_RETRY_DELAYS_MS.length - 1,
+    )];
+    loopState.quietTimer = setTimeout(() => {
+      if (state !== loopState || loopState.latestPendingAlert !== alert) return;
+      void emitTerminalAlert(alert);
+    }, delayMs);
+    loopState.quietTimer.unref?.();
+  }
+
   function invalidatePendingTerminal(loopState: PiReducerState): void {
     clearQuietTimer(loopState);
     loopState.latestPendingAlert = undefined;
+    loopState.terminalDeliveryInFlight = false;
+    loopState.terminalDeliveryAttempts = 0;
   }
 
   function schedulePendingTerminal(ctx: ExtensionContext) {
@@ -262,6 +335,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       state.sessionId !== scheduledSessionId ||
       state.flowRevision !== scheduledFlowRevision ||
       !state.latestPendingAlert ||
+      state.settledRunGeneration !== state.latestPendingAlert.runGeneration ||
       state.loopRunning
     ) return;
     if (runtimeHasNewWork(ctx)) {
@@ -274,21 +348,41 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   }
 
   function submitTerminalCandidate(
-    type: PendingTerminalAlert['type'],
+    candidate: StoredTerminalCandidate,
     ctx: ExtensionContext,
-    agentText: string,
-    fingerprint?: string,
-    actionablePrompt?: PendingTerminalAlert['actionablePrompt'],
+    runGeneration: number,
   ) {
     if (!session || !state?.rootSessionActive || state.terminalEmittedForCurrentLoop || state.latestPendingAlert) return;
-    state.latestPendingAlert = {
-      type,
-      agentText: normalizeAssistantTextForEvent(type, session, agentText),
+    const commonAlert = {
+      agentText: normalizeAssistantTextForEvent(candidate.type, session, candidate.agentText),
       humanText: deriveMessageTexts(ctx).latestUserText,
-      fingerprint,
-      actionablePrompt,
+      fingerprint: candidate.fingerprint,
       createdAt: new Date().toISOString(),
       flowRevision: state.flowRevision,
+      runGeneration,
+    };
+    state.latestPendingAlert = candidate.type === 'need_human'
+      ? { ...commonAlert, type: candidate.type, reason: candidate.reason }
+      : { ...commonAlert, type: candidate.type };
+    schedulePendingTerminal(ctx);
+  }
+
+  function submitErrorCandidate(
+    ctx: ExtensionContext,
+    result: LatestAgentEndResult,
+    runGeneration: number,
+  ): void {
+    if (!session || !state?.rootSessionActive || state.terminalEmittedForCurrentLoop || state.latestPendingAlert) return;
+    const error = extractNeedHumanError(result);
+    state.latestPendingAlert = {
+      type: 'need_human',
+      reason: 'error',
+      agentText: error.message,
+      error,
+      humanText: deriveMessageTexts(ctx).latestUserText,
+      createdAt: new Date().toISOString(),
+      flowRevision: state.flowRevision,
+      runGeneration,
     };
     schedulePendingTerminal(ctx);
   }
@@ -302,7 +396,8 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       flowRevision: 0,
       activeLeafId,
       pendingHandleCandidate: undefined,
-      agentEndConsumedForCurrentRun: false,
+      generationSequence: 0,
+      inputCursor: 0,
     };
     return state;
   }
@@ -356,25 +451,36 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   }
 
   function clearBranchSensitiveState(loopState: PiReducerState) {
+    deliverySequence += 1;
     invalidatePendingTerminal(loopState);
     loopState.latestAgentEndResult = undefined;
     loopState.terminalEmittedForCurrentLoop = false;
     loopState.pendingHandleCandidate = undefined;
     loopState.flowRevision += 1;
+    loopState.loopRunning = false;
+    loopState.currentRunGeneration = undefined;
+    loopState.settledRunGeneration = undefined;
   }
 
-  function beginNewLowLevelRun(loopState: PiReducerState) {
+  function beginNewLowLevelRun(loopState: PiReducerState): number {
     invalidatePendingTerminal(loopState);
     loopState.latestAgentEndResult = undefined;
     loopState.terminalEmittedForCurrentLoop = false;
     loopState.flowRevision += 1;
+    loopState.generationSequence += 1;
+    loopState.currentRunGeneration = loopState.generationSequence;
+    loopState.settledRunGeneration = undefined;
+    loopState.loopRunning = true;
+    return loopState.currentRunGeneration;
   }
 
   pi.on('session_start', async (_event, ctx) => {
+    deliverySequence += 1;
     stopHeartbeat();
     commandPoller?.stop();
     commandPoller = null;
 
+    clearQuietTimer(state);
     session = deriveSession(ctx);
     const sessionId = deriveSessionId(ctx);
     heartbeatContext.sessionId = sessionId;
@@ -393,6 +499,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   });
 
   pi.on('session_shutdown', async (_event, ctx) => {
+    deliverySequence += 1;
     const sessionId = heartbeatContext.sessionId;
     stopHeartbeat();
     clearRegistrationWarningTimer();
@@ -416,13 +523,20 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     resetEmittedFingerprints();
   });
 
-  pi.on('input', async (_event, _ctx) => {
+  pi.on('input', async (event, _ctx) => {
     if (!state) return;
     state.lastInputAt = Date.now();
+    state.inputCursor += 1;
+    reportPendingHandleAfterLocalInput(state);
+
+    if (event.streamingBehavior === 'steer' || event.streamingBehavior === 'followUp') return;
+
     invalidatePendingTerminal(state);
     state.latestAgentEndResult = undefined;
     state.flowRevision += 1;
-    reportPendingHandleAfterLocalInput(state);
+    state.loopRunning = false;
+    state.currentRunGeneration = undefined;
+    state.settledRunGeneration = undefined;
   });
 
   pi.on('agent_start', async (_event, ctx) => {
@@ -431,8 +545,6 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     session = deriveSession(ctx);
     const loopState = ensureLoopState(session.sessionId, deriveActiveLeafId(ctx));
     beginNewLowLevelRun(loopState);
-    loopState.agentEndConsumedForCurrentRun = false;
-    loopState.loopRunning = true;
     await pushWorking(ctx, deriveLatestActivityText(ctx));
   });
 
@@ -444,23 +556,34 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
 
     session = deriveSession(ctx);
     const loopState = ensureLoopState(session.sessionId, deriveActiveLeafId(ctx));
-    if (loopState.agentEndConsumedForCurrentRun) return;
+    const runGeneration = loopState.currentRunGeneration;
+    if (!loopState.loopRunning || runGeneration === undefined) return;
 
-    loopState.agentEndConsumedForCurrentRun = true;
     loopState.loopRunning = false;
-    loopState.latestAgentEndResult = extractLatestAssistantEnd(event.messages);
-    await pushWorking(ctx, loopState.latestAgentEndResult.errorText ?? loopState.latestAgentEndResult.agentText);
+    loopState.latestAgentEndResult = extractLatestAssistantEnd(event.messages, runGeneration);
+    await pushWorking(ctx, loopState.latestAgentEndResult.agentText);
   });
 
   pi.on('agent_settled', async (_event, ctx) => {
     const eventSessionId = deriveSessionId(ctx);
     if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId || !state || !session) return;
     const loopState = state;
-    if (loopState.sessionId !== eventSessionId || loopState.loopRunning || loopState.latestPendingAlert) return;
+    if (loopState.sessionId !== eventSessionId || loopState.latestPendingAlert) return;
+    const runGeneration = loopState.currentRunGeneration;
+    if (runGeneration === undefined) return;
+    if (loopState.loopRunning) {
+      loopState.loopRunning = false;
+      loopState.currentRunGeneration = undefined;
+      loopState.latestAgentEndResult = undefined;
+      return;
+    }
 
     const result = loopState.latestAgentEndResult;
     loopState.latestAgentEndResult = undefined;
-    if (!result?.assistantFound || loopState.terminalEmittedForCurrentLoop) return;
+    loopState.currentRunGeneration = undefined;
+    if (!result || result.runGeneration !== runGeneration) return;
+    loopState.settledRunGeneration = runGeneration;
+    if (!result.assistantFound || loopState.terminalEmittedForCurrentLoop) return;
 
     const stopReason = result.stopReason;
     if (stopReason === 'aborted') {
@@ -476,24 +599,8 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       return;
     }
 
-    if (stopReason === 'error') {
-      submitTerminalCandidate(
-        'need_human',
-        ctx,
-        sanitizeDisplayText(result.errorText, ERROR_PREVIEW_MAX_LENGTH) ?? 'Pi stopped after an unrecovered error.',
-      );
-      return;
-    }
-    if (stopReason === 'length') {
-      submitTerminalCandidate('need_human', ctx, 'Pi stopped after reaching the response length limit.');
-      return;
-    }
-    if (stopReason === 'toolUse') {
-      submitTerminalCandidate('need_human', ctx, 'Pi stopped while waiting to use a tool.');
-      return;
-    }
     if (stopReason !== undefined && stopReason !== 'stop') {
-      submitTerminalCandidate('need_human', ctx, unsupportedReasonPreview(stopReason));
+      submitErrorCandidate(ctx, result, runGeneration);
       return;
     }
 
@@ -501,16 +608,8 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       sessionId: loopState.sessionId,
       activeLeafId: loopState.activeLeafId,
     });
-    if (classification.type === 'suppress_duplicate') return;
-    submitTerminalCandidate(
-      classification.type === 'done' ? 'done' : 'need_human',
-      ctx,
-      classification.agentText,
-      classification.fingerprint,
-      classification.type === 'question_requested'
-        ? { promptId: `question-${Date.now()}`, type: 'question', label: 'Reply' }
-        : undefined,
-    );
+    if (classification.suppressed) return;
+    submitTerminalCandidate(classification, ctx, runGeneration);
   });
 
   pi.on('session_tree', async (event, ctx) => {

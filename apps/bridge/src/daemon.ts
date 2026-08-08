@@ -11,8 +11,8 @@ import type {
   HostEnrollmentRequest,
   HostProjection,
 } from '@ariava/protocol';
-import { canonicalE2ECurrentSessionsDigestV1 } from '@ariava/protocol';
-import { createId, isoNow, sleep } from '@ariava/shared-utils';
+import { AGENT_ADAPTER_PROTOCOL_VERSION, canonicalE2ECurrentSessionsDigestV1 } from '@ariava/protocol';
+import { isoNow } from '@ariava/shared-utils';
 import { AgentAdapterClient } from './agent-adapter/client';
 import { writeAgentAdapterConfig } from './agent-adapter/config';
 import { AgentAdapterRegistry } from './agent-adapter/registry';
@@ -31,6 +31,7 @@ import type { AgentDriver, BridgeConfig, BridgeSyncResult } from './types';
 import { prepareCommandForExecution } from './e2e/command-execution';
 import { LocalLinkKeyring } from './e2e/link-keyring';
 import { EncryptedUploadOrchestrator } from './e2e/upload-orchestrator';
+import { acquireRuntimeCoordinator, type RuntimeCoordinator } from './runtime-lock';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const BRIDGE_VERSION = readPackageVersion();
@@ -73,9 +74,67 @@ export interface ReconciliationScheduler {
 }
 
 const DEFAULT_RECONCILIATION_SCHEDULER: ReconciliationScheduler = {
+  schedule: (callback, delayMs) => {
+    const timer = setTimeout(callback, delayMs);
+    timer.unref();
+    return timer;
+  },
+  cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+const HOST_PRESENCE_HEARTBEAT_INTERVAL_MS = 30_000;
+
+export interface PollWaitScheduler {
+  schedule(callback: () => void, delayMs: number): unknown;
+  cancel(handle: unknown): void;
+}
+
+const DEFAULT_POLL_WAIT_SCHEDULER: PollWaitScheduler = {
   schedule: (callback, delayMs) => setTimeout(callback, delayMs),
   cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
+
+export class RuntimeHealthLogger {
+  private readonly failures = new Map<string, { lastLogAt: number; suppressed: number }>();
+  private readonly active = new Set<string>();
+  private readonly recovered = new Set<string>();
+
+  constructor(
+    private readonly write: (line: string) => void = (line) => { process.stderr.write(line); },
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  failure(scope: 'driver' | 'relay_presence', driver: string | undefined, count: number): void {
+    const key = `${scope}:${driver ?? ''}`;
+    const timestamp = this.now();
+    const current = this.failures.get(key) ?? { lastLogAt: 0, suppressed: 0 };
+    this.active.add(key);
+    this.recovered.delete(key);
+    if (timestamp - current.lastLogAt < 30_000) {
+      current.suppressed += 1;
+      this.failures.set(key, current);
+      return;
+    }
+    this.write(`${JSON.stringify({
+      component: 'bridge_runtime_health', outcome: 'degraded',
+      code: scope === 'driver' ? 'driver_reconciliation_failed' : 'relay_presence_refresh_failed',
+      ...(driver ? { driver } : {}), count, suppressed: current.suppressed,
+    })}\n`);
+    this.failures.set(key, { lastLogAt: timestamp, suppressed: 0 });
+  }
+
+  recovery(scope: 'driver' | 'relay_presence', driver: string | undefined, count: number): void {
+    const key = `${scope}:${driver ?? ''}`;
+    if (this.recovered.has(key)) return;
+    this.recovered.add(key);
+    this.active.delete(key);
+    this.write(`${JSON.stringify({
+      component: 'bridge_runtime_health', outcome: 'recovered',
+      code: scope === 'driver' ? 'driver_reconciliation_failed' : 'relay_presence_refresh_failed',
+      ...(driver ? { driver } : {}), count,
+    })}\n`);
+    this.failures.delete(key);
+  }
+}
 
 export class EncryptedEventFailureLogger {
   private lastLogAt = 0;
@@ -108,6 +167,7 @@ export class EncryptedEventFailureLogger {
 export class BridgeDaemon {
   private relayClient?: RelayClient;
   private readonly stateStore: BridgeStateStore;
+  private readonly runtimeCoordinator: RuntimeCoordinator;
   private readonly adapterRegistry: AgentAdapterRegistry;
   private readonly adapterClient: AgentAdapterClient;
   private readonly adapterServer: AgentAdapterServer;
@@ -119,37 +179,60 @@ export class BridgeDaemon {
   private startupValidated = false;
   private syncFlight?: Promise<BridgeSyncResult>;
   private reconciliationTimer?: unknown;
+  private presenceHeartbeatTimer?: unknown;
+  private presenceFlight?: Promise<void>;
   private reconciliationRequested = true;
   private currentSessionsSnapshotFailureCount = 0;
   private lastCurrentSessionsSnapshotFailureLogAt = 0;
   private readonly encryptedEventFailureLogger = new EncryptedEventFailureLogger();
+  private readonly runtimeHealthLogger = new RuntimeHealthLogger();
+  private pollWaitTimer?: unknown;
+  private pollWaitResolve?: () => void;
   constructor(
     private readonly config: BridgeConfig,
     drivers?: AgentDriver[],
     private readonly identityStore?: HostIdentityStore,
     registryNow?: () => Date,
     private readonly reconciliationScheduler: ReconciliationScheduler = DEFAULT_RECONCILIATION_SCHEDULER,
+    private readonly pollWaitScheduler: PollWaitScheduler = DEFAULT_POLL_WAIT_SCHEDULER,
   ) {
-    this.stateStore = new BridgeStateStore(config.statePath);
-    this.adapterRegistry = new AgentAdapterRegistry(
-      config.hostId, this.stateStore, () => this.scheduleRegistryReconciliation(), registryNow,
-    );
-    this.adapterClient = new AgentAdapterClient(this.adapterRegistry);
-    this.adapterServer = new AgentAdapterServer(
-      { port: config.agentAdapter.port, secret: config.agentAdapter.secret, hostId: config.hostId },
-      this.adapterRegistry,
-    );
-    this.drivers = drivers ?? [new PaiDriver(this.adapterClient, config.hostId)];
-    this.router = new CommandRouter(this.stateStore, new Map(this.drivers.map((driver) => [driver.name, driver])), config.hostId);
+    this.runtimeCoordinator = acquireRuntimeCoordinator(config.statePath);
+    let stateStore: BridgeStateStore | undefined;
+    try {
+      stateStore = new BridgeStateStore(config.statePath, undefined, {
+        deferRuntimePreflight: typeof (globalThis as { Bun?: unknown }).Bun === 'undefined',
+        runtimeCoordinator: this.runtimeCoordinator,
+      });
+      this.stateStore = stateStore;
+      this.adapterRegistry = new AgentAdapterRegistry(
+        config.hostId, this.stateStore, () => this.scheduleRegistryReconciliation(), registryNow,
+      );
+      this.adapterClient = new AgentAdapterClient(this.adapterRegistry);
+      this.adapterServer = new AgentAdapterServer(
+        { port: config.agentAdapter.port, secret: config.agentAdapter.secret, hostId: config.hostId },
+        this.adapterRegistry,
+        () => this.stateStore.getRuntimeHealth(),
+      );
+      this.drivers = drivers ?? [new PaiDriver(this.adapterClient, config.hostId)];
+      this.router = new CommandRouter(this.stateStore, new Map(this.drivers.map((driver) => [driver.name, driver])), config.hostId);
+    } catch (error) {
+      stateStore?.dispose();
+      this.runtimeCoordinator.dispose();
+      throw error;
+    }
   }
 
   private stopped = false;
-  private wakeRunLoop?: () => void;
   private relayAbortController = new AbortController();
   async start(): Promise<void> {
     await this.validateStartup();
     await this.adapterServer.start();
-    writeAgentAdapterConfig(this.config.agentAdapter.configPath, { url: this.adapterServer.url, secret: this.config.agentAdapter.secret });
+    writeAgentAdapterConfig(this.config.agentAdapter.configPath, {
+      url: this.adapterServer.url,
+      secret: this.config.agentAdapter.secret,
+      protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+    });
+    this.schedulePresenceHeartbeat();
   }
 
   private verifyFilesystem(): void {
@@ -157,7 +240,7 @@ export class BridgeDaemon {
     ensureAriavaSecureDirectories([
       dirname(this.config.configPath), dirname(this.config.statePath), dirname(this.config.agentAdapter.configPath), dirname(this.config.identityPath),
     ]);
-    for (const path of [this.config.configPath, this.config.statePath, this.config.agentAdapter.configPath]) {
+    for (const path of [this.config.configPath, this.config.agentAdapter.configPath]) {
       if (pathHasFilesystemEvidence(path)) readSecureJson<unknown>(path);
     }
     this.filesystemVerified = true;
@@ -165,28 +248,33 @@ export class BridgeDaemon {
 
   private async validateStartup(): Promise<void> {
     if (this.startupValidated) return;
-    assertProductionNodeRuntime();
-    assertNodeCryptoSelfTest();
-    this.verifyFilesystem();
-    const identity = await this.resolveIdentityStore().load();
-    if (!identity) throw new HostIdentityError('ERR_IDENTITY_NOT_INITIALIZED', 'Host identity is not initialized; run `ariava init`');
-    if (!this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
-      throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Configured identity metadata does not match the local Host identity');
+    try {
+      assertProductionNodeRuntime();
+      assertNodeCryptoSelfTest();
+      this.verifyFilesystem();
+      const identity = await this.resolveIdentityStore().load();
+      if (!identity) throw new HostIdentityError('ERR_IDENTITY_NOT_INITIALIZED', 'Host identity is not initialized; run `ariava init`');
+      if (!this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
+        throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Configured identity metadata does not match the local Host identity');
+      }
+      // Bun is retained only as a source-test runner and lacks production ChaChaPoly.
+      // Production Node preflights runtime state before creating any E2E identity/keyring material.
+      if (typeof (globalThis as { Bun?: unknown }).Bun === 'undefined') {
+        const recovery = this.stateStore.initializeEncryptedSpool(identity.hostId, this.config.identityPath, this.config.runtimePlatform ?? process.platform);
+        if (recovery.droppedUnreadableItems > 0) process.stderr.write(`Ariava dropped ${recovery.droppedUnreadableItems} unreadable encrypted spool item(s).\n`);
+      }
+      const encryptionStore = createRuntimeHostEncryptionIdentityStore(this.config.identityPath, this.config.runtimePlatform ?? process.platform);
+      this.encryptionIdentity = encryptionStore.loadOrCreate(identity.hostId);
+      this.keyring = new LocalLinkKeyring(`${this.config.identityPath}.e2e-keyring.json`, this.encryptionIdentity);
+      this.relayClient = new RelayClient(
+        { baseUrl: this.config.relayBaseUrl, signer: identity.signer },
+        () => this.relayAbortController.signal,
+      );
+      this.startupValidated = true;
+    } catch (error) {
+      this.disposeRuntimeCoordinator();
+      throw error;
     }
-    const encryptionStore = createRuntimeHostEncryptionIdentityStore(this.config.identityPath, this.config.runtimePlatform ?? process.platform);
-    this.encryptionIdentity = encryptionStore.loadOrCreate(identity.hostId);
-    // Bun is retained only as a source-test runner and lacks production ChaChaPoly.
-    // Production Node startup migrates and enables the encrypted retry spool.
-    if (typeof (globalThis as { Bun?: unknown }).Bun === 'undefined') {
-      const recovery = this.stateStore.initializeEncryptedSpool(identity.hostId, this.config.identityPath, this.config.runtimePlatform ?? process.platform);
-      if (recovery.droppedUnreadableItems > 0) process.stderr.write(`Ariava dropped ${recovery.droppedUnreadableItems} unreadable encrypted spool item(s).\n`);
-    }
-    this.keyring = new LocalLinkKeyring(`${this.config.identityPath}.e2e-keyring.json`, this.encryptionIdentity);
-    this.relayClient = new RelayClient(
-      { baseUrl: this.config.relayBaseUrl, signer: identity.signer },
-      () => this.relayAbortController.signal,
-    );
-    this.startupValidated = true;
   }
 
   private resolveIdentityStore(): HostIdentityStore {
@@ -207,19 +295,44 @@ export class BridgeDaemon {
     this.reconciliationTimer = this.reconciliationScheduler.schedule(() => {
       this.reconciliationTimer = undefined;
       this.reconciliationRequested = true;
-      this.wakeRunLoop?.();
+      this.cancelPollWait();
     }, 300);
+  }
+
+  private schedulePresenceHeartbeat(): void {
+    if (this.stopped || this.presenceHeartbeatTimer !== undefined) return;
+    this.presenceHeartbeatTimer = this.reconciliationScheduler.schedule(() => {
+      this.presenceHeartbeatTimer = undefined;
+      this.runPresenceHeartbeat();
+    }, HOST_PRESENCE_HEARTBEAT_INTERVAL_MS);
+  }
+
+  private runPresenceHeartbeat(): void {
+    if (this.stopped) return;
+    void this.ensureHostPresence()
+      .catch(() => {})
+      .finally(() => this.schedulePresenceHeartbeat());
   }
 
   stop(): void {
     this.stopped = true;
+    this.adapterRegistry.dispose();
     if (this.reconciliationTimer !== undefined) {
       this.reconciliationScheduler.cancel(this.reconciliationTimer);
       this.reconciliationTimer = undefined;
     }
+    if (this.presenceHeartbeatTimer !== undefined) {
+      this.reconciliationScheduler.cancel(this.presenceHeartbeatTimer);
+      this.presenceHeartbeatTimer = undefined;
+    }
+    this.cancelPollWait();
     this.relayAbortController.abort();
     this.adapterServer.stop(true);
-    this.wakeRunLoop?.();
+    this.disposeRuntimeCoordinator();
+  }
+  private disposeRuntimeCoordinator(): void {
+    this.stateStore.dispose();
+    this.runtimeCoordinator.dispose();
   }
   get adapterUrl(): string { return this.adapterServer.url; }
   get driverNames(): string[] { return this.drivers.map((driver) => driver.name); }
@@ -240,37 +353,40 @@ export class BridgeDaemon {
     this.reconciliationRequested = false;
     let offline = false;
     try {
-      await this.registerHostPresence();
+      await this.ensureHostPresence();
     } catch {
-      const prior = this.stateStore.getHost();
-      if (prior) this.stateStore.setHost({ ...prior, bridgeStatus: 'degraded' });
       offline = true;
     }
 
     const newEvents: CanonicalEvent[] = [];
     let authoritativeSetComplete = true;
     for (const driver of this.drivers) {
+      const observedAt = isoNow();
+      const nextRetryAt = new Date(Date.parse(observedAt) + this.config.pollIntervalMs).toISOString();
       try {
         const persistedDriverSessions = this.stateStore.listSessions()
           .filter((session) => this.stateStore.getDriverNameForSession(session.sessionId) === driver.name);
         const sessions = await driver.listSessions(this.config.hostId);
         if (driver.isAuthoritativeSetReady?.(persistedDriverSessions) === false) {
           authoritativeSetComplete = false;
+          const degradation = this.stateStore.recordDriverReconciliationFailure(driver.name, observedAt, nextRetryAt);
+          this.runtimeHealthLogger.failure('driver', driver.name, degradation.count);
           continue;
         }
         this.stateStore.replaceDriverSessions(driver.name, sessions);
-      } catch (error) {
-        if (!this.stateStore.hasReconciledDriver(driver.name)) authoritativeSetComplete = false;
-        const event = this.buildDriverErrorEvent(driver.name, error);
-        this.stateStore.queuePendingEvent(event);
-        newEvents.push(event);
+        const recovered = this.stateStore.recordDriverReconciliationSuccess(driver.name);
+        if (recovered) this.runtimeHealthLogger.recovery('driver', driver.name, recovered.count);
+      } catch {
+        authoritativeSetComplete = false;
+        const degradation = this.stateStore.recordDriverReconciliationFailure(driver.name, observedAt, nextRetryAt);
+        this.runtimeHealthLogger.failure('driver', driver.name, degradation.count);
       }
     }
     // A driver failure must never turn a partial list into an authoritative replacement.
     // Successful drivers have been reconciled above, while failed drivers retain their last
     // complete persisted set. Build the Host snapshot only from that reconciled store.
     const nextSessions = this.stateStore.listSessions();
-    const activeSessions = nextSessions.filter((session) => !isDiagnosticSession(session));
+    const activeSessions = nextSessions;
     let encryptedPublishingReady = true;
     if (authoritativeSetComplete && !offline) {
       try { encryptedPublishingReady = await this.flushCurrentSessionsSnapshot(activeSessions); }
@@ -346,7 +462,7 @@ export class BridgeDaemon {
 
   async pairWatch(pairingCode: string): Promise<BridgePairWatchResponse> {
     await this.validateStartup();
-    await this.registerHostPresence();
+    await this.ensureHostPresence();
     return this.client().pairWatch(pairingCode);
   }
 
@@ -358,8 +474,7 @@ export class BridgeDaemon {
       try { await this.syncOnce(); }
       catch (error) {
         if (this.stopped || isAbortError(error)) break;
-        this.stateStore.queuePendingEvent(this.buildBridgeFailureEvent(error));
-        await this.flushPendingEvents();
+        process.stderr.write(`Ariava bridge loop failed: ${this.formatError(error)}\n`);
       }
       if (this.reconciliationRequested) continue;
       if (!this.stopped) await this.waitForNextPoll();
@@ -367,11 +482,27 @@ export class BridgeDaemon {
   }
 
   private async waitForNextPoll(): Promise<void> {
-    await Promise.race([
-      sleep(this.config.pollIntervalMs),
-      new Promise<void>((resolveStop) => { this.wakeRunLoop = resolveStop; }),
-    ]);
-    this.wakeRunLoop = undefined;
+    await new Promise<void>((resolvePoll) => {
+      let fired = false;
+      const handle = this.pollWaitScheduler.schedule(() => {
+        fired = true;
+        this.pollWaitTimer = undefined;
+        if (this.pollWaitResolve === resolvePoll) this.pollWaitResolve = undefined;
+        resolvePoll();
+      }, this.config.pollIntervalMs);
+      if (!fired) {
+        this.pollWaitTimer = handle;
+        this.pollWaitResolve = resolvePoll;
+      }
+    });
+  }
+
+  private cancelPollWait(): void {
+    if (this.pollWaitTimer !== undefined) this.pollWaitScheduler.cancel(this.pollWaitTimer);
+    this.pollWaitTimer = undefined;
+    const resolvePoll = this.pollWaitResolve;
+    this.pollWaitResolve = undefined;
+    resolvePoll?.();
   }
 
   private async buildEnrollment(identity: HostIdentity): Promise<HostEnrollmentRequest> {
@@ -387,12 +518,39 @@ export class BridgeDaemon {
     return { hostName: this.config.hostName, platform: this.config.hostPlatform, bridgeVersion: this.config.bridgeVersion };
   }
 
+  private ensureHostPresence(): Promise<void> {
+    if (this.presenceFlight) return this.presenceFlight;
+    const observedAt = isoNow();
+    const nextRetryAt = new Date(Date.parse(observedAt) + this.config.pollIntervalMs).toISOString();
+    const flight = this.registerHostPresence()
+      .then(() => {
+        if (this.stopped) return;
+        const recovered = this.stateStore.recordRelayPresenceSuccess();
+        if (recovered) this.runtimeHealthLogger.recovery('relay_presence', undefined, recovered.count);
+      })
+      .catch((error: unknown) => {
+        if (!this.stopped) {
+          const prior = this.stateStore.getHost();
+          if (prior) this.stateStore.setHost({ ...prior, bridgeStatus: 'degraded' });
+          const degradation = this.stateStore.recordRelayPresenceFailure(observedAt, nextRetryAt);
+          this.runtimeHealthLogger.failure('relay_presence', undefined, degradation.count);
+        }
+        throw error;
+      });
+    this.presenceFlight = flight;
+    void flight.finally(() => {
+      if (this.presenceFlight === flight) this.presenceFlight = undefined;
+    }).catch(() => {});
+    return flight;
+  }
+
   private async registerHostPresence(): Promise<void> {
     const identity = await this.resolveIdentityStore().load();
     if (!identity || !this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
       throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Host identity changed while daemon was running');
     }
     const response = await this.client().enrollHost(await this.buildEnrollment(identity));
+    if (this.stopped) return;
     this.stateStore.setHost(response.host);
   }
 
@@ -509,7 +667,7 @@ export class BridgeDaemon {
           correlationId: prepared.code,
           updatedAt: isoNow(),
         };
-        this.stateStore.rememberCommandResult(result);
+        this.stateStore.rememberCommandResult(result, command);
         handled.push(result);
         await this.client().submitCommandResult(result);
         continue;
@@ -522,17 +680,6 @@ export class BridgeDaemon {
   }
 
 
-  private buildDriverErrorEvent(driverName: string, error: unknown): CanonicalEvent {
-    return { eventId: createId('evt'), hostId: this.config.hostId, sessionId: `driver:${driverName}`, provider: driverName,
-      type: 'driver_error', status: 'unknown', typeLabel: deriveEventTypeLabel('driver_error'),
-      agentText: `Driver ${driverName} failed: ${this.formatError(error)}`, contextText: `driver:${driverName}`, createdAt: isoNow() };
-  }
-
-  private buildBridgeFailureEvent(error: unknown): CanonicalEvent {
-    return { eventId: createId('evt'), hostId: this.config.hostId, sessionId: `host:${this.config.hostId}`, provider: 'bridge',
-      type: 'host_unavailable', status: 'unknown', typeLabel: deriveEventTypeLabel('host_unavailable'),
-      agentText: `Bridge loop recovered from an error: ${this.formatError(error)}`, contextText: this.config.hostName, createdAt: isoNow() };
-  }
 
   private formatError(error: unknown): string {
     const raw = error instanceof Error ? error.message : String(error);
@@ -554,16 +701,6 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
 }
 
-function deriveEventTypeLabel(type: CanonicalEvent['type']): string {
-  switch (type) {
-    case 'question_requested': return 'Agent question';
-    case 'blocked': return 'Session blocked';
-    case 'done': return 'Task complete';
-    case 'working': return 'In progress';
-    case 'driver_error': return 'Driver error';
-    case 'host_unavailable': return 'Host unavailable';
-  }
-}
 
 function samePersistedIdentity(
   configured: import('./identity').HostIdentityMetadata,
@@ -586,9 +723,6 @@ function samePersistedIdentity(
     && storageMatches;
 }
 
-function isDiagnosticSession(session: CanonicalSessionState): boolean {
-  return session.sessionId.startsWith('driver:') || session.sessionId.startsWith('host:');
-}
 
 function snapshotError(
   error: unknown,

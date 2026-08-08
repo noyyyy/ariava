@@ -41,7 +41,7 @@
     "release:prepare": "./scripts/publish-npm-safe.sh --prepare",
     "build:pi-bundle": "bun run --cwd extensions/pi build && node ./scripts/build-pi-release-bundle.mjs",
     "package:assert": "node ./scripts/package-assert.mjs",
-    "test": "bun run build && bun run ./scripts/run-test-lane.mjs shared && bun run --cwd extensions/pi test",
+    "test": "bun run build && bun run ./scripts/run-test-lane.mjs shared && node ./scripts/run-node-bridge-tests.mjs && bun run --cwd extensions/pi test",
     "test:macos": "bun run ./scripts/run-test-lane.mjs macos",
     "test:linux": "bun run ./scripts/run-test-lane.mjs linux",
     "verify": "bun run test && bun run --cwd extensions/pi typecheck && bun run package:assert",

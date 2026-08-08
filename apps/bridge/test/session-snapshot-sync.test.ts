@@ -30,7 +30,7 @@ async function fixture(handler: (request: Request) => Response | Promise<Respons
 }
 
 const activeSession = (sessionId: string) => ({ sessionId, provider: 'pi', projectName: 'secret-project', nameText: `Session ${sessionId}`,
-  latestActivityText: 'protected activity', stateLabel: 'Working', status: 'working', updatedAt: '2026-07-29T00:00:00.000Z' });
+  latestActivityText: 'protected activity', status: 'working', updatedAt: '2026-07-29T00:00:00.000Z' });
 
 function relay(hostId: string, lifecycle: (body: any) => Response) {
   return async (request: Request) => {
@@ -63,6 +63,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     const afterFailure = JSON.parse(readFileSync(fx.config.statePath, 'utf8')).currentSessionsSnapshot;
     expect(afterFailure).toEqual({ version: 1, lastAllocatedRevision: 1, lastAcceptedRevision: 0 });
     online = true;
+    fx.daemon.stop();
     const restartedIdentityStore = new LinuxJsonHostIdentityStore(fx.config.identityPath);
     const restarted = new BridgeDaemon(fx.config, [{ name: 'test', listSessions: async () => [], executeCommand: async () => { throw new Error('unused'); } }], restartedIdentityStore);
     expect((await restarted.syncOnce()).offline).toBe(false);
@@ -201,6 +202,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     expect((await fx.daemon.syncOnce()).offline).toBe(true);
     expect((fx.daemon as any).stateStore.listInflightSessionIds()).toEqual(['session-b']);
     failSecond = false; uploads.length = 0;
+    fx.daemon.stop();
     const restartedIdentityStore = new LinuxJsonHostIdentityStore(fx.config.identityPath);
     const restartedDriver = { name: 'test', listSessions: async () => [activeSession('session-a'), activeSession('session-b')].map((session) => ({ ...session, hostId })), executeCommand: async () => { throw new Error('unused'); } };
     const restarted = new BridgeDaemon(fx.config, [restartedDriver], restartedIdentityStore);

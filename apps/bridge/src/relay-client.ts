@@ -9,8 +9,8 @@ import type {
   E2EActivationAckV1,
   E2EConfirmationSubmissionV1,
   E2ERecipientSnapshotV1,
-  EncryptedEventUploadV1,
-  EncryptedSessionSnapshotUploadV1,
+  EncryptedEventUploadV2,
+  EncryptedSessionSnapshotUploadV2,
   HandleSessionRequest,
   HostEnrollmentRequest,
   HostEnrollmentResponse,
@@ -159,19 +159,19 @@ export class RelayClient {
     return this.request('GET', '/v2/bridge/e2e/recipients', undefined);
   }
 
-  publishEncryptedEvent(event: EncryptedEventUploadV1, session: EncryptedSessionSnapshotUploadV1): Promise<{ ok: true }> {
+  publishEncryptedEvent(event: EncryptedEventUploadV2, session: EncryptedSessionSnapshotUploadV2): Promise<{ ok: true }> {
     return this.request('POST', '/v2/bridge/e2e/events', { event, session });
   }
 
-  reconcileEncryptedEvent(event: EncryptedEventUploadV1, session: EncryptedSessionSnapshotUploadV1): Promise<{ committed: boolean }> {
+  reconcileEncryptedEvent(event: EncryptedEventUploadV2, session: EncryptedSessionSnapshotUploadV2): Promise<{ committed: boolean }> {
     return this.request('POST', '/v2/bridge/e2e/events/reconcile', { event, session });
   }
 
-  reconcileEncryptedSession(session: EncryptedSessionSnapshotUploadV1): Promise<boolean> {
+  reconcileEncryptedSession(session: EncryptedSessionSnapshotUploadV2): Promise<boolean> {
     return this.request<{ committed: boolean }>('POST', '/v2/bridge/e2e/sessions/reconcile', { session }).then((value) => value.committed);
   }
 
-  publishEncryptedSession(session: EncryptedSessionSnapshotUploadV1): Promise<{ ok: true }> {
+  publishEncryptedSession(session: EncryptedSessionSnapshotUploadV2): Promise<{ ok: true }> {
     return this.request('POST', '/v2/bridge/e2e/sessions', { session });
   }
 

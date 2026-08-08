@@ -74,6 +74,13 @@ export function chachaPolySeal(
   return { nonce: new Uint8Array(nonce), ciphertext: new Uint8Array(Buffer.concat([encrypted, cipher.getAuthTag()])) };
 }
 
+export class ChaChaPolyAuthenticationError extends Error {
+  constructor(cause?: unknown) {
+    super('ChaChaPoly authentication failed', { cause });
+    this.name = 'ChaChaPolyAuthenticationError';
+  }
+}
+
 export function chachaPolyOpen(key: Uint8Array, nonce: Uint8Array, wireCiphertext: Uint8Array, aad: Uint8Array): Uint8Array {
   assertAeadInput(key, nonce);
   if (wireCiphertext.byteLength < 16) throw new TypeError('ChaChaPoly ciphertext is shorter than its tag');
@@ -82,7 +89,11 @@ export function chachaPolyOpen(key: Uint8Array, nonce: Uint8Array, wireCiphertex
   const decipher = createDecipheriv('chacha20-poly1305', key, nonce, { authTagLength: 16 });
   decipher.setAAD(aad, { plaintextLength: ciphertext.byteLength });
   decipher.setAuthTag(tag);
-  return new Uint8Array(Buffer.concat([decipher.update(ciphertext), decipher.final()]));
+  try {
+    return new Uint8Array(Buffer.concat([decipher.update(ciphertext), decipher.final()]));
+  } catch (error) {
+    throw new ChaChaPolyAuthenticationError(error);
+  }
 }
 
 function assertAeadInput(key: Uint8Array, nonce: Uint8Array): void {

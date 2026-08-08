@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import type { BridgeConfig } from '../types';
+import type { BridgeConfig, BridgeRuntimeHealth } from '../types';
 import type { AriavaInstallMetadata, ResolvedAriavaConfig } from './config';
 import type { PiExtensionStatus } from './pi-extension';
 import type { ServiceBackend, ServiceSupportReason } from './service/index';
@@ -26,6 +26,7 @@ export interface HostManagerStatus {
   cliVersion: string;
   configComplete: boolean;
   bridgeHealth: 'online' | 'degraded' | 'offline';
+  runtimeHealth?: BridgeRuntimeHealth;
   hostId: string;
   hostName: string;
   relayBaseUrl: string;
@@ -73,16 +74,16 @@ export function buildHostManagerStatus(args: {
   cliVersion: string;
   identityInspection?: HostManagerStatus['identity'];
   statePresent?: boolean;
+  runtimeHealth?: BridgeRuntimeHealth;
 }): HostManagerStatus {
   const { config, bridgeConfig, installMetadata, serviceStatus, piStatus, cliVersion, identityInspection } = args;
   return {
     cliVersion,
     configComplete: isConfigComplete(config),
-    bridgeHealth: deriveBridgeHealth(
-      bridgeConfig.statePath,
-      serviceStatus.installed,
-      args.statePresent,
-    ),
+    bridgeHealth: args.runtimeHealth?.status === 'degraded'
+      ? 'degraded'
+      : deriveBridgeHealth(bridgeConfig.statePath, serviceStatus.installed, args.statePresent),
+    ...(args.runtimeHealth ? { runtimeHealth: structuredClone(args.runtimeHealth) } : {}),
     hostId: config.identity?.hostId ?? bridgeConfig.hostId,
     hostName: config.hostName || bridgeConfig.hostName,
     relayBaseUrl: bridgeConfig.relayBaseUrl,

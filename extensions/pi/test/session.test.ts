@@ -56,11 +56,10 @@ function makeContext(options: {
 }
 
 describe('active preview extraction', () => {
-  test('derives a normal session as idle/Ready without unknown', () => {
+  test('derives a normal session as canonical idle without unknown', () => {
     const session = deriveSession(makeContext({ contextMessages: [userMessage('  Start here  ')] }));
 
     expect(session.status).toBe('idle');
-    expect(session.stateLabel).toBe('Ready');
     expect(session.openingText).toBe('Start here');
     expect(JSON.stringify(session)).not.toContain('unknown');
   });
@@ -136,13 +135,12 @@ describe('active preview extraction', () => {
       cwd: '/tmp/ariava',
       rawSessionName: 'ariava',
       openingText: undefined,
-      stateLabel: 'Unknown',
-      status: 'unknown',
+      status: 'idle',
       pid: 1,
     } as const;
 
     expect(normalizeAssistantTextForEvent('done', session, longText)).toBe(longText);
-    expect(withSessionStatus(session, 'done', longText).latestActivityText).toBe(longText);
+    expect(withSessionStatus(session, 'idle', longText).latestActivityText).toBe(longText);
   });
 
   test('preserves assistant text line breaks and spacing when normalizing event text', () => {

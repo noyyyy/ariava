@@ -1,8 +1,10 @@
+import { AGENT_ADAPTER_PROTOCOL_VERSION } from '@ariava/protocol';
 import { pathHasFilesystemEvidence, readSecureJson, writeSecureJson } from '../host-manager/secure-files';
 
 export interface AgentAdapterDiscoveryFile {
   url: string;
   secret: string;
+  protocolVersion: typeof AGENT_ADAPTER_PROTOCOL_VERSION;
 }
 
 export function readAgentAdapterConfig(path: string, expectedPort?: number): AgentAdapterDiscoveryFile | null {
@@ -27,11 +29,13 @@ export function validateAgentAdapterDiscovery(
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
-  const hasExpectedKeys = keys.length === 2 && keys.includes('url') && keys.includes('secret');
+  const hasExpectedKeys = keys.length === 3
+    && keys.includes('url') && keys.includes('secret') && keys.includes('protocolVersion');
   if (!hasExpectedKeys
     || typeof record.url !== 'string'
     || typeof record.secret !== 'string'
-    || record.secret.trim().length === 0) {
+    || record.secret.trim().length === 0
+    || record.protocolVersion !== AGENT_ADAPTER_PROTOCOL_VERSION) {
     throw new Error('Agent Adapter discovery file is invalid');
   }
 
@@ -50,7 +54,7 @@ export function validateAgentAdapterDiscovery(
     || (expectedPort !== undefined && port !== expectedPort)) {
     throw new Error('Agent Adapter discovery URL port is invalid');
   }
-  return { url: url.origin, secret: record.secret };
+  return { url: url.origin, secret: record.secret, protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION };
 }
 
 export function isLoopbackHostname(hostname: string): boolean {

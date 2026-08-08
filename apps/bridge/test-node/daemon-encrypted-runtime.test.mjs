@@ -16,11 +16,12 @@ test.afterEach(() => dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: tr
 
 function session(hostId, id) {
   return { sessionId: id, hostId, provider: 'pi', projectName: `project-${id}`, nameText: `name-${id}`,
-    latestActivityText: `activity-${id}`, stateLabel: 'Blocked', status: 'blocked', updatedAt: '2026-07-20T00:00:00.000Z' };
+    latestActivityText: `activity-${id}`, status: 'idle', updatedAt: '2026-07-20T00:00:00.000Z' };
 }
 function event(hostId, id = 'event-1', sessionId = 'session-1') {
-  return { eventId: id, hostId, sessionId, provider: 'pi', type: 'blocked', status: 'blocked', typeLabel: 'Blocked',
-    assistantText: `SECRET-${id}`, createdAt: '2026-07-20T00:00:01.000Z' };
+  return { eventId: id, hostId, sessionId, provider: 'pi', type: 'done', status: 'idle', typeLabel: 'Task complete',
+    agentText: `SECRET-${id}`, projectName: `project-${sessionId}`, contextText: `name-${sessionId} · project-${sessionId}`,
+    hbaseSessionKey: sessionId, harnessProvider: 'pi', createdAt: '2026-07-20T00:00:01.000Z' };
 }
 function responseError(reason) { return new Response(JSON.stringify({ reason }), { status: 409, headers: { 'content-type': 'application/json' } }); }
 async function unwrap(response) {
@@ -48,8 +49,10 @@ async function fixture(handler, sessions = []) {
   const snapshots = (version) => ({ version: 1, hostId, recipientSetVersion: version, recipients: [{
     linkId, linkGeneration: 1, watchDeviceId: watchId, epoch: 1, state: 'active', watchBinding: binding }] });
   const config = { hostId, relayBaseUrl: 'http://relay.invalid', statePath: join(root, 'state.json'), identityPath };
-  const state = new BridgeStateStore(config.statePath); state.replaceDriverSessions('test', sessions);
+  const state = new BridgeStateStore(config.statePath);
   state.initializeEncryptedSpool(config.hostId, config.identityPath, 'linux');
+  state.replaceDriverSessions('test', sessions);
+  state.setRecipientSetVersion(1);
   const calls = [];
   const invoke = async (path, body) => {
     calls.push({ path, body });
@@ -68,7 +71,13 @@ async function fixture(handler, sessions = []) {
 }
 
 async function seedEvent(f, value) {
-  f.state.queuePendingEvent(value);
+  const terminal = {
+    sessionId: value.sessionId, hostId: value.hostId, provider: value.provider, projectName: value.projectName,
+    nameText: `name-${value.sessionId}`, latestActivityText: value.agentText, status: 'idle',
+    updatedAt: value.createdAt, lastEventId: value.eventId, hbaseSessionKey: value.hbaseSessionKey,
+    harnessProvider: value.harnessProvider,
+  };
+  f.state.queuePendingEvent(value, terminal);
 }
 
 test('BridgeDaemon delegates encrypted uploads to the production orchestrator', async () => {
@@ -128,6 +137,7 @@ for (const phase of ['journaled', 'revision-committed', 'inflight-removed', 'sou
       await seedEvent(f, event(f.config.hostId)); let crashed = false;
       const uploader = f.orchestrator(undefined, { eventCompletionStep: (at) => { if (!crashed && at === phase) { crashed = true; throw new Error(`crash:${at}`); } } });
       await assert.rejects(uploader.flushPendingEvents(), new RegExp(`crash:${phase}`));
+      f.state.dispose();
       const restartedState = new BridgeStateStore(f.config.statePath);
       restartedState.initializeEncryptedSpool(f.config.hostId, f.config.identityPath, 'linux');
       assert.equal(restartedState.currentSessionRevision('session-1'), 1);
@@ -153,14 +163,18 @@ test('all-session recipient refresh replaces stale inflight on two consecutive r
     throw new Error(path);
   }, []);
   try {
-    const state = new BridgeStateStore(f.config.statePath); state.replaceDriverSessions('test', [
+    const state = f.state;
+    state.initializeEncryptedSpool(f.config.hostId, f.config.identityPath, 'linux');
+    state.replaceDriverSessions('test', [
       { ...s1, hostId: f.config.hostId }, { ...s2, hostId: f.config.hostId },
-    ]); state.initializeEncryptedSpool(f.config.hostId, f.config.identityPath, 'linux');
+    ]);
     const ok = await f.orchestrator(state).publishRecipientChangeSnapshots(f.snapshots(1), f.recipients);
     assert.equal(ok, true);
     assert.deepEqual([...attempts.keys()].sort(), ['s1', 's2']);
     assert.equal(attempts.get('s1'), 3); assert.equal(attempts.get('s2'), 3);
-    const restarted = new BridgeStateStore(f.config.statePath); restarted.initializeEncryptedSpool(f.config.hostId, f.config.identityPath, 'linux');
+    state.dispose();
+    const restarted = new BridgeStateStore(f.config.statePath);
+    restarted.initializeEncryptedSpool(f.config.hostId, f.config.identityPath, 'linux');
     assert.equal(restarted.currentSessionRevision('s1'), 1); assert.equal(restarted.currentSessionRevision('s2'), 1);
     assert.deepEqual(restarted.listInflightSessionIds(), []);
   } finally { f.restore(); }
@@ -180,9 +194,9 @@ test('recipient refresh publishes current+1 when the ambiguous old-version uploa
     throw new Error(path);
   });
   try {
-    const state = new BridgeStateStore(f.config.statePath);
-    state.replaceDriverSessions('test', [session(f.config.hostId, 'ambiguous-session')]);
+    const state = f.state;
     state.initializeEncryptedSpool(f.config.hostId, f.config.identityPath, 'linux');
+    state.replaceDriverSessions('test', [session(f.config.hostId, 'ambiguous-session')]);
     const ok = await f.orchestrator(state).publishRecipientChangeSnapshots(f.snapshots(1), f.recipients);
     assert.equal(ok, true); assert.equal(reconcileCalls, 1);
     assert.deepEqual(attempts, [{ version: 1, revision: 1 }, { version: 2, revision: 2 }]);

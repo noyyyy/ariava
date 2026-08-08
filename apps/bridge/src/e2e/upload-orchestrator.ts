@@ -1,4 +1,4 @@
-import type { E2ERecipientSnapshotV1, EncryptedEventUploadV1, EncryptedSessionSnapshotUploadV1 } from '@ariava/protocol';
+import type { E2ERecipientSnapshotV1, EncryptedEventUploadV2, EncryptedSessionSnapshotUploadV2 } from '@ariava/protocol';
 import type { HostEncryptionIdentity } from '../identity';
 import type { RelayClient } from '../relay-client';
 import { RelayClientError } from '../relay-client';
@@ -20,7 +20,7 @@ export interface EncryptedUploadHooks {
   eventFailure?: (failure: EncryptedEventFailure) => void;
 }
 
-type EncryptedEventAndSession = { event: EncryptedEventUploadV1; session: EncryptedSessionSnapshotUploadV1 };
+type EncryptedEventAndSession = { event: EncryptedEventUploadV2; session: EncryptedSessionSnapshotUploadV2 };
 
 export class EncryptedUploadOrchestrator {
   constructor(private readonly stateStore: BridgeStateStore, private readonly client: RelayClient,
@@ -38,7 +38,7 @@ export class EncryptedUploadOrchestrator {
       for (const sessionId of sessionIds) {
         const session = this.stateStore.getSession(sessionId);
         if (!session) return undefined;
-        let upload = this.stateStore.getInflightSessionUpload(sessionId) as EncryptedSessionSnapshotUploadV1 | undefined;
+        let upload = this.stateStore.getInflightSessionUpload(sessionId) as EncryptedSessionSnapshotUploadV2 | undefined;
         if (!upload || upload.recipientSetVersion !== passVersion) {
           const next = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: upload?.revision ?? this.stateStore.nextSessionRevision(sessionId),
             recipientSetVersion: passVersion, recipients, hostIdentity: this.encryptionIdentity });
@@ -96,7 +96,8 @@ export class EncryptedUploadOrchestrator {
     let flushed = 0;
     for (const pending of this.stateStore.peekPendingUploads()) {
       const event = pending.event;
-      const session = this.stateStore.getSession(event.sessionId) ?? pending.session ?? syntheticSessionForEvent(event);
+      const session = pending.session;
+      assertEventSessionBinding(event, session);
       let inflight = this.stateStore.getInflightEventUpload(event.eventId) as EncryptedEventAndSession | undefined;
       if (!inflight || inflight.event.recipientSetVersion !== snapshot.recipientSetVersion
         || inflight.session.recipientSetVersion !== snapshot.recipientSetVersion) {
@@ -206,7 +207,7 @@ export class EncryptedUploadOrchestrator {
       }
     }
     for (const sessionId of pendingIds) {
-      let upload = this.stateStore.getInflightSessionUpload(sessionId) as EncryptedSessionSnapshotUploadV1 | undefined; if (!upload) return false;
+      let upload = this.stateStore.getInflightSessionUpload(sessionId) as EncryptedSessionSnapshotUploadV2 | undefined; if (!upload) return false;
       for (;;) {
         try {
           await this.client.publishEncryptedSession(upload);
@@ -249,22 +250,36 @@ export class EncryptedUploadOrchestrator {
   }
 }
 
-function syntheticSessionForEvent(event: import('@ariava/protocol').CanonicalEvent): import('@ariava/protocol').CanonicalSessionState {
-  return { sessionId: event.sessionId, hostId: event.hostId, provider: event.provider, projectName: 'system',
-    nameText: event.contextText ?? event.sessionId, latestActivityText: event.agentText, stateLabel: 'Unknown', status: event.status, updatedAt: event.createdAt };
-}
 function eventEncryptionInput(event: import('@ariava/protocol').CanonicalEvent, session: import('@ariava/protocol').CanonicalSessionState) {
-  return { event: { eventId: event.eventId, hostId: event.hostId, sessionId: event.sessionId, provider: event.provider, type: event.type, status: event.status,
-    ...(event.correlationId ? { correlationId: event.correlationId } : {}), createdAt: event.createdAt }, protectedEvent: { version: 1 as const, agentText: event.agentText,
-    ...(event.humanText !== undefined ? { humanText: event.humanText } : {}), ...(event.contextText !== undefined ? { contextText: event.contextText } : {}),
-    ...(event.actionablePrompt ? { actionablePrompt: event.actionablePrompt } : {}) }, ...sessionEncryptionInput(session) };
+  assertEventSessionBinding(event, session);
+  return {
+    event: { eventId: event.eventId, hostId: event.hostId, sessionId: event.sessionId, provider: event.provider,
+      type: event.type, status: event.status, ...(event.correlationId ? { correlationId: event.correlationId } : {}),
+      createdAt: event.createdAt },
+    protectedEvent: { version: 2 as const, agentText: event.agentText,
+      ...(event.humanText !== undefined ? { humanText: event.humanText } : {}),
+      ...(event.projectName !== undefined ? { projectName: event.projectName } : {}),
+      ...(event.contextText !== undefined ? { contextText: event.contextText } : {}),
+      ...(event.workingDirectory !== undefined ? { workingDirectory: event.workingDirectory } : {}),
+      ...(event.hbaseSessionKey !== undefined ? { hbaseSessionKey: event.hbaseSessionKey } : {}),
+      ...(event.harnessProvider !== undefined ? { harnessProvider: event.harnessProvider } : {}),
+      ...(event.actionablePrompt ? { actionablePrompt: event.actionablePrompt } : {}),
+      ...(event.type === 'need_human' ? { needHuman: event.needHuman } : {}) },
+    ...sessionEncryptionInput(session),
+  };
 }
 function sessionEncryptionInput(session: import('@ariava/protocol').CanonicalSessionState) {
-  return { session: { hostId: session.hostId, sessionId: session.sessionId, provider: session.provider, status: session.status, updatedAt: session.updatedAt,
-    ...(session.lastEventId ? { lastEventId: session.lastEventId } : {}), ...(session.snoozedUntil ? { snoozedUntil: session.snoozedUntil } : {}) },
-    protectedSession: { version: 1 as const, projectName: session.projectName, nameText: session.nameText,
+  return {
+    session: { hostId: session.hostId, sessionId: session.sessionId, provider: session.provider, status: session.status,
+      updatedAt: session.updatedAt, ...(session.lastEventId ? { lastEventId: session.lastEventId } : {}),
+      ...(session.snoozedUntil ? { snoozedUntil: session.snoozedUntil } : {}) },
+    protectedSession: { version: 2 as const, projectName: session.projectName, nameText: session.nameText,
       ...(session.openingText !== undefined ? { openingText: session.openingText } : {}),
-      ...(session.latestActivityText !== undefined ? { latestActivityText: session.latestActivityText } : {}) } };
+      ...(session.latestActivityText !== undefined ? { latestActivityText: session.latestActivityText } : {}),
+      ...(session.workingDirectory !== undefined ? { workingDirectory: session.workingDirectory } : {}),
+      ...(session.hbaseSessionKey !== undefined ? { hbaseSessionKey: session.hbaseSessionKey } : {}),
+      ...(session.harnessProvider !== undefined ? { harnessProvider: session.harnessProvider } : {}) },
+  };
 }
 function attachNotificationPreviews(
   upload: EncryptedEventAndSession,
@@ -287,6 +302,16 @@ function attachNotificationPreviews(
     });
   } catch {
     upload.event.notificationPreviews = [];
+  }
+}
+
+function assertEventSessionBinding(
+  event: import('@ariava/protocol').CanonicalEvent,
+  session: import('@ariava/protocol').CanonicalSessionState,
+ ): void {
+  if (event.hostId !== session.hostId || event.sessionId !== session.sessionId || event.provider !== session.provider
+    || event.status !== session.status || session.lastEventId !== event.eventId) {
+    throw new TypeError('Event upload requires its corresponding terminal Session snapshot');
   }
 }
 

@@ -1,12 +1,20 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import type { CanonicalEvent, CommandEnvelope, CommandResult, HandleSessionRequest, SessionStatus } from '@ariava/protocol';
-import type { AgentAdapter } from './adapter-interface';
+import {
+  AGENT_ADAPTER_PROTOCOL_HEADER,
+  AGENT_ADAPTER_PROTOCOL_VERSION,
+  type CommandEnvelope,
+  type CommandResult,
+  type HandleSessionRequest,
+  type SessionStatus,
+} from '@ariava/protocol';
+import type { AgentAdapter, AgentAdapterEvent } from './adapter-interface';
 import type { PiSessionInfo } from './session';
 
 export interface AgentAdapterDiscoveryFile {
   url: string;
   secret: string;
+  protocolVersion: typeof AGENT_ADAPTER_PROTOCOL_VERSION;
 }
 
 export interface AgentAdapterClientOptions {
@@ -33,7 +41,11 @@ export class AgentAdapterClient implements AgentAdapter {
     this.configPath = resolveAgentAdapterConfigPath(options.configPath);
     this.pinnedDiscovery = Boolean(options.baseUrl && options.secret);
     if (options.baseUrl && options.secret) {
-      this.cachedDiscovery = { url: options.baseUrl, secret: options.secret };
+      this.cachedDiscovery = {
+        url: options.baseUrl,
+        secret: options.secret,
+        protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+      };
     }
   }
 
@@ -46,12 +58,10 @@ export class AgentAdapterClient implements AgentAdapter {
     await this.fetch('DELETE', `/v1/agent/sessions/${encodeURIComponent(sessionId)}`, undefined);
   }
 
-  async pushEvent(event: Partial<CanonicalEvent>): Promise<{ eventId: string }> {
-    const sessionId = event.sessionId;
-    if (!sessionId) {
-      throw new Error('pushEvent requires sessionId');
-    }
-    const response = await this.fetch('POST', `/v1/agent/sessions/${encodeURIComponent(sessionId)}/events`, event);
+  async pushEvent(event: AgentAdapterEvent): Promise<{ eventId: string }> {
+    const response = await this.fetch(
+      'POST', `/v1/agent/sessions/${encodeURIComponent(event.sessionId)}/events`, event,
+    );
     return (await response.json()) as { eventId: string };
   }
 
@@ -146,6 +156,7 @@ export class AgentAdapterClient implements AgentAdapter {
       headers: {
         authorization: `Bearer ${discovery.secret}`,
         'content-type': 'application/json',
+        [AGENT_ADAPTER_PROTOCOL_HEADER]: String(discovery.protocolVersion),
       },
     };
     if (body !== undefined) {
@@ -187,12 +198,16 @@ export class AgentAdapterClient implements AgentAdapter {
 }
 
 function isDiscoveryFile(value: unknown): value is AgentAdapterDiscoveryFile {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as Record<string, unknown>).url === 'string' &&
-    typeof (value as Record<string, unknown>).secret === 'string'
-  );
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  return keys.length === 3
+    && keys.includes('url')
+    && keys.includes('secret')
+    && keys.includes('protocolVersion')
+    && typeof record.url === 'string'
+    && typeof record.secret === 'string'
+    && record.protocolVersion === AGENT_ADAPTER_PROTOCOL_VERSION;
 }
 
 function sleep(ms: number): Promise<void> {

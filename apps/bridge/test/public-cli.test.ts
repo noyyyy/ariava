@@ -1090,7 +1090,7 @@ describe('public ariava CLI', () => {
       secureJsonFixture(join(devRoot, 'bridge-state.json'), { sourceBridge: 'ready' });
       secureJsonFixture(join(devRoot, 'agent-adapter.json'), {
         url: 'http://127.0.0.1:7273',
-        secret: 'dev-only-secret',
+        secret: 'dev-only-secret', protocolVersion: 2,
       });
       const cliVersion = JSON.parse(readFileSync(join(publicCoreRoot, 'package.json'), 'utf8')).version;
 

@@ -12,14 +12,22 @@ mock.module('../src/e2e/node-crypto', () => ({
 
 const session = {
   sessionId: 'session-test', hostId: 'host-test', provider: 'pi', projectName: 'Ariava', nameText: 'Session',
-  stateLabel: 'Done', status: 'done', updatedAt: '2026-08-01T00:00:00.000Z',
+  status: 'idle', updatedAt: '2026-08-01T00:00:01.000Z',
 } satisfies CanonicalSessionState;
 
-function event(overrides: Partial<CanonicalEvent>): CanonicalEvent {
+function doneEvent(overrides: Partial<CanonicalEvent> = {}): CanonicalEvent {
   return {
-    eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'done', status: 'done',
-    typeLabel: 'Done', agentText: 'Finished successfully', createdAt: '2026-08-01T00:00:01.000Z', ...overrides,
-  };
+    eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'done', status: 'idle',
+    typeLabel: 'Task complete', agentText: 'Finished successfully', createdAt: '2026-08-01T00:00:01.000Z', ...overrides,
+  } as CanonicalEvent;
+}
+
+function needHumanEvent(overrides: Partial<CanonicalEvent> = {}): CanonicalEvent {
+  return {
+    eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'need_human', status: 'need_human',
+    typeLabel: 'Needs attention', agentText: 'Review the result', needHuman: { reason: 'blocked' },
+    createdAt: '2026-08-01T00:00:01.000Z', ...overrides,
+  } as CanonicalEvent;
 }
 
 function recipient(index: number) {
@@ -27,55 +35,63 @@ function recipient(index: number) {
     linkId: `link-${index}`, linkGeneration: 1, watchDeviceId: `watch-${index}`, epoch: index, state: 'active' as const,
     transcriptDigest: 'A'.repeat(43),
     watchBinding: { version: 1 as const, entityType: 'watch' as const, entityId: `watch-${index}`, identityKeyId: `key-${index}`,
-      encryptionKeyId: `ekey-watch-${index}`, publicKey: 'A'.repeat(43), sequence: 1, issuedAt: '2026-08-01T00:00:00.000Z',
+      encryptionKeyId: `ekey-watch-${index}`, publicKey: 'A'.repeat(43), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z',
       bindingSignature: 'B'.repeat(86) },
   };
 }
 
-describe('notification preview selection', () => {
+describe('notification preview v2', () => {
+  test('uses the exact canonical fields and eventType without protected reason/error', () => {
+    const preview = buildNotificationPreview(needHumanEvent({
+      needHuman: { reason: 'error', error: { kind: 'provider_failure', message: 'Private provider cause.', providerCode: 'E_PRIVATE', retryExhausted: true } },
+    }), { ...session, status: 'need_human' });
+    expect(preview).toEqual({
+      version: 2, projectName: 'Ariava', eventType: 'need_human', bodyText: 'Review the result', truncated: false,
+    });
+    expect(Object.keys(preview!)).toEqual(['version', 'projectName', 'eventType', 'bodyText', 'truncated']);
+    expect(JSON.stringify(preview)).not.toMatch(/reason|error|provider|Private/u);
+  });
+
+  test('builds previews only for canonical terminal Events', () => {
+    expect(buildNotificationPreview(doneEvent(), session)?.eventType).toBe('done');
+    expect(buildNotificationPreview(needHumanEvent(), { ...session, status: 'need_human' })?.eventType).toBe('need_human');
+    expect(buildNotificationPreview({ ...doneEvent(), type: 'working', status: 'working' } as never, session)).toBeUndefined();
+  });
+
   test.each([
-    ['done', 'done', 'done'],
-    ['need_human', 'blocked', 'need_human'],
-  ] as const)('maps canonical %s events to %s', (type, status, expected) => {
-    expect(buildNotificationPreview(event({ type, status }), session)?.state).toBe(expected);
+    'Bearer token-value',
+    'Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==',
+    'Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==',
+    'Authorization: Bearer token-value',
+    'sk-AAAAAAAAAAAAAAAA',
+    'AKIAABCDEFGHIJKLMNOP',
+  ])('fully sanitizes credential form %s', (credential) => {
+    const body = buildNotificationPreview(doneEvent({
+      agentText: `Provider failed with ${credential}; safe tail.`,
+    }), session)?.bodyText;
+    expect(body).toContain('[redacted credential]');
+    expect(body).toContain('safe tail');
+    expect(body).not.toContain(credential.split(/\s+/u).at(-1)!);
   });
 
-  test('uses agent text before the bounded fallback text', () => {
-    expect(buildNotificationPreview(event({ type: 'done', status: 'done', agentText: ' agent detail ' }), session)).toMatchObject({ bodyText: 'agent detail', source: 'agentText' });
-    expect(buildNotificationPreview(event({ type: 'done', status: 'done', agentText: '  ', contextText: 'private context' }), session)).toMatchObject({ bodyText: 'Task completed.', source: 'fallback' });
-  });
-
-  test('trims outer whitespace and collapses excessive blank lines to one blank line', () => {
+  test('normalizes and truncates at exactly 200 Unicode grapheme clusters', () => {
     expect(normalizeNotificationPreviewBody('  first  \n \n\t\n second  ')).toEqual({ bodyText: 'first\n\nsecond', truncated: false });
-  });
-
-  test('truncates at exactly 200 Unicode grapheme clusters without splitting complex graphemes', () => {
-    const complex = ['👩🏽‍💻', '🇨🇦', 'e\u0301'];
-    const exact = 'a'.repeat(197) + complex.join('');
-    expect(Array.from(new Intl.Segmenter('en', { granularity: 'grapheme' }).segment(exact))).toHaveLength(200);
+    const exact = 'a'.repeat(197) + ['👩🏽‍💻', '🇨🇦', 'e\u0301'].join('');
     expect(normalizeNotificationPreviewBody(exact)).toEqual({ bodyText: exact, truncated: false });
     expect(normalizeNotificationPreviewBody(exact + 'Z')).toEqual({ bodyText: `${exact}…`, truncated: true });
   });
 
-  test('omits previews that exceed protocol UTF-8 or total serialized-byte limits', () => {
-    expect(buildNotificationPreview(event({}), { ...session, projectName: '界'.repeat(100) })).toBeUndefined();
-    expect(buildNotificationPreview(event({ agentText: '👨‍👩‍👧‍👦'.repeat(200) }), session)).toBeUndefined();
-    expect(buildNotificationPreview(event({ agentText: `e${'\u0301'.repeat(4_000)}` }), session)).toBeUndefined();
-  });
-
-  test('creates an independent opaque envelope and matching wrap for each eligible recipient', async () => {
+  test('binds outer preview eventType and v2 payload kind for each recipient', async () => {
     const { encryptNotificationPreviews } = await import('../src/e2e/envelope');
-    const plaintext = buildNotificationPreview(event({}), session)!;
+    const plaintext = buildNotificationPreview(doneEvent(), session)!;
     const envelopes = encryptNotificationPreviews({
-      event: event({}), plaintext, recipients: [recipient(1), recipient(2)],
+      event: doneEvent(), plaintext, recipients: [recipient(1), recipient(2)],
       hostIdentity: { version: 1, hostId: 'host-test', encryptionKeyId: 'ekey-host', publicKey: '',
         privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' },
     });
-    expect(envelopes).toHaveLength(2);
-    expect(envelopes.map((item) => item.watchDeviceId)).toEqual(['watch-1', 'watch-2']);
-    expect(new Set(envelopes.map((item) => item.content.contentId)).size).toBe(2);
+    expect(envelopes.map((item) => item.eventType)).toEqual(['done', 'done']);
+    expect(envelopes.every((item) => item.content.payloadKind === 'notification-preview-v2')).toBe(true);
     expect(envelopes.every((item) => item.content.contentId === item.keyWrap.contentId)).toBe(true);
-    expect(envelopes.map((item) => item.keyWrap.recipientEncryptionKeyId)).toEqual(['ekey-watch-1', 'ekey-watch-2']);
     expect(JSON.stringify(envelopes)).not.toContain(plaintext.bodyText);
   });
 });
