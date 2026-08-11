@@ -18,6 +18,17 @@ describe('secure JSON files', () => {
     expect(readFileSync(path, 'utf8')).toEndWith('\n');
   });
 
+  test('normalizes newly created controlled directories when umask removes owner permissions', () => {
+    const previous = process.umask(0o777);
+    try {
+      const path = join(root(), 'state', 'bridge-state.json');
+      writeSecureJson(path, { value: 1 });
+      expect(lstatSync(join(path, '..')).mode & 0o777).toBe(0o700);
+    } finally {
+      process.umask(previous);
+    }
+  });
+
   test('rejects group/world permissions and symlinks', () => {
     const base = root();
     const path = join(base, 'config.json');
@@ -35,6 +46,15 @@ describe('secure JSON files', () => {
     writeSecureJson(join(base, 'config.json'), {});
     chmodSync(base, 0o755);
     expect(() => writeSecureJson(join(base, 'state.json'), {})).toThrow();
+  });
+
+  test('rejects a controlled directory without owner execute permission', () => {
+    const base = join(root(), 'custom-root');
+    mkdirSync(base, { mode: 0o700 });
+    chmodSync(base, 0o600);
+    expect(() => writeSecureJson(join(base, 'config.json'), {})).toThrow(
+      `Secure directory check failed: ${base} (expected mode 0700, found 0600)`,
+    );
   });
 
   test('validates custom parent directories without Ariava path-name heuristics', () => {
@@ -66,6 +86,20 @@ describe('secure JSON files', () => {
     })).toThrow('Secure parent directory changed during atomic write');
     expect(pathHasFilesystemEvidence(target)).toBe(false);
     expect(pathHasFilesystemEvidence(join(displaced, 'state.json'))).toBe(false);
+  });
+
+  test('aborts atomic promotion if the parent directory mode changes', () => {
+    const parent = join(root(), 'state');
+    mkdirSync(parent, { mode: 0o700 });
+    const target = join(parent, 'state.json');
+    try {
+      expect(() => writeSecureFile(target, Buffer.from('new'), undefined, false, {
+        beforePromotion() { chmodSync(parent, 0o300); },
+      })).toThrow('Secure parent directory changed during atomic write');
+    } finally {
+      chmodSync(parent, 0o700);
+    }
+    expect(pathHasFilesystemEvidence(target)).toBe(false);
   });
 
   test('owner-controlled service writes reject insecure modes, wrong owners, and symlinked directories', () => {

@@ -52,12 +52,15 @@ export function ensureSecureDirectory(path: string, uid = currentUid()): void {
   // The pre-existing boundary (for example ~/.config or /tmp) is not Ariava-controlled.
   // Every directory created or subsequently used by Ariava is checked explicitly below.
   for (const directory of missing.reverse()) {
+    let created = false;
     try {
-      mkdirSync(directory, { mode: 0o700 });
+      mkdirSecureDirectory(directory);
+      created = true;
     } catch (error) {
       // A concurrent creator is acceptable only when it created exactly the secure directory expected.
       if (!pathHasFilesystemEvidence(directory)) throw new SecureFileError(`Could not create secure directory: ${directory}`, error);
     }
+    if (created) normalizeCreatedSecureDirectory(directory, uid);
     assertSecureDirectory(directory, uid);
   }
 }
@@ -70,8 +73,11 @@ export function assertSecureDirectory(path: string, uid = currentUid()): void {
   } catch (error) {
     throw new SecureFileError(`Secure directory check failed: ${absolute}`, error);
   }
-  if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o077) !== 0) {
-    throw new SecureFileError(`Secure directory check failed: ${absolute}`);
+  const mode = stat.mode & 0o777;
+  if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== uid || mode !== 0o700) {
+    throw new SecureFileError(
+      `Secure directory check failed: ${absolute} (expected mode 0700, found ${mode.toString(8).padStart(4, '0')})`,
+    );
   }
 }
 
@@ -414,13 +420,53 @@ export function redactSensitive(value: unknown, secrets: readonly string[] = [])
   return visit(value);
 }
 
+function mkdirSecureDirectory(path: string): void {
+  const previousUmask = process.umask(0);
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } finally {
+    process.umask(previousUmask);
+  }
+}
+
+
+function normalizeCreatedSecureDirectory(path: string, uid: number): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | directoryFlag() | noFollowFlag());
+    assertCreatedSecureDirectory(path, fd, uid);
+    fchmodSync(fd, 0o700);
+    assertCreatedSecureDirectory(path, fd, uid, true);
+  } catch (error) {
+    throw error instanceof SecureFileError
+      ? error
+      : new SecureFileError(`Could not secure newly created directory: ${path}`, error);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function assertCreatedSecureDirectory(path: string, fd: number, uid: number, requireMode = false): void {
+  const retained = fstatSync(fd);
+  const current = lstatSync(path);
+  if (
+    !retained.isDirectory() || !current.isDirectory() || current.isSymbolicLink()
+    || retained.uid !== uid || current.uid !== uid
+    || retained.dev !== current.dev || retained.ino !== current.ino
+    || (requireMode && ((retained.mode & 0o777) !== 0o700 || (current.mode & 0o777) !== 0o700))
+  ) {
+    throw new SecureFileError(`Newly created secure directory changed before validation: ${path}`);
+  }
+}
+
+
 function assertRetainedParent(path: string, fd: number, uid: number): void {
   const retained = fstatSync(fd);
   const current = lstatSync(path);
   if (
     !retained.isDirectory() || !current.isDirectory() || current.isSymbolicLink()
     || retained.uid !== uid || current.uid !== uid
-    || (retained.mode & 0o077) !== 0 || (current.mode & 0o077) !== 0
+    || (retained.mode & 0o777) !== 0o700 || (current.mode & 0o777) !== 0o700
     || retained.dev !== current.dev || retained.ino !== current.ino
   ) {
     throw new SecureFileError(`Secure parent directory changed during atomic write: ${path}`);
