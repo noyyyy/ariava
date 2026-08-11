@@ -19,7 +19,7 @@ function session(hostId, id) {
     latestActivityText: `activity-${id}`, status: 'idle', updatedAt: '2026-07-20T00:00:00.000Z' };
 }
 function event(hostId, id = 'event-1', sessionId = 'session-1') {
-  return { eventId: id, hostId, sessionId, provider: 'pi', type: 'done', status: 'idle', typeLabel: 'Task complete',
+  return { eventId: id, hostId, sessionId, provider: 'pi', type: 'done', status: 'idle',
     agentText: `SECRET-${id}`, projectName: `project-${sessionId}`, contextText: `name-${sessionId} · project-${sessionId}`,
     hbaseSessionKey: sessionId, harnessProvider: 'pi', createdAt: '2026-07-20T00:00:01.000Z' };
 }

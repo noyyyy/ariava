@@ -9,6 +9,7 @@ import {
   type ReconciliationScheduler,
 } from '../src/daemon';
 import { LinuxJsonHostIdentityStore, publicIdentityMetadata } from '../src/identity';
+import { spoolKeyIdForKey } from '../src/e2e/local-spool';
 
 const roots: string[] = [];
 const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
@@ -161,6 +162,43 @@ describe('BridgeDaemon', () => {
     config.statePath = `${process.cwd()}/.state/ariava/test-bridge-state-${Date.now()}.json`;
     const daemon = new BridgeDaemon(config);
     expect(daemon.driverNames).toEqual(['pi']);
+    daemon.stop();
+  });
+
+  test('Bun source daemon defers schema 2 state to startup preflight', async () => {
+    const root = join(tmpdir(), `bridge-daemon-schema2-${Date.now()}`);
+    roots.push(root);
+    mkdirSync(root, { mode: 0o700 });
+    const identityPath = join(root, 'identity.json');
+    const identityStore = new LinuxJsonHostIdentityStore(identityPath);
+    const identity = await identityStore.createFirstRun();
+    const statePath = join(root, 'state.json');
+    const epoch = '00000000-0000-4000-8000-000000000002';
+    const state = {
+      schemaVersion: 2, runtimeResetEpoch: epoch, host: null, sessions: {}, sessionDrivers: {}, reconciledDrivers: {},
+      recentEvents: [], sessionRevisions: {}, pendingHandles: {}, commandResults: {}, seenCommands: {},
+      currentSessionsSnapshot: { version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0 },
+      runtimeHealth: { status: 'healthy', drivers: [] },
+    };
+    const key = new Uint8Array(32).fill(7);
+    const keyId = spoolKeyIdForKey(key);
+    writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    writeFileSync(`${statePath}.spool.json`, `${JSON.stringify({
+      version: 2, runtimeStateSchemaVersion: 2, runtimeResetEpoch: epoch, hostId: identity.hostId, keyId, items: [],
+    })}\n`, { mode: 0o600 });
+    writeFileSync(`${identityPath}.spool-key.json`, `${JSON.stringify({
+      version: 1, hostId: identity.hostId, key: Buffer.from(key).toString('base64url'),
+    })}\n`, { mode: 0o600 });
+    const config = loadBridgeConfig();
+    Object.assign(config, {
+      runtimePlatform: 'linux', hostPlatform: 'linux', hostId: identity.hostId, identity: publicIdentityMetadata(identity),
+      relayBaseUrl: 'http://relay.invalid', configPath: join(root, 'config.json'), statePath, identityPath,
+      agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+    });
+    const daemon = new BridgeDaemon(config, [], identityStore);
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).schemaVersion).toBe(2);
+    await (daemon as any).validateStartup();
+    expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject({ schemaVersion: 3, recentEvents: [], sessions: {} });
     daemon.stop();
   });
 
@@ -442,10 +480,14 @@ describe('BridgeDaemon', () => {
     const daemon = await createLongPollingDaemon('http://127.0.0.1:1');
     const registry = (daemon as any).adapterRegistry;
     const stateStore = (daemon as any).stateStore;
+    stateStore.initializeEncryptedSpool(
+      (daemon as any).config.hostId, (daemon as any).config.identityPath, 'linux',
+      { loadOrCreate: () => new Uint8Array(32).fill(7) },
+    );
     registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/' });
     stateStore.appendRecentEvent({
       eventId: 'evt-handle', hostId: (daemon as any).config.hostId, sessionId: 'sess-handle', provider: 'pi',
-      type: 'done', status: 'idle', typeLabel: 'Task complete', agentText: 'Done', createdAt: '2026-08-07T00:00:00.000Z',
+      type: 'done', status: 'idle', agentText: 'Done', createdAt: '2026-08-07T00:00:00.000Z',
     });
     registry.handleSession('sess-handle', { handledThroughEventId: 'evt-handle', action: 'pi_input' });
     const delivered: unknown[] = [];

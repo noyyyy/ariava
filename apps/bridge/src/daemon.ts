@@ -200,7 +200,7 @@ export class BridgeDaemon {
     let stateStore: BridgeStateStore | undefined;
     try {
       stateStore = new BridgeStateStore(config.statePath, undefined, {
-        deferRuntimePreflight: typeof (globalThis as { Bun?: unknown }).Bun === 'undefined',
+        deferRuntimePreflight: true,
         runtimeCoordinator: this.runtimeCoordinator,
       });
       this.stateStore = stateStore;
@@ -257,11 +257,12 @@ export class BridgeDaemon {
       if (!this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
         throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Configured identity metadata does not match the local Host identity');
       }
-      // Bun is retained only as a source-test runner and lacks production ChaChaPoly.
-      // Production Node preflights runtime state before creating any E2E identity/keyring material.
-      if (typeof (globalThis as { Bun?: unknown }).Bun === 'undefined') {
-        const recovery = this.stateStore.initializeEncryptedSpool(identity.hostId, this.config.identityPath, this.config.runtimePlatform ?? process.platform);
-        if (recovery.droppedUnreadableItems > 0) process.stderr.write(`Ariava dropped ${recovery.droppedUnreadableItems} unreadable encrypted spool item(s).\n`);
+      // Preflight runtime state before creating dependent encryption material in Bun and Node.
+      const recovery = this.stateStore.initializeEncryptedSpool(
+        identity.hostId, this.config.identityPath, this.config.runtimePlatform ?? process.platform,
+      );
+      if (recovery.droppedUnreadableItems > 0) {
+        process.stderr.write(`Ariava dropped ${recovery.droppedUnreadableItems} unreadable encrypted spool item(s).\n`);
       }
       const encryptionStore = createRuntimeHostEncryptionIdentityStore(this.config.identityPath, this.config.runtimePlatform ?? process.platform);
       this.encryptionIdentity = encryptionStore.loadOrCreate(identity.hostId);

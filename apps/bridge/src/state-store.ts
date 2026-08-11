@@ -38,8 +38,9 @@ import {
   type RuntimeCoordinator,
 } from './runtime-lock';
 
-export const BRIDGE_RUNTIME_STATE_SCHEMA_VERSION = 2 as const;
-const PRIOR_RUNTIME_STATE_SCHEMA_VERSION = 1 as const;
+export const BRIDGE_RUNTIME_STATE_SCHEMA_VERSION = 3 as const;
+const OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION = 2 as const;
+const LEGACY_RUNTIME_STATE_SCHEMA_VERSION = 1 as const;
 const RESET_INTENT_VERSION = 1 as const;
 const ABSENT_HASH = 'absent';
 const MAX_RECENT_EVENTS = 200;
@@ -58,8 +59,8 @@ function emptyState(runtimeResetEpoch = randomUUID()): PersistedBridgeState {
 
 interface RuntimeResetIntentV1 {
   version: 1;
-  fromSchemaVersion: 1;
-  toSchemaVersion: 2;
+  fromSchemaVersion: 1 | 2;
+  toSchemaVersion: 2 | 3;
   hostId: string;
   epoch: string;
   keyId: string;
@@ -158,7 +159,13 @@ export class BridgeStateStore {
   ): PersistedBridgeState {
     try {
       const intentPath = runtimeResetIntentPathForState(this.filePath);
-      if (pathHasFilesystemEvidence(intentPath)) return this.resumeRuntimeReset(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
+      if (pathHasFilesystemEvidence(intentPath)) {
+        const resumed = this.resumeRuntimeReset(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
+        if (resumed.schemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION) {
+          return parseCurrentState(resumed, hostId);
+        }
+        return this.preflightRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
+      }
       const stateBytes = readOptionalSecureBytes(this.filePath);
       const spoolPath = spoolPathForState(this.filePath);
       const spoolBytes = readOptionalSecureBytes(spoolPath);
@@ -171,11 +178,21 @@ export class BridgeStateStore {
         assertCurrentRuntimeRelationships(state, spool, hostId);
         return state;
       }
-      if (!stateRecord && !spoolRecord) return this.initializeFreshRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
-      if (!isRecognizedPriorRuntime(stateRecord, spoolRecord, hostId)) {
+      if (!stateRecord && !spoolRecord) {
+        return this.initializeFreshRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
+      }
+      if (isRecognizedObsoleteRuntime(stateRecord, spoolRecord, hostId)) {
+        return this.beginRuntimeReset(hostId, keyStore, stateBytes, spoolBytes,
+          OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION,
+          resetStep, resetWriteHooks, resetRemoveHooks) as PersistedBridgeState;
+      }
+      if (!isRecognizedLegacyRuntime(stateRecord, spoolRecord, hostId)) {
         throw new Error('Bridge runtime schema is unknown, malformed, or internally inconsistent');
       }
-      return this.beginRuntimeReset(hostId, keyStore, stateBytes, spoolBytes, resetStep, resetWriteHooks, resetRemoveHooks);
+      this.beginRuntimeReset(hostId, keyStore, stateBytes, spoolBytes,
+        LEGACY_RUNTIME_STATE_SCHEMA_VERSION, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION,
+        resetStep, resetWriteHooks, resetRemoveHooks);
+      return this.preflightRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
     } catch (error) {
       throw new Error('Bridge runtime preflight failed closed', { cause: error });
     }
@@ -185,15 +202,18 @@ export class BridgeStateStore {
     resetWriteHooks?: SecureFileWriteHooks,
     resetRemoveHooks?: SecureFileRemoveHooks,
   ): PersistedBridgeState {
-    return this.beginRuntimeReset(hostId, keyStore, undefined, undefined, resetStep, resetWriteHooks, resetRemoveHooks);
+    return this.beginRuntimeReset(hostId, keyStore, undefined, undefined,
+      OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION,
+      resetStep, resetWriteHooks, resetRemoveHooks) as PersistedBridgeState;
   }
 
   private beginRuntimeReset(
     hostId: string, keyStore: SpoolKeyStore, stateSource: Buffer | undefined, spoolSource: Buffer | undefined,
+    fromSchemaVersion: 1 | 2, toSchemaVersion: 2 | 3,
     resetStep?: (phase: RuntimeResetPhase) => void,
     resetWriteHooks?: SecureFileWriteHooks,
     resetRemoveHooks?: SecureFileRemoveHooks,
-  ): PersistedBridgeState {
+  ): Record<string, unknown> {
     resetStep?.('before-intent');
     const key = keyStore.loadOrCreate(hostId, { allowCreate: spoolSource === undefined });
     let keyId: string;
@@ -203,14 +223,13 @@ export class BridgeStateStore {
       throw new Error('Bridge runtime spool key mismatch');
     }
     const epoch = randomUUID();
-    const stateTarget = emptyState(epoch);
-    const spoolTarget = currentSpoolFile(hostId, epoch, keyId);
+    const stateTarget = emptyStateForSchema(toSchemaVersion, epoch);
+    const spoolTarget = spoolFileForSchema(toSchemaVersion, hostId, epoch, keyId);
     const statePath = resolve(this.filePath);
     const spoolPath = resolve(spoolPathForState(this.filePath));
     const intentPath = resolve(runtimeResetIntentPathForState(this.filePath));
     const intent: RuntimeResetIntentV1 = {
-      version: RESET_INTENT_VERSION, fromSchemaVersion: PRIOR_RUNTIME_STATE_SCHEMA_VERSION,
-      toSchemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, hostId, epoch, keyId,
+      version: RESET_INTENT_VERSION, fromSchemaVersion, toSchemaVersion, hostId, epoch, keyId,
       statePath, spoolPath, intentPath,
       stateSourceHash: hashOptional(stateSource), spoolSourceHash: hashOptional(spoolSource),
       stateTargetHash: hashBytes(serializeSecureJson(stateTarget)), spoolTargetHash: hashBytes(serializeSecureJson(spoolTarget)),
@@ -225,12 +244,12 @@ export class BridgeStateStore {
     hostId: string, keyStore: SpoolKeyStore, resetStep?: (phase: RuntimeResetPhase) => void,
     resetWriteHooks?: SecureFileWriteHooks,
     resetRemoveHooks?: SecureFileRemoveHooks,
-  ): PersistedBridgeState {
+  ): Record<string, unknown> {
     const intent = parseResetIntent(readSecureJson<unknown>(runtimeResetIntentPathForState(this.filePath)));
     if (intent.hostId !== hostId) throw new Error('Bridge runtime reset intent Host mismatch');
     assertResetIntentPaths(intent, this.filePath);
-    const stateTarget = emptyState(intent.epoch);
-    const spoolTarget = currentSpoolFile(hostId, intent.epoch, intent.keyId);
+    const stateTarget = emptyStateForSchema(intent.toSchemaVersion, intent.epoch);
+    const spoolTarget = spoolFileForSchema(intent.toSchemaVersion, hostId, intent.epoch, intent.keyId);
     assertRuntimeResetTargets(intent, stateTarget, spoolTarget);
     this.assertRuntimeResetMembers(intent, hostId, stateTarget, spoolTarget);
     const key = keyStore.loadOrCreate(hostId, { allowCreate: false });
@@ -241,7 +260,7 @@ export class BridgeStateStore {
   }
 
   private assertRuntimeResetMembers(
-    intent: RuntimeResetIntentV1, hostId: string, stateTarget: PersistedBridgeState, spoolTarget: LocalSpoolFileV2,
+    intent: RuntimeResetIntentV1, hostId: string, stateTarget: Record<string, unknown>, spoolTarget: LocalSpoolFileV2,
   ): { stateBytes: Buffer | undefined; spoolBytes: Buffer | undefined } {
     const stateBytes = readOptionalSecureBytes(this.filePath);
     const spoolBytes = readOptionalSecureBytes(spoolPathForState(this.filePath));
@@ -251,7 +270,7 @@ export class BridgeStateStore {
       && stateBytes && spoolBytes) {
       const state = parseRawJson(stateBytes, 'Bridge runtime reset state source');
       const spool = parseRawJson(spoolBytes, 'Bridge runtime reset spool source');
-      if (!state || !spool || !hasRecognizedPriorRuntimeRelationships(state, spool)) {
+      if (!state || !spool || !hasResetSourceRelationships(intent, state, spool, hostId)) {
         throw new Error('Bridge runtime reset source relationships are invalid');
       }
     }
@@ -259,11 +278,11 @@ export class BridgeStateStore {
   }
 
   private finishRuntimeReset(
-    intent: RuntimeResetIntentV1, stateTarget: PersistedBridgeState, spoolTarget: LocalSpoolFileV2,
+    intent: RuntimeResetIntentV1, stateTarget: Record<string, unknown>, spoolTarget: LocalSpoolFileV2,
     resetStep?: (phase: RuntimeResetPhase) => void,
     resetWriteHooks?: SecureFileWriteHooks,
     resetRemoveHooks?: SecureFileRemoveHooks,
-  ): PersistedBridgeState {
+  ): Record<string, unknown> {
     assertRuntimeResetTargets(intent, stateTarget, spoolTarget);
     const { stateBytes, spoolBytes } = this.assertRuntimeResetMembers(intent, intent.hostId, stateTarget, spoolTarget);
     if (hashOptional(spoolBytes) !== intent.spoolTargetHash) {
@@ -970,7 +989,7 @@ function parseCurrentState(value: unknown, hostId?: string): PersistedBridgeStat
 
 function isRecognizedPriorStateRecord(value: Record<string, unknown> | undefined, hostId: string): boolean {
   if (!value || !hasOnlyKeys(value, PRIOR_STATE_KEYS)) return false;
-  if (value.schemaVersion !== undefined && value.schemaVersion !== PRIOR_RUNTIME_STATE_SCHEMA_VERSION) return false;
+  if (value.schemaVersion !== undefined && value.schemaVersion !== LEGACY_RUNTIME_STATE_SCHEMA_VERSION) return false;
   if (value.host !== undefined && value.host !== null && !isRecognizedPriorHost(value.host, hostId)) return false;
   if (value.sessions !== undefined && !isKeyedValueMap(value.sessions, isRecognizedPriorSession, 'sessionId', hostId)) return false;
   if (value.sessionDrivers !== undefined && !isStringMap(value.sessionDrivers)) return false;
@@ -993,7 +1012,7 @@ function isRecognizedPriorStateRecord(value: Record<string, unknown> | undefined
   return hasRecognizedPriorStateRelationships(value, hostId);
 }
 
-function isRecognizedPriorRuntime(
+function isRecognizedLegacyRuntime(
   state: Record<string, unknown> | undefined, spool: Record<string, unknown> | undefined, hostId: string,
 ): boolean {
   if ((state && !isRecognizedPriorStateRecord(state, hostId)) || (spool && !isRecognizedPriorSpoolRecord(spool, hostId))) {
@@ -1002,14 +1021,49 @@ function isRecognizedPriorRuntime(
   return !state || !spool || hasRecognizedPriorRuntimeRelationships(state, spool);
 }
 
+function isRecognizedObsoleteRuntime(
+  state: Record<string, unknown> | undefined, spool: Record<string, unknown> | undefined, hostId: string,
+): boolean {
+  if (!state || !spool || !isObsoleteStateRecord(state, hostId) || !isSpoolRecordForSchema(
+    spool, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, hostId, state.runtimeResetEpoch as string, 'current',
+  )) return false;
+  return hasRecognizedPriorRuntimeRelationships(state, spool);
+}
+
+function isObsoleteStateRecord(value: Record<string, unknown>, hostId: string): boolean {
+  if (!hasExactOptionalKeys(value, CURRENT_STATE_REQUIRED_KEYS, CURRENT_STATE_OPTIONAL_KEYS)
+    || value.schemaVersion !== OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION || !isRuntimeEpoch(value.runtimeResetEpoch)
+    || !(value.host === null || isCurrentHost(value.host)) || !isValueMap(value.sessions, isCurrentSession)
+    || !isStringMap(value.sessionDrivers) || !isTrueMap(value.reconciledDrivers)
+    || !Array.isArray(value.recentEvents) || !value.recentEvents.every(isObsoleteEvent)
+    || !isNonNegativeIntegerMap(value.sessionRevisions) || !isValueMap(value.pendingHandles, isCurrentPendingHandle)
+    || !isValueMap(value.commandResults, isCurrentCommandResult) || !isStringMap(value.seenCommands)
+    || !isCurrentSnapshot(value.currentSessionsSnapshot)) return false;
+  if (value.recipientSetVersion !== undefined && !isPositiveSafeInteger(value.recipientSetVersion)) return false;
+  if ((value.eventUploadCompletions !== undefined && !isValueMap(value.eventUploadCompletions, isCurrentEventCompletion))
+    || (value.producerEventReservations !== undefined && !isValueMap(value.producerEventReservations, isCurrentProducerReservation))
+    || (value.terminalCancellations !== undefined && !isValueMap(value.terminalCancellations, isCurrentTerminalCancellation))
+    || (value.runtimeHealth !== undefined && !isCurrentRuntimeHealth(value.runtimeHealth))) return false;
+  try {
+    assertCurrentStateRelationships(value as unknown as PersistedBridgeState, hostId);
+    return true;
+  } catch { return false; }
+}
+
 function parseCurrentSpoolRecord(value: Record<string, unknown>, hostId: string, epoch: string): LocalSpoolFileV2 {
-  if (!hasExactKeys(value, ['version', 'runtimeStateSchemaVersion', 'runtimeResetEpoch', 'hostId', 'keyId', 'items'])
-    || value.version !== 2 || value.runtimeStateSchemaVersion !== BRIDGE_RUNTIME_STATE_SCHEMA_VERSION
-    || value.runtimeResetEpoch !== epoch || value.hostId !== hostId || !isVerifier(value.keyId)
-    || !Array.isArray(value.items) || !value.items.every((item) => isRawSpoolItem(item, hostId, 'current'))) {
+  if (!isSpoolRecordForSchema(value, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, hostId, epoch, 'current')) {
     throw new Error('current Bridge runtime spool schema is invalid');
   }
   return structuredClone(value) as unknown as LocalSpoolFileV2;
+}
+
+function isSpoolRecordForSchema(
+  value: Record<string, unknown>, schemaVersion: 2 | 3, hostId: string, epoch: string, kind: 'current' | 'standalone-v2',
+): boolean {
+  return hasExactKeys(value, ['version', 'runtimeStateSchemaVersion', 'runtimeResetEpoch', 'hostId', 'keyId', 'items'])
+    && value.version === 2 && value.runtimeStateSchemaVersion === schemaVersion
+    && value.runtimeResetEpoch === epoch && value.hostId === hostId && isVerifier(value.keyId)
+    && Array.isArray(value.items) && value.items.every((item) => isRawSpoolItem(item, hostId, kind));
 }
 
 function isRecognizedPriorSpoolRecord(value: Record<string, unknown>, hostId: string): boolean {
@@ -1017,11 +1071,8 @@ function isRecognizedPriorSpoolRecord(value: Record<string, unknown>, hostId: st
     && value.items.every((item) => isRawSpoolItem(item, hostId, 'v1'))) {
     return hasRecognizedPriorSpoolRelationships(value.items);
   }
-  return hasExactKeys(value, ['version', 'runtimeStateSchemaVersion', 'runtimeResetEpoch', 'hostId', 'keyId', 'items'])
-    && value.version === 2 && value.runtimeStateSchemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION
-    && value.runtimeResetEpoch === 'standalone' && value.hostId === hostId && isVerifier(value.keyId)
-    && Array.isArray(value.items) && value.items.every((item) => isRawSpoolItem(item, hostId, 'standalone-v2'))
-    && hasRecognizedPriorSpoolRelationships(value.items);
+  return isSpoolRecordForSchema(value, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, hostId, 'standalone', 'standalone-v2')
+    && hasRecognizedPriorSpoolRelationships(value.items as unknown[]);
 }
 
 function isRawSpoolItem(value: unknown, hostId: string, kind: 'current' | 'v1' | 'standalone-v2'): boolean {
@@ -1043,8 +1094,8 @@ function parseResetIntent(value: unknown): RuntimeResetIntentV1 {
   if (!isRecord(value) || !hasExactKeys(value, [
     'version', 'fromSchemaVersion', 'toSchemaVersion', 'hostId', 'epoch', 'keyId', 'statePath', 'spoolPath',
     'intentPath', 'stateSourceHash', 'spoolSourceHash', 'stateTargetHash', 'spoolTargetHash', 'createdAt',
-  ]) || value.version !== RESET_INTENT_VERSION || value.fromSchemaVersion !== PRIOR_RUNTIME_STATE_SCHEMA_VERSION
-    || value.toSchemaVersion !== BRIDGE_RUNTIME_STATE_SCHEMA_VERSION || !isNonEmptyString(value.hostId)
+  ]) || value.version !== RESET_INTENT_VERSION || !isValidResetTransition(value.fromSchemaVersion, value.toSchemaVersion)
+    || !isNonEmptyString(value.hostId)
     || !isRuntimeEpoch(value.epoch) || !isVerifier(value.keyId)
     || !isAbsoluteResolvedPath(value.statePath) || !isAbsoluteResolvedPath(value.spoolPath)
     || !isAbsoluteResolvedPath(value.intentPath)
@@ -1056,11 +1107,17 @@ function parseResetIntent(value: unknown): RuntimeResetIntentV1 {
   return value as unknown as RuntimeResetIntentV1;
 }
 
-function currentSpoolFile(hostId: string, epoch: string, keyId: string): LocalSpoolFileV2 {
-  return {
-    version: 2, runtimeStateSchemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, runtimeResetEpoch: epoch,
-    hostId, keyId, items: [],
-  };
+function isValidResetTransition(from: unknown, to: unknown): boolean {
+  return (from === LEGACY_RUNTIME_STATE_SCHEMA_VERSION && to === OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION)
+    || (from === OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION && to === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION);
+}
+
+function emptyStateForSchema(schemaVersion: 2 | 3, epoch: string): Record<string, unknown> {
+  return { ...emptyState(epoch), schemaVersion };
+}
+
+function spoolFileForSchema(schemaVersion: 2 | 3, hostId: string, epoch: string, keyId: string): LocalSpoolFileV2 {
+  return { version: 2, runtimeStateSchemaVersion: schemaVersion, runtimeResetEpoch: epoch, hostId, keyId, items: [] };
 }
 
 function assertResetIntentPaths(intent: RuntimeResetIntentV1, statePath: string): void {
@@ -1072,30 +1129,42 @@ function assertResetIntentPaths(intent: RuntimeResetIntentV1, statePath: string)
 }
 
 function assertRuntimeResetTargets(
-  intent: RuntimeResetIntentV1, stateTarget: PersistedBridgeState, spoolTarget: LocalSpoolFileV2,
+  intent: RuntimeResetIntentV1, stateTarget: Record<string, unknown>, spoolTarget: LocalSpoolFileV2,
 ): void {
   if (hashBytes(serializeSecureJson(stateTarget)) !== intent.stateTargetHash
     || hashBytes(serializeSecureJson(spoolTarget)) !== intent.spoolTargetHash) {
     throw new Error('Bridge runtime reset intent target hash is invalid');
   }
-  parseCurrentState(stateTarget, intent.hostId);
-  const parsedSpool = parseCurrentSpoolRecord(spoolTarget as unknown as Record<string, unknown>, intent.hostId, intent.epoch);
-  assertCurrentRuntimeRelationships(stateTarget, parsedSpool, intent.hostId);
+  if (intent.toSchemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION) {
+    const state = parseCurrentState(stateTarget, intent.hostId);
+    const spool = parseCurrentSpoolRecord(spoolTarget as unknown as Record<string, unknown>, intent.hostId, intent.epoch);
+    assertCurrentRuntimeRelationships(state, spool, intent.hostId);
+  } else if (!isObsoleteStateRecord(stateTarget, intent.hostId) || !isSpoolRecordForSchema(
+    spoolTarget as unknown as Record<string, unknown>, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, intent.hostId, intent.epoch, 'current',
+  )) {
+    throw new Error('Bridge runtime reset intent obsolete target is invalid');
+  }
 }
 
 function assertResetStateMember(
-  bytes: Buffer | undefined, intent: RuntimeResetIntentV1, hostId: string, target: PersistedBridgeState,
+  bytes: Buffer | undefined, intent: RuntimeResetIntentV1, hostId: string, target: Record<string, unknown>,
 ): void {
   const actual = hashOptional(bytes);
   assertResetMemberHash('state', actual, intent.stateSourceHash, intent.stateTargetHash);
   if (actual === intent.stateTargetHash) {
-    const parsed = parseCurrentState(parseRawJson(bytes, 'Bridge runtime reset state target'), hostId);
-    if (JSON.stringify(parsed) !== JSON.stringify(target)) throw new Error('Bridge runtime reset state target is invalid');
+    const parsed = parseRawJson(bytes, 'Bridge runtime reset state target');
+    const valid = intent.toSchemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION
+      ? !!parsed && isCurrentStateRecord(parsed)
+      : !!parsed && isObsoleteStateRecord(parsed, hostId);
+    if (!valid || JSON.stringify(parsed) !== JSON.stringify(target)) {
+      throw new Error('Bridge runtime reset state target is invalid');
+    }
   } else if (bytes) {
     const state = parseRawJson(bytes, 'Bridge runtime reset state source');
-    if (!isRecognizedPriorStateRecord(state, hostId)) {
-      throw new Error('Bridge runtime reset state source schema is invalid');
-    }
+    const valid = intent.fromSchemaVersion === LEGACY_RUNTIME_STATE_SCHEMA_VERSION
+      ? isRecognizedPriorStateRecord(state, hostId)
+      : !!state && isObsoleteStateRecord(state, hostId);
+    if (!valid) throw new Error('Bridge runtime reset state source schema is invalid');
   }
 }
 
@@ -1105,13 +1174,18 @@ function assertResetSpoolMember(
   const actual = hashOptional(bytes);
   assertResetMemberHash('spool', actual, intent.spoolSourceHash, intent.spoolTargetHash);
   if (actual === intent.spoolTargetHash) {
-    const parsed = parseCurrentSpoolRecord(parseRawJson(bytes, 'Bridge runtime reset spool target')!, hostId, intent.epoch);
-    if (JSON.stringify(parsed) !== JSON.stringify(target)) throw new Error('Bridge runtime reset spool target is invalid');
+    const spool = parseRawJson(bytes, 'Bridge runtime reset spool target');
+    if (!spool || !isSpoolRecordForSchema(spool, intent.toSchemaVersion, hostId, intent.epoch, 'current')
+      || JSON.stringify(spool) !== JSON.stringify(target)) {
+      throw new Error('Bridge runtime reset spool target is invalid');
+    }
   } else if (bytes) {
     const spool = parseRawJson(bytes, 'Bridge runtime reset spool source');
-    if (!spool || !isRecognizedPriorSpoolRecord(spool, hostId)) {
-      throw new Error('Bridge runtime reset spool source schema is invalid');
-    }
+    const valid = intent.fromSchemaVersion === LEGACY_RUNTIME_STATE_SCHEMA_VERSION
+      ? !!spool && isRecognizedPriorSpoolRecord(spool, hostId)
+      : !!spool && isSpoolRecordForSchema(spool, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, hostId,
+        (spool.runtimeResetEpoch as string), 'current');
+    if (!valid) throw new Error('Bridge runtime reset spool source schema is invalid');
   }
 }
 
@@ -1182,7 +1256,7 @@ function isCurrentSession(value: unknown): boolean {
     || (key === 'actionablePrompt' ? isCurrentActionablePrompt(value[key]) : typeof value[key] === 'string'));
 }
 const EVENT_REQUIRED_KEYS = [
-  'eventId', 'hostId', 'sessionId', 'provider', 'type', 'status', 'typeLabel', 'agentText', 'createdAt',
+  'eventId', 'hostId', 'sessionId', 'provider', 'type', 'status', 'agentText', 'createdAt',
 ] as const;
 const EVENT_OPTIONAL_KEYS = [
   'humanText', 'projectName', 'contextText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider',
@@ -1561,6 +1635,18 @@ function hasRecognizedPriorSpoolRelationships(items: unknown[]): boolean {
   return true;
 }
 
+function hasResetSourceRelationships(
+  intent: RuntimeResetIntentV1, state: Record<string, unknown>, spool: Record<string, unknown>, hostId: string,
+): boolean {
+  if (intent.fromSchemaVersion === LEGACY_RUNTIME_STATE_SCHEMA_VERSION) {
+    return hasRecognizedPriorRuntimeRelationships(state, spool);
+  }
+  return isObsoleteStateRecord(state, hostId)
+    && isSpoolRecordForSchema(spool, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, hostId,
+      state.runtimeResetEpoch as string, 'current')
+    && hasRecognizedPriorRuntimeRelationships(state, spool);
+}
+
 function hasRecognizedPriorRuntimeRelationships(state: Record<string, unknown>, spool: Record<string, unknown>): boolean {
   const sessions = state.sessions as Record<string, Record<string, unknown>> | undefined ?? {};
   const events = new Map<string, Record<string, unknown>>();
@@ -1605,9 +1691,25 @@ function isRecognizedPriorSession(value: unknown, hostId: string): boolean {
     || (key === 'actionablePrompt' ? isCurrentActionablePrompt(value[key]) : typeof value[key] === 'string'));
 }
 
+const OBSOLETE_EVENT_REQUIRED_KEYS = [...EVENT_REQUIRED_KEYS, 'typeLabel'] as const;
+
+function isObsoleteEvent(value: unknown): boolean {
+  if (!isRecord(value) || !hasExactOptionalKeys(value, OBSOLETE_EVENT_REQUIRED_KEYS, EVENT_OPTIONAL_KEYS)
+    || !OBSOLETE_EVENT_REQUIRED_KEYS.filter((key) => key !== 'type' && key !== 'status')
+      .every((key) => isNonEmptyString(value[key]))) {
+    return false;
+  }
+  if (value.type === 'done') { if (value.status !== 'idle' || value.needHuman !== undefined) return false; }
+  else if (value.type === 'need_human') { if (value.status !== 'need_human' || !isCurrentNeedHuman(value.needHuman)) return false; }
+  else return false;
+  return EVENT_OPTIONAL_KEYS.every((key) => value[key] === undefined || key === 'needHuman'
+    || (key === 'actionablePrompt' ? isCurrentActionablePrompt(value[key]) : typeof value[key] === 'string'));
+}
+
 function isRecognizedPriorEvent(value: unknown, hostId: string): boolean {
-  return isRecord(value) && hasExactOptionalKeys(value, EVENT_REQUIRED_KEYS, EVENT_OPTIONAL_KEYS.filter((key) => key !== 'needHuman'))
-    && value.hostId === hostId && EVENT_REQUIRED_KEYS.filter((key) => key !== 'type' && key !== 'status')
+  return isRecord(value)
+    && hasExactOptionalKeys(value, OBSOLETE_EVENT_REQUIRED_KEYS, EVENT_OPTIONAL_KEYS.filter((key) => key !== 'needHuman'))
+    && value.hostId === hostId && OBSOLETE_EVENT_REQUIRED_KEYS.filter((key) => key !== 'type' && key !== 'status')
       .every((key) => isNonEmptyString(value[key]))
     && ['working', 'blocked', 'done', 'question_requested'].includes(value.type as string)
     && ['idle', 'working', 'blocked', 'done', 'unknown'].includes(value.status as string)

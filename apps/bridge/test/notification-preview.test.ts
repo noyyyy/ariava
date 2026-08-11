@@ -18,14 +18,14 @@ const session = {
 function doneEvent(overrides: Partial<CanonicalEvent> = {}): CanonicalEvent {
   return {
     eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'done', status: 'idle',
-    typeLabel: 'Task complete', agentText: 'Finished successfully', createdAt: '2026-08-01T00:00:01.000Z', ...overrides,
+    agentText: 'Finished successfully', createdAt: '2026-08-01T00:00:01.000Z', ...overrides,
   } as CanonicalEvent;
 }
 
 function needHumanEvent(overrides: Partial<CanonicalEvent> = {}): CanonicalEvent {
   return {
     eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'need_human', status: 'need_human',
-    typeLabel: 'Needs attention', agentText: 'Review the result', needHuman: { reason: 'blocked' },
+    agentText: 'Review the result', needHuman: { reason: 'blocked' },
     createdAt: '2026-08-01T00:00:01.000Z', ...overrides,
   } as CanonicalEvent;
 }

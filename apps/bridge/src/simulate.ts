@@ -22,7 +22,6 @@ export function buildSimulatedSession(hostId: string, scenario: SimulationScenar
 export function buildSimulatedEvent(session: CanonicalSessionState, scenario: SimulationScenario): CanonicalEvent {
   const base = {
     eventId: session.lastEventId!, hostId: session.hostId, sessionId: session.sessionId, provider: session.provider,
-    typeLabel: scenario === 'done' ? 'Task complete' : 'Needs attention',
     agentText: scenario === 'question' ? 'Which environment should the rollout target?' : session.latestActivityText ?? 'Agent update',
     projectName: session.projectName, workingDirectory: session.workingDirectory, hbaseSessionKey: session.hbaseSessionKey,
     harnessProvider: session.harnessProvider, actionablePrompt: session.actionablePrompt, createdAt: session.updatedAt,

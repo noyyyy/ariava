@@ -25,6 +25,9 @@ function daemonFixture(drivers: Array<{ name: string; listSessions(hostId: strin
     agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
   });
   const daemon = new BridgeDaemon(config, drivers as never);
+  (daemon as any).stateStore.initializeEncryptedSpool(
+    config.hostId, config.identityPath, 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) },
+  );
   (daemon as any).startupValidated = true;
   (daemon as any).registerHostPresence = async () => {};
   let manifests = 0;

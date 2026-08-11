@@ -38,7 +38,7 @@ function terminalSession(overrides: Partial<CanonicalSessionState> = {}): Canoni
 function doneEvent(overrides: Partial<CanonicalEvent> = {}): CanonicalEvent {
   return {
     eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'done', status: 'idle',
-    typeLabel: 'Task complete', agentText: 'terminal activity', projectName: 'secret-project',
+    agentText: 'terminal activity', projectName: 'secret-project',
     workingDirectory: '/secret/project', hbaseSessionKey: 'hbase-secret', harnessProvider: 'pi',
     createdAt: '2026-08-07T00:00:01.000Z', ...overrides,
   } as CanonicalEvent;
@@ -46,7 +46,7 @@ function doneEvent(overrides: Partial<CanonicalEvent> = {}): CanonicalEvent {
 
 function needHumanEvent(): CanonicalEvent {
   return {
-    ...doneEvent(), type: 'need_human', status: 'need_human', typeLabel: 'Needs attention',
+    ...doneEvent(), type: 'need_human', status: 'need_human',
     needHuman: { reason: 'error', error: { kind: 'provider_failure', message: 'Sanitized provider failure.', providerCode: 'E_PROVIDER', retryExhausted: true } },
   };
 }

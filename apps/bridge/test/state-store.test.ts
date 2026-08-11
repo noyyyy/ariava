@@ -112,7 +112,7 @@ describe('BridgeStateStore', () => {
     expect(store.peekPendingEvents()).toEqual([]);
     expect(store.peekPendingSessionHandles()).toEqual([]);
     const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
-    expect(persisted.schemaVersion).toBe(2);
+    expect(persisted.schemaVersion).toBe(3);
     expect(persisted).not.toHaveProperty('pendingEvents');
     expect(persisted).not.toHaveProperty('pendingReads');
     expect(store.getRuntimeHealth()).toEqual({ status: 'healthy', drivers: [] });
@@ -211,11 +211,11 @@ describe('BridgeStateStore', () => {
     }]);
     store.appendRecentEvent({
       eventId: 'evt-1', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
-      typeLabel: 'Task complete', agentText: 'First', createdAt: '2026-07-16T00:00:01Z',
+      agentText: 'First', createdAt: '2026-07-16T00:00:01Z',
     });
     store.appendRecentEvent({
       eventId: 'evt-2', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
-      typeLabel: 'Task complete', agentText: 'Second', createdAt: '2026-07-16T00:00:02Z',
+      agentText: 'Second', createdAt: '2026-07-16T00:00:02Z',
     });
     store.queuePendingSessionHandle({
       hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-2',
@@ -294,7 +294,7 @@ describe('BridgeStateStore', () => {
     const keyStore = { loadOrCreate: () => new Uint8Array(32).fill(7) };
     const event = {
       eventId: 'evt-atomic', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
-      typeLabel: 'Task complete', agentText: 'Finished', projectName: 'project', contextText: 'Task · project',
+      agentText: 'Finished', projectName: 'project', contextText: 'Task · project',
       workingDirectory: '/project', hbaseSessionKey: 'sess-1', harnessProvider: 'pi', createdAt: '2026-08-07T00:00:01.000Z',
     } satisfies CanonicalEvent;
     const session = {
@@ -344,6 +344,21 @@ describe('BridgeStateStore', () => {
     expect(persisted.sessions['sess-1']).toEqual(session);
   });
 
+  test('rejects persisted current Events containing legacy typeLabel', () => {
+    const root = join(tmpdir(), `bridge-store-event-keys-${Date.now()}`); paths.push(root);
+    const statePath = join(root, 'state.json');
+    const store = new BridgeStateStore(statePath);
+    store.appendRecentEvent({
+      eventId: 'evt-current', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
+      agentText: 'Done', createdAt: LEGACY_AT,
+    });
+    store.dispose();
+    const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
+    persisted.recentEvents[0].typeLabel = 'Task complete';
+    writeFileSync(statePath, JSON.stringify(persisted), { mode: 0o600 });
+    expect(() => new BridgeStateStore(statePath)).toThrow('Bridge state file is invalid or insecure');
+  });
+
   test('rejects orphan and foreign handle cursors without mutation', () => {
     const root = join(tmpdir(), `bridge-store-handle-binding-${Date.now()}`); paths.push(root);
     const store = new BridgeStateStore(join(root, 'state.json'));
@@ -353,7 +368,7 @@ describe('BridgeStateStore', () => {
     }]);
     store.appendRecentEvent({
       eventId: 'evt-1', hostId: 'host-1', sessionId: 'sess-other', provider: 'pi', type: 'done', status: 'idle',
-      typeLabel: 'Task complete', agentText: 'Foreign', createdAt: LEGACY_AT,
+      agentText: 'Foreign', createdAt: LEGACY_AT,
     });
     const handle = { hostId: 'host-1', sessionId: 'sess-1', handledAt: LEGACY_AT, action: 'pi_input' as const, updatedAt: LEGACY_AT };
     expect(() => store.queuePendingSessionHandle({ ...handle, handledThroughEventId: 'missing' })).toThrow(/durable Event/u);
@@ -374,7 +389,7 @@ describe('BridgeStateStore', () => {
     }]);
     store.appendRecentEvent({
       eventId: 'evt-bound', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
-      typeLabel: 'Task complete', agentText: 'Done', createdAt: LEGACY_AT,
+      agentText: 'Done', createdAt: LEGACY_AT,
     });
     store.queuePendingSessionHandle({
       hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-bound', handledAt: LEGACY_AT,
@@ -401,7 +416,7 @@ describe('BridgeStateStore', () => {
     }]);
     store.appendRecentEvent({
       eventId: 'evt-bound', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
-      typeLabel: 'Task complete', agentText: 'Done', createdAt: LEGACY_AT,
+      agentText: 'Done', createdAt: LEGACY_AT,
     });
     store.queuePendingSessionHandle({
       hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-bound', handledAt: LEGACY_AT,
@@ -410,14 +425,14 @@ describe('BridgeStateStore', () => {
     for (let index = 0; index < 200; index += 1) {
       store.appendRecentEvent({
         eventId: `evt-new-${index}`, hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
-        typeLabel: 'Task complete', agentText: 'New', createdAt: `2026-08-08T00:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z`,
+        agentText: 'New', createdAt: `2026-08-08T00:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z`,
       });
     }
     expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).recentEvents.some((event: { eventId: string }) => event.eventId === 'evt-bound')).toBe(true);
     store.removePendingSessionHandle('host-1', 'sess-1', 'evt-bound');
     store.appendRecentEvent({
       eventId: 'evt-new-final', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
-      typeLabel: 'Task complete', agentText: 'Newest', createdAt: '2026-08-09T00:00:00.000Z',
+      agentText: 'Newest', createdAt: '2026-08-09T00:00:00.000Z',
     });
     expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).recentEvents.some((event: { eventId: string }) => event.eventId === 'evt-bound')).toBe(false);
   });

@@ -146,6 +146,32 @@ function setupOldRuntime() {
   };
 }
 
+function setupObsoleteRuntime() {
+  const fixture = setupOldRuntime();
+  const epoch = '00000000-0000-4000-8000-000000000002';
+  const state = {
+    schemaVersion: 2, runtimeResetEpoch: epoch,
+    host: { hostId: HOST_ID, hostName: 'Obsolete Host', platform: 'linux', bridgeVersion: '0.2.0',
+      registeredAt: CREATED_AT, lastSeenAt: CREATED_AT, bridgeStatus: 'online' },
+    sessions: { session: { sessionId: 'session', hostId: HOST_ID, provider: 'pi', projectName: 'project',
+      nameText: 'name', status: 'idle', updatedAt: CREATED_AT, lastEventId: 'event' } },
+    sessionDrivers: { session: 'pi' }, reconciledDrivers: { pi: true },
+    recentEvents: [{ eventId: 'event', hostId: HOST_ID, sessionId: 'session', provider: 'pi', type: 'done',
+      status: 'idle', typeLabel: 'Task complete', agentText: 'OBSOLETE_EVENT', createdAt: CREATED_AT }],
+    sessionRevisions: { session: 7 }, recipientSetVersion: 9, pendingHandles: {},
+    commandResults: { command: { commandId: 'command', hostId: HOST_ID, sessionId: 'session', accepted: true,
+      status: 'executed', message: 'obsolete', updatedAt: CREATED_AT } }, seenCommands: { command: CREATED_AT },
+    currentSessionsSnapshot: { version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0 },
+    runtimeHealth: { status: 'healthy', drivers: [] },
+  };
+  const keyId = spoolKeyIdForKey(new Uint8Array(32).fill(7));
+  const spool = { version: 2, runtimeStateSchemaVersion: 2, runtimeResetEpoch: epoch, hostId: HOST_ID, keyId,
+    items: [spoolItem('event-source-v2', standaloneSpoolBinding('event-source-v2'))] };
+  writeFileSync(fixture.statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  writeFileSync(fixture.spoolPath, `${JSON.stringify(spool)}\n`, { mode: 0o600 });
+  return fixture;
+}
+
 function openDeferred(statePath) {
   return new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
 }
@@ -189,6 +215,75 @@ function assertReset(fixture, store) {
     assert.deepEqual(readFileSync(path), fixture.preservedBytes[name], name);
   }
 }
+
+test('valid schema 2 runtime is recognized only to reset atomically to empty schema 3', () => {
+  const fixture = setupObsoleteRuntime();
+  try {
+    const store = initialize(fixture);
+    assertReset(fixture, store);
+    assert.doesNotMatch(readFileSync(fixture.statePath, 'utf8'), /OBSOLETE_EVENT|obsolete/);
+    assert.doesNotMatch(readFileSync(fixture.spoolPath, 'utf8'), /event-source-v2/);
+  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+for (const [name, mutate] of [
+  ['typeLabel missing', ({ state }) => { delete state.recentEvents[0].typeLabel; }],
+  ['typeLabel malformed', ({ state }) => { state.recentEvents[0].typeLabel = 7; }],
+  ['Host mismatch', ({ state }) => { state.sessions.session.hostId = 'foreign-host'; }],
+  ['epoch mismatch', ({ spool }) => { spool.runtimeResetEpoch = '00000000-0000-4000-8000-000000000003'; }],
+  ['key mismatch', ({ spool }) => { spool.keyId = 'A'.repeat(43); }],
+  ['Event relationship mismatch', ({ spool }) => { spool.items[0].sessionId = 'orphan'; }],
+]) {
+  test(`malformed or mismatched schema 2 ${name} fails closed without mutation`, () => {
+    const fixture = setupObsoleteRuntime();
+    try {
+      const state = JSON.parse(readFileSync(fixture.statePath, 'utf8'));
+      const spool = JSON.parse(readFileSync(fixture.spoolPath, 'utf8'));
+      mutate({ state, spool });
+      const stateBytes = Buffer.from(`${JSON.stringify(state)}\n`);
+      const spoolBytes = Buffer.from(`${JSON.stringify(spool)}\n`);
+      writeFileSync(fixture.statePath, stateBytes, { mode: 0o600 });
+      writeFileSync(fixture.spoolPath, spoolBytes, { mode: 0o600 });
+      let keyAccessed = false;
+      assert.throws(() => openDeferred(fixture.statePath).initializeEncryptedSpool(HOST_ID, fixture.identityPath, 'linux', {
+        loadOrCreate: () => { keyAccessed = true; return new Uint8Array(32).fill(7); },
+      }), /preflight failed closed/i);
+      assert.equal(keyAccessed, name === 'key mismatch');
+      assert.deepEqual(readFileSync(fixture.statePath), stateBytes);
+      assert.deepEqual(readFileSync(fixture.spoolPath), spoolBytes);
+      assert.equal(lstatSync(runtimeResetIntentPathForState(fixture.statePath), { throwIfNoEntry: false }), undefined);
+    } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+  });
+}
+
+test('interrupted schema 2 to 3 reset resumes without preserving obsolete records', () => {
+  const fixture = setupObsoleteRuntime();
+  try {
+    assert.throws(() => initialize(fixture, (phase) => {
+      if (phase === 'after-spool') throw new Error('crash:after-spool');
+    }), /preflight failed closed/i);
+    const intent = JSON.parse(readFileSync(runtimeResetIntentPathForState(fixture.statePath), 'utf8'));
+    assert.deepEqual([intent.fromSchemaVersion, intent.toSchemaVersion], [2, 3]);
+    const store = initialize(fixture);
+    assertReset(fixture, store);
+    assert.doesNotMatch(readFileSync(fixture.statePath, 'utf8'), /OBSOLETE_EVENT|obsolete/);
+  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+
+test('interrupted legacy reset intent remains explicitly schema 1 to 2 before schema 3 cutover', () => {
+  const fixture = setupOldRuntime();
+  try {
+    assert.throws(() => initialize(fixture, (phase) => {
+      if (phase === 'after-intent') throw new Error('crash:after-intent');
+    }), /preflight failed closed/i);
+    const intent = JSON.parse(readFileSync(runtimeResetIntentPathForState(fixture.statePath), 'utf8'));
+    assert.deepEqual([intent.fromSchemaVersion, intent.toSchemaVersion], [1, 2]);
+    const store = initialize(fixture);
+    assertReset(fixture, store);
+  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
 
 test('recognized prior runtime resets every JSON family and encrypted sidecar kind without replay', () => {
   const fixture = setupOldRuntime();
@@ -579,7 +674,7 @@ for (const lifecycle of ['unregister', 'ttl']) {
       const terminal = { sessionId: 'session', hostId: HOST_ID, provider: 'pi', projectName: 'project', nameText: 'name',
         status: 'idle', updatedAt: CREATED_AT, lastEventId: 'event' };
       const event = { eventId: 'event', hostId: HOST_ID, sessionId: 'session', provider: 'pi', type: 'done', status: 'idle',
-        typeLabel: 'Done', agentText: 'done', createdAt: CREATED_AT };
+        agentText: 'done', createdAt: CREATED_AT };
       store.queuePendingEvent(event, terminal); store.commitSessionRevision('session', 1); store.removePendingEvent('event');
       const commandResult = { commandId: `command-${lifecycle}`, hostId: HOST_ID, sessionId: 'session', accepted: true,
         status: 'executed', message: lifecycle, updatedAt: CREATED_AT };
@@ -641,7 +736,7 @@ test('current state Host and relationship adversarial matrix fails before key ac
       const terminal = { sessionId: 'session', hostId: HOST_ID, provider: 'pi', projectName: 'project', nameText: 'name',
         status: 'idle', updatedAt: CREATED_AT, lastEventId: 'event' };
       const event = { eventId: 'event', hostId: HOST_ID, sessionId: 'session', provider: 'pi', type: 'done', status: 'idle',
-        typeLabel: 'Done', agentText: 'done', createdAt: CREATED_AT };
+        agentText: 'done', createdAt: CREATED_AT };
       store.queuePendingEvent(event, terminal);
       store.queuePendingSessionHandle({ hostId: HOST_ID, sessionId: 'session', handledThroughEventId: 'event',
         handledAt: CREATED_AT, action: 'pi_input', updatedAt: CREATED_AT });

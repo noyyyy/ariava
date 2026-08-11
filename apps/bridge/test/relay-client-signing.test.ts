@@ -25,7 +25,7 @@ class RecordingSigner implements HostRequestSigner {
 
 const enrollment = { hostId, keyId: `key_${'B'.repeat(43)}`, algorithm: 'Ed25519', publicKey: 'A'.repeat(43), hostName: 'Host', platform: 'linux', bridgeVersion: '1.0.0' } as const;
 const metadata = { hostName: 'Host', platform: 'linux', bridgeVersion: '1.0.0' } as const;
-const event = { eventId: 'evt_1', hostId, sessionId, provider: 'pi', type: 'done', status: 'idle', typeLabel: 'Task complete', agentText: 'Finished', createdAt: '2026-07-15T00:00:00.000Z' } as any;
+const event = { eventId: 'evt_1', hostId, sessionId, provider: 'pi', type: 'done', status: 'idle', agentText: 'Finished', createdAt: '2026-07-15T00:00:00.000Z' } as any;
 const session = { sessionId, hostId, provider: 'pi', projectName: 'p', nameText: 'n', status: 'idle', updatedAt: '2026-07-15T00:00:00.000Z' } as any;
 const snapshot = { hostId, revision: 1, observedAt: '2026-07-15T00:00:00.000Z', recipientSetVersion: 1, sessions: [{ sessionId, sessionRevision: 1 }] } as any;
 const commandResult = { commandId: 'cmd_1', hostId, sessionId, type: 'interrupt', status: 'completed', completedAt: '2026-07-15T00:00:00.000Z' } as any;

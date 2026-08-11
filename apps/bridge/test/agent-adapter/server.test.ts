@@ -164,7 +164,7 @@ describe('AgentAdapterServer', () => {
   test('accepts only the exact complete canonical producer DTO', async () => {
     registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', nameText: 'p', cwd: '/', status: 'working' });
     const canonical = {
-      sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle', typeLabel: 'Task complete',
+      sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
       agentText: 'Finished', projectName: 'p', contextText: 'p', workingDirectory: '/',
       hbaseSessionKey: 'sess-1', harnessProvider: 'pi', createdAt: '2026-08-07T00:00:01.000Z',
     };
@@ -178,10 +178,11 @@ describe('AgentAdapterServer', () => {
   });
 
   test.each([
-    ['omitted type', { sessionId: 'sess-1', provider: 'pi', status: 'idle', typeLabel: 'Task complete', agentText: 'Finished', createdAt: '2026-08-07T00:00:01.000Z' }],
-    ['legacy type', { sessionId: 'sess-1', provider: 'pi', type: 'blocked', status: 'blocked', typeLabel: 'Blocked', agentText: 'Blocked', createdAt: '2026-08-07T00:00:01.000Z' }],
-    ['excess field', { sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle', typeLabel: 'Task complete', agentText: 'Finished', createdAt: '2026-08-07T00:00:01.000Z', extra: true }],
-    ['malformed NeedHuman', { sessionId: 'sess-1', provider: 'pi', type: 'need_human', status: 'need_human', typeLabel: 'Needs attention', agentText: 'Failed', needHuman: { reason: 'error', error: { kind: 'provider_failure', message: 'Bearer secret', retryExhausted: true } }, createdAt: '2026-08-07T00:00:01.000Z' }],
+    ['omitted type', { sessionId: 'sess-1', provider: 'pi', status: 'idle', agentText: 'Finished', createdAt: '2026-08-07T00:00:01.000Z' }],
+    ['legacy type', { sessionId: 'sess-1', provider: 'pi', type: 'blocked', status: 'blocked', agentText: 'Blocked', createdAt: '2026-08-07T00:00:01.000Z' }],
+    ['legacy typeLabel', { sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle', typeLabel: 'Task complete', agentText: 'Finished', createdAt: '2026-08-07T00:00:01.000Z' }],
+    ['excess field', { sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle', agentText: 'Finished', createdAt: '2026-08-07T00:00:01.000Z', extra: true }],
+    ['malformed NeedHuman', { sessionId: 'sess-1', provider: 'pi', type: 'need_human', status: 'need_human', agentText: 'Failed', needHuman: { reason: 'error', error: { kind: 'provider_failure', message: 'Bearer secret', retryExhausted: true } }, createdAt: '2026-08-07T00:00:01.000Z' }],
   ])('rejects %s without mutating the Session', async (_name, body) => {
     registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', nameText: 'p', cwd: '/', status: 'working' });
     const before = registry.listSessions()[0];
@@ -197,7 +198,7 @@ describe('AgentAdapterServer', () => {
     registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', nameText: 'p', cwd: '/' });
 
     const canonical = (agentText: string, createdAt: string) => ({
-      sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle', typeLabel: 'Task complete',
+      sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
       agentText, projectName: 'p', contextText: 'p', workingDirectory: '/',
       hbaseSessionKey: 'sess-1', harnessProvider: 'pi', createdAt,
     });
@@ -220,6 +221,8 @@ describe('AgentAdapterServer', () => {
     for (const legacyBody of [
       { handledThroughEventId: eventId, latestReadEventId: eventId },
       { handledThroughEventId: eventId, action: 'watch_reply' },
+      { handledThroughEventId: eventId, actorId: 'host-spoofed' },
+      { handledThroughEventId: eventId, handledByIdentityId: 'host-spoofed' },
     ]) {
       const rejected = await fetch(url('/v1/agent/sessions/sess-1/handle'), {
         method: 'POST', headers: headers(), body: JSON.stringify(legacyBody),

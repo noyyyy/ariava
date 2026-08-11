@@ -57,11 +57,11 @@ export interface RegisterSessionInput {
 const SESSION_TTL_MS = 45_000;
 const TERMINAL_RETRY_DELAYS_MS = [100, 500, 2_000, 5_000] as const;
 const EVENT_KEYS = [
-  'sessionId', 'provider', 'type', 'status', 'typeLabel', 'agentText', 'humanText', 'projectName', 'contextText',
+  'sessionId', 'provider', 'type', 'status', 'agentText', 'humanText', 'projectName', 'contextText',
   'workingDirectory', 'hbaseSessionKey', 'harnessProvider', 'actionablePrompt', 'correlationId', 'createdAt', 'needHuman',
 ] as const;
 const EVENT_REQUIRED_KEYS = [
-  'sessionId', 'provider', 'type', 'status', 'typeLabel', 'agentText', 'projectName', 'contextText', 'workingDirectory',
+  'sessionId', 'provider', 'type', 'status', 'agentText', 'projectName', 'contextText', 'workingDirectory',
   'hbaseSessionKey', 'harnessProvider', 'createdAt',
 ] as const;
 const PROMPT_KEYS = ['promptId', 'type', 'label', 'options', 'expiresAt'] as const;
@@ -455,7 +455,7 @@ export class AgentAdapterRegistry {
 
 function parseCanonicalProducerEvent(value: unknown): AgentAdapterEventInput {
   const event = exactRecord(value, EVENT_KEYS, EVENT_REQUIRED_KEYS, 'canonical Event');
-  for (const key of ['sessionId', 'provider', 'typeLabel', 'agentText', 'projectName', 'contextText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider', 'createdAt'] as const) requireString(event, key);
+  for (const key of ['sessionId', 'provider', 'agentText', 'projectName', 'contextText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider', 'createdAt'] as const) requireString(event, key);
   for (const key of ['humanText', 'correlationId'] as const) optionalString(event, key);
   if (!isCanonicalTimestamp(event.createdAt)) throw new TypeError('canonical Event createdAt is invalid');
   const invariant = validateCanonicalEventInvariant({ type: event.type, status: event.status, ...(Object.hasOwn(event, 'needHuman') ? { needHuman: event.needHuman } : {}) });
@@ -551,7 +551,6 @@ function producerEventFingerprint(event: AgentAdapterEventInput | CanonicalEvent
     provider: producer.provider,
     type: producer.type,
     status: producer.status,
-    typeLabel: producer.typeLabel,
     ...(producer.correlationId === undefined ? {} : { correlationId: producer.correlationId }),
     createdAt: producer.createdAt,
   });

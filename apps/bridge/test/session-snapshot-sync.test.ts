@@ -25,7 +25,6 @@ async function fixture(handler: (request: Request) => Response | Promise<Respons
     statePath: join(root, 'state.json'), identityPath, agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') } });
   const driver = { name: 'test', listSessions: async () => sessions.map((session) => ({ ...session, hostId: identity.hostId })), executeCommand: async () => { throw new Error('unused'); } };
   const daemon = new BridgeDaemon(config, [driver], identityStore);
-  if (sessions.length) (daemon as any).stateStore.initializeEncryptedSpool(identity.hostId, identityPath, 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
   return { daemon, config, identity, driver };
 }
 
@@ -206,7 +205,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     const restartedIdentityStore = new LinuxJsonHostIdentityStore(fx.config.identityPath);
     const restartedDriver = { name: 'test', listSessions: async () => [activeSession('session-a'), activeSession('session-b')].map((session) => ({ ...session, hostId })), executeCommand: async () => { throw new Error('unused'); } };
     const restarted = new BridgeDaemon(fx.config, [restartedDriver], restartedIdentityStore);
-    (restarted as any).stateStore.initializeEncryptedSpool(hostId, fx.config.identityPath, 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
+    await (restarted as any).validateStartup();
     expect((restarted as any).stateStore.listInflightSessionIds()).toEqual(['session-b']);
     expect((await restarted.syncOnce()).offline).toBe(false);
     expect((restarted as any).encryptionIdentity).toBeDefined();

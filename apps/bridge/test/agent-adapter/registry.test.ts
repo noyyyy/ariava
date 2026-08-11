@@ -35,7 +35,6 @@ function doneEvent(overrides: Partial<AgentAdapterEventInput> = {}): AgentAdapte
     provider: 'pi',
     type: 'done',
     status: 'idle',
-    typeLabel: 'Task complete',
     agentText: 'Finished successfully',
     projectName: 'project',
     contextText: 'Task · project',
@@ -53,7 +52,6 @@ function needHumanEvent(overrides: Partial<AgentAdapterEventInput> = {}): AgentA
     provider: 'pi',
     type: 'need_human',
     status: 'need_human',
-    typeLabel: 'Needs attention',
     agentText: 'Which environment should I target?',
     projectName: 'project',
     contextText: 'Task · project',
@@ -330,6 +328,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     ['producer eventId', { ...doneEvent(), eventId: 'producer-event' }],
     ['producer hostId', { ...doneEvent(), hostId: 'producer-host' }],
     ['excess field', { ...doneEvent(), unknownField: true }],
+    ['legacy typeLabel', { ...doneEvent(), typeLabel: 'Task complete' }],
     ...(['projectName', 'contextText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider'] as const).map((key) => [
       `omitted ${key}`, Object.fromEntries(Object.entries(doneEvent()).filter(([field]) => field !== key)),
     ]),

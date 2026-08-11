@@ -40,7 +40,6 @@ interface CanonicalEventBase {
   hostId: string;
   sessionId: string;
   provider: string;
-  typeLabel: string;
   agentText: string;
   humanText?: string;
   projectName?: string;

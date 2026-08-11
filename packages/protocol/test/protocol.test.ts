@@ -22,11 +22,12 @@ import {
   type NeedHumanError,
   type SessionReadSource,
   type SessionHandleAction,
+  type HandleSessionRequest,
 } from '../src';
 
 const baseEvent: CanonicalEvent = {
   eventId: 'evt_1', hostId: 'host_1', sessionId: 'sess_1', provider: 'pi', type: 'need_human', status: 'need_human',
-  typeLabel: 'Needs attention', agentText: 'Needs help', needHuman: { reason: 'blocked' }, createdAt: '2026-06-28T10:00:00Z',
+  agentText: 'Needs help', needHuman: { reason: 'blocked' }, createdAt: '2026-06-28T10:00:00Z',
 };
 
 const validError: NeedHumanError = {
@@ -83,6 +84,13 @@ describe('protocol helpers', () => {
     expect(validateEventTypeStatusPair('done', 'need_human')).toBe(false);
     expect(validateEventTypeStatusPair('need_human', 'idle')).toBe(false);
     expect(validateEventTypeStatusPair('blocked', 'blocked')).toBe(false);
+  });
+
+  test('omits the redundant display label from canonical Events', () => {
+    expect(baseEvent).not.toHaveProperty('typeLabel');
+    expect(Object.keys(baseEvent)).toEqual([
+      'eventId', 'hostId', 'sessionId', 'provider', 'type', 'status', 'agentText', 'needHuman', 'createdAt',
+    ]);
   });
 
   test('accepts only exact canonical event/status/protected-context combinations', () => {
@@ -178,7 +186,7 @@ describe('protocol helpers', () => {
   });
 
 
-  test('exposes only canonical session read fields', () => {
+  test('exposes only canonical session read and handle fields', () => {
     const request: MarkSessionReadRequest = {
       latestReadEventId: 'evt-2',
       readAt: '2026-07-13T10:00:00.000Z',
@@ -188,5 +196,9 @@ describe('protocol helpers', () => {
     const source: SessionReadSource = 'watch_view'; expect(source).toBe('watch_view');
     expect(SESSION_HANDLE_ACTIONS).toEqual(['pi_input', 'watch_reply', 'bridge_recovery']);
     const action: SessionHandleAction = 'watch_reply'; expect(action).toBe('watch_reply');
+    const handle: HandleSessionRequest = { handledThroughEventId: 'evt-2', action: 'pi_input' };
+    expect(Object.keys(handle)).toEqual(['handledThroughEventId', 'action']);
+    expect(handle).not.toHaveProperty('actorId');
+    expect(handle).not.toHaveProperty('handledByIdentityId');
   });
 });

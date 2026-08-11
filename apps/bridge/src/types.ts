@@ -134,7 +134,7 @@ export interface BridgeRuntimeHealth {
 }
 
 export interface PersistedBridgeState {
-  schemaVersion: 2;
+  schemaVersion: 3;
   runtimeResetEpoch: string;
   host: HostProjection | null;
   sessions: Record<string, CanonicalSessionState>;

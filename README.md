@@ -76,16 +76,14 @@ The command surface is intentionally narrow. Ariava does not expose arbitrary sh
 
 ## Canonical Runtime Model
 
-Ariava uses one encrypted, versioned runtime model:
+Ariava uses one encrypted, versioned Session/Event model across Pi and the local Bridge:
 
-- Event type is exactly `done | need_human`.
-- Session status is exactly `idle | working | need_human`.
-- Normal completion atomically produces one `done` Event and an `idle` Session.
-- Driver failures are Bridge health/log/retry concerns, not user-facing Events.
-- Host availability is a Relay-presence concern, not a Session status.
-- Encrypted runtime payloads use `event-content-v2`, `session-content-v2`, and `notification-preview-v2`.
-- Notification categories are exactly `agent.done` and `agent.need_human`.
-- There is no compatibility decoder, negotiation, dual read/write, or fallback for prior runtime payload versions.
+- Event type is exactly `done | need_human`; Session status is exactly `idle | working | need_human`.
+- Normal completion atomically produces one `done` Event and an `idle` Session. A question, blocker, or exhausted runtime error produces one `need_human` Event and a `need_human` Session.
+- Clients derive Event labels and Session display state from canonical type, status, and protected context; neither is stored in the canonical runtime contract.
+- Driver failures are Bridge health/log/retry concerns, not canonical Event types. Host availability is a Relay-presence concern, not a Session status.
+- Protected envelopes use `event-content-v2`, `session-content-v2`, and `notification-preview-v2`; notification routing uses only `agent.done` and `agent.need_human`.
+- This is an intentional breaking cutover. There is no compatibility decoder, negotiation, dual read/write, or fallback for the active model. The Bridge recognizes valid prior schema 2 runtime only to atomically reset it to empty schema 3 state; obsolete Sessions and Events are not replayed.
 
 ## Build from Source
 

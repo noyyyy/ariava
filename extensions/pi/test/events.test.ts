@@ -6,6 +6,12 @@ import { buildDoneEvent, buildNeedHumanEvent, extractNeedHumanError } from '../s
 import ariavaPiExtension from '../src/index';
 import type { PiSessionInfo } from '../src/session';
 
+type WithoutBridgeIdentity<T> = T extends CanonicalEvent ? Omit<T, 'eventId' | 'hostId'> : never;
+type TypesEqual<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends (<Value>() => Value extends Right ? 1 : 2)
+    ? (<Value>() => Value extends Right ? 1 : 2) extends (<Value>() => Value extends Left ? 1 : 2) ? true : false
+    : false;
+
 const session: PiSessionInfo = {
   sessionId: 'session-1',
   provider: 'pi',
@@ -24,7 +30,6 @@ describe('canonical terminal event builders', () => {
       provider: 'pi',
       type: 'done',
       status: 'idle',
-      typeLabel: 'Task complete',
       agentText: 'Finished safely.',
       humanText: 'Please finish.',
       projectName: 'demo',
@@ -397,10 +402,13 @@ describe('ariavaPiExtension event mapping', () => {
   });
 
   test('adapter event DTO is exactly canonical minus Bridge-assigned identity fields', () => {
+    type ExpectedAgentAdapterEvent = WithoutBridgeIdentity<CanonicalEvent>;
+    const exactTypeBoundary: TypesEqual<AgentAdapterEvent, ExpectedAgentAdapterEvent> = true;
     const assertAssignable = (_event: AgentAdapterEvent): void => {};
     const event = buildDoneEvent(session, 'Complete.', undefined, '2026-08-07T00:00:00.000Z');
     assertAssignable(event);
     const canonicalAfterBridge: CanonicalEvent = { ...event, eventId: 'event-1', hostId: 'host-1' };
+    expect(exactTypeBoundary).toBe(true);
     expect(canonicalAfterBridge).toMatchObject({ type: 'done', status: 'idle' });
   });
 });

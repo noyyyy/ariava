@@ -90,7 +90,6 @@ describe('AgentAdapterClient', () => {
       provider: session.provider,
       type: 'done',
       status: 'idle',
-      typeLabel: 'Task complete',
       agentText: 'Tests passed',
       projectName: session.projectName,
       contextText: 'Demo session · demo',
@@ -107,7 +106,7 @@ describe('AgentAdapterClient', () => {
     const session = makeSession('sess-1');
     await client.registerSession(session);
     const event = await client.pushEvent({
-      sessionId: session.sessionId, provider: session.provider, type: 'done', status: 'idle', typeLabel: 'Task complete',
+      sessionId: session.sessionId, provider: session.provider, type: 'done', status: 'idle',
       agentText: 'Done', projectName: session.projectName, contextText: 'Demo session · demo', workingDirectory: session.cwd,
       hbaseSessionKey: session.sessionId, harnessProvider: 'pi', createdAt: '2026-07-16T00:00:00.000Z',
     });

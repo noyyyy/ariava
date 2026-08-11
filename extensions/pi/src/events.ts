@@ -86,7 +86,6 @@ export function buildDoneEvent(
     }),
     type: 'done',
     status: 'idle',
-    typeLabel: 'Task complete',
   };
 }
 
@@ -116,7 +115,6 @@ export function buildNeedHumanEvent(session: PiSessionInfo, input: NeedHumanEven
     }),
     type: 'need_human',
     status: 'need_human',
-    typeLabel: 'Needs attention',
     needHuman,
   };
 }
@@ -256,7 +254,7 @@ function buildEventBase(
     actionablePrompt?: ActionablePrompt;
     correlationId?: string;
   },
-): Omit<AgentAdapterEvent, 'type' | 'status' | 'typeLabel' | 'needHuman'> {
+): Omit<AgentAdapterEvent, 'type' | 'status' | 'needHuman'> {
   return {
     sessionId: session.sessionId,
     provider: session.provider,

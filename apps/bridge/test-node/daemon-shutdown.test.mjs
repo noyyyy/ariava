@@ -122,7 +122,7 @@ test('production daemon defers old-state decoding until startup preflight resets
     await daemon.validateStartup();
     const state = JSON.parse(readFileSync(statePath, 'utf8'));
     const spool = JSON.parse(readFileSync(spoolPathForState(statePath), 'utf8'));
-    assert.equal(state.schemaVersion, 2);
+    assert.equal(state.schemaVersion, 3);
     assert.equal(state.runtimeResetEpoch, spool.runtimeResetEpoch);
     assert.deepEqual(state.recentEvents, []);
     assert.deepEqual(spool.items, []);
