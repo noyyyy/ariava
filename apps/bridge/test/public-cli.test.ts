@@ -9,10 +9,10 @@ import { formatHumanCliFailure, normalizeCliFailure, runPublicCli } from '../src
 import { createIsolatedPublicCliEnvironment } from './fixtures/isolated-public-cli-env';
 import { createProfileCliHarness } from './fixtures/profile-cli-harness';
 
-const publicCoreRoot = join(import.meta.dir, '..', '..', '..');
+const publicRepoRoot = join(import.meta.dir, '..', '..', '..');
 const roots: string[] = [];
 const bunPath = process.execPath;
-const cliPath = join(publicCoreRoot, 'apps', 'bridge', 'src', 'public-cli.ts');
+const cliPath = join(publicRepoRoot, 'apps', 'bridge', 'src', 'public-cli.ts');
 
 function isolatedEnv(home: string, overrides: Record<string, string | undefined> = {}) {
   return createIsolatedPublicCliEnvironment(home, overrides).env;
@@ -402,7 +402,7 @@ describe('public ariava CLI', () => {
   });
 
   describe('--version option', () => {
-    const expectedVersion = JSON.parse(readFileSync(join(publicCoreRoot, 'package.json'), 'utf8')).version as string;
+    const expectedVersion = JSON.parse(readFileSync(join(publicRepoRoot, 'package.json'), 'utf8')).version as string;
 
     test('prints package SemVer only on stdout without config side effects', async () => {
       const home = mkdtempSync(join(tmpdir(), 'ariava-cli-version-home-'));
@@ -603,7 +603,7 @@ describe('public ariava CLI', () => {
   test('reports the package version in status and upgrade output', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     roots.push(home);
-    const expectedVersion = JSON.parse(readFileSync(join(publicCoreRoot, 'package.json'), 'utf8')).version;
+    const expectedVersion = JSON.parse(readFileSync(join(publicRepoRoot, 'package.json'), 'utf8')).version;
 
     const run = async (...args: string[]) => {
       const proc = Bun.spawn({
@@ -688,7 +688,7 @@ describe('public ariava CLI', () => {
     const body = JSON.parse(stdout);
     expect(body.ok).toBe(true);
     expect(body.data.managedPath).toBe(join(home, '.pi', 'agent', 'npm', 'node_modules', '@ariava', 'pi-extension'));
-    const expectedVersion = JSON.parse(readFileSync(join(publicCoreRoot, 'package.json'), 'utf8')).version;
+    const expectedVersion = JSON.parse(readFileSync(join(publicRepoRoot, 'package.json'), 'utf8')).version;
     const exactSource = `npm:@ariava/pi-extension@${expectedVersion}`;
     expect(body.data.source).toMatchObject({ kind: 'npm-package', package: exactSource });
     expect(readFileSync(isolated.piLogPath, 'utf8')).toContain(`install ${exactSource}`);
@@ -721,7 +721,7 @@ describe('public ariava CLI', () => {
     roots.push(home);
     const configRoot = join(home, '.config', 'ariava');
     secureJsonFixture(join(configRoot, 'config.json'), {});
-    const harnessPath = join(publicCoreRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
+    const harnessPath = join(publicRepoRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
     const proc = Bun.spawn({
       cmd: [bunPath, harnessPath, 'uninstall', '--purge', '--json'],
       cwd: process.cwd(),
@@ -745,7 +745,7 @@ describe('public ariava CLI', () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     roots.push(home);
 
-    const harnessPath = join(publicCoreRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
+    const harnessPath = join(publicRepoRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
     const proc = Bun.spawn({
       cmd: [bunPath, harnessPath, 'init', '--json'],
       cwd: process.cwd(),
@@ -990,7 +990,7 @@ describe('public ariava CLI', () => {
   });
 
   describe('injectable cross-platform service commands', () => {
-    const harnessPath = join(publicCoreRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
+    const harnessPath = join(publicRepoRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
 
     async function runHarness(home: string, scenario: string, ...args: string[]) {
       return runHarnessWithEnv(home, scenario, {}, ...args);
@@ -1092,7 +1092,7 @@ describe('public ariava CLI', () => {
         url: 'http://127.0.0.1:7273',
         secret: 'dev-only-secret', protocolVersion: 2,
       });
-      const cliVersion = JSON.parse(readFileSync(join(publicCoreRoot, 'package.json'), 'utf8')).version;
+      const cliVersion = JSON.parse(readFileSync(join(publicRepoRoot, 'package.json'), 'utf8')).version;
 
       const status = await runHarness(home, 'linux-supported', 'status');
 
@@ -1859,8 +1859,8 @@ describe('public ariava CLI', () => {
 
 describe('default lifecycle adapter structure', () => {
   test('keeps public-cli-app as a compatibility wrapper over the default adapter', () => {
-    const wrapper = readFileSync(join(publicCoreRoot, 'apps', 'bridge', 'src', 'public-cli-app.ts'), 'utf8');
-    const adapter = readFileSync(join(publicCoreRoot, 'apps', 'bridge', 'src', 'cli', 'lifecycle', 'default.ts'), 'utf8');
+    const wrapper = readFileSync(join(publicRepoRoot, 'apps', 'bridge', 'src', 'public-cli-app.ts'), 'utf8');
+    const adapter = readFileSync(join(publicRepoRoot, 'apps', 'bridge', 'src', 'cli', 'lifecycle', 'default.ts'), 'utf8');
 
     expect(wrapper).toContain('runAriavaCli(argv, createDefaultCliApplicationContext(overrides, onboardingOverrides))');
     expect(wrapper).not.toContain('runDefaultCli');

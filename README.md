@@ -1,4 +1,4 @@
-<!-- ARIAVA_PUBLIC_CORE_README: PUBLISHABLE -->
+<!-- ARIAVA_PUBLIC_REPO_README: PUBLISHABLE -->
 <p align="center">
   <img src="https://raw.githubusercontent.com/noyyyy/ariava/main/ariava.png" alt="Ariava" width="160" height="160">
 </p>

@@ -162,7 +162,7 @@ jobs:
           RELEASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
         run: |
           {
-            echo '## Public Core npm release'
+            echo '## Public Repo npm release'
             echo
             echo "- Tag: \`${RELEASE_TAG}\`"
             echo "- Commit: \`${RELEASE_COMMIT}\`"

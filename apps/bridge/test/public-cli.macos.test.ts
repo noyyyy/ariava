@@ -8,10 +8,10 @@ if (process.platform !== 'darwin') {
   throw new Error(`public-cli.macos.test.ts requires Darwin, received ${process.platform}`);
 }
 
-const publicCoreRoot = join(import.meta.dir, '..', '..', '..');
+const publicRepoRoot = join(import.meta.dir, '..', '..', '..');
 const roots: string[] = [];
 const bunPath = process.execPath;
-const cliPath = join(publicCoreRoot, 'apps', 'bridge', 'src', 'public-cli.ts');
+const cliPath = join(publicRepoRoot, 'apps', 'bridge', 'src', 'public-cli.ts');
 
 function isolatedEnv(home: string, overrides: Record<string, string | undefined> = {}) {
   return createIsolatedPublicCliEnvironment(home, overrides).env;

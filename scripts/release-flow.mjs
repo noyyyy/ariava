@@ -14,7 +14,7 @@ Commands:
   if (command === 'push') {
     const result = await pushRelease();
     console.log(`Pushed release commit ${result.commit} for Ariava ${result.version} to origin/${result.branch}.`);
-    console.log('Wait for the Public Core CI Linux and macOS jobs, then run: bun run release:tag');
+    console.log('Wait for the Public Repo CI Linux and macOS jobs, then run: bun run release:tag');
     return;
   }
 

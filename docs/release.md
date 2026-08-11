@@ -1,6 +1,6 @@
-# Public Core npm release
+# Public Repo npm release
 
-This document is the source of truth for releasing the two stable Public Core npm packages, in this fixed order:
+This document is the source of truth for releasing the two stable Public Repo npm packages, in this fixed order:
 
 1. `ariava`
 2. `@ariava/pi-extension`
@@ -9,7 +9,7 @@ The normal path uses GitHub Actions Trusted Publishing and short-lived OIDC cred
 
 ## Release boundaries
 
-A Public Core tag in `noyyyy/ariava` is the sole npm release trigger. A similarly named tag in a private product repository does **not** publish these packages. Updating a private product's `open-source/ariava` gitlink is a separate, later integration step.
+A Public Repo tag in `noyyyy/ariava` is the sole npm release trigger. A similarly named tag in a private product repository does **not** publish these packages. Updating a private product's `open-source/ariava` gitlink is a separate, later integration step.
 
 The workflows do not deploy Relay, publish Homebrew, create a GitHub Release, or build or upload watchOS/TestFlight artifacts. They do not bump versions, commit, create tags, or update another repository.
 
@@ -22,14 +22,14 @@ bun install --frozen-lockfile
 bun run verify
 ```
 
-`bun run verify` retains the complete shared build, generated pi bundle, extension test/typecheck, reviewed Public Core test, tarball/package smoke, and package assertion closure. The tag workflow's Ubuntu prepare job continues to invoke this exact command before packing artifacts; publication does not depend on a macOS runner or on another repository.
+`bun run verify` retains the complete shared build, generated pi bundle, extension test/typecheck, reviewed Public Repo test, tarball/package smoke, and package assertion closure. The tag workflow's Ubuntu prepare job continues to invoke this exact command before packing artifacts; publication does not depend on a macOS runner or on another repository.
 
-Direct pushes to `main` run two additive Public Core host checks:
+Direct pushes to `main` run two additive Public Repo host checks:
 
 - **Linux**: `ubuntu-latest` runs `bun run verify:linux`;
 - **macOS**: `macos-latest` runs `bun run verify:macos`.
 
-Both use frozen installs and exact Node 24.18.0, npm 11.18.0, and Bun 1.3.14. `bun run release:tag` requires the exact pushed commit's `Public Core CI` run and both named jobs to succeed before it creates a tag.
+Both use frozen installs and exact Node 24.18.0, npm 11.18.0, and Bun 1.3.14. `bun run release:tag` requires the exact pushed commit's `Public Repo CI` run and both named jobs to succeed before it creates a tag.
 
 A Mac maintainer may run the explicit Docker pre-acceptance lane before pushing:
 
@@ -70,13 +70,13 @@ These commands can touch a real user Keychain/launchd domain or manage a disposa
    bun run release:tag
    ```
 
-   The command requires a clean synchronized default branch and authenticated `gh`. It finds the exact commit's `Public Core CI` push run, waits for completion, requires successful **Linux** and **macOS** jobs, revalidates the remote branch and release state, then creates and pushes annotated tag `vX.Y.Z`. Missing, ambiguous, incomplete, failed, or cancelled CI evidence fails closed before tag creation.
+   The command requires a clean synchronized default branch and authenticated `gh`. It finds the exact commit's `Public Repo CI` push run, waits for completion, requires successful **Linux** and **macOS** jobs, revalidates the remote branch and release state, then creates and pushes annotated tag `vX.Y.Z`. Missing, ambiguous, incomplete, failed, or cancelled CI evidence fails closed before tag creation.
 4. Never move, delete, or recreate a public release tag to replace published content.
-5. Observe `publish-npm.yml`. Its read-only prepare job validates the strict tag, peeled commit, common versions, and default-branch ancestry; performs the frozen install and complete Public Core verification; packs, inspects, and smoke-tests the exact artifacts; then uploads only two tarballs and `release-manifest.json`.
+5. Observe `publish-npm.yml`. Its read-only prepare job validates the strict tag, peeled commit, common versions, and default-branch ancestry; performs the frozen install and complete Public Repo verification; packs, inspects, and smoke-tests the exact artifacts; then uploads only two tarballs and `release-manifest.json`.
 6. If the `npm-production` GitHub Environment requires approval, inspect the tag, commit, versions, filenames, and SHA-256 values before approving.
 7. The dependent publish job downloads those exact artifacts, verifies their manifest and digests, and publishes through npm Trusted Publishing. Only this job has `id-token: write`.
 8. Confirm the sanitized job summary and the npm registry pages show both `X.Y.Z` versions and `latest` dist-tags. Check npm provenance where npm exposes it.
-9. Update a private product gitlink only in an independent reviewed change after the Public Core release is accepted.
+9. Update a private product gitlink only in an independent reviewed change after the Public Repo release is accepted.
 
 The GitHub tag glob is only a coarse trigger. The shared release implementation accepts only canonical stable tags matching `vX.Y.Z` and fails before an npm write if the release context is invalid.
 

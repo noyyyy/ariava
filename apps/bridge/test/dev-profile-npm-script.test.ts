@@ -66,9 +66,9 @@ describe('Node-backed dev setup', () => {
     expect(buildScript).toContain("resolve(bridgeRoot, 'src', 'public-cli.ts')");
   });
 
-  test('resolves Public Core assets from the built dev entrypoint', () => {
+  test('resolves Public Repo assets from the built dev entrypoint', () => {
     const artifact = readFileSync(resolve(root, 'apps/bridge/dist/dev-profile-cli.js'), 'utf8');
-    expect(artifact).toContain('function resolvePublicCoreRoot(modulePath)');
+    expect(artifact).toContain('function resolvePublicRepoRoot(modulePath)');
     expect(artifact).toContain('SOURCE_PI_EXTENSION_PATH');
     for (const segment of ['extensions', 'pi', 'index.ts']) expect(artifact).toContain(`"${segment}"`);
     expect(existsSync(resolve(root, 'extensions', 'pi', 'index.ts'))).toBe(true);

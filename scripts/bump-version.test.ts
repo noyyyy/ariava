@@ -47,7 +47,7 @@ function readLockfileWorkspaceVersion(lockfile: string, workspacePath: string): 
 }
 
 describe('bump-version release preparation script', () => {
-  test('bumps every Public Core release version', async () => {
+  test('bumps every Public Repo release version', async () => {
     const root = makeFixture();
     try {
       const proc = Bun.spawn({
@@ -64,7 +64,7 @@ describe('bump-version release preparation script', () => {
       expect(exitCode, stderr).toBe(0);
       expect(stdout).toContain('Bumped Ariava version: 0.1.4 -> 0.1.5');
       expect(stdout).toContain('bun run release:push');
-      expect(stdout).toContain('Public Core CI Linux and macOS jobs');
+      expect(stdout).toContain('Public Repo CI Linux and macOS jobs');
       expect(stdout).toContain('bun run release:tag');
       expect(stdout).toContain('release: bump to 0.1.5');
       expect(stdout).toContain('approve publish-npm.yml in npm-production');

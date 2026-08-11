@@ -27,7 +27,7 @@ const LOCKFILE_WORKSPACES = Object.freeze([
   'packages/shared-utils',
 ]);
 
-const CI_WORKFLOW = 'Public Core CI';
+const CI_WORKFLOW = 'Public Repo CI';
 const REQUIRED_CI_JOBS = Object.freeze(['Linux', 'macOS']);
 const STABLE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
 

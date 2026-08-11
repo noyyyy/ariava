@@ -49,7 +49,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-describe('Public Core test lane collection policy', () => {
+describe('Public Repo test lane collection policy', () => {
   test('classifies approved suffixes and rejects alternative Bun test names deterministically', () => {
     expect(classifyTestFile('scripts/example.test.ts')).toBe('shared');
     expect(classifyTestFile('apps/bridge/test/example.macos.test.ts')).toBe('macos');

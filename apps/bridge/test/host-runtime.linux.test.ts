@@ -10,7 +10,7 @@ if (process.platform !== 'linux') {
   throw new Error(`host-runtime.linux.test.ts requires Linux, received ${process.platform}`);
 }
 
-const publicCoreRoot = join(import.meta.dir, '..', '..', '..');
+const publicRepoRoot = join(import.meta.dir, '..', '..', '..');
 const bunPath = process.execPath;
 const roots: string[] = [];
 
@@ -108,7 +108,7 @@ describe('Linux host runtime smoke', () => {
   test('resolves Linux host paths and imports the CLI from an unrelated disposable cwd', async () => {
     const home = temporaryRoot('ariava-linux-paths-');
     const runtime = isolatedRuntime(home, join(home, 'unrelated-cwd'));
-    const pathsUrl = pathToFileURL(join(publicCoreRoot, 'apps', 'bridge', 'src', 'host-manager', 'paths.ts')).href;
+    const pathsUrl = pathToFileURL(join(publicRepoRoot, 'apps', 'bridge', 'src', 'host-manager', 'paths.ts')).href;
     const paths = await spawnText([
       bunPath,
       '-e',
@@ -125,7 +125,7 @@ describe('Linux host runtime smoke', () => {
 
     const cli = await spawnText([
       bunPath,
-      join(publicCoreRoot, 'apps', 'bridge', 'src', 'public-cli.ts'),
+      join(publicRepoRoot, 'apps', 'bridge', 'src', 'public-cli.ts'),
       'help',
       '--json',
     ], runtime);
@@ -137,7 +137,7 @@ describe('Linux host runtime smoke', () => {
   test('reports the actual read-only systemctl capability probe without requiring a user bus', async () => {
     const home = temporaryRoot('ariava-linux-systemctl-');
     const runtime = isolatedRuntime(home, join(home, 'probe-cwd'));
-    const serviceUrl = pathToFileURL(join(publicCoreRoot, 'apps', 'bridge', 'src', 'host-manager', 'service', 'index.ts')).href;
+    const serviceUrl = pathToFileURL(join(publicRepoRoot, 'apps', 'bridge', 'src', 'host-manager', 'service', 'index.ts')).href;
     const probe = await spawnText([
       bunPath,
       '-e',

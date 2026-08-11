@@ -247,7 +247,7 @@ const prefix = dryRun ? 'Dry run: Ariava version would change' : 'Bumped Ariava 
 console.log(`${prefix} ${current} -> ${next}`);
 console.log('Next steps:');
 console.log('  bun run release:push');
-console.log('  Wait for the Public Core CI Linux and macOS jobs to pass.');
+console.log('  Wait for the Public Repo CI Linux and macOS jobs to pass.');
 console.log('  bun run release:tag');
 console.log(`  The release commit subject will be: release: bump to ${next}`);
 console.log('  Observe and, if configured, approve publish-npm.yml in npm-production.');

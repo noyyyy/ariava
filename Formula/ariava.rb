@@ -2,7 +2,7 @@ class Ariava < Formula
   desc "Apple Watch-first local bridge for coding-agent collaboration"
   homepage "https://github.com/noyyyy/ariava"
 
-  # Publication is intentionally fail-closed until a reviewed Public Core
+  # Publication is intentionally fail-closed until a reviewed Public Repo
   # release artifact exists. The candidate review must replace both placeholders
   # with a versioned public npm tarball URL and its real SHA-256 together.
   PUBLIC_ARTIFACT_URL = "ARIAVA_PUBLIC_ARTIFACT_URL_PENDING_REVIEW".freeze
@@ -12,12 +12,12 @@ class Ariava < Formula
   url PUBLIC_ARTIFACT_URL
   version "0.1.4"
   sha256 PUBLIC_ARTIFACT_SHA256
-  disable! date: "2026-07-16", because: "awaiting reviewed Public Core release artifact metadata"
+  disable! date: "2026-07-16", because: "awaiting reviewed Public Repo release artifact metadata"
 
   depends_on "node"
 
   def install
-    odie "Public Core artifact metadata has not been reviewed" unless PUBLIC_ARTIFACT_READY
+    odie "Public Repo artifact metadata has not been reviewed" unless PUBLIC_ARTIFACT_READY
 
     libexec.install "package.json"
     (libexec/"apps/bridge").install "apps/bridge/dist"

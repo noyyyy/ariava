@@ -10,7 +10,7 @@ export function runHostVerification(options = {}) {
   const platform = options.platform ?? process.platform;
   if (platform !== 'darwin') {
     const logError = options.consoleError ?? console.error;
-    logError(`verify:host is the local Darwin host gate; current platform is ${platform}. Linux verification is owned by the Public Core CI lane.`);
+    logError(`verify:host is the local Darwin host gate; current platform is ${platform}. Linux verification is owned by the Public Repo CI lane.`);
     return 1;
   }
 

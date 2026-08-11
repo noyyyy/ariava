@@ -1,4 +1,4 @@
-name: Public Core CI
+name: Public Repo CI
 
 on:
   pull_request:
@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # actions/checkout v5.1.0
-      - name: Check out Public Core
+      - name: Check out Public Repo
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
@@ -44,7 +44,7 @@ jobs:
       - name: Install frozen dependencies
         run: bun install --frozen-lockfile
 
-      - name: Verify Public Core on Linux
+      - name: Verify Public Repo on Linux
         run: bun run verify:linux
 
   macos:
@@ -52,7 +52,7 @@ jobs:
     runs-on: macos-latest
     steps:
       # actions/checkout v5.1.0
-      - name: Check out Public Core
+      - name: Check out Public Repo
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
@@ -81,5 +81,5 @@ jobs:
       - name: Install frozen dependencies
         run: bun install --frozen-lockfile
 
-      - name: Verify Public Core on macOS
+      - name: Verify Public Repo on macOS
         run: bun run verify:macos

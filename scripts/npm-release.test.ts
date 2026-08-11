@@ -208,7 +208,7 @@ describe('release contract', () => {
     ]);
   });
 
-  test('common versions exactly cover bump-script manifests and Public Core lock workspaces', () => {
+  test('common versions exactly cover bump-script manifests and Public Repo lock workspaces', () => {
     const root = fixture();
     try {
       expect(validateCommonVersions(root, VERSION, { includeGenerated: true })).toBe(VERSION);

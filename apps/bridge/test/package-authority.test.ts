@@ -22,7 +22,7 @@ afterEach(() => {
 });
 
 describe('Ariava package authority', () => {
-  test('resolves the Public Core manifest from the source lifecycle depth', () => {
+  test('resolves the Public Repo manifest from the source lifecycle depth', () => {
     const expectedRoot = resolve(import.meta.dir, '..', '..', '..');
     const authority = findAriavaPackageAuthority(artifactUrl(join(
       expectedRoot,

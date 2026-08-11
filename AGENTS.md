@@ -26,7 +26,7 @@ This repository contains the Ariava Bridge, pi extension, protocol, and shared u
 
 Reviewed test roots classify files by suffix:
 
-- `*.test.ts` — shared Public Core coverage;
+- `*.test.ts` — shared Public Repo coverage;
 - `*.macos.test.ts` — native macOS lane;
 - `*.linux.test.ts` — native Linux lane;
 - `*.integration.test.*` — explicit opt-in integration, excluded from ordinary lanes.

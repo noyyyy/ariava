@@ -34,7 +34,7 @@ import { inspectCurrentNodeRuntime } from '../../runtime/node-runtime';
 import { runNodeCryptoSelfTest } from '../../e2e/node-crypto-self-test';
 import type { ProfileProbeEvidence, ProfileRuntimeProbe } from '../probes/profile';
 
-function resolvePublicCoreRoot(modulePath: string): string {
+function resolvePublicRepoRoot(modulePath: string): string {
   let candidate = dirname(modulePath);
   while (true) {
     const packagePath = resolve(candidate, 'package.json');
@@ -48,13 +48,13 @@ function resolvePublicCoreRoot(modulePath: string): string {
     if (parent === candidate) break;
     candidate = parent;
   }
-  throw new Error(`Unable to locate the Ariava Public Core root from ${modulePath}`);
+  throw new Error(`Unable to locate the Ariava Public Repo root from ${modulePath}`);
 }
 
-const PUBLIC_CORE_ROOT = resolvePublicCoreRoot(fileURLToPath(import.meta.url));
-const SOURCE_PI_EXTENSION_PATH = resolve(PUBLIC_CORE_ROOT, 'extensions', 'pi', 'index.ts');
+const PUBLIC_REPO_ROOT = resolvePublicRepoRoot(fileURLToPath(import.meta.url));
+const SOURCE_PI_EXTENSION_PATH = resolve(PUBLIC_REPO_ROOT, 'extensions', 'pi', 'index.ts');
 const DEV_BRIDGE_VERSION = resolveCliVersion('dev', () => (
-  JSON.parse(readFileSync(resolve(PUBLIC_CORE_ROOT, 'package.json'), 'utf8')) as { version?: unknown }
+  JSON.parse(readFileSync(resolve(PUBLIC_REPO_ROOT, 'package.json'), 'utf8')) as { version?: unknown }
 ));
 
 interface DevBridgeDaemon {

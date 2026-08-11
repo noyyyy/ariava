@@ -16,7 +16,7 @@ export function usage() {
 
 Modes:
   --prepare --output-dir <empty-dir>
-      Frozen-install and fully verify Public Core, pack and inspect both exact
+      Frozen-install and fully verify Public Repo, pack and inspect both exact
       tarballs, smoke-test the prepared ariava tarball in an isolated prefix,
       and atomically create release-manifest.json. This dry preparation makes
       no registry writes and does not require npm login or OIDC.
@@ -52,7 +52,7 @@ Required release context:
   default branch, and reject a supplied ref that does not match it.
 
 Options:
-  --root <path>                 Public Core checkout (default: repository root)
+  --root <path>                 Public Repo checkout (default: repository root)
   --output-dir <path>           Empty preparation output directory
   --tag <tag>                   Stable release tag (default: GITHUB_REF_NAME)
   --default-branch-ref <ref>    Validated refs/remotes/origin/* ref; local runs
