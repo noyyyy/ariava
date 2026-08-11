@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateHostRotationIdentity } from '../src/identity/host-identity';
+import { resetHostIdentity } from '../src/identity/manager';
 import { createRuntimeHostIdentityStore } from '../src/identity/runtime-store';
 import {
   MACOS_IDENTITY_KEYCHAIN_SERVICE,
@@ -187,6 +188,24 @@ describe('MacOSKeychainHostIdentityStore', () => {
     expect(readFileSync(devPath)).toEqual(metadata);
     expect(runner.items.get(identity.hostId)).toEqual(current);
     expect(runner.items.has(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev)).toBe(false);
+  });
+
+  test('explicit reset repairs corrupt metadata without deleting untrusted Keychain accounts', async () => {
+    const runner = new FakeKeychain();
+    const path = metadataPath();
+    const store = new MacOSKeychainHostIdentityStore(path, runner);
+    const previous = await store.createFirstRun();
+    const previousKey = runner.snapshot(previous.hostId);
+    writeFileSync(path, '{bad json');
+
+    const result = await resetHostIdentity(store, 'https://relay.test');
+
+    expect(result.revokedOldIdentity).toBe(false);
+    expect(result.warning).toContain('ERR_IDENTITY_INVALID');
+    expect(result.identity.hostId).not.toBe(previous.hostId);
+    expect(runner.snapshot(previous.hostId)).toEqual(previousKey);
+    expect((await store.load())?.hostId).toBe(result.identity.hostId);
+    expect(await store.inspect()).toMatchObject({ status: 'ready', hostId: result.identity.hostId });
   });
 
   test('requires an absolute secure metadata path before any Keychain write', async () => {

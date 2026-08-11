@@ -268,7 +268,7 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
 
   async resetAfterExplicitConfirmation(): Promise<HostIdentity> {
     const hasMetadata = this.metadataEvidence();
-    const previous = hasMetadata ? this.readMetadata() : undefined;
+    const previous = hasMetadata ? this.readMetadataForReset() : undefined;
     const interrupted = this.readCreationSentinelIfPresent();
     const generated = await generateHostIdentity({ type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: 'pending-reset' });
     const metadata = withKeychainStorage(generated.identity, generated.identity.hostId);
@@ -389,6 +389,19 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
       if (error instanceof HostIdentityError) throw error;
       const code = error instanceof SecureFileError ? 'ERR_IDENTITY_PERMISSIONS' : 'ERR_IDENTITY_INVALID';
       throw new HostIdentityError(code, 'macOS Host identity metadata is invalid', error);
+    }
+  }
+
+  private readMetadataForReset(): MacIdentityMetadataFile | undefined {
+    try {
+      return this.readMetadata();
+    } catch (error) {
+      if (error instanceof HostIdentityError
+        && error.code === 'ERR_IDENTITY_INVALID'
+        && this.hasIndexEvidence()) {
+        return undefined;
+      }
+      throw error;
     }
   }
 

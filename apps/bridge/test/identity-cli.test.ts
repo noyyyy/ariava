@@ -3,9 +3,15 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runPublicCli } from '../src/public-cli-app';
-import { HostIdentityError, LinuxJsonHostIdentityStore, publicIdentityMetadata } from '../src/identity';
+import {
+  HostIdentityError,
+  LinuxJsonHostIdentityStore,
+  MacOSKeychainHostIdentityStore,
+  publicIdentityMetadata,
+} from '../src/identity';
 import type { ServiceManager } from '../src/host-manager';
 import { createDefaultProfile } from '../src/cli/profiles/default';
+import { FakeKeychain } from './fixtures/fake-keychain';
 
 const roots: string[] = [];
 const originalFetch = globalThis.fetch;
@@ -331,15 +337,18 @@ describe('identity-safe public CLI', () => {
     } });
   });
 
-  test('corrupt explicit reset enrolls the new identity and reports zero links with warning', async () => {
+  test('public Host reset repairs corrupt macOS Keychain metadata and enrolls the replacement', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-reset-enroll-')); roots.push(home);
     const profile = withProfileHome(home, createDefaultProfile);
     const root = profile.resources.root;
     mkdirSync(root, { recursive: true, mode: 0o700 });
     const identityPath = profile.resources.identityMetadataPath;
-    const original = await new LinuxJsonHostIdentityStore(identityPath).createFirstRun();
+    const keychain = new FakeKeychain();
+    const store = new MacOSKeychainHostIdentityStore(identityPath, keychain);
+    const original = await store.createFirstRun();
+    const originalKey = keychain.snapshot(original.hostId);
     await Bun.write(identityPath, '{bad json');
-    let config: any = { identity: publicIdentityMetadata(original), identityPath, hostName: 'Linux host' };
+    let config: any = { identity: publicIdentityMetadata(original), identityPath, hostName: 'macOS host' };
     const paths: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init); paths.push(new URL(request.url).pathname);
@@ -350,11 +359,15 @@ describe('identity-safe public CLI', () => {
     const output: string[] = []; const errors: string[] = [];
     const deps = cliDeps(root, identityPath, () => config, (next) => { config = next; }, output, errors);
     deps.createProfile = () => profile;
+    deps.createHostIdentityStore = (path: string) => new MacOSKeychainHostIdentityStore(path, keychain);
     const code = await runPublicCli(['host', 'reset', '--confirm', '--json'], deps);
     expect(code, errors.join('')).toBe(0);
     expect(paths).toEqual(['/v2/bridge/enroll']);
     expect(JSON.parse(output[0]!).data).toMatchObject({ hostId: config.identity.hostId, links: [], revokedOldIdentity: false });
     expect(JSON.parse(output[0]!).data.warning).toContain('ERR_IDENTITY_INVALID');
+    expect(config.identity.hostId).not.toBe(original.hostId);
+    expect(keychain.snapshot(original.hostId)).toEqual(originalKey);
+    expect((await store.load())?.hostId).toBe(config.identity.hostId);
   });
 });
 
