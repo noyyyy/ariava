@@ -14,7 +14,8 @@ import {
 } from '../../../packages/protocol/dist/index.js';
 
 const publicRepoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const vectors = JSON.parse(readFileSync(resolve(publicRepoRoot, 'packages/protocol/test/fixtures/e2e-v2-vectors.json'), 'utf8'));
+const vectorsPath = resolve(publicRepoRoot, 'packages/protocol/test/fixtures/e2e-v2-vectors.json');
+const vectors = JSON.parse(readFileSync(vectorsPath, 'utf8'));
 const decode = (value) => new Uint8Array(Buffer.from(value, 'base64url'));
 
 test('Node 22 production crypto matches the frozen X25519/HKDF/ChaChaPoly vector', () => {

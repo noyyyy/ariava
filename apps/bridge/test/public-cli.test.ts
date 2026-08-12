@@ -13,6 +13,7 @@ const publicRepoRoot = join(import.meta.dir, '..', '..', '..');
 const roots: string[] = [];
 const bunPath = process.execPath;
 const cliPath = join(publicRepoRoot, 'apps', 'bridge', 'src', 'public-cli.ts');
+const harnessPath = join(publicRepoRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
 
 function isolatedEnv(home: string, overrides: Record<string, string | undefined> = {}) {
   return createIsolatedPublicCliEnvironment(home, overrides).env;
@@ -721,7 +722,6 @@ describe('public ariava CLI', () => {
     roots.push(home);
     const configRoot = join(home, '.config', 'ariava');
     secureJsonFixture(join(configRoot, 'config.json'), {});
-    const harnessPath = join(publicRepoRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
     const proc = Bun.spawn({
       cmd: [bunPath, harnessPath, 'uninstall', '--purge', '--json'],
       cwd: process.cwd(),
@@ -745,7 +745,6 @@ describe('public ariava CLI', () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     roots.push(home);
 
-    const harnessPath = join(publicRepoRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
     const proc = Bun.spawn({
       cmd: [bunPath, harnessPath, 'init', '--json'],
       cwd: process.cwd(),
@@ -990,7 +989,6 @@ describe('public ariava CLI', () => {
   });
 
   describe('injectable cross-platform service commands', () => {
-    const harnessPath = join(publicRepoRoot, 'apps', 'bridge', 'test', 'fixtures', 'public-cli-harness.ts');
 
     async function runHarness(home: string, scenario: string, ...args: string[]) {
       return runHarnessWithEnv(home, scenario, {}, ...args);
