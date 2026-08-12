@@ -591,19 +591,22 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,
         sessionId: command.sessionId, accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z' });
       const spool = (store as any).spool;
+      let cleanupFailureInjected = false;
       if (boundary === 'spool-remove') spool.removeMany = () => { throw new Error('spool remove failed'); };
       else {
         const originalWriteState = (store as any).writeState;
-        let writes = 0;
-        (store as any).writeState = (path: string, value: unknown) => {
-          writes += 1;
-          if (writes === 2) throw new Error('journal cleanup failed');
+        (store as any).writeState = (path: string, value: { terminalCancellations?: unknown }) => {
+          if (!cleanupFailureInjected && value.terminalCancellations === undefined) {
+            cleanupFailureInjected = true;
+            throw new Error('journal cleanup failed');
+          }
           originalWriteState(path, value);
         };
       }
       expect(registry.unregister('sess-1')).toBe(true);
       expect(registry.hasSession('sess-1')).toBe(false);
       expect(store.peekPendingEvents()).toEqual([]);
+      if (boundary === 'journal-cleanup') expect(cleanupFailureInjected).toBe(true);
       store.dispose();
       const restarted = initializedStore(dir);
       expect(restarted.peekPendingEvents()).toEqual([]);
