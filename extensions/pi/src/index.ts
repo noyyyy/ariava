@@ -595,7 +595,11 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       );
       heartbeatContext.status = 'idle';
       heartbeatContext.latestActivityText = session.latestActivityText;
-      await adapter.heartbeat(session.sessionId, 'idle', session.latestActivityText ?? null, session);
+      try {
+        await adapter.heartbeat(session.sessionId, 'idle', session.latestActivityText ?? null, session);
+      } catch (error) {
+        logExtensionError('heartbeat aborted session', error);
+      }
       return;
     }
 

@@ -1,4 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, setDefaultTimeout, test } from 'bun:test';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AgentAdapter, AgentAdapterEvent } from '../src/adapter-interface';
@@ -140,6 +142,16 @@ function deferred<T>() {
     resolve = promiseResolve;
   });
   return { promise, resolve };
+}
+
+async function waitForFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      if (readFileSync(path, 'utf8').length > 0) return;
+    } catch {}
+    await Bun.sleep(10);
+  }
+  throw new Error(`Timed out waiting for ${path}`);
 }
 
 describe('ariavaPiExtension settled lifecycle', () => {
@@ -353,6 +365,35 @@ describe('ariavaPiExtension settled lifecycle', () => {
     expect(missing.terminalEvents()).toEqual([]);
     await aborted.shutdown();
     await missing.shutdown();
+  });
+
+  test('aborted agent_settled records heartbeat failure without rejecting the pi lifecycle', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pi-aborted-heartbeat-'));
+    const logPath = join(directory, 'extension.log');
+    const originalLogPath = process.env.ARIAVA_PI_LOG_PATH;
+    process.env.ARIAVA_PI_LOG_PATH = logPath;
+    const harness = createHarness({
+      adapter: {
+        heartbeat: async (_sessionId, status) => {
+          if (status === 'idle') throw new Error('local bridge unavailable');
+        },
+      },
+    });
+    try {
+      await harness.start();
+      await end(harness, { stopReason: 'aborted' });
+
+      await expect(harness.emit('agent_settled')).resolves.toBeUndefined();
+      await waitForFile(logPath);
+      expect(readFileSync(logPath, 'utf8')).toContain('heartbeat aborted session');
+      expect(readFileSync(logPath, 'utf8')).toContain('local bridge unavailable');
+      expect(harness.terminalEvents()).toEqual([]);
+      await harness.shutdown();
+    } finally {
+      if (originalLogPath === undefined) delete process.env.ARIAVA_PI_LOG_PATH;
+      else process.env.ARIAVA_PI_LOG_PATH = originalLogPath;
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   test('queued follow-up runner sequence classifies only the final low-level result', async () => {
