@@ -369,6 +369,27 @@ describe('portable host-manager status', () => {
     });
   });
 
+  test.each([
+    { processRunning: false, statePresent: true, expected: 'offline' },
+    { processRunning: true, statePresent: false, expected: 'degraded' },
+    { processRunning: true, statePresent: true, expected: 'online' },
+  ] as const)('derives Bridge health from live process and state evidence: $expected', ({ processRunning, statePresent, expected }) => {
+    const statePath = join(homeOverride, 'bridge-health-state.json');
+    const config = resolveAriavaConfig({ relayBaseUrl: 'https://relay.example.test', hostId: 'host-1', hostName: 'Host', statePath }, join(homeOverride, 'config.json'));
+    const bridgeConfig = {
+      hostId: 'host-1', hostName: 'Host', hostPlatform: 'linux', relayBaseUrl: config.relayBaseUrl, statePath,
+      identityPath: config.identityPath, configPath: config.configPath, pollIntervalMs: 1000, bridgeVersion: '0.1.4',
+      agentAdapter: { port: 7272, secret: 'secret', configPath: config.agentAdapterConfigPath },
+    } satisfies BridgeConfig;
+    const status = buildHostManagerStatus({
+      config, bridgeConfig, installMetadata: {},
+      serviceStatus: { support: { supported: true, reason: 'supported' }, installed: true, enabled: true, loaded: true, processRunning },
+      piStatus: { installed: false, installPath: '/tmp/pi', managed: false, managedMetadataPath: '/tmp/pi/meta' },
+      cliVersion: '0.1.4', statePresent,
+    });
+    expect(status.bridgeHealth).toBe(expected);
+  });
+
   test('projects bounded runtime degradation into status without exposing diagnostics', () => {
     const statePath = join(homeOverride, 'runtime-health-state.json');
     const config = resolveAriavaConfig({ relayBaseUrl: 'https://relay.example.test', hostId: 'host-1', hostName: 'Host', statePath }, join(homeOverride, 'config.json'));

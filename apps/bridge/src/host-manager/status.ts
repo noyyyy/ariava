@@ -80,9 +80,9 @@ export function buildHostManagerStatus(args: {
   return {
     cliVersion,
     configComplete: isConfigComplete(config),
-    bridgeHealth: args.runtimeHealth?.status === 'degraded'
-      ? 'degraded'
-      : deriveBridgeHealth(bridgeConfig.statePath, serviceStatus.installed, args.statePresent),
+    bridgeHealth: deriveBridgeHealth(
+      bridgeConfig.statePath, serviceStatus.processRunning, args.runtimeHealth, args.statePresent,
+    ),
     ...(args.runtimeHealth ? { runtimeHealth: structuredClone(args.runtimeHealth) } : {}),
     hostId: config.identity?.hostId ?? bridgeConfig.hostId,
     hostName: config.hostName || bridgeConfig.hostName,
@@ -131,9 +131,11 @@ export function isConfigComplete(config: ResolvedAriavaConfig): boolean {
 
 function deriveBridgeHealth(
   statePath: string,
-  serviceInstalled: boolean,
+  processRunning: boolean,
+  runtimeHealth: BridgeRuntimeHealth | undefined,
   statePresent = existsSync(statePath),
 ): 'online' | 'degraded' | 'offline' {
-  if (statePresent) return 'online';
-  return serviceInstalled ? 'degraded' : 'offline';
+  if (!processRunning) return 'offline';
+  if (!statePresent || runtimeHealth?.status === 'degraded') return 'degraded';
+  return 'online';
 }
