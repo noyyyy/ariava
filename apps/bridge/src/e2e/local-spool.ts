@@ -153,7 +153,11 @@ export class MacOSSpoolKeyStore implements SpoolKeyStore {
   }
   removeForHostReplacement(expectedOldHostId?: string): void {
     if (!pathHasFilesystemEvidence(this.evidencePath)) return;
-    const evidence = parseMacOSSpoolEvidence(readSecureJson<unknown>(this.evidencePath), expectedOldHostId);
+    const evidence = parseMacOSSpoolEvidence(readSecureJson<unknown>(this.evidencePath));
+    if (expectedOldHostId === undefined || evidence.hostId !== expectedOldHostId) {
+      removeSecureFileIfPresent(this.evidencePath);
+      return;
+    }
     const result = this.runner.run(MACOS_SECURITY_PATH, [
       'delete-generic-password', '-s', SERVICE, '-a', evidence.account,
     ]);

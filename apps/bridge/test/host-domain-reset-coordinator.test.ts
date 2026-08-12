@@ -458,6 +458,13 @@ describe('Host-domain reset coordinator recovery', () => {
       };
       return store;
     };
+    const spoolCleanupHostIds: Array<string | undefined> = [];
+    const originalSpoolCreate = value.context.hostReplacementSpoolKey.create;
+    value.context.hostReplacementSpoolKey.create = (resources, platform) => {
+      const store = originalSpoolCreate(resources, platform);
+      store.removeForHostReplacement = (expectedOldHostId) => { spoolCleanupHostIds.push(expectedOldHostId); };
+      return store;
+    };
 
     await expect(resetHostDomain(
       value.context, value.dependencies(crashOnceAtPhase('signing-replacement-pending')),
@@ -471,6 +478,7 @@ describe('Host-domain reset coordinator recovery', () => {
     expect(result.hostId).not.toBe(futureDatedOldIdentity!.hostId);
     expect(result.warning).toContain('ERR_IDENTITY_INVALID');
     expect(value.counts()).toEqual({ signingReplacements: 1, encryptionReplacements: 1 });
+    expect(spoolCleanupHostIds).toEqual([undefined]);
   });
 
   test('live dev runtime fails before journal, Relay, signing, E2E, or config effects', async () => {

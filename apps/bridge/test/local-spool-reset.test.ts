@@ -134,11 +134,43 @@ describe('Host replacement local-spool key removal', () => {
     }
   });
 
-  test('macOS rejects malformed or mismatched evidence before Keychain access', () => {
+  test('macOS removes well-formed historical evidence without deleting its unrelated Keychain item', () => {
+    for (const version of [1, 2] as const) {
+      const evidencePath = join(root(), 'host.spool.json');
+      const account = `host-spool:${otherHostId}`;
+      const evidence = version === 1
+        ? { version, hostId: otherHostId, account }
+        : { version, hostId: otherHostId, account, keyId: spoolKeyIdForKey(key) };
+      writeFileSync(evidencePath, JSON.stringify(evidence), { mode: 0o600 });
+      const keychain = new FakeKeychain();
+      keychain.items.set(account, key);
+
+      new MacOSSpoolKeyStore(evidencePath, keychain).removeForHostReplacement(hostId);
+
+      expect(keychain.calls).toHaveLength(0);
+      expect(keychain.items.has(account)).toBe(true);
+      expect(existsSync(evidencePath)).toBe(false);
+    }
+  });
+
+  test('macOS without trusted old Host proof removes only well-formed evidence', () => {
+    const evidencePath = join(root(), 'host.spool.json');
+    const account = `host-spool:${hostId}`;
+    writeFileSync(evidencePath, JSON.stringify({ version: 1, hostId, account }), { mode: 0o600 });
+    const keychain = new FakeKeychain();
+    keychain.items.set(account, key);
+
+    new MacOSSpoolKeyStore(evidencePath, keychain).removeForHostReplacement();
+
+    expect(keychain.calls).toHaveLength(0);
+    expect(keychain.items.has(account)).toBe(true);
+    expect(existsSync(evidencePath)).toBe(false);
+  });
+
+  test('macOS rejects malformed evidence before Keychain access', () => {
     const evidencePath = join(root(), 'host.spool.json');
     const keychain = new FakeKeychain();
     for (const evidence of [
-      { version: 1, hostId: otherHostId, account: `host-spool:${otherHostId}` },
       { version: 1, hostId, account: `host-spool:${otherHostId}` },
       { version: 1, hostId, account: `host-spool:${hostId}`, extra: true },
       { version: 2, hostId, account: `host-spool:${hostId}`, keyId: 'invalid' },
