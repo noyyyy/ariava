@@ -10,6 +10,7 @@ import {
   MACOS_IDENTITY_EVIDENCE_ACCOUNTS,
   type MacOSIdentityProfile,
 } from '../identity/macos-keychain-store';
+import { runtimeLockPathForState, runtimeTakeoverMutexPathForState } from '../runtime-lock';
 
 export type AriavaProfileId = 'default' | 'dev';
 export type ProfileFilesystemProbeObserver = (path: string) => void;
@@ -26,6 +27,14 @@ export interface ProfileResourceSet {
   readonly agentAdapterConfigPath: string;
   readonly agentAdapterPort: number;
   readonly piExtensionLogPath: string;
+  readonly installMetadataPath: string;
+  readonly encryptedSpoolPath: string;
+  readonly runtimeResetIntentPath: string;
+  readonly runtimeLockPath: string;
+  readonly runtimeTakeoverMutexPath: string;
+  readonly macosSpoolEvidencePath: string;
+  readonly linuxSpoolKeyPath: string;
+  readonly hostDomainResetJournalPath: string;
 }
 
 export interface AriavaProfileDescriptor {
@@ -168,6 +177,14 @@ export function assertProfileDescriptor(descriptor: AriavaProfileDescriptor): vo
     statePath: join(resources.root, 'state', 'bridge-state.json'),
     agentAdapterConfigPath: join(resources.root, 'agent-adapter.json'),
     piExtensionLogPath: join(resources.root, 'pi-extension.log'),
+    installMetadataPath: join(resources.root, 'install.json'),
+    encryptedSpoolPath: `${resources.statePath}.spool.json`,
+    runtimeResetIntentPath: `${resources.statePath}.runtime-reset.json`,
+    runtimeLockPath: runtimeLockPathForState(resources.statePath),
+    runtimeTakeoverMutexPath: runtimeTakeoverMutexPathForState(resources.statePath),
+    macosSpoolEvidencePath: `${resources.identityMetadataPath}.spool.json`,
+    linuxSpoolKeyPath: `${resources.identityMetadataPath}.spool-key.json`,
+    hostDomainResetJournalPath: join(resources.root, 'host-domain-reset.json'),
   };
   const paths = resourcePaths(resources);
   for (const [name, expectedPath] of Object.entries(expectedPaths)) {
@@ -224,7 +241,13 @@ export function resolveProfileResources(
     identityMetadataPath: selectedIdentityPath,
     encryptionIdentityPath: hostEncryptionIdentityPath(selectedIdentityPath),
     linkKeyringPath: hostLinkKeyringPath(selectedIdentityPath),
+    macosSpoolEvidencePath: `${selectedIdentityPath}.spool.json`,
+    linuxSpoolKeyPath: `${selectedIdentityPath}.spool-key.json`,
     statePath: config.statePath,
+    encryptedSpoolPath: `${config.statePath}.spool.json`,
+    runtimeResetIntentPath: `${config.statePath}.runtime-reset.json`,
+    runtimeLockPath: runtimeLockPathForState(config.statePath),
+    runtimeTakeoverMutexPath: runtimeTakeoverMutexPathForState(config.statePath),
     agentAdapterConfigPath: config.agentAdapterConfigPath,
     agentAdapterPort: config.agentAdapterPort,
   });
@@ -328,6 +351,14 @@ function resourcePaths(resources: ProfileResourceSet) {
     statePath: resources.statePath,
     agentAdapterConfigPath: resources.agentAdapterConfigPath,
     piExtensionLogPath: resources.piExtensionLogPath,
+    installMetadataPath: resources.installMetadataPath,
+    encryptedSpoolPath: resources.encryptedSpoolPath,
+    runtimeResetIntentPath: resources.runtimeResetIntentPath,
+    runtimeLockPath: resources.runtimeLockPath,
+    runtimeTakeoverMutexPath: resources.runtimeTakeoverMutexPath,
+    macosSpoolEvidencePath: resources.macosSpoolEvidencePath,
+    linuxSpoolKeyPath: resources.linuxSpoolKeyPath,
+    hostDomainResetJournalPath: resources.hostDomainResetJournalPath,
   };
 }
 
@@ -463,6 +494,14 @@ function resourceSet(
     agentAdapterConfigPath: paths.agentAdapterConfigPath,
     agentAdapterPort: paths.agentAdapterPort,
     piExtensionLogPath: paths.piExtensionLogPath,
+    installMetadataPath: join(paths.root, 'install.json'),
+    encryptedSpoolPath: `${paths.statePath}.spool.json`,
+    runtimeResetIntentPath: `${paths.statePath}.runtime-reset.json`,
+    runtimeLockPath: runtimeLockPathForState(paths.statePath),
+    runtimeTakeoverMutexPath: runtimeTakeoverMutexPathForState(paths.statePath),
+    macosSpoolEvidencePath: `${paths.identityPath}.spool.json`,
+    linuxSpoolKeyPath: `${paths.identityPath}.spool-key.json`,
+    hostDomainResetJournalPath: join(paths.root, 'host-domain-reset.json'),
   };
 }
 

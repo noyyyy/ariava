@@ -2,7 +2,8 @@ import {
   enrollCurrentIdentity,
   inspectPublicIdentity,
   publicIdentityMetadata,
-  resetHostIdentity,
+  replaceHostIdentityAfterRevoke,
+  revokeHostIdentityForReset,
   rotateHostIdentity,
   HostIdentityError,
   type HostEncryptionIdentity,
@@ -11,9 +12,11 @@ import {
   type HostIdentityStore,
 } from '../../identity';
 import type { HostPlatform, KeyRotationResponse } from '@ariava/protocol';
-import { probeHostPlatform } from '../../host-platform';
 import { buildProfileInitializedConfig } from './initialize';
 import { loadResolvedProfileConfig, type AriavaProfileCliContext } from '../context';
+import { resetHostDomain, type HostDomainResetPrimitive, type HostDomainResetResult } from './host-domain-reset';
+import { AriavaCliError } from '../../host-manager/service/errors';
+import { loadHostDomainResetJournal } from './host-domain-reset-journal';
 
 export async function inspectProfileIdentity(
   context: AriavaProfileCliContext,
@@ -36,74 +39,64 @@ export async function rotateProfileIdentity(
   dependencies: ProfileIdentityRotationDependencies = defaultRotationDependencies,
 ): Promise<KeyRotationResponse> {
   context.validation.descriptor();
-  const { fileConfig, resolved, resources } = loadResolvedProfileConfig(context);
-  const store = context.identity.create(resources, context.platform);
-  const result = await dependencies.rotate(store, resolved.relayBaseUrl);
-  const identity = await store.load();
-  if (!identity) throw new HostIdentityError('ERR_IDENTITY_MISSING', 'Rotated identity could not be loaded');
-  saveProfileConfig(context, { ...fileConfig, identity: publicIdentityMetadata(identity) });
-  return result;
+  const loaded = loadResolvedProfileConfig(context);
+  return context.hostIdentityOperationLock.run(loaded.resources, async () => {
+    const { fileConfig, resolved, resources } = loaded;
+    const journal = loadHostDomainResetJournal(resources);
+    if (journal) {
+      throw new AriavaCliError(
+        'ERR_HOST_RESET_IN_PROGRESS',
+        `Host reset recovery is pending at phase ${journal.phase}; key rotation is blocked.`,
+        {
+          phase: journal.phase, operationId: journal.operationId, retryable: true,
+          remediation: { message: 'Resume the pending Host reset before rotating the Host key.' },
+        },
+      );
+    }
+    const store = context.identity.create(resources, context.platform);
+    const result = await dependencies.rotate(store, resolved.relayBaseUrl);
+    const identity = await store.load();
+    if (!identity) throw new HostIdentityError('ERR_IDENTITY_MISSING', 'Rotated identity could not be loaded');
+    saveProfileConfig(context, { ...fileConfig, identity: publicIdentityMetadata(identity) });
+    return result;
+  });
 }
 
 export interface ProfileIdentityResetDependencies {
   bridgeVersion: string;
-  reset(store: HostIdentityStore, relayBaseUrl: string): Promise<{
-    identity: HostIdentity;
-    revokedOldIdentity: boolean;
-    warning?: string;
+  enroll: HostDomainResetPrimitive['enroll'];
+  revoke?: HostDomainResetPrimitive['revoke'];
+  replace?: HostDomainResetPrimitive['replace'];
+  reset?(store: HostIdentityStore, relayBaseUrl: string): Promise<{
+    identity: HostIdentity; revokedOldIdentity: boolean; warning?: string;
   }>;
-  enroll(
-    relayBaseUrl: string,
-    identity: HostIdentity,
-    metadata: { hostName: string; platform: HostPlatform; bridgeVersion: string },
-    encryptionIdentity: HostEncryptionIdentity,
-  ): Promise<void>;
 }
 
-export interface ProfileIdentityResetResult {
-  hostId: string;
-  keyId: string;
-  revokedOldIdentity: boolean;
-  links: [];
-  warning?: string;
-}
+export type ProfileIdentityResetResult = HostDomainResetResult;
 
 export async function resetProfileIdentity(
   context: AriavaProfileCliContext,
   dependencies: ProfileIdentityResetDependencies,
 ): Promise<ProfileIdentityResetResult> {
-  context.validation.descriptor();
-  const loaded = loadResolvedProfileConfig(context);
-  const baseConfig = buildProfileInitializedConfig(context, loaded.fileConfig);
-  const resolved = { ...loaded.resolved, ...baseConfig };
-  const resources = context.validation.resolved(resolved);
-  const store = context.identity.create(resources, context.platform);
-  const result = await dependencies.reset(store, resolved.relayBaseUrl);
-  const encryptionIdentity = context.encryptionIdentity
-    .create(resources, context.platform)
-    .replaceForReset(result.identity.hostId);
-  const config = {
-    ...baseConfig,
-    identity: publicIdentityMetadata(result.identity),
-  };
-  saveProfileConfig(context, config);
-  await dependencies.enroll(
-    resolved.relayBaseUrl,
-    result.identity,
-    {
-      hostName: resolved.hostName,
-      platform: probeHostPlatform(context.platform),
-      bridgeVersion: dependencies.bridgeVersion,
+  if (dependencies.revoke && dependencies.replace) return resetHostDomain(context, dependencies as HostDomainResetPrimitive);
+  let legacyReplacement: HostIdentity | undefined;
+  const legacyReset = dependencies.reset;
+  if (!legacyReset) throw new TypeError('Host reset dependencies are incomplete');
+  return resetHostDomain(context, {
+    bridgeVersion: dependencies.bridgeVersion,
+    enroll: dependencies.enroll,
+    async revoke(identity, relayBaseUrl) {
+      const { resources } = loadResolvedProfileConfig(context);
+      const store = context.identity.create(resources, context.platform);
+      const result = await legacyReset(store, relayBaseUrl);
+      legacyReplacement = result.identity;
+      return result.revokedOldIdentity ? 'revoked' : 'identity-already-revoked';
     },
-    encryptionIdentity,
-  );
-  return {
-    hostId: result.identity.hostId,
-    keyId: result.identity.keyId,
-    revokedOldIdentity: result.revokedOldIdentity,
-    links: [],
-    ...(result.warning ? { warning: result.warning } : {}),
-  };
+    async replace() {
+      if (!legacyReplacement) throw new TypeError('Legacy Host reset did not produce a replacement identity');
+      return legacyReplacement;
+    },
+  });
 }
 
 export function createDefaultProfileIdentityResetDependencies(
@@ -111,7 +104,8 @@ export function createDefaultProfileIdentityResetDependencies(
 ): ProfileIdentityResetDependencies {
   return {
     bridgeVersion,
-    reset: resetHostIdentity,
+    revoke: revokeHostIdentityForReset,
+    replace: replaceHostIdentityAfterRevoke,
     enroll: enrollCurrentIdentity,
   };
 }

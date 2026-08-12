@@ -58,5 +58,8 @@ export interface HostIdentityStore {
   stageRotation(next: PendingHostIdentity): Promise<void>;
   abortRotation(operationId: string): Promise<void>;
   promoteRotation(operationId: string): Promise<HostIdentity>;
-  resetAfterExplicitConfirmation(): Promise<HostIdentity>;
+  resetAfterExplicitConfirmation(operationId?: string): Promise<HostIdentity>;
+  recoverExplicitReset?(operationId: string): Promise<HostIdentity | null>;
+  completeExplicitReset?(operationId: string): void;
+  deleteAfterHostReplacement?(account: string): void;
 }

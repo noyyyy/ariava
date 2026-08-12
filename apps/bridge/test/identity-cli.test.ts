@@ -360,6 +360,7 @@ describe('identity-safe public CLI', () => {
     const deps = cliDeps(root, identityPath, () => config, (next) => { config = next; }, output, errors);
     deps.createProfile = () => profile;
     deps.createHostIdentityStore = (path: string) => new MacOSKeychainHostIdentityStore(path, keychain);
+    deps.hostIdentityOperationLock = { run: (_resources, operation) => operation() };
     const code = await runPublicCli(['host', 'reset', '--confirm', '--json'], deps);
     expect(code, errors.join('')).toBe(0);
     expect(paths).toEqual(['/v2/bridge/enroll']);

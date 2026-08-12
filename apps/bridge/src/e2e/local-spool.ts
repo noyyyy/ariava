@@ -3,11 +3,17 @@ import { base64UrlDecode, base64UrlEncode, encodeLengthPrefixedFields } from '@a
 import {
   pathHasFilesystemEvidence,
   readSecureJson,
+  removeSecureFileIfPresent,
   writeSecureJson,
   writeSecureJsonExclusive,
   type SecureFileWriteHooks,
 } from '../host-manager/secure-files';
-import { MACOS_SECURITY_PATH, SpawnKeychainCommandRunner, type KeychainCommandRunner } from '../identity/macos-keychain-store';
+import {
+  isKeychainMissing,
+  MACOS_SECURITY_PATH,
+  SpawnKeychainCommandRunner,
+  type KeychainCommandRunner,
+} from '../identity/macos-keychain-store';
 import { ChaChaPolyAuthenticationError, chachaPolyOpen, chachaPolySeal } from './node-crypto';
 
 const LOCAL_SPOOL_PAYLOAD_KINDS = [
@@ -48,6 +54,10 @@ const SERVICE = 'io.noyx.ariava.local-spool-v1';
 const encoder = new TextEncoder();
 
 export interface SpoolKeyStore { loadOrCreate(hostId: string, options?: { allowCreate?: boolean }): Uint8Array; }
+export interface HostReplacementSpoolKeyStore {
+  removeForHostReplacement(expectedOldHostId?: string): void;
+  assertAbsentForHostReplacement(): void;
+}
 export interface SpoolRecoveryReport { droppedUnreadableItems: number }
 
 export class LocalSpoolRecoveryRequiredError extends Error {
@@ -58,7 +68,7 @@ export class LocalSpoolRecoveryRequiredError extends Error {
 }
 
 export class LinuxSpoolKeyStore implements SpoolKeyStore {
-  constructor(private readonly path: string) {}
+  constructor(private readonly path: string, private readonly uid?: number) {}
   loadOrCreate(hostId: string, options: { allowCreate?: boolean } = {}): Uint8Array {
     if (!pathHasFilesystemEvidence(this.path)) {
       if (options.allowCreate === false) throw new LocalSpoolRecoveryRequiredError('local spool key is missing; recovery is required');
@@ -78,6 +88,18 @@ export class LinuxSpoolKeyStore implements SpoolKeyStore {
       throw new LocalSpoolRecoveryRequiredError('local spool key verifier is invalid; recovery is required');
     }
     return key;
+  }
+  removeForHostReplacement(expectedOldHostId?: string): void {
+    if (!pathHasFilesystemEvidence(this.path)) return;
+    const record = readSecureJson<unknown>(this.path, this.uid);
+    const parsed = parseLinuxSpoolKey(record, expectedOldHostId);
+    parsed.key.fill(0);
+    removeSecureFileIfPresent(this.path, this.uid);
+  }
+  assertAbsentForHostReplacement(): void {
+    if (pathHasFilesystemEvidence(this.path)) {
+      throw new LocalSpoolRecoveryRequiredError('local spool key evidence remains; recovery is required');
+    }
   }
 }
 
@@ -114,6 +136,9 @@ export class MacOSSpoolKeyStore implements SpoolKeyStore {
       }
       return key;
     }
+    if (!isKeychainMissing(existing)) {
+      throw new LocalSpoolRecoveryRequiredError('local spool Keychain read is uncertain; recovery is required');
+    }
     if (options.allowCreate === false || pathHasFilesystemEvidence(this.evidencePath)) {
       throw new LocalSpoolRecoveryRequiredError('local spool Keychain item is missing; recovery is required');
     }
@@ -126,11 +151,36 @@ export class MacOSSpoolKeyStore implements SpoolKeyStore {
     } satisfies MacOSSpoolKeyEvidenceV2, undefined, this.evidenceWriteHooks);
     return new Uint8Array(key);
   }
+  removeForHostReplacement(expectedOldHostId?: string): void {
+    if (!pathHasFilesystemEvidence(this.evidencePath)) return;
+    const evidence = parseMacOSSpoolEvidence(readSecureJson<unknown>(this.evidencePath), expectedOldHostId);
+    const result = this.runner.run(MACOS_SECURITY_PATH, [
+      'delete-generic-password', '-s', SERVICE, '-a', evidence.account,
+    ]);
+    if (result.error || (result.status !== 0 && !isKeychainMissing(result))) {
+      throw new LocalSpoolRecoveryRequiredError('local spool Keychain deletion is uncertain; recovery is required');
+    }
+    removeSecureFileIfPresent(this.evidencePath);
+  }
+  assertAbsentForHostReplacement(): void {
+    if (pathHasFilesystemEvidence(this.evidencePath)) {
+      throw new LocalSpoolRecoveryRequiredError('local spool Keychain evidence remains; recovery is required');
+    }
+  }
 }
 
-export function createRuntimeSpoolKeyStore(identityPath: string, platform: NodeJS.Platform | string): SpoolKeyStore {
-  return platform === 'darwin' ? new MacOSSpoolKeyStore(`${identityPath}.spool.json`)
+export function createRuntimeSpoolKeyStore(
+  identityPath: string, platform: NodeJS.Platform | string,
+  runner?: KeychainCommandRunner,
+): SpoolKeyStore & HostReplacementSpoolKeyStore {
+  return platform === 'darwin' ? new MacOSSpoolKeyStore(`${identityPath}.spool.json`, runner)
     : new LinuxSpoolKeyStore(`${identityPath}.spool-key.json`);
+}
+
+export function createRuntimeHostReplacementSpoolKeyStore(
+  identityPath: string, platform: NodeJS.Platform | string, runner?: KeychainCommandRunner,
+ ): HostReplacementSpoolKeyStore {
+  return createRuntimeSpoolKeyStore(identityPath, platform, runner);
 }
 
 export class LocalEncryptedSpool {
@@ -279,6 +329,55 @@ export class LocalEncryptedSpool {
       hostId: this.hostId, keyId: this.keyId, items,
     } satisfies LocalSpoolFileV2);
   }
+}
+
+function parseLinuxSpoolKey(value: unknown, expectedOldHostId?: string): { key: Uint8Array } {
+  if (!isRecord(value) || !hasExactKeys(value, value.version === 1
+    ? ['version', 'hostId', 'key']
+    : ['version', 'hostId', 'keyId', 'key'])) throw invalidSpoolEvidence();
+  if ((value.version !== 1 && value.version !== 2) || !isCanonicalHostId(value.hostId)
+    || (expectedOldHostId !== undefined && value.hostId !== expectedOldHostId)
+    || typeof value.key !== 'string') throw invalidSpoolEvidence();
+  let key: Uint8Array;
+  try { key = base64UrlDecode(value.key, 32, 'local spool key'); } catch { throw invalidSpoolEvidence(); }
+  if (value.version === 2 && value.keyId !== spoolKeyIdForKey(key)) {
+    key.fill(0);
+    throw invalidSpoolEvidence();
+  }
+  return { key };
+}
+
+function parseMacOSSpoolEvidence(value: unknown, expectedOldHostId?: string): MacOSSpoolKeyEvidenceV1 | MacOSSpoolKeyEvidenceV2 {
+  if (!isRecord(value) || !hasExactKeys(value, value.version === 1
+    ? ['version', 'hostId', 'account']
+    : ['version', 'hostId', 'account', 'keyId'])) throw invalidSpoolEvidence();
+  if ((value.version !== 1 && value.version !== 2) || !isCanonicalHostId(value.hostId)
+    || (expectedOldHostId !== undefined && value.hostId !== expectedOldHostId)
+    || value.account !== `host-spool:${value.hostId}`
+    || (value.version === 2 && !isCanonicalSpoolKeyId(value.keyId))) throw invalidSpoolEvidence();
+  return value as unknown as MacOSSpoolKeyEvidenceV1 | MacOSSpoolKeyEvidenceV2;
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function isCanonicalHostId(value: unknown): value is string {
+  return typeof value === 'string' && /^host_[A-Za-z0-9_-]{43}$/u.test(value);
+}
+
+function isCanonicalSpoolKeyId(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/u.test(value);
+}
+
+function invalidSpoolEvidence(): LocalSpoolRecoveryRequiredError {
+  return new LocalSpoolRecoveryRequiredError('local spool key metadata is invalid; recovery is required');
 }
 
 export function spoolPathForState(statePath: string): string { return `${statePath}.spool.json`; }

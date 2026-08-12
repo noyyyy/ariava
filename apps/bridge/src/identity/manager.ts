@@ -87,6 +87,32 @@ export async function rotateHostIdentity(
   }
 }
 
+export async function revokeHostIdentityForReset(
+  identity: HostIdentity,
+  relayBaseUrl: string,
+): Promise<'revoked' | 'identity-already-revoked'> {
+  try {
+    const result = await new RelayClient({ baseUrl: relayBaseUrl, signer: identity.signer }).revokeIdentity();
+    if (result.entityId !== identity.hostId || result.status !== 'revoked' || !isCanonicalTimestamp(result.revokedAt)) {
+      throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Relay returned a malformed Host identity revoke result');
+    }
+    return 'revoked';
+  } catch (error) {
+    if (error instanceof RelayClientError && error.status === 401
+      && isExactIdentityRevokedBody(error.body)) return 'identity-already-revoked';
+    throw error;
+  }
+}
+
+export async function replaceHostIdentityAfterRevoke(store: HostIdentityStore, operationId?: string): Promise<HostIdentity> {
+  return store.resetAfterExplicitConfirmation(operationId);
+}
+
+function isExactIdentityRevokedBody(body: unknown): boolean {
+  return Boolean(body && typeof body === 'object' && !Array.isArray(body)
+    && (body as Record<string, unknown>).code === 'identity_revoked');
+}
+
 export async function resetHostIdentity(
   store: HostIdentityStore,
   relayBaseUrl: string,

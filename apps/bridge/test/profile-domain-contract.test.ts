@@ -562,7 +562,7 @@ describe('profile-aware identity rotation and reset', () => {
       bridgeVersion: '1.2.3-test',
     });
     expect(harness.config(profileId).identity).toMatchObject({ hostId: result.hostId, keyId: result.keyId });
-    expect(actionIndex(harness, profileId, 'encryption.replace')).toBeLessThan(actionIndex(harness, profileId, 'filesystemWrites'));
+    expect(enrollment).toMatchObject({ encryptionHostId: result.hostId });
     expect(harness.sentinelBytes(unselected)).toEqual(sentinelBefore);
     expectZeroAccess(harness, unselected);
   });

@@ -13,6 +13,7 @@ import type {
   CommandResult,
   CommandRunner,
   ServiceInstallInput,
+  ServiceInstallOptions,
   ServiceLogs,
   ServiceManager,
   ServiceStatus,
@@ -92,7 +93,7 @@ export class SystemdUserServiceManager implements ServiceManager {
     this.now = dependencies.now ?? isoNow;
   }
 
-  install(input: ServiceInstallInput): AriavaServiceInstallRecord {
+  install(input: ServiceInstallInput, options: ServiceInstallOptions = {}): AriavaServiceInstallRecord {
     this.assertSupported();
     const runtimePath = absoluteServicePath(input.runtimePath, 'runtimePath');
     const ariavaBinPath = absoluteServicePath(input.ariavaBinPath, 'ariavaBinPath');
@@ -122,8 +123,12 @@ export class SystemdUserServiceManager implements ServiceManager {
     }
 
     this.runSystemctl(['--user', 'daemon-reload'], 'ERR_SERVICE_INSTALL', secrets);
+    const enabled = options.enabled ?? true;
+    const start = options.start ?? true;
     this.runSystemctl(
-      ['--user', 'enable', '--now', this.serviceId],
+      enabled
+        ? ['--user', 'enable', ...(start ? ['--now'] : []), this.serviceId]
+        : ['--user', 'disable', ...(start ? ['--now'] : []), this.serviceId],
       'ERR_SERVICE_INSTALL',
       secrets,
     );

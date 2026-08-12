@@ -21,10 +21,17 @@ export async function runStatusCommand(
     return dependencies.runPiStatus();
   }
   if (argv.length !== 0) throw new Error('Usage: ariava status [pi]');
-  const status = dependencies.lifecycle.buildStatus(await probeProfile(dependencies));
+  const shared = await probeProfile(dependencies);
+  const status = dependencies.lifecycle.buildStatus(shared);
+  if (shared.hostDomainReset.pending && status && typeof status === 'object') {
+    Object.assign(status, { hostDomainReset: shared.hostDomainReset });
+  }
   const profileId = dependencies.context().profile.id;
+  const human = dependencies.lifecycle.formatStatus(status);
   return {
     envelope: { ok: true, code: 'ok', message: profileId === 'dev' ? 'Ariava dev host status.' : 'Ariava host status.', data: status },
-    human: dependencies.lifecycle.formatStatus(status),
+    human: shared.hostDomainReset.pending
+      ? `${human}\nHost reset: pending (${shared.hostDomainReset.phase})\nRemediation: ${shared.hostDomainReset.remediation}`
+      : human,
   };
 }

@@ -960,6 +960,14 @@ export function readCurrentRuntimeHealth(statePath: string): BridgeRuntimeHealth
   } catch { return undefined; }
 }
 
+export function assertCurrentRuntimeArtifacts(statePath: string, hostId: string): void {
+  const state = parseCurrentState(readSecureJson<unknown>(statePath), hostId);
+  const spool = parseCurrentSpoolRecord(
+    readSecureJson<Record<string, unknown>>(spoolPathForState(statePath)), hostId, state.runtimeResetEpoch,
+  );
+  assertCurrentRuntimeRelationships(state, spool, hostId);
+}
+
 function isRuntimeResetHooks(value: SecureFileWriteHooks | RuntimeResetHooks | undefined): value is RuntimeResetHooks {
   return value !== undefined && ('write' in value || 'remove' in value);
 }

@@ -2,7 +2,15 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathHasFilesystemEvidence, redactSensitive, readSecureJson, writeOwnerControlledFile, writeSecureFile, writeSecureJson } from '../src/host-manager/secure-files';
+import {
+  pathHasFilesystemEvidence,
+  redactSensitive,
+  readSecureJson,
+  removeSecureFileIfPresent,
+  writeOwnerControlledFile,
+  writeSecureFile,
+  writeSecureJson,
+} from '../src/host-manager/secure-files';
 
 const roots: string[] = [];
 function root(): string { const value = mkdtempSync(join(tmpdir(), 'ariava-secure-')); chmodSync(value, 0o700); roots.push(value); return value; }
@@ -147,6 +155,43 @@ describe('secure JSON files', () => {
     })).toThrow('Owner-controlled parent directory changed during atomic write');
     expect(pathHasFilesystemEvidence(target)).toBe(false);
     expect(pathHasFilesystemEvidence(join(displaced, 'ariava.service'))).toBe(false);
+  });
+
+  test('validates secure parents even when the removal target is absent', () => {
+    const base = root();
+    const secureParent = join(base, 'secure-parent');
+    mkdirSync(secureParent, { mode: 0o700 });
+    expect(() => removeSecureFileIfPresent(join(secureParent, 'missing.json'))).not.toThrow();
+
+    chmodSync(secureParent, 0o755);
+    expect(() => removeSecureFileIfPresent(join(secureParent, 'missing.json'))).toThrow();
+    chmodSync(secureParent, 0o700);
+    expect(() => removeSecureFileIfPresent(
+      join(secureParent, 'missing.json'),
+      (process.getuid?.() ?? 0) + 1,
+    )).toThrow();
+
+    const symlinkTarget = join(base, 'symlink-target');
+    mkdirSync(symlinkTarget, { mode: 0o700 });
+    const symlinkParent = join(base, 'symlink-parent');
+    symlinkSync(symlinkTarget, symlinkParent);
+    expect(() => removeSecureFileIfPresent(join(symlinkParent, 'missing.json'))).toThrow();
+  });
+
+  test('preserves a replacement inode introduced immediately before secure unlink', () => {
+    const base = root();
+    const target = join(base, 'journal.json');
+    const replacement = join(base, 'replacement.json');
+    writeFileSync(target, 'original', { mode: 0o600 });
+    writeFileSync(replacement, 'replacement', { mode: 0o600 });
+
+    expect(() => removeSecureFileIfPresent(target, undefined, {
+      beforeUnlink() {
+        renameSync(replacement, target);
+      },
+    })).toThrow(/changed|removal/i);
+
+    expect(readFileSync(target, 'utf8')).toBe('replacement');
   });
 
   test('agent adapter loader fails closed on dangling discovery symlink evidence', async () => {

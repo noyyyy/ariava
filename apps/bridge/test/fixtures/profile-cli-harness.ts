@@ -68,6 +68,7 @@ export function createProfileCliHarness(): ProfileCliHarness {
     default: fakeIdentity('default'),
     dev: fakeIdentity('dev'),
   };
+  const hostIdentityOperationTails = new Map<string, Promise<void>>();
 
   for (const profile of Object.values(profiles)) {
     mkdirSync(profile.resources.root, { recursive: true, mode: 0o700 });
@@ -110,9 +111,31 @@ export function createProfileCliHarness(): ProfileCliHarness {
           saveUserConfig(config, path);
         },
       },
+      hostIdentityOperationLock: {
+        async run(resources, operation) {
+          const lockPath = resources.hostDomainResetJournalPath;
+          const previous = hostIdentityOperationTails.get(lockPath) ?? Promise.resolve();
+          let release!: () => void;
+          const barrier = new Promise<void>((resolve) => { release = resolve; });
+          const tail = previous.then(() => barrier);
+          hostIdentityOperationTails.set(lockPath, tail);
+          await previous;
+          events.push({ profile: profile.id, initiatedBy: profile.id, action: 'hostIdentityOperationLock.run', path: lockPath });
+          try {
+            return await operation();
+          } finally {
+            release();
+            if (hostIdentityOperationTails.get(lockPath) === tail) hostIdentityOperationTails.delete(lockPath);
+          }
+        },
+      },
       identity: {
         create() {
-          return fakeIdentityStore(profile, identities[profile.id], counters[profile.id], events);
+          return fakeIdentityStore(
+            profile, identities[profile.id], counters[profile.id], events,
+            () => identities[profile.id],
+            (replacement) => { identities[profile.id] = replacement; },
+          );
         },
       },
       encryptionIdentity: {
@@ -128,7 +151,7 @@ export function createProfileCliHarness(): ProfileCliHarness {
             replaceForReset: () => {
               counters[profile.id].filesystemWrites += 1;
               events.push({ profile: profile.id, initiatedBy: profile.id, action: 'encryption.replace', path: resources.encryptionIdentityPath });
-              return fakeEncryptionIdentity(profile.id);
+              return fakeEncryptionIdentity(profile.id, identities[profile.id].hostId);
             },
           };
         },
@@ -162,23 +185,24 @@ function fakeIdentityStore(
   identity: HostIdentity,
   counters: ProfileAccessCounters,
   events: ProfileAccessEvent[],
+  readIdentity: () => HostIdentity = () => identity,
+  persistIdentity: (identity: HostIdentity) => void = () => {},
 ): HostIdentityStore {
-  const inspection = fakeInspection(profile, identity);
   return {
     async inspect() {
       counters.keychainProbes += 1;
       events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainProbes', path: profile.resources.identityMetadataPath });
-      return inspection;
+      return fakeInspection(profile, readIdentity());
     },
     async load() {
       counters.keychainReads += 1;
       events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainReads', path: profile.resources.identityMetadataPath });
-      return identity;
+      return readIdentity();
     },
     async createFirstRun() {
       counters.keychainWrites += 1;
       events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainWrites', path: profile.resources.identityMetadataPath });
-      return identity;
+      return readIdentity();
     },
     async loadPending(): Promise<PendingHostIdentity | null> {
       counters.keychainReads += 1;
@@ -196,20 +220,27 @@ function fakeIdentityStore(
     async promoteRotation() {
       counters.keychainWrites += 1;
       events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainWrites', path: profile.resources.identityMetadataPath });
-      return identity;
+      return readIdentity();
     },
     async resetAfterExplicitConfirmation() {
       counters.keychainDeletes += 1;
       counters.keychainWrites += 1;
       events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainDeletes', path: profile.resources.identityMetadataPath });
       events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainWrites', path: profile.resources.identityMetadataPath });
-      return identity;
+      const replacementSuffix = profile.id === 'default' ? 'R' : 'W';
+      const currentIdentity = fakeIdentityWithSuffix(profile.id, replacementSuffix);
+      persistIdentity(currentIdentity);
+      return currentIdentity;
     },
   };
 }
 
 function fakeIdentity(profile: AriavaProfileId): HostIdentity {
   const suffix = profile === 'default' ? 'D' : 'V';
+  return fakeIdentityWithSuffix(profile, suffix);
+}
+
+function fakeIdentityWithSuffix(profile: AriavaProfileId, suffix: string): HostIdentity {
   const hostId = `host_${suffix.repeat(43)}`;
   return {
     identityVersion: 2,
@@ -250,11 +281,11 @@ function fakeInspection(profile: AriavaProfileDescriptor, identity: HostIdentity
   };
 }
 
-function fakeEncryptionIdentity(profile: AriavaProfileId) {
+function fakeEncryptionIdentity(profile: AriavaProfileId, hostId = fakeIdentity(profile).hostId) {
   const suffix = profile === 'default' ? 1 : 2;
   return {
     version: 1 as const,
-    hostId: fakeIdentity(profile).hostId,
+    hostId,
     encryptionKeyId: `ekey_${profile}`,
     publicKey: `encryption-public-${profile}`,
     privateKeyPkcs8: new Uint8Array([suffix]),

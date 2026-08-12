@@ -32,6 +32,10 @@ import { prepareCommandForExecution } from './e2e/command-execution';
 import { LocalLinkKeyring } from './e2e/link-keyring';
 import { EncryptedUploadOrchestrator } from './e2e/upload-orchestrator';
 import { acquireRuntimeCoordinator, type RuntimeCoordinator } from './runtime-lock';
+import { createDefaultProfile } from './cli/profiles/default';
+import { createDevProfile } from './cli/profiles/dev';
+import { assertHostDomainResetRuntimeStartAllowed } from './cli/operations/host-domain-reset-journal';
+import { resolveAriavaDevProfilePaths } from './host-manager/dev-profile';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const BRIDGE_VERSION = readPackageVersion();
@@ -196,6 +200,12 @@ export class BridgeDaemon {
     private readonly reconciliationScheduler: ReconciliationScheduler = DEFAULT_RECONCILIATION_SCHEDULER,
     private readonly pollWaitScheduler: PollWaitScheduler = DEFAULT_POLL_WAIT_SCHEDULER,
   ) {
+    const journalPath = resolve(dirname(config.configPath), 'host-domain-reset.json');
+    if (pathHasFilesystemEvidence(journalPath)) {
+      const profile = configPathMatchesProfile(config.configPath, 'dev') ? createDevProfile() : createDefaultProfile();
+      const resources = profile.resolveResources(resolvePersistedAriavaConfig(config.configPath));
+      assertHostDomainResetRuntimeStartAllowed(resources);
+    }
     this.runtimeCoordinator = acquireRuntimeCoordinator(config.statePath);
     let stateStore: BridgeStateStore | undefined;
     try {
@@ -722,6 +732,11 @@ function samePersistedIdentity(
     && configured.algorithm === actual.algorithm
     && configured.createdAt === actual.createdAt
     && storageMatches;
+}
+
+
+function configPathMatchesProfile(configPath: string, profile: 'dev'): boolean {
+  return profile === 'dev' && resolve(configPath) === resolve(resolveAriavaDevProfilePaths().configPath);
 }
 
 

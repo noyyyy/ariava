@@ -1,3 +1,7 @@
+import { withHostIdentityOperationLock } from './operations/host-identity-operation-lock';
+import { unmanagedHostDomainResetLifecycle, type HostDomainResetLifecycleAdapter } from './operations/host-domain-reset';
+import { createRuntimeHostReplacementSpoolKeyStore, type HostReplacementSpoolKeyStore } from '../e2e/local-spool';
+import { acquireRuntimeCoordinator, type RuntimeCoordinator } from '../runtime-lock';
 import {
   assertProfileDescriptorForEffects,
   assertSelectedProfileResourcesForEffects,
@@ -127,6 +131,18 @@ export interface ProfileRelayFactory {
 
 export type ResolvedProfileResources = ReturnType<AriavaProfileDescriptor['resolveResources']>;
 
+export interface ProfileRuntimeCoordinatorFactory {
+  acquire(resources: ResolvedProfileResources): RuntimeCoordinator;
+}
+
+export interface ProfileHostReplacementSpoolKeyFactory {
+  create(resources: ResolvedProfileResources, platform: NodeJS.Platform | string): HostReplacementSpoolKeyStore;
+}
+
+export interface ProfileHostIdentityOperationLock {
+  run<T>(resources: ResolvedProfileResources, operation: () => Promise<T>): Promise<T>;
+}
+
 export interface AriavaProfileCliContext {
   profile: AriavaProfileDescriptor;
   platform: NodeJS.Platform | string;
@@ -142,6 +158,10 @@ export interface AriavaProfileCliContext {
   encryptionIdentity: ProfileEncryptionIdentityFactory;
   linkKeyring?: ProfileLinkKeyringFactory;
   relay?: ProfileRelayFactory;
+  runtimeCoordinator: ProfileRuntimeCoordinatorFactory;
+  hostReplacementSpoolKey: ProfileHostReplacementSpoolKeyFactory;
+  hostDomainResetLifecycle: HostDomainResetLifecycleAdapter;
+  hostIdentityOperationLock: ProfileHostIdentityOperationLock;
   validation: {
     descriptor(): void;
     selected(): void;
@@ -165,6 +185,10 @@ export interface CreateProfileCliContextInput {
   encryptionIdentity?: ProfileEncryptionIdentityFactory;
   linkKeyring?: ProfileLinkKeyringFactory;
   relay?: ProfileRelayFactory;
+  runtimeCoordinator?: ProfileRuntimeCoordinatorFactory;
+  hostReplacementSpoolKey?: ProfileHostReplacementSpoolKeyFactory;
+  hostDomainResetLifecycle?: HostDomainResetLifecycleAdapter;
+  hostIdentityOperationLock?: ProfileHostIdentityOperationLock;
   observeValidation?(phase: 'descriptor' | 'selected' | 'resolved'): void;
   observeFilesystemProbe?(path: string): void;
   access?(kind: ProfileAccessKind, path?: string): void;
@@ -198,6 +222,18 @@ export function createProfileCliContext(input: CreateProfileCliContextInput): Ar
     },
     linkKeyring: input.linkKeyring,
     relay: input.relay,
+    runtimeCoordinator: input.runtimeCoordinator ?? {
+      acquire: (resources) => acquireRuntimeCoordinator(resources.statePath, resources.encryptedSpoolPath),
+    },
+    hostReplacementSpoolKey: input.hostReplacementSpoolKey ?? {
+      create: (resources, platform) => createRuntimeHostReplacementSpoolKeyStore(
+        resources.identityMetadataPath, platform,
+      ),
+    },
+    hostDomainResetLifecycle: input.hostDomainResetLifecycle ?? unmanagedHostDomainResetLifecycle(),
+    hostIdentityOperationLock: input.hostIdentityOperationLock ?? {
+      run: (resources, operation) => withHostIdentityOperationLock(resources, operation),
+    },
     validation: {
       descriptor: () => {
         input.observeValidation?.('descriptor');

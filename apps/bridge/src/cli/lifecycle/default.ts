@@ -76,9 +76,14 @@ import { readAgentAdapterConfig } from '../../agent-adapter/config';
 import { inspectCurrentNodeRuntime, probeNodeRuntimePath } from '../../runtime/node-runtime';
 import { runNodeCryptoSelfTest } from '../../e2e/node-crypto-self-test';
 import { createDefaultProfile } from '../profiles/default';
-import { createProfileCliContext, type AriavaCliApplicationContext } from '../context';
+import {
+  createProfileCliContext,
+  type AriavaCliApplicationContext,
+  type ProfileHostIdentityOperationLock,
+} from '../context';
 import type { AriavaProfileDescriptor } from '../profile';
 import { createDefaultProfileIdentityResetDependencies } from '../operations/identity';
+import type { HostDomainResetLifecycleAdapter } from '../operations/host-domain-reset';
 import { createDefaultPairProfileDependencies } from '../operations/pair';
 import { normalizeCliFailure, type CliFailure } from '../failure';
 import { runSharedHostCommand } from '../commands';
@@ -123,6 +128,7 @@ export interface PublicCliDependencies {
   probeRuntimePath(path: string): ReturnType<typeof inspectCurrentNodeRuntime>;
   cryptoSelfTest(): boolean;
   createPairDependencies(bridgeVersion: string): ReturnType<typeof createDefaultPairProfileDependencies>;
+  hostIdentityOperationLock?: ProfileHostIdentityOperationLock;
 }
 
 export interface PublicCliOnboardingDependencies {
@@ -306,7 +312,7 @@ function createDefaultStatusDependencies(deps: PublicCliDependencies) {
           cliVersion: CLI_VERSION,
           identityInspection: shared.identity,
           statePresent: shared.paths.statePresent,
-          runtimeHealth: readRuntimeHealth(shared.paths.statePath),
+          runtimeHealth: shared.hostDomainReset.pending ? undefined : readRuntimeHealth(shared.paths.statePath),
         });
       },
       formatStatus: (status: unknown) => formatStatus(status as ReturnType<typeof buildHostManagerStatus>),
@@ -361,7 +367,7 @@ function createDefaultDoctorDependencies(deps: PublicCliDependencies) {
           documentMetadataValid: metadataResult.diagnostics.documentMetadataValid !== false,
           logsAvailable: manager.logsAvailable(),
           statePathParentExists: shared.paths.statePathParentExists,
-          bridgeRuntimeHealth: readRuntimeHealth(shared.paths.statePath),
+          bridgeRuntimeHealth: shared.hostDomainReset.pending ? undefined : readRuntimeHealth(shared.paths.statePath),
           relayConfigured: shared.relay.configured,
           identity: shared.identity,
           agentAdapterConfigPath: shared.adapter.configPath,
@@ -434,6 +440,8 @@ function createDefaultProfileContext(
         resources.identityProfile,
       ),
     },
+    hostDomainResetLifecycle: createDefaultHostDomainResetLifecycle(deps),
+    hostIdentityOperationLock: deps.hostIdentityOperationLock,
   });
 }
 
@@ -1134,6 +1142,89 @@ function selectionPublicArgs(selection: { extensions: readonly string[] }, publi
   if (publicArgs.includes('--extension') || publicArgs.includes('--no-extensions')) return [...publicArgs];
   if (selection.extensions.includes('pi')) return ['--extension', 'pi', ...publicArgs];
   return ['--no-extensions', ...publicArgs];
+}
+
+
+export function createDefaultHostDomainResetLifecycle(deps: PublicCliDependencies): HostDomainResetLifecycleAdapter {
+  let manager: ServiceManager | undefined;
+  let record: AriavaInstallMetadata['service'];
+  const runtimePath = () => deps.realpath(deps.currentRuntimePath());
+  const binPath = () => deps.realpath(deps.currentAriavaBinPath());
+  return {
+    prepare() {
+      manager = deps.createServiceManager();
+      requireServiceSupport(manager);
+      const metadata = deps.loadInstallMetadataDetailed();
+      if (!metadata.diagnostics.serviceMetadataValid) {
+        throw new AriavaCliError('ERR_SERVICE_METADATA', 'Service metadata is invalid; repair it before Host reset.');
+      }
+      record = metadata.metadata.service;
+      if (!record) {
+        return { managed: true, installed: false, enabled: false, wasRunning: false, backend: manager.backend! };
+      }
+      if (record.backend !== manager.backend) {
+        throw new AriavaCliError('ERR_SERVICE_METADATA', 'Service backend does not match the current platform.');
+      }
+      const status = manager.status(record, runtimePath(), binPath());
+      if (!status.installed) {
+        throw new AriavaCliError(
+          'ERR_SERVICE_METADATA',
+          'Service install metadata is stale; remove or repair it before Host reset.',
+        );
+      }
+      return { managed: true, installed: true, enabled: status.enabled, wasRunning: status.processRunning, backend: record.backend };
+    },
+    stopAndConfirm(snapshot) {
+      if (!snapshot.installed || !record || !manager) return;
+      if (snapshot.wasRunning) manager.stop(record);
+      const status = manager.status(record, runtimePath(), binPath());
+      if (status.processRunning) throw new AriavaCliError('ERR_SERVICE_COMMAND', 'Ariava service did not stop before Host reset.');
+    },
+    synchronizeMetadata(snapshot, identityReference) {
+      if (!snapshot.installed || !record || !manager) return;
+      const resolved = deps.resolveAriavaConfig();
+      const refreshed = manager.install({ ...serviceInstallInput(deps, resolved), identityReference }, {
+        enabled: snapshot.enabled,
+        start: false,
+      });
+      record = refreshed;
+      deps.mergeInstallMetadata({ service: refreshed, identityPath: resolved.identityPath });
+    },
+    restoreAndConfirm(snapshot, identityReference) {
+      if (!snapshot.installed || !record || !manager) return false;
+      assertIdentityReference(record, identityReference);
+      const current = manager.status(record, runtimePath(), binPath());
+      if (snapshot.wasRunning && !current.processRunning) manager.start(record);
+      return assertRestoredState(snapshot, record, manager, runtimePath(), binPath());
+    },
+    validateRestored(snapshot, identityReference) {
+      if (!snapshot.installed || !record || !manager) return false;
+      assertIdentityReference(record, identityReference);
+      return assertRestoredState(snapshot, record, manager, runtimePath(), binPath());
+    },
+  };
+}
+
+
+function assertIdentityReference(
+  record: NonNullable<AriavaInstallMetadata['service']>,
+  expected: NonNullable<AriavaInstallMetadata['service']>['identityReference'],
+): void {
+  if (JSON.stringify(record.identityReference) !== JSON.stringify(expected)) {
+    throw new AriavaCliError('ERR_SERVICE_METADATA', 'Service metadata identity does not match the replacement Host.');
+  }
+}
+
+function assertRestoredState(
+  snapshot: Parameters<HostDomainResetLifecycleAdapter['restoreAndConfirm']>[0],
+  record: NonNullable<AriavaInstallMetadata['service']>,
+  manager: ServiceManager, runtimePath: string, binPath: string,
+): boolean {
+  const status = manager.status(record, runtimePath, binPath);
+  if (status.processRunning !== snapshot.wasRunning) {
+    throw new AriavaCliError('ERR_SERVICE_COMMAND', 'Ariava service state could not be restored after Host reset.');
+  }
+  return status.processRunning;
 }
 
 

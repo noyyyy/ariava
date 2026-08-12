@@ -15,6 +15,9 @@ export interface FakeKeychainCall {
 export class FakeKeychain implements KeychainCommandRunner {
   readonly calls: FakeKeychainCall[] = [];
   readonly items = new Map<string, Uint8Array>();
+  deleteResult?: { status: number | null; stderr: string; error?: Error };
+  deleteResultForAccount?: (account: string) => { status: number | null; stderr: string; error?: Error } | undefined;
+  readResultForAccount?: (account: string) => { status: number | null; stderr: string; error?: Error } | undefined;
 
   run(command: string, args: readonly string[], stdin?: Uint8Array): KeychainCommandResult {
     if (command !== MACOS_SECURITY_PATH) return this.record(command, args, stdin, undefined, 'unsupported');
@@ -42,12 +45,23 @@ export class FakeKeychain implements KeychainCommandRunner {
       return this.record(command, args, stdin, account, 'write');
     }
     if (args[0] === 'find-generic-password') {
+      const result = this.readResultForAccount?.(account);
+      if (result) {
+        return this.record(command, args, stdin, account, 'read', result.status, result.stderr, new Uint8Array(), result.error);
+      }
       const value = this.items.get(account);
       return value
         ? this.record(command, args, stdin, account, 'read', 0, '', Buffer.from(`${Buffer.from(value).toString('hex')}\n`, 'utf8'))
-        : this.record(command, args, stdin, account, 'read', 44, 'could not be found');
+        : this.record(
+          command, args, stdin, account, 'read', 44,
+          'security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.',
+        );
     }
     if (args[0] === 'delete-generic-password') {
+      const result = this.deleteResultForAccount?.(account) ?? this.deleteResult;
+      if (result) {
+        return this.record(command, args, stdin, account, 'delete', result.status, result.stderr, new Uint8Array(), result.error);
+      }
       this.items.delete(account);
       return this.record(command, args, stdin, account, 'delete');
     }
@@ -76,8 +90,9 @@ export class FakeKeychain implements KeychainCommandRunner {
     status = 0,
     stderr = '',
     stdout: Uint8Array = new Uint8Array(),
+    error?: Error,
   ): KeychainCommandResult {
     this.calls.push({ command, args, ...(stdin ? { stdin } : {}), ...(account ? { account } : {}), action });
-    return { status, stdout, stderr };
+    return { status, stdout, stderr, ...(error ? { error } : {}) };
   }
 }

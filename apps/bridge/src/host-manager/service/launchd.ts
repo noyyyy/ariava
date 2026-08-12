@@ -16,6 +16,7 @@ import type {
   CommandResult,
   CommandRunner,
   ServiceInstallInput,
+  ServiceInstallOptions,
   ServiceLogs,
   ServiceManager,
   ServiceStatus,
@@ -31,6 +32,7 @@ export interface LaunchdServiceDefinition {
   stdoutPath: string;
   stderrPath: string;
   programArguments: string[];
+  enabled: boolean;
 }
 
 export interface LaunchdFileSystem {
@@ -127,7 +129,7 @@ export class LaunchdServiceManager implements ServiceManager {
     this.bootstrapRetryDelayMs = dependencies.bootstrapRetryDelayMs ?? DEFAULT_BOOTSTRAP_RETRY_DELAY_MS;
   }
 
-  install(input: ServiceInstallInput): AriavaServiceInstallRecord {
+  install(input: ServiceInstallInput, options: ServiceInstallOptions = {}): AriavaServiceInstallRecord {
     const runtimePath = absoluteServicePath(input.runtimePath, 'runtimePath');
     const ariavaBinPath = absoluteServicePath(input.ariavaBinPath, 'ariavaBinPath');
     const configPath = absoluteServicePath(input.configPath ?? ARIAVA_CONFIG_PATH, 'configPath');
@@ -136,6 +138,7 @@ export class LaunchdServiceManager implements ServiceManager {
       definitionPath: this.definitionPath,
       stdoutLogPath: this.stdoutLogPath,
       stderrLogPath: this.stderrLogPath,
+      enabled: options.enabled ?? true,
     });
     try {
       writeLaunchdServiceDefinition(this.fileSystem, definition);
@@ -150,7 +153,9 @@ export class LaunchdServiceManager implements ServiceManager {
 
     const secrets = [runtimePath, ariavaBinPath, configPath];
     this.unloadService(this.serviceId, 'ERR_SERVICE_INSTALL', secrets);
-    this.bootstrapDefinition(this.serviceId, this.definitionPath, 'ERR_SERVICE_INSTALL', secrets);
+    if (options.start ?? true) {
+      this.bootstrapDefinition(this.serviceId, this.definitionPath, 'ERR_SERVICE_INSTALL', secrets);
+    }
 
     return {
       backend: 'launchd',
@@ -200,9 +205,11 @@ export class LaunchdServiceManager implements ServiceManager {
     const definitionPath = record?.definitionPath ?? this.definitionPath;
     const serviceId = record?.serviceId ?? this.serviceId;
     // start must tolerate a half-unloaded or still-loaded agent: unload first,
-    // wait for launchd to drop the job, then bootstrap with transient retries.
+    // wait for launchd to drop the job, bootstrap with transient retries, then
+    // explicitly start definitions whose RunAtLoad/KeepAlive intent is disabled.
     this.unloadService(serviceId, 'ERR_SERVICE_COMMAND', secrets);
     this.bootstrapDefinition(serviceId, definitionPath, 'ERR_SERVICE_COMMAND', secrets);
+    this.runLaunchctl(['kickstart', this.serviceTarget(serviceId)], true, 'ERR_SERVICE_COMMAND', secrets);
   }
 
   stop(record?: AriavaServiceInstallRecord): void {
@@ -410,7 +417,9 @@ export function buildLaunchdServiceDefinition(
   configPathOrOverrides: string | {
     serviceId?: string; definitionPath?: string; stdoutLogPath?: string; stderrLogPath?: string;
   } = ARIAVA_CONFIG_PATH,
-  overrides: { serviceId?: string; definitionPath?: string; stdoutLogPath?: string; stderrLogPath?: string } = {},
+  overrides: {
+    serviceId?: string; definitionPath?: string; stdoutLogPath?: string; stderrLogPath?: string; enabled?: boolean;
+  } = {},
 ): LaunchdServiceDefinition {
   const absoluteNodePath = absoluteServicePath(nodePath, 'runtimePath');
   const absoluteAriavaBinPath = absoluteServicePath(ariavaBinPath, 'ariavaBinPath');
@@ -428,6 +437,7 @@ export function buildLaunchdServiceDefinition(
     stdoutPath: resolvedOverrides.stdoutLogPath ?? ARIAVA_STDOUT_LOG_PATH,
     stderrPath: resolvedOverrides.stderrLogPath ?? ARIAVA_STDERR_LOG_PATH,
     programArguments: [absoluteNodePath, absoluteAriavaBinPath, 'internal', 'bridge-daemon', '--config', absoluteConfigPath],
+    enabled: resolvedOverrides.enabled ?? true,
   };
 }
 
@@ -531,9 +541,9 @@ export function renderLaunchdPlist(definition: LaunchdServiceDefinition): string
 ${escapedArgs}
     </array>
     <key>RunAtLoad</key>
-    <true/>
+    <${definition.enabled ? 'true' : 'false'}/>
     <key>KeepAlive</key>
-    <true/>
+    <${definition.enabled ? 'true' : 'false'}/>
     <key>StandardOutPath</key>
     <string>${escapeXml(definition.stdoutPath)}</string>
     <key>StandardErrorPath</key>

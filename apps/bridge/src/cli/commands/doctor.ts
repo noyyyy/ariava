@@ -19,7 +19,9 @@ export async function runDoctorCommand(
   if (argv.length !== 0) throw new Error('Usage: ariava doctor');
   const shared = await probeProfile(dependencies);
   const checks = dependencies.lifecycle.buildChecks(shared);
+  if (shared.hostDomainReset.pending) checks.hostDomainReset = shared.hostDomainReset;
   const healthy = dependencies.lifecycle.healthy(checks, shared);
+  const human = dependencies.lifecycle.formatDoctor(checks);
   return {
     envelope: {
       ok: healthy,
@@ -27,7 +29,9 @@ export async function runDoctorCommand(
       message: healthy ? 'Ariava doctor completed.' : 'Ariava doctor found issues.',
       data: checks,
     } as AriavaCliCommandSuccess['envelope'],
-    human: dependencies.lifecycle.formatDoctor(checks),
+    human: shared.hostDomainReset.pending
+      ? `${human}\nHost reset: pending (${shared.hostDomainReset.phase})\nRemediation: ${shared.hostDomainReset.remediation}`
+      : human,
     exitCode: healthy ? 0 : 1,
   };
 }

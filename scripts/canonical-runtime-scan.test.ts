@@ -53,7 +53,7 @@ function stripRecognizedPriorResetDecoder(source: string, path: string): string 
   const resetDecoderArtifact = path === 'apps/bridge/src/state-store.ts'
     || path.match(/^apps\/bridge\/dist\/(?:cli|daemon|dev-profile-cli|public-cli|state-store)\.js$/u);
   if (!resetDecoderArtifact || !source.match(forbiddenRuntime)) return source;
-  const priorSessionKeys = source.match(/(?:const|var) PRIOR_SESSION_REQUIRED_KEYS = \[\.\.\.SESSION_REQUIRED_KEYS, ["']stateLabel["']\](?: as const)?;/u)?.[0];
+  const priorSessionKeys = source.match(/(?:^|\n)[ \t]*(?:(?:const|var) PRIOR_SESSION_REQUIRED_KEYS = \[\.\.\.SESSION_REQUIRED_KEYS, ["']stateLabel["']\](?: as const)?|PRIOR_SESSION_REQUIRED_KEYS = \[\.\.\.SESSION_REQUIRED_KEYS, ["']stateLabel["']\]);/u)?.[0];
   const decoder = source.match(/function isRecognizedPriorSession[^]*?function isRecognizedPriorSpoolMigration\([^)]*\)(?:: boolean)? \{[^]*?\}(?=\s*(?:function|$))/u)?.[0];
   expect(priorSessionKeys, path).toBeDefined();
   expect(decoder, path).toBeDefined();
@@ -94,6 +94,36 @@ describe('canonical runtime active-source and documentation scan', () => {
       const active = stripRecognizedPriorResetDecoder(readFileSync(file, 'utf8'), path);
       expect(active, path).not.toMatch(forbiddenRuntime);
     }
+  });
+
+  test('strips only the complete recognized-prior decoder in source and bundled forms', () => {
+    const decoder = [
+      'function isRecognizedPriorSession(value) { return value.stateLabel; }',
+      'function isRecognizedPriorEvent(value) { return value === "question_requested"; }',
+      'function isRecognizedPriorSpoolMigration(value) { return Boolean(value); }',
+      'function nextBundledHelper() {}',
+    ].join('\n');
+    const declarations = [
+      "const PRIOR_SESSION_REQUIRED_KEYS = [...SESSION_REQUIRED_KEYS, 'stateLabel'] as const;",
+      'var PRIOR_SESSION_REQUIRED_KEYS = [...SESSION_REQUIRED_KEYS, "stateLabel"];',
+      '  PRIOR_SESSION_REQUIRED_KEYS = [...SESSION_REQUIRED_KEYS, "stateLabel"];',
+    ];
+
+    for (const declaration of declarations) {
+      const active = stripRecognizedPriorResetDecoder(`${declaration}\n${decoder}`, 'apps/bridge/dist/dev-profile-cli.js');
+      expect(active).not.toMatch(forbiddenRuntime);
+    }
+
+    expect(() => stripRecognizedPriorResetDecoder(
+      `${declarations[2]}\nfunction isRecognizedPriorSession(value) { return value.stateLabel; }`,
+      'apps/bridge/dist/dev-profile-cli.js',
+    )).toThrow();
+
+    const unrelatedLegacyContent = stripRecognizedPriorResetDecoder(
+      `${declarations[2]}\n${decoder}\nconst unrelated = "stateLabel";`,
+      'apps/bridge/dist/dev-profile-cli.js',
+    );
+    expect(unrelatedLegacyContent).toMatch(forbiddenRuntime);
   });
 
   test('enforces the exact versioned Agent Adapter cutover', () => {

@@ -44,6 +44,11 @@ export interface ServiceInstallInput {
   installedAt?: string;
 }
 
+export interface ServiceInstallOptions {
+  enabled?: boolean;
+  start?: boolean;
+}
+
 export interface ServiceStatus {
   backend?: ServiceBackend;
   support: ServiceSupport;
@@ -81,7 +86,7 @@ export interface ServiceLogs {
 export interface ServiceManager {
   readonly backend?: ServiceBackend;
   readonly support: ServiceSupport;
-  install(input: ServiceInstallInput): AriavaServiceInstallRecord;
+  install(input: ServiceInstallInput, options?: ServiceInstallOptions): AriavaServiceInstallRecord;
   uninstall(record?: AriavaServiceInstallRecord): void;
   start(record?: AriavaServiceInstallRecord): void;
   stop(record?: AriavaServiceInstallRecord): void;

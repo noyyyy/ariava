@@ -138,6 +138,22 @@ describe('LaunchdServiceManager', () => {
     expect(plist).toContain(`<string>${stderrLogPath}</string>`);
   });
 
+  test('refreshes metadata while staying booted out and preserving disabled intent', () => {
+    const { manager, runner, definitionPath } = fixture();
+    manager.install({
+      runtimePath: '/opt/node/bin/node',
+      ariavaBinPath: '/opt/ariava/bin/ariava',
+      configPath: '/tmp/ariava-config.json',
+      identityReference: { type: 'macos-keychain', service: 'io.noyx.ariava.host-identity', account: 'host_new' },
+    }, { enabled: false, start: false });
+    expect(readFileSync(definitionPath, 'utf8')).toContain('<key>RunAtLoad</key>\n    <false/>');
+    expect(readFileSync(definitionPath, 'utf8')).toContain('<key>KeepAlive</key>\n    <false/>');
+    expect(runner.calls).toEqual([
+      { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },
+      { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },
+    ]);
+  });
+
   test('uses the expected launchctl lifecycle commands', () => {
     const { manager, runner, definitionPath } = fixture();
     const record = {
@@ -160,6 +176,7 @@ describe('LaunchdServiceManager', () => {
       { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },
       { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },
       { command: 'launchctl', args: ['bootstrap', 'gui/501', definitionPath] },
+      { command: 'launchctl', args: ['kickstart', 'gui/501/io.test.ariava'] },
       { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },
       { command: 'launchctl', args: ['kickstart', '-k', 'gui/501/io.test.ariava'] },
       { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },

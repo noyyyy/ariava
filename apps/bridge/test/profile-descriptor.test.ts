@@ -48,6 +48,14 @@ describe('trusted profile descriptors', () => {
         agentAdapterConfigPath: resolve(home, 'xdg', 'ariava', 'agent-adapter.json'),
         agentAdapterPort: 7272,
         piExtensionLogPath: resolve(home, 'xdg', 'ariava', 'pi-extension.log'),
+        installMetadataPath: resolve(home, 'xdg', 'ariava', 'install.json'),
+        encryptedSpoolPath: resolve(home, 'xdg', 'ariava', 'state', 'bridge-state.json.spool.json'),
+        runtimeResetIntentPath: resolve(home, 'xdg', 'ariava', 'state', 'bridge-state.json.runtime-reset.json'),
+        runtimeLockPath: resolve(home, 'xdg', 'ariava', 'state', 'bridge-state.json.runtime.lock'),
+        runtimeTakeoverMutexPath: resolve(home, 'xdg', 'ariava', 'state', 'bridge-state.json.runtime.lock.takeover'),
+        macosSpoolEvidencePath: resolve(home, 'xdg', 'ariava', 'host-identity.json.spool.json'),
+        linuxSpoolKeyPath: resolve(home, 'xdg', 'ariava', 'host-identity.json.spool-key.json'),
+        hostDomainResetJournalPath: resolve(home, 'xdg', 'ariava', 'host-domain-reset.json'),
       },
     });
     expect(defaultProfile.defaultHostName('workstation')).toBe('workstation');
@@ -68,6 +76,14 @@ describe('trusted profile descriptors', () => {
         agentAdapterConfigPath: resolve(home, '.config', 'ariava-dev', 'agent-adapter.json'),
         agentAdapterPort: 7273,
         piExtensionLogPath: resolve(home, '.config', 'ariava-dev', 'pi-extension.log'),
+        installMetadataPath: resolve(home, '.config', 'ariava-dev', 'install.json'),
+        encryptedSpoolPath: resolve(home, '.config', 'ariava-dev', 'state', 'bridge-state.json.spool.json'),
+        runtimeResetIntentPath: resolve(home, '.config', 'ariava-dev', 'state', 'bridge-state.json.runtime-reset.json'),
+        runtimeLockPath: resolve(home, '.config', 'ariava-dev', 'state', 'bridge-state.json.runtime.lock'),
+        runtimeTakeoverMutexPath: resolve(home, '.config', 'ariava-dev', 'state', 'bridge-state.json.runtime.lock.takeover'),
+        macosSpoolEvidencePath: resolve(home, '.config', 'ariava-dev', 'host-identity.json.spool.json'),
+        linuxSpoolKeyPath: resolve(home, '.config', 'ariava-dev', 'host-identity.json.spool-key.json'),
+        hostDomainResetJournalPath: resolve(home, '.config', 'ariava-dev', 'host-domain-reset.json'),
       },
     });
     expect(devProfile.defaultHostName('workstation')).toBe('workstation (Dev)');
@@ -242,6 +258,11 @@ describe('trusted profile descriptors', () => {
       agentAdapterConfigPath,
       agentAdapterPort: 8123,
       identityMetadataPath: defaultProfile.resources.identityMetadataPath,
+      encryptedSpoolPath: `${statePath}.spool.json`,
+      runtimeResetIntentPath: `${statePath}.runtime-reset.json`,
+      runtimeLockPath: `${statePath}.runtime.lock`,
+      runtimeTakeoverMutexPath: `${statePath}.runtime.lock.takeover`,
+      hostDomainResetJournalPath: join(defaultProfile.resources.root, 'host-domain-reset.json'),
     });
   });
 
@@ -258,6 +279,9 @@ describe('trusted profile descriptors', () => {
       identityMetadataPath: customIdentityPath,
       encryptionIdentityPath: `${customIdentityPath}.e2e.json`,
       linkKeyringPath: `${customIdentityPath}.e2e-keyring.json`,
+      macosSpoolEvidencePath: `${customIdentityPath}.spool.json`,
+      linuxSpoolKeyPath: `${customIdentityPath}.spool-key.json`,
+      hostDomainResetJournalPath: join(defaultProfile.resources.root, 'host-domain-reset.json'),
     });
 
     const devProfile = withProfileEnvironment(home, undefined, () => createDevProfile());
@@ -330,6 +354,14 @@ function resourcePaths(resources: ProfileResourceSet): string[] {
     resources.statePath,
     resources.agentAdapterConfigPath,
     resources.piExtensionLogPath,
+    resources.installMetadataPath,
+    resources.encryptedSpoolPath,
+    resources.runtimeResetIntentPath,
+    resources.runtimeLockPath,
+    resources.runtimeTakeoverMutexPath,
+    resources.macosSpoolEvidencePath,
+    resources.linuxSpoolKeyPath,
+    resources.hostDomainResetJournalPath,
   ];
 }
 

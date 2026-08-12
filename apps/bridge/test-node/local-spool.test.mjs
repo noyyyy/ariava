@@ -144,7 +144,11 @@ class FakeMacKeychain {
     if (args[0] === 'find-generic-password') {
       const value = this.items.get(args[args.indexOf('-a') + 1]);
       return value ? { status: 0, stdout: Buffer.from(`${Buffer.from(value).toString('hex')}\n`), stderr: '' }
-        : { status: 44, stdout: new Uint8Array(), stderr: 'missing' };
+        : {
+          status: 44,
+          stdout: new Uint8Array(),
+          stderr: 'security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.',
+        };
     }
     if (args[0] === '-i' && stdin) {
       const script = Buffer.from(stdin).toString('utf8');

@@ -90,7 +90,7 @@ export function assertSecureFile(path: string, uid = currentUid()): void {
   } catch (error) {
     throw new SecureFileError(`Secure file check failed: ${absolute}`, error);
   }
-  if (stat.isSymbolicLink() || !stat.isFile() || stat.uid !== uid || (stat.mode & 0o177) !== 0 || (stat.mode & 0o600) !== 0o600) {
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.uid !== uid || !hasExactSecureFileMode(stat.mode)) {
     throw new SecureFileError(`Secure file check failed: ${absolute}`);
   }
 }
@@ -120,7 +120,7 @@ export function readSecureFile(path: string, uid = currentUid()): Buffer {
   try {
     fd = openSync(absolute, constants.O_RDONLY | noFollowFlag());
     const stat = fstatSync(fd);
-    if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o177) !== 0 || (stat.mode & 0o600) !== 0o600) {
+    if (!stat.isFile() || stat.uid !== uid || !hasExactSecureFileMode(stat.mode)) {
       throw new SecureFileError(`Secure open-file check failed: ${absolute}`);
     }
     return readFileSync(fd);
@@ -156,6 +156,7 @@ export interface SecureFileWriteHooks {
 }
 
 export interface SecureFileRemoveHooks {
+  beforeUnlink?(path: string): void;
   afterUnlink?(path: string): void;
   afterDirectorySync?(path: string): void;
 }
@@ -192,7 +193,7 @@ export function writeSecureFile(
     fsyncSync(fd);
     hooks.afterFileSync?.(absolute);
     const stat = fstatSync(fd);
-    if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o177) !== 0 || (stat.mode & 0o600) !== 0o600) {
+    if (!stat.isFile() || stat.uid !== uid || !hasExactSecureFileMode(stat.mode)) {
       throw new SecureFileError(`Secure temporary file check failed: ${absolute}`);
     }
     closeSync(fd);
@@ -265,7 +266,7 @@ export function writeOwnerControlledFile(
     writeFileSync(fd, contents);
     fsyncSync(fd);
     const stat = fstatSync(fd);
-    if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o177) !== 0 || (stat.mode & 0o600) !== 0o600) {
+    if (!stat.isFile() || stat.uid !== uid || !hasExactSecureFileMode(stat.mode)) {
       throw new SecureFileError(`Owner-controlled temporary file check failed: ${absolute}`);
     }
     closeSync(fd);
@@ -376,6 +377,38 @@ export function removeOwnerControlledFile(path: string, controlledRoot: string, 
   }
 }
 
+export function removeSecureFileIfPresent(
+  path: string, uid = currentUid(), hooks: SecureFileRemoveHooks = {},
+): void {
+  const absolute = requireAbsolute(path);
+  const parent = dirname(absolute);
+  let parentFd: number | undefined;
+  try {
+    parentFd = openSync(parent, constants.O_RDONLY | directoryFlag() | noFollowFlag());
+    assertRetainedParent(parent, parentFd, uid);
+    if (!pathHasFilesystemEvidence(absolute)) {
+      assertRetainedParent(parent, parentFd, uid);
+      return;
+    }
+    const target = secureTargetSnapshot(absolute, uid);
+    assertRetainedParent(parent, parentFd, uid);
+    hooks.beforeUnlink?.(absolute);
+    assertRetainedParent(parent, parentFd, uid);
+    assertRetainedSecureTarget(absolute, target, uid);
+    unlinkSync(absolute);
+    hooks.afterUnlink?.(absolute);
+    assertRetainedParent(parent, parentFd, uid);
+    fsyncSync(parentFd);
+    hooks.afterDirectorySync?.(absolute);
+  } catch (error) {
+    throw error instanceof SecureFileError
+      ? error
+      : new SecureFileError(`Secure file removal failed: ${absolute}`, error);
+  } finally {
+    if (parentFd !== undefined) closeSync(parentFd);
+  }
+}
+
 export function removeSecureFile(
   path: string, uid = currentUid(), hooks: SecureFileRemoveHooks = {},
 ): void {
@@ -429,7 +462,6 @@ function mkdirSecureDirectory(path: string): void {
   }
 }
 
-
 function normalizeCreatedSecureDirectory(path: string, uid: number): void {
   let fd: number | undefined;
   try {
@@ -459,6 +491,36 @@ function assertCreatedSecureDirectory(path: string, fd: number, uid: number, req
   }
 }
 
+function secureTargetSnapshot(path: string, uid: number): ReturnType<typeof lstatSync> {
+  let target;
+  try {
+    target = lstatSync(path);
+  } catch (error) {
+    throw new SecureFileError(`Secure file check failed: ${path}`, error);
+  }
+  if (target.isSymbolicLink() || !target.isFile() || target.uid !== uid || !hasExactSecureFileMode(target.mode)) {
+    throw new SecureFileError(`Secure file check failed: ${path}`);
+  }
+  return target;
+}
+
+function assertRetainedSecureTarget(
+  path: string,
+  expected: ReturnType<typeof lstatSync>,
+  uid: number,
+): void {
+  let current;
+  try {
+    current = secureTargetSnapshot(path, uid);
+  } catch (error) {
+    throw new SecureFileError(`Secure removal target changed before unlink: ${path}`, error);
+  }
+  if (expected.dev !== current.dev || expected.ino !== current.ino
+    || expected.uid !== current.uid || expected.mode !== current.mode) {
+    throw new SecureFileError(`Secure removal target changed before unlink: ${path}`);
+  }
+}
+
 
 function assertRetainedParent(path: string, fd: number, uid: number): void {
   const retained = fstatSync(fd);
@@ -480,6 +542,10 @@ function retainedParentStillMatches(path: string, fd: number, uid: number): bool
   } catch {
     return false;
   }
+}
+
+function hasExactSecureFileMode(mode: number): boolean {
+  return (mode & 0o7777) === 0o600;
 }
 
 function currentUid(): number {

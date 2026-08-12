@@ -1,8 +1,15 @@
+import { randomUUID } from 'node:crypto';
 import { isAbsolute, resolve } from 'node:path';
 import { base64UrlDecode, base64UrlEncode } from '@ariava/protocol';
-import { pathHasFilesystemEvidence, readSecureJson, writeSecureJson, writeSecureJsonExclusive } from '../host-manager/secure-files';
+import { pathHasFilesystemEvidence, readSecureJson, removeSecureFile, writeSecureJson, writeSecureJsonExclusive } from '../host-manager/secure-files';
 import { HostIdentityError } from './errors';
-import { MACOS_SECURITY_PATH, SpawnKeychainCommandRunner, type KeychainCommandRunner } from './macos-keychain-store';
+import {
+  isKeychainLocked,
+  isKeychainMissing,
+  MACOS_SECURITY_PATH,
+  SpawnKeychainCommandRunner,
+  type KeychainCommandRunner,
+} from './macos-keychain-store';
 import { generateHostEncryptionIdentity, importHostEncryptionPrivateKey, type HostEncryptionIdentity } from './host-encryption-key';
 
 export const MACOS_ENCRYPTION_KEYCHAIN_SERVICE = 'io.noyx.ariava.host-e2e-key' as const;
@@ -17,9 +24,27 @@ interface MacEncryptionMetadata {
   account: string;
 }
 
+interface MacEncryptionResetSentinel {
+  schema: 'ariava-macos-encryption-reset-v1';
+  phase: 'prepared';
+  operationId: string;
+  candidate: MacEncryptionMetadata;
+  previousAccount: string | null;
+}
+
+export interface MacOSEncryptionResetHooks {
+  afterResetSentinel?(): void;
+  afterResetKeyWrite?(): void;
+  afterResetMetadataWrite?(): void;
+}
+
 export class MacOSEncryptionKeyStore {
   readonly metadataPath: string;
-  constructor(metadataPath: string, private readonly runner: KeychainCommandRunner = new SpawnKeychainCommandRunner()) {
+  constructor(
+    metadataPath: string,
+    private readonly runner: KeychainCommandRunner = new SpawnKeychainCommandRunner(),
+    private readonly resetHooks: MacOSEncryptionResetHooks = {},
+  ) {
     if (!isAbsolute(metadataPath)) throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'macOS encryption metadata path must be absolute');
     this.metadataPath = resolve(metadataPath);
   }
@@ -53,23 +78,89 @@ export class MacOSEncryptionKeyStore {
     return this.loadRequired(hostId);
   }
 
-  replaceForReset(hostId: string): HostEncryptionIdentity {
-    const identity = generateHostEncryptionIdentity(hostId);
-    const account = keychainAccount(identity);
+  replaceForReset(hostId: string, operationId?: string): HostEncryptionIdentity {
+    const resetOperationId = operationId ?? `standalone_${randomUUID().replaceAll('-', '')}`;
+    const existing = this.readResetSentinelIfPresent();
+    if (existing) {
+      if (existing.operationId !== resetOperationId || existing.candidate.hostId !== hostId) {
+        throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'A different macOS encryption identity reset is pending');
+      }
+      const recovered = this.finishReset(existing);
+      if (!operationId) this.completeReset(resetOperationId);
+      return recovered;
+    }
     const previous = this.load();
-    this.writeItem(account, identity.privateKeyPkcs8, false);
+    const identity = generateHostEncryptionIdentity(hostId);
+    const candidate = metadata(identity);
+    const sentinel = {
+      schema: 'ariava-macos-encryption-reset-v1', phase: 'prepared', operationId: resetOperationId,
+      candidate, previousAccount: previous ? keychainAccount(previous) : null,
+    } satisfies MacEncryptionResetSentinel;
+    this.writeResetSentinel(sentinel);
+    this.resetHooks.afterResetSentinel?.();
+    this.writeItem(candidate.account, identity.privateKeyPkcs8, false);
+    this.resetHooks.afterResetKeyWrite?.();
+    const recovered = this.finishReset(sentinel);
+    if (!operationId) this.completeReset(resetOperationId);
+    return recovered;
+  }
+
+  recoverReset(hostId: string, operationId: string): HostEncryptionIdentity | null {
+    const sentinel = this.readResetSentinelIfPresent();
+    if (!sentinel) return null;
+    if (sentinel.operationId !== operationId || sentinel.candidate.hostId !== hostId) {
+      throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'macOS encryption reset evidence belongs to another operation');
+    }
+    return this.finishReset(sentinel);
+  }
+
+  completeReset(operationId: string): void {
+    const sentinel = this.readResetSentinelIfPresent();
+    if (!sentinel) return;
+    if (sentinel.operationId !== operationId) {
+      throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'macOS encryption reset evidence belongs to another operation');
+    }
+    try { removeSecureFile(this.resetSentinelPath()); }
+    catch (error) { throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'Could not clear macOS encryption reset evidence', error); }
+  }
+
+  private finishReset(sentinel: MacEncryptionResetSentinel): HostEncryptionIdentity {
+    const privateKeyPkcs8 = this.readItem(sentinel.candidate.account);
+    importHostEncryptionPrivateKey({ ...sentinel.candidate, privateKeyPkcs8 });
     try {
-      writeSecureJson(this.metadataPath, metadata(identity));
-      const loaded = this.loadRequired(hostId);
-      if (previous) this.deleteItem(keychainAccount(previous));
+      writeSecureJson(this.metadataPath, sentinel.candidate);
+      this.resetHooks.afterResetMetadataWrite?.();
+      const loaded = this.loadRequired(sentinel.candidate.hostId);
+      if (sentinel.previousAccount && sentinel.previousAccount !== sentinel.candidate.account) this.deleteItem(sentinel.previousAccount);
       return loaded;
     } catch (error) {
-      this.deleteItem(account);
-      if (previous) {
-        try { writeSecureJson(this.metadataPath, metadata(previous)); } catch { /* preserve the original failure */ }
-      }
       throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'Could not replace macOS encryption metadata', error);
     }
+  }
+
+  private resetSentinelPath(): string { return `${this.metadataPath}.resetting`; }
+
+  private readResetSentinelIfPresent(): MacEncryptionResetSentinel | undefined {
+    try {
+      if (!pathHasFilesystemEvidence(this.resetSentinelPath())) return undefined;
+      const value = readSecureJson<unknown>(this.resetSentinelPath());
+      if (!validResetSentinel(value)) throw new Error('invalid reset sentinel');
+      return value;
+    } catch (error) {
+      throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'macOS encryption reset evidence is invalid', error);
+    }
+  }
+
+  private writeResetSentinel(value: MacEncryptionResetSentinel): void {
+    try { writeSecureJsonExclusive(this.resetSentinelPath(), value); }
+    catch (error) { throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'Could not durably mark macOS encryption reset', error); }
+  }
+
+  deleteAfterHostReplacement(encryptionKeyId: string): void {
+    if (!/^ekey_[A-Za-z0-9_-]{43}$/u.test(encryptionKeyId)) {
+      throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Invalid old Host encryption Keychain account');
+    }
+    this.deleteItem(`host-e2e:${encryptionKeyId}`);
   }
 
   private loadRequired(hostId: string): HostEncryptionIdentity {
@@ -88,7 +179,18 @@ export class MacOSEncryptionKeyStore {
   private readItem(account: string): Uint8Array {
     assertSafeKeychainIdentifier(account, 'account');
     const result = this.runner.run(MACOS_SECURITY_PATH, ['find-generic-password', '-s', MACOS_ENCRYPTION_KEYCHAIN_SERVICE, '-a', account, '-w']);
-    if (result.status !== 0 || result.error) throw new HostIdentityError('ERR_IDENTITY_MISSING', 'macOS encryption Keychain item is missing');
+    if (result.status !== 0 || result.error) {
+      if (isKeychainLocked(result)) {
+        throw new HostIdentityError(
+          'ERR_IDENTITY_KEYCHAIN_LOCKED',
+          'macOS login Keychain is locked or unavailable in this session.',
+        );
+      }
+      if (isKeychainMissing(result)) {
+        throw new HostIdentityError('ERR_IDENTITY_MISSING', 'macOS encryption Keychain item is missing');
+      }
+      throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'macOS encryption Keychain read failed');
+    }
     const encoded = Buffer.from(result.stdout).toString('utf8').trimEnd();
     if (!/^(?:[0-9a-f]{2})+$/iu.test(encoded)) throw new HostIdentityError('ERR_IDENTITY_INVALID', 'macOS encryption Keychain encoding is invalid');
     return base64UrlDecode(base64UrlEncode(Buffer.from(encoded, 'hex')), undefined, 'X25519 PKCS#8');
@@ -96,8 +198,31 @@ export class MacOSEncryptionKeyStore {
 
   private deleteItem(account: string): void {
     assertSafeKeychainIdentifier(account, 'account');
-    this.runner.run(MACOS_SECURITY_PATH, ['delete-generic-password', '-s', MACOS_ENCRYPTION_KEYCHAIN_SERVICE, '-a', account]);
+    const result = this.runner.run(
+      MACOS_SECURITY_PATH,
+      ['delete-generic-password', '-s', MACOS_ENCRYPTION_KEYCHAIN_SERVICE, '-a', account],
+    );
+    if (result.status === 0 && !result.error) return;
+    if (isKeychainMissing(result)) return;
+    if (isKeychainLocked(result)) {
+      throw new HostIdentityError(
+        'ERR_IDENTITY_KEYCHAIN_LOCKED',
+        'macOS login Keychain is locked or unavailable in this session.',
+      );
+    }
+    throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'macOS encryption Keychain delete failed');
   }
+}
+
+function validResetSentinel(value: unknown): value is MacEncryptionResetSentinel {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).sort().join(',') !== 'candidate,operationId,phase,previousAccount,schema') return false;
+  return record.schema === 'ariava-macos-encryption-reset-v1' && record.phase === 'prepared'
+    && typeof record.operationId === 'string' && /^[A-Za-z0-9_-]{1,128}$/u.test(record.operationId)
+    && validMetadata(record.candidate as MacEncryptionMetadata)
+    && (record.previousAccount === null || (typeof record.previousAccount === 'string'
+      && /^host-e2e:ekey_[A-Za-z0-9_-]{43}$/u.test(record.previousAccount)));
 }
 
 function metadata(identity: HostEncryptionIdentity): MacEncryptionMetadata {

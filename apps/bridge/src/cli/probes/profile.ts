@@ -7,6 +7,7 @@ import {
   type AriavaProfileCliContext,
   type ResolvedProfileResources,
 } from '../context';
+import { loadHostDomainResetJournal, type HostDomainResetJournalV1 } from '../operations/host-domain-reset-journal';
 
 export interface ProfileRuntimeProbe {
   nodeFound: boolean;
@@ -49,6 +50,12 @@ export interface ProfileProbeEvidence {
     piLogPath: string;
   };
   runtime: ProfileRuntimeProbe;
+  hostDomainReset: {
+    pending: boolean;
+    phase?: HostDomainResetJournalV1['phase'];
+    operationId?: string;
+    remediation?: string;
+  };
 }
 
 export async function probeProfile(
@@ -77,6 +84,11 @@ export async function probeProfile(
   }
   const statePresent = pathExists(context, dependencies, resources.statePath);
   const statePathParentExists = pathExists(context, dependencies, dirname(resources.statePath));
+  const resetJournal = loadHostDomainResetJournal(resources);
+  const resetPending = resetJournal !== null;
+  const resetRemediation = context.profile.id === 'dev'
+    ? 'bun run dev:cli -- host reset --confirm'
+    : 'ariava host reset --confirm';
 
   return {
     profile: context.profile.id,
@@ -105,6 +117,12 @@ export async function probeProfile(
       piLogPath: resources.piExtensionLogPath,
     },
     runtime: dependencies.runtime(),
+    hostDomainReset: resetPending ? {
+      pending: true,
+      phase: resetJournal!.phase,
+      operationId: resetJournal!.operationId,
+      remediation: resetRemediation,
+    } : { pending: false },
   };
 }
 

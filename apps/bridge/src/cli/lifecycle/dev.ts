@@ -358,7 +358,7 @@ function createDevStatusDependencies(deps: DevProfileDependencies) {
             statePresent: shared.paths.statePresent,
             discoveryPresent: shared.adapter.present,
             discoveryValid: shared.adapter.valid,
-            ready: shared.paths.statePresent && shared.adapter.valid,
+            ready: !shared.hostDomainReset.pending && shared.paths.statePresent && shared.adapter.valid,
           },
           pi: {
             mode: 'source-extension' as const,
@@ -397,7 +397,7 @@ function createDevDoctorDependencies(deps: DevProfileDependencies) {
           statePresent: shared.paths.statePresent,
           discoveryPresent: shared.adapter.present,
           discoveryValid: shared.adapter.valid,
-          ready: shared.paths.statePresent && shared.adapter.valid,
+          ready: !shared.hostDomainReset.pending && shared.paths.statePresent && shared.adapter.valid,
         },
         sourcePi: {
           mode: 'source-extension' as const,

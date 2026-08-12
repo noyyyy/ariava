@@ -11,6 +11,7 @@ interface ChildAction {
   args: string[];
 }
 
+const originalSpawnSync = childProcess.spawnSync;
 let activeActions: ChildAction[] | undefined;
 mock.module('node:child_process', () => ({
   ...childProcess,
@@ -20,7 +21,9 @@ mock.module('node:child_process', () => ({
   execSync: recordUnsupportedChildAction('execSync'),
   execFileSync: recordUnsupportedChildAction('execFileSync'),
   fork: recordUnsupportedChildAction('fork'),
-  spawnSync(command: string, args: string[] = []) {
+  spawnSync(...spawnArgs: unknown[]) {
+    if (!activeActions) return Reflect.apply(originalSpawnSync, childProcess, spawnArgs);
+    const [command, args = []] = spawnArgs as [string, string[]?];
     recordChildAction(command, args);
     return { status: 0, stdout: '', stderr: '' };
   },
@@ -72,6 +75,30 @@ describe('Node-backed dev setup', () => {
     expect(artifact).toContain('SOURCE_PI_EXTENSION_PATH');
     for (const segment of ['extensions', 'pi', 'index.ts']) expect(artifact).toContain(`"${segment}"`);
     expect(existsSync(resolve(root, 'extensions', 'pi', 'index.ts'))).toBe(true);
+  });
+
+  test('delegates spawnSync outside recording and records it exactly while active', async () => {
+    const mockedChildProcess = await import('node:child_process');
+    const delegated = mockedChildProcess.spawnSync(
+      process.execPath,
+      ['-e', 'process.stdout.write(process.env.ARIAVA_SPAWN_MARKER ?? "")'],
+      { encoding: 'utf8', env: { ...process.env, ARIAVA_SPAWN_MARKER: 'delegated' } },
+    );
+    expect(delegated.status).toBe(0);
+    expect(delegated.stdout).toBe('delegated');
+
+    const actions: ChildAction[] = [];
+    activeActions = actions;
+    try {
+      expect(mockedChildProcess.spawnSync('pi', ['--no-extensions'], { encoding: 'utf8' })).toEqual({
+        status: 0,
+        stdout: '',
+        stderr: '',
+      });
+      expect(actions).toEqual([{ command: 'pi', args: ['--no-extensions'] }]);
+    } finally {
+      activeActions = undefined;
+    }
   });
 
   test('records the exact child actions allowed for each dev lifecycle command', async () => {
@@ -332,12 +359,17 @@ const SAFE_DEV_LIFECYCLE_MODULES = [
   'cli/failure.ts',
   'cli/operations/identity.ts',
   'cli/operations/initialize.ts',
+  'cli/operations/host-domain-reset.ts',
+  'cli/operations/host-domain-artifacts.ts',
+  'cli/operations/host-domain-reset-journal.ts',
+  'cli/operations/host-identity-operation-lock.ts',
   'cli/operations/pair.ts',
   'cli/operations/watches.ts',
   'cli/output.ts',
   'cli/profile.ts',
   'cli/probes/profile.ts',
   'cli/profiles/dev.ts',
+  'cli/profiles/default.ts',
   'cli/lifecycle/dev.ts',
   'command-router.ts',
   'daemon.ts',
@@ -359,6 +391,7 @@ const SAFE_DEV_LIFECYCLE_MODULES = [
   'host-manager/secure-files.ts',
   'host-manager/status.ts',
   'host-manager/service/errors.ts',
+  'host-manager/process-aware-lock.ts',
   'host-manager/service/migration.ts',
   'host-platform.ts',
   'identity/errors.ts',

@@ -32,6 +32,7 @@ interface LinuxIdentityRecord {
   publicKeyFingerprint: string;
   privateKeyPkcs8: string;
   createdAt: string;
+  resetOperationId?: string;
   pendingRotation?: {
     operationId: string;
     issuedAt: string;
@@ -155,10 +156,27 @@ export class LinuxJsonHostIdentityStore implements HostIdentityStore {
     return identity;
   }
 
-  async resetAfterExplicitConfirmation(): Promise<HostIdentity> {
+  async resetAfterExplicitConfirmation(operationId?: string): Promise<HostIdentity> {
     const material = await generateHostIdentity({ type: 'linux-json', path: this.identityPath });
-    this.writeRecord(toRecord(material.identity, material.privateKeyPkcs8));
+    this.writeRecord({ ...toRecord(material.identity, material.privateKeyPkcs8), ...(operationId ? { resetOperationId: operationId } : {}) });
     return material.identity;
+  }
+
+  async recoverExplicitReset(operationId: string): Promise<HostIdentity | null> {
+    if (!this.hasEvidence()) return null;
+    const record = this.readRecord();
+    return record.resetOperationId === operationId ? this.importRecord(record) : null;
+  }
+
+  completeExplicitReset(operationId: string): void {
+    if (!this.hasEvidence()) return;
+    const record = this.readRecord();
+    if (record.resetOperationId === undefined) return;
+    if (record.resetOperationId !== operationId) {
+      throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'Linux Host identity reset evidence belongs to another operation');
+    }
+    delete record.resetOperationId;
+    this.writeRecord(record);
   }
 
   private hasEvidence(): boolean {
@@ -238,14 +256,17 @@ function isLinuxIdentityRecord(value: unknown): value is LinuxIdentityRecord {
   const record = value as Record<string, unknown>;
   const allowed = new Set([
     'version', 'entityType', 'hostId', 'keyId', 'algorithm', 'publicKey',
-    'publicKeyFingerprint', 'privateKeyPkcs8', 'createdAt', 'pendingRotation',
+    'publicKeyFingerprint', 'privateKeyPkcs8', 'createdAt', 'resetOperationId', 'pendingRotation',
   ]);
   const valid = Object.keys(record).every((key) => allowed.has(key))
     && record.version === 1 && record.entityType === 'host' && record.algorithm === 'Ed25519'
-    && ['hostId', 'keyId', 'publicKey', 'publicKeyFingerprint', 'privateKeyPkcs8', 'createdAt'].every((key) => typeof record[key] === 'string');
+    && ['hostId', 'keyId', 'publicKey', 'publicKeyFingerprint', 'privateKeyPkcs8', 'createdAt'].every((key) => typeof record[key] === 'string')
+    && (record.resetOperationId === undefined || (typeof record.resetOperationId === 'string'
+      && /^[A-Za-z0-9_-]{1,128}$/u.test(record.resetOperationId)));
   if (!valid || record.pendingRotation === undefined) return valid;
   const pending = record.pendingRotation as Record<string, unknown>;
   return Object.keys(pending).every((key) => key === 'operationId' || key === 'issuedAt' || key === 'identity')
     && typeof pending.operationId === 'string' && typeof pending.issuedAt === 'string' && isLinuxIdentityRecord(pending.identity)
-    && !(pending.identity as LinuxIdentityRecord).pendingRotation;
+    && !(pending.identity as LinuxIdentityRecord).pendingRotation
+    && !(pending.identity as LinuxIdentityRecord).resetOperationId;
 }

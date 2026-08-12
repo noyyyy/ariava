@@ -2,7 +2,9 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LinuxJsonHostIdentityStore, resetHostIdentity, rotateHostIdentity } from '../src/identity';
+import {
+  LinuxJsonHostIdentityStore, resetHostIdentity, revokeHostIdentityForReset, rotateHostIdentity,
+} from '../src/identity';
 import { RelayClientError } from '../src/relay-client';
 
 const roots: string[] = [];
@@ -140,6 +142,26 @@ describe('Host rotation and reset lifecycle', () => {
       await expect(resetHostIdentity(store, 'https://relay.test')).rejects.toBeInstanceOf(response === 'http' ? RelayClientError : Error);
       expect((await store.load())!.keyId).toBe(before.keyId);
     }
+  });
+
+  test.each([
+    ['exact committed revoke', 401, { code: 'identity_revoked' }, true],
+    ['other 401', 401, { code: 'unauthorized' }, false],
+    ['404', 404, { code: 'identity_revoked' }, false],
+    ['409', 409, { code: 'identity_revoked' }, false],
+    ['500', 500, { code: 'identity_revoked' }, false],
+    ['malformed', 401, 'identity_revoked', false],
+  ] as const)('classifies %s conservatively', async (_name, status, body, committed) => {
+    const root = mkdtempSync(join(tmpdir(), 'ariava-revoke-recovery-')); roots.push(root);
+    const store = new LinuxJsonHostIdentityStore(join(root, 'identity.json'));
+    const identity = await store.createFirstRun();
+    globalThis.fetch = (async () => typeof body === 'string'
+      ? new Response(body, { status })
+      : Response.json(body, { status })) as typeof fetch;
+    const promise = revokeHostIdentityForReset(identity, 'https://relay.test');
+    if (committed) expect(await promise).toBe('identity-already-revoked');
+    else await expect(promise).rejects.toBeInstanceOf(RelayClientError);
+    expect((await store.load())!.keyId).toBe(identity.keyId);
   });
 
   test('explicit reset repairs corrupt identity with warning and enrolls as a new zero-link host', async () => {

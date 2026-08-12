@@ -211,6 +211,18 @@ describe('SystemdUserServiceManager', () => {
     ]);
   });
 
+  test('refreshes unit metadata without starting and preserves disabled intent', () => {
+    const current = fixture();
+    current.manager.install({ runtimePath: '/usr/bin/node', ariavaBinPath: '/usr/bin/ariava' }, {
+      enabled: false,
+      start: false,
+    });
+    expect(current.runner.calls).toEqual([
+      { command: 'systemctl', args: ['--user', 'daemon-reload'] },
+      { command: 'systemctl', args: ['--user', 'disable', 'ariava.service'] },
+    ]);
+  });
+
   test('forces the C locale for every systemctl call while preserving the parent environment', () => {
     const current = fixture();
     mkdirSync(dirname(current.definitionPath), { recursive: true });

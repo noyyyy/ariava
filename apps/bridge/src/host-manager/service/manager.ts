@@ -25,6 +25,7 @@ import type {
   AriavaServiceInstallRecord,
   CommandRunner,
   ServiceInstallInput,
+  ServiceInstallOptions,
   ServiceLogs,
   ServiceManager,
   ServiceStatus,
@@ -120,7 +121,7 @@ class UnsupportedServiceManager implements ServiceManager {
     this.backend = support.backend;
   }
 
-  install(_input: ServiceInstallInput): AriavaServiceInstallRecord {
+  install(_input: ServiceInstallInput, _options?: ServiceInstallOptions): AriavaServiceInstallRecord {
     throw supportError(this.support);
   }
 

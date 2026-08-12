@@ -71,7 +71,7 @@ export async function runHostCommand(
         message: dev ? 'Dev Host identity reset.' : 'Host identity reset.',
         data: result,
       },
-      human: `Reset ${dev ? 'dev ' : ''}Host identity to ${result.hostId}; links: 0${result.warning ? `; warning: ${result.warning}` : ''}`,
+      human: `Reset ${dev ? 'dev ' : ''}Host identity to ${result.hostId}; links: 0; pair Watches again${result.warning ? `; warning: ${result.warning}` : ''}`,
     };
   }
   throw new Error(context.profile.id === 'dev'

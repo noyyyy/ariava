@@ -116,6 +116,9 @@ describe('stable Ariava CLI errors', () => {
       'ERR_PAIR_CANCELLED',
       'ERR_ONBOARDING_NOT_READY',
       'ERR_COMMAND_UNAVAILABLE_FOR_PROFILE',
+      'ERR_HOST_RESET_IN_PROGRESS',
+      'ERR_HOST_RESET_RUNTIME_ACTIVE',
+      'ERR_HOST_RESET_RECOVERY_REQUIRED',
     ]);
   });
 

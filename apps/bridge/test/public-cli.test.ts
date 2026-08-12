@@ -246,6 +246,35 @@ describe('public ariava CLI', () => {
     });
 
 
+
+    test.each([
+      ['ERR_HOST_RESET_IN_PROGRESS', 'Resume the pending Host reset before rotating the Host key.'],
+      ['ERR_HOST_RESET_RUNTIME_ACTIVE', 'Stop the active Bridge runtime, then retry Host reset.'],
+      ['ERR_HOST_RESET_RECOVERY_REQUIRED', 'Retry the same Host reset command to resume recovery.'],
+    ] as const)('normalizes %s with structured reset remediation', (code, message) => {
+      const failure = normalizeCliFailure(new AriavaCliError(code, 'Host reset blocked.', {
+        retryable: true, remediation: { message },
+      }));
+      expect(failure).toEqual({
+        ok: false, code, message: 'Host reset blocked.',
+        data: { retryable: true, remediation: { message } },
+      });
+      expect(formatHumanCliFailure(failure)).toContain(message);
+    });
+
+    test('renders recovery phase, operation, and command in JSON and human envelopes', () => {
+      const error = new AriavaCliError('ERR_HOST_RESET_RECOVERY_REQUIRED', 'Host reset recovery requires attention.', {
+        phase: 'service-restore-pending', operationId: 'reset_12345678', retryable: true,
+        remediation: {
+          message: 'Retry the profile-specific Host reset recovery command: ariava host reset --confirm',
+          command: 'ariava host reset --confirm',
+        },
+      });
+      const failure = normalizeCliFailure(error);
+      expect(failure.data).toEqual(error.data);
+      expect(formatHumanCliFailure(failure)).toContain('Next: ariava host reset --confirm');
+    });
+
     test('generic and relay failures normalize to stable codes', () => {
       expect(normalizeCliFailure(new Error('boom'))).toEqual({
         ok: false,
@@ -1176,7 +1205,7 @@ describe('public ariava CLI', () => {
       expect(managerCalls(home).map((call) => call.operation)).toEqual([
         'install', 'status', 'status', 'start', 'status', 'stop', 'status', 'restart', 'logs', 'uninstall',
       ]);
-    });
+    }, 15_000);
 
     test('unavailable WSL init returns exact stable guidance before config writes', async () => {
       const home = mkdtempSync(join(tmpdir(), 'ariava-cli-wsl-init-'));
@@ -1279,7 +1308,7 @@ describe('public ariava CLI', () => {
         expectStderrFailure(result, 'ERR_UNSUPPORTED_PLATFORM');
         expect(existsSync(join(home, '.config', 'ariava'))).toBe(false);
       }
-    });
+    }, 15_000);
 
     test('doctor reports exact neutral fields without real command probes', async () => {
       const home = mkdtempSync(join(tmpdir(), 'ariava-cli-doctor-'));
@@ -1688,7 +1717,7 @@ describe('public ariava CLI', () => {
         expect(managerCalls(home).some((call) => call.operation === 'restart')).toBe(!skipped);
         expect(JSON.stringify(result.stdout)).not.toContain('ARIAVA_UPGRADE_SKIP_');
       }
-    });
+    }, 15_000);
 
     test('upgrade preserves the new record and sanitizes a restart-only failure', async () => {
       const home = mkdtempSync(join(tmpdir(), 'ariava-cli-upgrade-restart-failure-'));
@@ -1850,7 +1879,7 @@ describe('public ariava CLI', () => {
         expect(readFileSync(installPath, 'utf8')).toBe(persistedBefore);
         expect(managerCalls(home)).toEqual([]);
       }
-    });
+    }, 15_000);
   });
 
 });

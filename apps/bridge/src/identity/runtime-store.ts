@@ -20,7 +20,10 @@ export function createRuntimeHostIdentityStore(
 export interface HostEncryptionIdentityStore {
   load(): HostEncryptionIdentity | null;
   loadOrCreate(hostId: string): HostEncryptionIdentity;
-  replaceForReset(hostId: string): HostEncryptionIdentity;
+  replaceForReset(hostId: string, operationId?: string): HostEncryptionIdentity;
+  recoverReset?(hostId: string, operationId: string): HostEncryptionIdentity | null;
+  completeReset?(operationId: string): void;
+  deleteAfterHostReplacement?(encryptionKeyId: string): void;
 }
 
 export function hostEncryptionIdentityPath(identityPath: string): string {
