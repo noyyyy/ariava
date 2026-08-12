@@ -24,6 +24,8 @@ This repository contains the Ariava Bridge, pi extension, protocol, and shared u
 
 ## Test lanes and validation
 
+Do not use source-text assertions to claim runtime behavior; execute the Public product flow instead, reserving source scans only for explicit repository-wide policy/static invariants without crossing the Public Repo boundary.
+
 Reviewed test roots classify files by suffix:
 
 - `*.test.ts` — shared Public Repo coverage;
