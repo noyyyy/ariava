@@ -26,6 +26,8 @@ This repository contains the Ariava Bridge, pi extension, protocol, and shared u
 
 Do not use source-text assertions to claim runtime behavior; execute the Public product flow instead, reserving source scans only for explicit repository-wide policy/static invariants without crossing the Public Repo boundary.
 
+Protocol evolution tests must assert the current contract and executable upgrade, rejection, reset, or migration behavior. Do not maintain permanent historical field/token blacklists, scan generated bundles or npm tarballs for retired strings, or parse bundler output to allow legacy-decoder exceptions. A release-specific transition guard may be temporary only when the governing spec names its removal condition; remove it once that transition is complete.
+
 Reviewed test roots classify files by suffix:
 
 - `*.test.ts` — shared Public Repo coverage;

@@ -93,8 +93,6 @@ describe('npm package artifact assertion', () => {
       'apps/bridge/dist/ui/assets/unreviewed.txt',
       'Users/example/private.txt',
       'ariava-private/README.md',
-      'packages/protocol/dist/fixtures/e2e-v1-vectors.json',
-      'packages/protocol/dist/fixtures/notification-preview-v1-vector.json',
     ]) {
       const result = run([...required, forbidden]);
       expect(result.exitCode, `${forbidden}: ${result.stderr.toString()}`).toBe(1);
@@ -108,39 +106,20 @@ describe('npm package artifact assertion', () => {
   });
 
   test('validates packaged runtime v2 and parity fixture contents', () => {
-    const legacyEvent = runTarball(required, 'root', {
+    const wrongVersion = runTarball(required, 'root', {
       'packages/protocol/dist/fixtures/e2e-v2-vectors.json': JSON.stringify({
-        version: 2, event: { contentId: 'event', contentAAD: 'event-content-v1' },
+        version: 1, event: { contentId: 'event', contentAAD: 'aad' },
         session: { contentId: 'session', contentAAD: 'aad' },
       }),
     });
-    expect(legacyEvent.exitCode).toBe(1);
-    expect(legacyEvent.stderr.toString()).toContain('event-content-v1');
+    expect(wrongVersion.exitCode).toBe(1);
+    expect(wrongVersion.stderr.toString()).toContain('runtime v2 interoperability fixture');
 
     const emptyParity = runTarball(required, 'root', {
       'packages/protocol/dist/fixtures/need-human-error-validation-v2.json': JSON.stringify({ version: 2, cases: [] }),
     });
     expect(emptyParity.exitCode).toBe(1);
     expect(emptyParity.stderr.toString()).toContain('parity fixture');
-  });
-
-  test('scans all packaged runtime bytes and permits only the recognized-prior reset decoder', () => {
-    const legacyPi = runTarball(required, 'root', {
-      'extensions/pi/bundle/index.js': "export const category = 'agent.blocked';",
-    });
-    expect(legacyPi.exitCode).toBe(1);
-    expect(legacyPi.stderr.toString()).toContain('extensions/pi/bundle/index.js contains agent.blocked');
-
-    const resetDecoder = [
-      'var PRIOR_SESSION_REQUIRED_KEYS = [...SESSION_REQUIRED_KEYS, "stateLabel"];',
-      'function isRecognizedPriorSession(value, hostId) { return value.status === "blocked"; }',
-      'function isRecognizedPriorEvent(value, hostId) { return value.type === "question_requested"; }',
-      'function isRecognizedPriorSpoolMigration(value) { return value.version === 1; }',
-    ].join('\n');
-    const recognizedPrior = runTarball(required, 'root', {
-      'apps/bridge/dist/cli.js': resetDecoder,
-    });
-    expect(recognizedPrior.exitCode).toBe(0);
   });
 
   test('accepts only the generated scoped package public files and validates its metadata', () => {
@@ -156,9 +135,6 @@ describe('npm package artifact assertion', () => {
       }),
     };
     expect(runTarball(piFiles, 'pi', valid).exitCode).toBe(0);
-    const legacy = runTarball(piFiles, 'pi', { ...valid, 'index.js': "export const category = 'agent.question';" });
-    expect(legacy.exitCode).toBe(1);
-    expect(legacy.stderr.toString()).toContain('index.js contains agent.question');
     expect(runTarball([...piFiles, 'src/private.ts'], 'pi', valid).exitCode).toBe(1);
     expect(runTarball(piFiles, 'pi', { ...valid, 'package.json': JSON.stringify({ name: '@ariava/pi-extension', version: '1.2.3', private: true }) }).exitCode).toBe(1);
   });

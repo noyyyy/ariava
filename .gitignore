@@ -12,3 +12,4 @@ tmp/
 !.env.example
 ariava-*.tgz
 .pi-subagents
+.pi
