@@ -180,6 +180,78 @@ describe('BridgeStateStore', () => {
     store.replaceDriverSessions('pi', []);
     expect(store.listSessions()).toHaveLength(0);
   });
+  function producerTombstoneFixture(label: string, registerSession = true) {
+    const root = join(tmpdir(), `bridge-store-producer-${label}-${Date.now()}`);
+    paths.push(root);
+    const statePath = join(root, 'state.json');
+    const identityPath = join(root, 'identity.json');
+    const keyStore = { loadOrCreate: () => new Uint8Array(32).fill(7) };
+    const event = {
+      eventId: 'evt-completed', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
+      agentText: 'Done', createdAt: LEGACY_AT,
+    } satisfies CanonicalEvent;
+    const session = {
+      sessionId: event.sessionId, hostId: event.hostId, provider: event.provider, projectName: 'project', nameText: 'Task',
+      status: 'idle', updatedAt: LEGACY_AT, lastEventId: event.eventId,
+    } satisfies CanonicalSessionState;
+    const reservation = {
+      version: 1 as const, eventId: event.eventId, sessionId: event.sessionId, fingerprint: 'fingerprint',
+      createdAt: event.createdAt,
+    };
+    const store = new BridgeStateStore(statePath);
+    store.initializeEncryptedSpool(event.hostId, identityPath, 'linux', keyStore);
+    if (registerSession) store.replaceDriverSessions('pi', [session]);
+    store.appendRecentEvent(event);
+    store.reserveProducerEvent(reservation);
+    return { root, statePath, identityPath, keyStore, store, event, session, reservation };
+  }
+
+  test.each(['reconcile', 'unregister'] as const)('retains completed producer dedupe tombstones through %s Session removal and restart', (removal) => {
+    const { statePath, identityPath, keyStore, store, session, reservation } = producerTombstoneFixture(`history-${removal}`);
+    if (removal === 'reconcile') store.replaceDriverSessions('pi', []);
+    else expect(store.removeSession(session.sessionId, 'pi')).toBe(true);
+    store.dispose();
+
+    const restarted = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    expect(() => restarted.initializeEncryptedSpool('host-1', identityPath, 'linux', keyStore)).not.toThrow();
+    expect(restarted.listSessions()).toEqual([]);
+    expect(restarted.getProducerEventReservation(session.sessionId, reservation.fingerprint)).toEqual(reservation);
+    restarted.dispose();
+  });
+
+  test('retains completed producer dedupe tombstones after their Event history is evicted', () => {
+    const { statePath, identityPath, keyStore, store, event, reservation } = producerTombstoneFixture('eviction');
+    store.replaceDriverSessions('pi', []);
+    for (let index = 0; index < 201; index += 1) {
+      store.appendRecentEvent({
+        eventId: `evt-new-${index}`, hostId: 'host-1', sessionId: 'other', provider: 'pi', type: 'done', status: 'idle',
+        agentText: 'New', createdAt: new Date(Date.parse(LEGACY_AT) + index + 1).toISOString(),
+      });
+    }
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).recentEvents.some(
+      (candidate: { eventId: string }) => candidate.eventId === event.eventId,
+    )).toBe(false);
+    store.dispose();
+
+    const restarted = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    expect(() => restarted.initializeEncryptedSpool('host-1', identityPath, 'linux', keyStore)).not.toThrow();
+    expect(restarted.getProducerEventReservation(event.sessionId, reservation.fingerprint)?.eventId).toBe(event.eventId);
+    restarted.dispose();
+  });
+
+  test('fails closed on a producer tombstone that conflicts with retained Event evidence', () => {
+    const { statePath, identityPath, keyStore, store } = producerTombstoneFixture('corruption', false);
+    store.dispose();
+
+    const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
+    persisted.producerEventReservations['sess-1\nfingerprint'].createdAt = '2026-08-07T00:00:01.000Z';
+    writeFileSync(statePath, JSON.stringify(persisted), { mode: 0o600 });
+
+    const restarted = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    expect(() => restarted.initializeEncryptedSpool('host-1', identityPath, 'linux', keyStore))
+      .toThrow('Bridge runtime preflight failed closed');
+    restarted.dispose();
+  });
   test('breaking preflight clears every recognized legacy runtime family', () => {
     const root = join(tmpdir(), `bridge-store-${Date.now()}`); paths.push(root);
     const statePath = join(root, 'state.json');

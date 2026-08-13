@@ -41,6 +41,7 @@ describe('Bridge current session snapshot state', () => {
     const root = mkdtempSync(join(tmpdir(), 'bridge-snapshot-state-')); roots.push(root);
     const store = new BridgeStateStore(join(root, 'state.json'));
     const first = (await store.createCurrentSessionsPublication('host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z'))!;
+    store.setRecipientSetVersion(1);
     expect(store.acceptCurrentSessionsPublication(first.request, 'digest-1', first.contentDigest)).toBe(true);
     expect(await store.createCurrentSessionsPublication('host-1', [makeSession()], 1, '2026-07-20T00:00:10.000Z')).toBeUndefined();
 
@@ -51,6 +52,17 @@ describe('Bridge current session snapshot state', () => {
     });
     const next = await store.createCurrentSessionsPublication('host-1', [makeSession('working')], 1, '2026-07-20T00:00:11.000Z', 8);
     expect(next?.request.revision).toBe(9);
+  });
+
+  test('rejects accepted publication evidence before its recipient set is locally committed', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bridge-snapshot-state-')); roots.push(root);
+    const store = new BridgeStateStore(join(root, 'state.json'));
+    const publication = (await store.createCurrentSessionsPublication(
+      'host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z',
+    ))!;
+    expect(() => store.acceptCurrentSessionsPublication(publication.request, 'digest-1', publication.contentDigest))
+      .toThrow('recipient set is not locally committed');
+    expect(store.getCurrentSessionsSnapshotState().lastAcceptedRevision).toBe(0);
   });
 
   test('a lost publication result allocates a higher revision after restart', async () => {
@@ -93,6 +105,7 @@ describe('Bridge current session snapshot state', () => {
     const root = mkdtempSync(join(tmpdir(), 'bridge-snapshot-state-')); roots.push(root);
     const store = new BridgeStateStore(join(root, 'state.json'));
     const first = (await store.createCurrentSessionsPublication('host-1', [makeSession()], 1, '2026-07-20T00:00:01.000Z'))!;
+    store.setRecipientSetVersion(1);
     expect(store.acceptCurrentSessionsPublication(first.request, 'digest-1', first.contentDigest)).toBe(true);
     const changed = await store.createCurrentSessionsPublication('host-1', [makeSession()], 2, '2026-07-20T00:00:02.000Z');
     expect(changed?.request).toMatchObject({ revision: 2, recipientSetVersion: 2 });

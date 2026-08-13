@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { E2E_SUITE_V1, base64UrlEncode } from '../../../packages/protocol/dist/index.js';
@@ -80,6 +80,59 @@ async function seedEvent(f, value) {
   f.state.queuePendingEvent(value, terminal);
 }
 
+function tamperSpoolCiphertexts(spoolPath, predicate) {
+  const file = JSON.parse(readFileSync(spoolPath, 'utf8'));
+  let tampered = 0;
+  for (const item of file.items) {
+    if (!predicate(item)) continue;
+    const bytes = Buffer.from(item.ciphertext, 'base64url');
+    bytes[0] ^= 1;
+    item.ciphertext = bytes.toString('base64url');
+    tampered += 1;
+  }
+  assert.ok(tampered > 0);
+  writeFileSync(spoolPath, `${JSON.stringify(file)}\n`, { mode: 0o600 });
+  return tampered;
+}
+
+function terminalSessionFor(sourceEvent) {
+  return {
+    sessionId: sourceEvent.sessionId, hostId: sourceEvent.hostId, provider: 'pi', projectName: sourceEvent.projectName,
+    nameText: `name-${sourceEvent.sessionId}`, latestActivityText: sourceEvent.agentText, status: 'idle',
+    updatedAt: sourceEvent.createdAt, lastEventId: sourceEvent.eventId, hbaseSessionKey: sourceEvent.hbaseSessionKey,
+    harnessProvider: sourceEvent.harnessProvider,
+  };
+}
+
+function createDurableCancellation(label) {
+  const root = mkdtempSync(join(tmpdir(), `ariava-cancel-${label}-`));
+  dirs.push(root);
+  chmodSync(root, 0o700);
+  const statePath = join(root, 'state.json');
+  const identityPath = join(root, 'identity.json');
+  const spoolPath = `${statePath}.spool.json`;
+  const hostId = `host_${'H'.repeat(43)}`;
+  const keyStore = { loadOrCreate: () => new Uint8Array(32).fill(7) };
+  const store = new BridgeStateStore(statePath);
+  store.initializeEncryptedSpool(hostId, identityPath, 'linux', keyStore);
+  const sourceEvent = event(hostId, `event-${label}`, `session-${label}`);
+  const terminal = terminalSessionFor(sourceEvent);
+  store.reserveProducerEventTuple(sourceEvent, terminal, 'fingerprint');
+  store.reserveProducerEvent({
+    version: 1, eventId: sourceEvent.eventId, sessionId: sourceEvent.sessionId,
+    fingerprint: 'fingerprint', createdAt: sourceEvent.createdAt,
+  });
+  const removeMany = store.spool.removeMany.bind(store.spool);
+  store.spool.removeMany = () => { throw new Error('cleanup unavailable'); };
+  try {
+    store.cancelTerminalEvent({ eventId: sourceEvent.eventId, sessionId: sourceEvent.sessionId,
+      fingerprint: 'fingerprint', removeSession: true });
+  } finally {
+    store.spool.removeMany = removeMany;
+  }
+  return { statePath, identityPath, spoolPath, hostId, keyStore, store, sourceEvent, terminal };
+}
+
 test('BridgeDaemon delegates encrypted uploads to the production orchestrator', async () => {
   const f = await fixture(({ path, snapshots }) => {
     if (path === '/v2/bridge/e2e/recipients') return Response.json(snapshots(1));
@@ -148,6 +201,159 @@ for (const phase of ['journaled', 'revision-committed', 'inflight-removed', 'sou
     } finally { f.restore(); }
   });
 }
+
+for (const { name, removedItemId } of [
+  { name: 'inflight-remove-before-flag', removedItemId: 'inflight:event:event-1' },
+  { name: 'source-remove-before-flag', removedItemId: 'event-1' },
+]) {
+  test(`event completion restart repairs ${name}`, async () => {
+    const f = await fixture(({ path, snapshots }) => {
+      if (path === '/v2/bridge/e2e/recipients') return Response.json(snapshots(1));
+      if (path === '/v2/bridge/e2e/events') return Response.json({ ok: true });
+      throw new Error(path);
+    });
+    try {
+      await seedEvent(f, event(f.config.hostId));
+      f.state.replaceDriverSessions('pi', []);
+      const uploader = f.orchestrator();
+      const originalWriteState = f.state.writeState;
+      let failNextStateWrite = false;
+      f.state.writeState = (path, value) => {
+        if (failNextStateWrite) { failNextStateWrite = false; throw new Error(`crash:${name}`); }
+        originalWriteState(path, value);
+      };
+      const spool = f.state.spool;
+      const originalRemove = spool.remove.bind(spool);
+      spool.remove = (itemId) => {
+        originalRemove(itemId);
+        if (itemId === removedItemId) failNextStateWrite = true;
+      };
+      await assert.rejects(uploader.flushPendingEvents(), new RegExp(`crash:${name}`));
+      f.state.dispose();
+      const restarted = new BridgeStateStore(f.config.statePath);
+      restarted.initializeEncryptedSpool(f.config.hostId, f.config.identityPath, 'linux');
+      assert.equal(restarted.currentSessionRevision('session-1'), 1);
+      assert.equal(restarted.peekPendingUploads().length, 0);
+      assert.equal(restarted.getInflightEventUpload('event-1'), undefined);
+      assert.equal(JSON.parse(readFileSync(f.config.statePath, 'utf8')).eventUploadCompletions, undefined);
+      restarted.dispose();
+    } finally { f.restore(); }
+  });
+}
+
+for (const { name, unreadableItemIds, inflightRemains } of [
+  { name: 'source', unreadableItemIds: ['event-1'], inflightRemains: true },
+  { name: 'source-and-inflight', unreadableItemIds: ['event-1', 'inflight:event:event-1'], inflightRemains: false },
+]) {
+  test(`event completion restart survives a second crash after unreadable ${name} recovery`, async () => {
+    const f = await fixture(({ path, snapshots }) => {
+      if (path === '/v2/bridge/e2e/recipients') return Response.json(snapshots(1));
+      if (path === '/v2/bridge/e2e/events') return Response.json({ ok: true });
+      throw new Error(path);
+    });
+    try {
+      await seedEvent(f, event(f.config.hostId));
+      await assert.rejects(f.orchestrator(undefined, {
+        eventCompletionStep: (phase) => { if (phase === 'journaled') throw new Error('crash:journaled'); },
+      }).flushPendingEvents(), /crash:journaled/);
+      f.state.dispose();
+      const spoolPath = `${f.config.statePath}.spool.json`;
+      assert.equal(tamperSpoolCiphertexts(spoolPath, (item) => unreadableItemIds.includes(item.spoolItemId)),
+        unreadableItemIds.length);
+
+      const interrupted = new BridgeStateStore(f.config.statePath);
+      assert.throws(() => interrupted.initializeEncryptedSpool(
+        f.config.hostId, f.config.identityPath, 'linux', undefined, undefined, {
+          recoveryStep: () => { throw new Error('crash:after-unreadable-recovery'); },
+        },
+      ), /crash:after-unreadable-recovery/);
+      interrupted.dispose();
+      const afterRecovery = JSON.parse(readFileSync(spoolPath, 'utf8'));
+      assert.equal(afterRecovery.items.some((item) => item.spoolItemId === 'event-1'), false);
+      assert.equal(afterRecovery.items.some((item) => item.spoolItemId === 'inflight:event:event-1'), inflightRemains);
+
+      const restarted = new BridgeStateStore(f.config.statePath);
+      assert.deepEqual(restarted.initializeEncryptedSpool(f.config.hostId, f.config.identityPath, 'linux'),
+        { droppedUnreadableItems: 0 });
+      assert.equal(restarted.currentSessionRevision('session-1'), 1);
+      assert.equal(restarted.peekPendingUploads().length, 0);
+      assert.equal(restarted.getInflightEventUpload('event-1'), undefined);
+      assert.equal(JSON.parse(readFileSync(f.config.statePath, 'utf8')).eventUploadCompletions, undefined);
+      restarted.dispose();
+    } finally { f.restore(); }
+  });
+}
+
+test('restart finishes durable cancellation after dropping an unreadable cancellation journal', () => {
+  const { statePath, identityPath, spoolPath, hostId, keyStore, store, sourceEvent } =
+    createDurableCancellation('cancel');
+  store.dispose();
+  assert.equal(tamperSpoolCiphertexts(spoolPath, (item) => item.payloadKind === 'terminal-cancellation-v2'), 1);
+
+  const restarted = new BridgeStateStore(statePath);
+  assert.deepEqual(restarted.initializeEncryptedSpool(hostId, identityPath, 'linux', keyStore),
+    { droppedUnreadableItems: 1 });
+  assert.equal(restarted.getSession(sourceEvent.sessionId), undefined);
+  assert.deepEqual(restarted.peekPendingEvents(), []);
+  assert.equal(restarted.getTerminalEventCancellation(sourceEvent.sessionId), undefined);
+  assert.doesNotMatch(JSON.stringify(JSON.parse(readFileSync(statePath, 'utf8'))), /event-cancel/);
+  restarted.dispose();
+});
+
+for (const { name, unreadableKinds, reservationRemains, journalRemains } of [
+  { name: 'source', unreadableKinds: ['event-reservation-v2'], reservationRemains: false, journalRemains: true },
+  { name: 'journal', unreadableKinds: ['terminal-cancellation-v2'], reservationRemains: true, journalRemains: false },
+  { name: 'source-and-journal', unreadableKinds: ['event-reservation-v2', 'terminal-cancellation-v2'],
+    reservationRemains: false, journalRemains: false },
+]) {
+  test(`durable cancellation restart survives a second crash after unreadable ${name} recovery`, () => {
+    const { statePath, identityPath, spoolPath, hostId, keyStore, store, sourceEvent } =
+      createDurableCancellation(name);
+    store.dispose();
+    assert.equal(tamperSpoolCiphertexts(spoolPath, (item) => unreadableKinds.includes(item.payloadKind)),
+      unreadableKinds.length);
+
+    const interrupted = new BridgeStateStore(statePath);
+    assert.throws(() => interrupted.initializeEncryptedSpool(hostId, identityPath, 'linux', keyStore, undefined, {
+      recoveryStep: () => { throw new Error('crash:after-unreadable-recovery'); },
+    }), /crash:after-unreadable-recovery/);
+    interrupted.dispose();
+    const afterRecovery = JSON.parse(readFileSync(spoolPath, 'utf8'));
+    assert.equal(afterRecovery.items.some((item) => item.payloadKind === 'event-reservation-v2'), reservationRemains);
+    assert.equal(afterRecovery.items.some((item) => item.payloadKind === 'terminal-cancellation-v2'), journalRemains);
+
+    const restarted = new BridgeStateStore(statePath);
+    assert.deepEqual(restarted.initializeEncryptedSpool(hostId, identityPath, 'linux', keyStore),
+      { droppedUnreadableItems: 0 });
+    assert.equal(restarted.getSession(sourceEvent.sessionId), undefined);
+    assert.deepEqual(restarted.peekPendingEvents(), []);
+    assert.equal(restarted.getTerminalEventCancellation(sourceEvent.sessionId), undefined);
+    assert.doesNotMatch(JSON.stringify(JSON.parse(readFileSync(statePath, 'utf8'))), new RegExp(sourceEvent.eventId));
+    restarted.dispose();
+  });
+}
+
+test('durable cancellation rejects a readable source with a mismatched fingerprint before mutation', () => {
+  const { statePath, identityPath, spoolPath, hostId, keyStore, store, sourceEvent, terminal } =
+    createDurableCancellation('source-conflict');
+  store.spool.replace([sourceEvent.eventId], [{
+    spoolItemId: sourceEvent.eventId, sessionId: sourceEvent.sessionId, eventId: sourceEvent.eventId,
+    payloadKind: 'event-reservation-v2', createdAt: sourceEvent.createdAt,
+    plaintext: new TextEncoder().encode(JSON.stringify({
+      event: sourceEvent, session: terminal, producerFingerprint: 'wrong',
+    })),
+  }]);
+  store.dispose();
+  const stateBytes = readFileSync(statePath);
+  const spoolBytes = readFileSync(spoolPath);
+
+  const restarted = new BridgeStateStore(statePath);
+  assert.throws(() => restarted.initializeEncryptedSpool(hostId, identityPath, 'linux', keyStore),
+    /producer fingerprint is invalid|source conflicts with state/);
+  restarted.dispose();
+  assert.deepEqual(readFileSync(statePath), stateBytes);
+  assert.deepEqual(readFileSync(spoolPath), spoolBytes);
+});
 
 test('all-session recipient refresh replaces stale inflight on two consecutive recipient versions', async () => {
   const s1 = session('placeholder', 's1'); const s2 = session('placeholder', 's2'); let version = 1; const attempts = new Map();

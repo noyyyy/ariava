@@ -75,8 +75,13 @@ interface RuntimeResetIntentV1 {
 }
 
 type RuntimeResetPhase = 'before-intent' | 'after-intent' | 'after-spool' | 'after-state' | 'after-cleanup';
+type RuntimeRecoveryPhase = 'after-unreadable-recovery';
 export interface BridgeStateStoreOptions { deferRuntimePreflight?: boolean; runtimeCoordinator?: RuntimeCoordinator }
-export interface RuntimeResetHooks { write?: SecureFileWriteHooks; remove?: SecureFileRemoveHooks }
+export interface RuntimeResetHooks {
+  write?: SecureFileWriteHooks;
+  remove?: SecureFileRemoveHooks;
+  recoveryStep?: (phase: RuntimeRecoveryPhase) => void;
+}
 
 export class BridgeStateStore {
   private storedState: PersistedBridgeState;
@@ -134,6 +139,7 @@ export class BridgeStateStore {
       BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, this.state.runtimeResetEpoch, () => this.assertRuntimeAccess(),
     );
     const recovery = this.spool.recoverUnreadable();
+    if (isRuntimeResetHooks(resetHooks)) resetHooks.recoveryStep?.('after-unreadable-recovery');
     this.reconcileTerminalCancellations();
     this.reconcileProducerEventReservations();
     this.reconcilePendingEventJournal();
@@ -433,6 +439,9 @@ export class BridgeStateStore {
   getCurrentSessionsSnapshotState(): PersistedCurrentSessionsSnapshotState { return structuredClone(this.state.currentSessionsSnapshot); }
   acceptCurrentSessionsPublication(request: ReplaceE2ECurrentSessionsRequestV1, digest: string, contentDigest: string): boolean {
     const current = this.state.currentSessionsSnapshot;
+    if (this.state.recipientSetVersion !== request.recipientSetVersion) {
+      throw new TypeError('current Sessions publication recipient set is not locally committed');
+    }
     if (request.revision < current.lastAcceptedRevision) return false;
     this.state.currentSessionsSnapshot = { version: 1, lastAllocatedRevision: Math.max(current.lastAllocatedRevision, request.revision),
       lastAcceptedRevision: Math.max(current.lastAcceptedRevision, request.revision), lastAcceptedDigest: digest,
@@ -521,8 +530,24 @@ export class BridgeStateStore {
     }
     this.finishTerminalCancellation(cancellation);
   }
+  private assertTerminalCancellationSource(cancellation: PersistedTerminalCancellationV1): void {
+    if (!this.spool) return;
+    const source = this.spool.get(cancellation.eventId);
+    if (!source) return;
+    if (source.payloadKind !== 'event-reservation-v2'
+      || source.eventId !== cancellation.eventId
+      || source.sessionId !== cancellation.sessionId) {
+      throw new TypeError('terminal cancellation source conflicts with state');
+    }
+    const tuple = this.openProducerTuple('event-reservation-v2', cancellation.eventId, cancellation.fingerprint);
+    if (!tuple || tuple.event.eventId !== cancellation.eventId || tuple.event.sessionId !== cancellation.sessionId
+      || tuple.session.sessionId !== cancellation.sessionId) {
+      throw new TypeError('terminal cancellation source conflicts with state');
+    }
+  }
   private finishTerminalCancellation(cancellation: PersistedTerminalCancellationV1): void {
     if (!this.spool) return;
+    this.assertTerminalCancellationSource(cancellation);
     const itemId = terminalCancellationItemId(cancellation.eventId);
     const sourceExists = this.spool.get(cancellation.eventId) !== undefined;
     const intentExists = this.spool.get(itemId) !== undefined;
@@ -554,8 +579,6 @@ export class BridgeStateStore {
         if (JSON.stringify(persisted) !== JSON.stringify(cancellation)) {
           throw new TypeError('terminal cancellation recovery journal conflicts with state');
         }
-      } else if (this.spool.get(cancellation.eventId)) {
-        throw new Error('terminal cancellation recovery journal is incomplete');
       }
       this.finishTerminalCancellation(cancellation);
       if (this.state.terminalCancellations?.[cancellation.eventId]) {
@@ -563,7 +586,32 @@ export class BridgeStateStore {
       }
       intents.delete(cancellation.eventId);
     }
-    for (const item of intents.values()) this.spool.remove(item.spoolItemId);
+    for (const item of intents.values()) {
+      const cancellation = this.openSpoolJson(item.spoolItemId) as PersistedTerminalCancellationV1;
+      const reservationKey = producerReservationKey(cancellation.sessionId, cancellation.fingerprint);
+      const reservation = this.state.producerEventReservations?.[reservationKey];
+      const source = this.spool.get(cancellation.eventId);
+      if (!reservation || reservation.eventId !== cancellation.eventId
+        || source?.payloadKind !== 'event-reservation-v2' || source.sessionId !== cancellation.sessionId) {
+        throw new TypeError('terminal cancellation recovery journal conflicts with pending Event evidence');
+      }
+      this.assertTerminalCancellationSource(cancellation);
+      const nextState = structuredClone(this.state);
+      delete nextState.producerEventReservations?.[reservationKey];
+      if (nextState.producerEventReservations && Object.keys(nextState.producerEventReservations).length === 0) {
+        delete nextState.producerEventReservations;
+      }
+      (nextState.terminalCancellations ??= {})[cancellation.eventId] = cancellation;
+      if (cancellation.removeSession) {
+        delete nextState.sessions[cancellation.sessionId];
+        delete nextState.sessionDrivers[cancellation.sessionId];
+      }
+      this.commit(nextState);
+      this.finishTerminalCancellation(cancellation);
+      if (this.state.terminalCancellations?.[cancellation.eventId]) {
+        throw new Error('terminal cancellation recovery requires retry');
+      }
+    }
   }
 
   appendRecentEvent(event: CanonicalEvent): void {
@@ -969,7 +1017,7 @@ export function assertCurrentRuntimeArtifacts(statePath: string, hostId: string)
 }
 
 function isRuntimeResetHooks(value: SecureFileWriteHooks | RuntimeResetHooks | undefined): value is RuntimeResetHooks {
-  return value !== undefined && ('write' in value || 'remove' in value);
+  return value !== undefined && ('write' in value || 'remove' in value || 'recoveryStep' in value);
 }
 
 function isCurrentStateRecord(value: Record<string, unknown>): boolean {
@@ -1370,7 +1418,6 @@ function isCanonicalHealthTimestamp(value: unknown): value is string {
 
 function assertCurrentStateRelationships(state: PersistedBridgeState, hostId: string): void {
   if (state.host && state.host.hostId !== hostId) throw new Error('Bridge runtime Host projection belongs to another Host');
-  const sessions = new Set(Object.keys(state.sessions));
   const events = new Map<string, CanonicalEvent>();
   for (const [sessionId, session] of Object.entries(state.sessions)) {
     if (session.sessionId !== sessionId || session.hostId !== hostId) throw new Error('Bridge runtime Session binding is invalid');
@@ -1410,24 +1457,26 @@ function assertCurrentStateRelationships(state: PersistedBridgeState, hostId: st
   for (const [eventId, completion] of Object.entries(state.eventUploadCompletions ?? {})) {
     const currentRevision = state.sessionRevisions[completion.sessionId] ?? 0;
     const event = events.get(eventId);
-    if (eventId !== completion.eventId || !sessions.has(completion.sessionId)
-      || !event || event.sessionId !== completion.sessionId
-      || currentRevision < completion.revision - 1 || currentRevision > completion.revision) {
+    const revisionIsValid = currentRevision === completion.revision
+      || (completion.revisionCommitted !== true && currentRevision === completion.revision - 1);
+    if (eventId !== completion.eventId
+      || (event && event.sessionId !== completion.sessionId)
+      || !revisionIsValid
+      || (completion.inflightRemoved === true && completion.revisionCommitted !== true)
+      || (completion.sourceRemoved === true && completion.inflightRemoved !== true)) {
       throw new Error('Bridge runtime Event completion binding is invalid');
     }
   }
   for (const [key, reservation] of Object.entries(state.producerEventReservations ?? {})) {
     const event = events.get(reservation.eventId);
-    if (key !== producerReservationKey(reservation.sessionId, reservation.fingerprint) || !sessions.has(reservation.sessionId)
-      || (event && event.sessionId !== reservation.sessionId)) {
+    if (key !== producerReservationKey(reservation.sessionId, reservation.fingerprint)
+      || (event && (event.sessionId !== reservation.sessionId || event.createdAt !== reservation.createdAt))) {
       throw new Error('Bridge runtime producer fingerprint binding is invalid');
     }
   }
   for (const [eventId, cancellation] of Object.entries(state.terminalCancellations ?? {})) {
     const event = events.get(eventId);
-    if (eventId !== cancellation.eventId
-      || (!cancellation.removeSession && !sessions.has(cancellation.sessionId))
-      || (event && event.sessionId !== cancellation.sessionId)) {
+    if (eventId !== cancellation.eventId || (event && event.sessionId !== cancellation.sessionId)) {
       throw new Error('Bridge runtime terminal cancellation binding is invalid');
     }
   }
@@ -1454,6 +1503,8 @@ function assertCurrentRuntimeRelationships(state: PersistedBridgeState, spool: L
   for (const item of spool.items) {
     if (ids.has(item.spoolItemId)) throw new Error('Bridge runtime spool item ID is duplicated');
     ids.add(item.spoolItemId);
+  }
+  for (const item of spool.items) {
     const eventKind = item.payloadKind !== 'session-source-v2' && item.payloadKind !== 'session-upload-v2';
     if (eventKind && !item.eventId) throw new Error('Bridge runtime spool Event binding is invalid');
     if (item.payloadKind === 'event-source-v2') {
@@ -1490,21 +1541,20 @@ function assertCurrentRuntimeRelationships(state: PersistedBridgeState, spool: L
     if (item.payloadKind === 'terminal-cancellation-v2') {
       const cancellation = state.terminalCancellations?.[item.eventId!];
       if (item.spoolItemId !== terminalCancellationItemId(item.eventId!)
-        || !cancellation || cancellation.sessionId !== item.sessionId) {
+        || (cancellation && cancellation.sessionId !== item.sessionId)) {
         throw new Error('Bridge runtime terminal cancellation spool binding is invalid');
       }
     }
   }
   for (const completion of Object.values(state.eventUploadCompletions ?? {})) {
-    if (!completion.inflightRemoved && !ids.has(`inflight:event:${completion.eventId}`)) {
-      throw new Error('Bridge runtime Event completion upload is missing');
+    const inflight = spool.items.find((item) => item.spoolItemId === `inflight:event:${completion.eventId}`);
+    const source = spool.items.find((item) => item.spoolItemId === completion.eventId);
+    if ((inflight && (inflight.payloadKind !== 'event-upload-v2' || inflight.sessionId !== completion.sessionId))
+      || (source && (source.payloadKind !== 'event-source-v2' || source.sessionId !== completion.sessionId))
+      || (completion.inflightRemoved === true && inflight)
+      || (completion.sourceRemoved === true && source)) {
+      throw new Error('Bridge runtime Event completion spool binding is invalid');
     }
-    if (!completion.sourceRemoved && !ids.has(completion.eventId)) throw new Error('Bridge runtime Event completion source is missing');
-  }
-  for (const cancellation of Object.values(state.terminalCancellations ?? {})) {
-    const journal = ids.has(terminalCancellationItemId(cancellation.eventId));
-    const source = ids.has(cancellation.eventId);
-    if (!journal && source) throw new Error('Bridge runtime terminal cancellation journal is missing');
   }
 }
 

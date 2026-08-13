@@ -574,6 +574,34 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     } finally { cleanup(); }
   });
 
+  test('restart completes cancellation whose spool intent committed before state metadata', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-cancel-intent-only-'));
+    try {
+      const statePath = join(dir, 'state.json');
+      const store = initializedStore(dir);
+      const registry = new AgentAdapterRegistry('host-1', store, () => {}, () => new Date(), {
+        schedule: () => Symbol('retry'), cancel: () => {},
+      });
+      register(registry);
+      const command = makeCommand('sess-1');
+      registry.enqueueCommand(command);
+      const eventId = registry.pushEvent('sess-1', doneEvent({ correlationId: 'intent-only' }));
+      await registry.dequeueCommand('sess-1', 0);
+      store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
+      registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,
+        sessionId: command.sessionId, accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z' });
+      (store as any).writeState = () => { throw new Error('state commit failed'); };
+      expect(() => registry.unregister('sess-1')).toThrow('state commit failed');
+      store.dispose();
+
+      const restarted = initializedStore(dir);
+      expect(restarted.getSession('sess-1')).toBeUndefined();
+      expect(restarted.peekPendingEvents()).toEqual([]);
+      expect(JSON.stringify(JSON.parse(readFileSync(statePath, 'utf8')))).not.toContain(eventId);
+      restarted.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test.each(['spool-remove', 'journal-cleanup'] as const)('committed cancellation survives %s failure and restart never replays the Event', async (boundary) => {
     const dir = mkdtempSync(join(tmpdir(), `bridge-registry-cancel-${boundary}-`));
     try {
