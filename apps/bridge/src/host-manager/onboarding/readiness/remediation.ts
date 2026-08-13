@@ -12,8 +12,12 @@ export function errorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+export function firstFailedCheck(checks: HostReadinessCheck[]): HostReadinessCheck | undefined {
+  return checks.find((check) => !check.ready);
+}
+
 export function readinessFailureActions(checks: HostReadinessCheck[]): StrictReadinessResult['nextActions'] {
-  const failed = checks.find((check) => !check.ready);
+  const failed = firstFailedCheck(checks);
   if (!failed) {
     return [{ id: 'retry-onboarding', message: 'Strict readiness checks failed.' }];
   }
@@ -25,29 +29,6 @@ export function readinessFailureActions(checks: HostReadinessCheck[]): StrictRea
     message: remediation.message,
     ...(remediation.command ? { command: remediation.command } : {}),
   }];
-}
-
-export function piPackageNotReadyAction(
-  status: PiExtensionStatus | undefined,
-  version: string,
-): StrictReadinessResult['nextActions'][number] {
-  return {
-    id: 'retry-onboarding',
-    message: piPackageNotReadyMessage(status, version),
-    command: 'ariava setup --extension pi',
-  };
-}
-
-export function readinessError(
-  code: 'ERR_AGENT_ADAPTER_DISCOVERY' | 'ERR_AGENT_ADAPTER_NOT_LOOPBACK' | 'ERR_RELAY_UNREACHABLE' | 'ERR_RELAY_AUTH_FAILED' | 'ERR_IDENTITY_INVALID',
-  message: string,
-  retryable = true,
-): AriavaCliError {
-  return new AriavaCliError(code, message, {
-    step: 'strict-readiness',
-    retryable,
-    remediation: defaultReadinessRemediation(code, message),
-  });
 }
 
 export function defaultReadinessRemediation(code: string | undefined, message: string): { message: string; command?: string } {
@@ -75,7 +56,7 @@ export function defaultReadinessRemediation(code: string | undefined, message: s
   return { message, command: 'ariava setup --resume' };
 }
 
-function piPackageNotReadyMessage(status: PiExtensionStatus | undefined, version: string): string {
+export function piPackageNotReadyMessage(status: PiExtensionStatus | undefined, version: string): string {
   if (!status?.installed) {
     return `Exact Pi extension package @ariava/pi-extension@${version} is not installed.`;
   }
@@ -89,4 +70,16 @@ function piPackageNotReadyMessage(status: PiExtensionStatus | undefined, version
     return `Pi extension readiness failed: ${status.mismatchReasons.join(', ')}.`;
   }
   return `Exact Pi extension package evidence for @ariava/pi-extension@${version} is not ready.`;
+}
+
+export function readinessError(
+  code: 'ERR_AGENT_ADAPTER_DISCOVERY' | 'ERR_AGENT_ADAPTER_NOT_LOOPBACK' | 'ERR_RELAY_UNREACHABLE' | 'ERR_RELAY_AUTH_FAILED' | 'ERR_IDENTITY_INVALID',
+  message: string,
+  retryable = true,
+): AriavaCliError {
+  return new AriavaCliError(code, message, {
+    step: 'strict-readiness',
+    retryable,
+    remediation: defaultReadinessRemediation(code, message),
+  });
 }

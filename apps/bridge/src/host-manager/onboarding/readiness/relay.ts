@@ -1,46 +1,58 @@
 import { randomBytes } from 'node:crypto';
-import type { HostEnrollmentResponse } from '@ariava/protocol';
+import type { HostEnrollmentResponse, HostPlatform } from '@ariava/protocol';
 import { base64UrlEncode, isCanonicalTimestamp } from '@ariava/protocol';
+import type { HostIdentity } from '../../../identity/types';
 import { RelayClient, RelayClientError } from '../../../relay-client';
+import type { ResolvedAriavaConfig } from '../../config';
 import { AriavaCliError } from '../../service/errors';
-import type { StrictReadinessDependencies, StrictReadinessInput } from './check';
 import { boundedPositive, fetchBounded, linkedAbortController } from './bounded-fetch';
 import { readinessError } from './remediation';
 
-export function defaultNonce(): string {
-  return base64UrlEncode(randomBytes(16));
+export interface RelayReadinessDependencies {
+  fetch: typeof fetch;
+  createRelayClient(
+    options: ConstructorParameters<typeof RelayClient>[0],
+    requestSignal?: () => AbortSignal | undefined,
+  ): Pick<RelayClient, 'enrollHost'>;
+  nonce(): string;
 }
 
-const defaultRelayDependencies: Pick<StrictReadinessDependencies, 'fetch' | 'createRelayClient' | 'nonce'> = {
+export interface RelayHealthInput {
+  config: Pick<ResolvedAriavaConfig, 'relayBaseUrl'>;
+  requestTimeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface RelayEnrollmentInput extends RelayHealthInput {
+  identity: Pick<HostIdentity, 'hostId' | 'keyId' | 'algorithm' | 'publicKey' | 'signer'>;
+  hostMetadata: { hostName: string; platform: HostPlatform; bridgeVersion: string };
+}
+
+export const defaultRelayReadinessDependencies: RelayReadinessDependencies = {
   fetch,
   createRelayClient: (options, requestSignal) => new RelayClient(options, requestSignal),
-  nonce: defaultNonce,
+  // Signed-request nonces must be canonical base64url of exactly 16 bytes.
+  nonce: () => base64UrlEncode(randomBytes(16)),
 };
 
-function resolveRelayDependencies(
-  overrides: Partial<StrictReadinessDependencies>,
-): Pick<StrictReadinessDependencies, 'fetch' | 'createRelayClient' | 'nonce'> {
-  return { ...defaultRelayDependencies, ...overrides };
-}
-
 export async function checkRelay(
-  input: Pick<StrictReadinessInput, 'config' | 'identity' | 'hostMetadata' | 'requestTimeoutMs' | 'signal'>,
-  overrides: Partial<StrictReadinessDependencies> = {},
+  input: RelayEnrollmentInput,
+  overrides: Partial<RelayReadinessDependencies> = {},
 ): Promise<void> {
-  const deps = resolveRelayDependencies(overrides);
+  const deps = { ...defaultRelayReadinessDependencies, ...overrides };
   await checkRelayHealth(input, deps);
   await checkRelayEnrollment(input, deps);
 }
 
 export async function checkRelayHealth(
-  input: Pick<StrictReadinessInput, 'config' | 'requestTimeoutMs' | 'signal'>,
-  overrides: Partial<StrictReadinessDependencies> = {},
+  input: RelayHealthInput,
+  overrides: Partial<RelayReadinessDependencies> = {},
 ): Promise<void> {
-  const deps = resolveRelayDependencies(overrides);
+  const deps = { ...defaultRelayReadinessDependencies, ...overrides };
   const timeoutMs = boundedPositive(input.requestTimeoutMs, 5_000);
   let health: Response;
   try {
-    health = await fetchBounded(new URL('/health', input.config.relayBaseUrl), { signal: input.signal }, timeoutMs, deps);
+    health = await fetchBounded(new URL('/health', input.config.relayBaseUrl), { signal: input.signal }, timeoutMs, deps.fetch);
   } catch (error) {
     if (input.signal?.aborted) throw error;
     throw readinessError('ERR_RELAY_UNREACHABLE', 'Relay health could not be reached.');
@@ -56,10 +68,10 @@ export async function checkRelayHealth(
 }
 
 export async function checkRelayEnrollment(
-  input: Pick<StrictReadinessInput, 'config' | 'identity' | 'hostMetadata' | 'requestTimeoutMs' | 'signal'>,
-  overrides: Partial<StrictReadinessDependencies> = {},
+  input: RelayEnrollmentInput,
+  overrides: Partial<RelayReadinessDependencies> = {},
 ): Promise<void> {
-  const deps = resolveRelayDependencies(overrides);
+  const deps = { ...defaultRelayReadinessDependencies, ...overrides };
   const timeoutMs = boundedPositive(input.requestTimeoutMs, 5_000);
   const controller = linkedAbortController(input.signal);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -103,7 +115,7 @@ function isExactOk(value: unknown): boolean {
 function assertEnrollmentResponse(
   response: HostEnrollmentResponse,
   hostId: string,
-  metadata: StrictReadinessInput['hostMetadata'],
+  metadata: RelayEnrollmentInput['hostMetadata'],
 ): void {
   const host = response?.host;
   if (!host || host.hostId !== hostId || host.hostName !== metadata.hostName || host.platform !== metadata.platform

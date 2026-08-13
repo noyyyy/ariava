@@ -1,11 +1,14 @@
 import type { HostPlatform } from '@ariava/protocol';
-import { readAgentAdapterConfig, type AgentAdapterDiscoveryFile } from '../../../agent-adapter/config';
 import type { HostIdentity, HostIdentityInspection } from '../../../identity/types';
-import { RelayClient } from '../../../relay-client';
 import type { AriavaInstallMetadata, ResolvedAriavaConfig } from '../../config';
 import type { PiExtensionStatus } from '../../pi-extension';
-import type { AriavaServiceInstallRecord, ServiceStatus } from '../../service/types';
-import type { OnboardingCliEvidence, OnboardingTarget, StrictReadinessResult } from '../types';
+import type { AriavaServiceInstallRecord } from '../../service/types';
+import type {
+  HostReadinessCheck,
+  OnboardingCliEvidence,
+  OnboardingTarget,
+  StrictReadinessResult,
+} from '../types';
 import {
   exactPiPackageReady,
   identityReady,
@@ -14,24 +17,29 @@ import {
   serviceReferencesReady,
   stableCliMatches,
 } from './evidence';
-import { pollForDiscoveryAndHealth } from './local-bridge';
-import { errorCode, errorMessage, piPackageNotReadyAction, readinessFailureActions } from './remediation';
-import { checkRelayEnrollment, checkRelayHealth, defaultNonce } from './relay';
-import { boundedPositive, throwIfAborted } from './bounded-fetch';
+import {
+  defaultLocalBridgeDependencies,
+  pollForDiscoveryAndHealth,
+  pollForService,
+  type LocalBridgeDependencies,
+  type ReadinessClock,
+} from './local-bridge';
+import {
+  errorCode,
+  errorMessage,
+  piPackageNotReadyMessage,
+  readinessFailureActions,
+} from './remediation';
+import {
+  checkRelayEnrollment,
+  checkRelayHealth,
+  defaultRelayReadinessDependencies,
+  type RelayReadinessDependencies,
+} from './relay';
 
-export interface ReadinessClock {
-  now(): number;
-  sleep(milliseconds: number): Promise<void>;
-}
+export type { ReadinessClock } from './local-bridge';
 
-export interface StrictReadinessDependencies {
-  fetch: typeof fetch;
-  clock: ReadinessClock;
-  readDiscovery(path: string): AgentAdapterDiscoveryFile | null;
-  serviceStatus(): ServiceStatus;
-  createRelayClient(options: ConstructorParameters<typeof RelayClient>[0], requestSignal?: () => AbortSignal | undefined): Pick<RelayClient, 'enrollHost'>;
-  nonce(): string;
-}
+export interface StrictReadinessDependencies extends LocalBridgeDependencies, RelayReadinessDependencies {}
 
 export interface StrictReadinessInput {
   target: OnboardingTarget;
@@ -52,125 +60,142 @@ export interface StrictReadinessInput {
   signal?: AbortSignal;
 }
 
-const defaultClock: ReadinessClock = {
-  now: () => Date.now(),
-  sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
-};
-
-const defaultReadinessDependencies: StrictReadinessDependencies = {
-  fetch,
-  clock: defaultClock,
-  readDiscovery: readAgentAdapterConfig,
-  serviceStatus: () => { throw new Error('A service status dependency is required'); },
-  createRelayClient: (options, requestSignal) => new RelayClient(options, requestSignal),
-  nonce: defaultNonce,
-};
-
-function resolveReadinessDependencies(
-  overrides: Partial<StrictReadinessDependencies>,
-): StrictReadinessDependencies {
-  return { ...defaultReadinessDependencies, ...overrides };
+export interface ReadinessDomainChecks {
+  stable: readonly HostReadinessCheck[];
+  service: readonly HostReadinessCheck[];
+  localAdapter: readonly HostReadinessCheck[];
+  relay: readonly HostReadinessCheck[];
 }
+
+export interface ReadinessEvidence {
+  domains: ReadinessDomainChecks;
+  piStatus: PiExtensionStatus | undefined;
+  cliVersion: string;
+}
+
+const defaultDependencies: StrictReadinessDependencies = {
+  ...defaultLocalBridgeDependencies,
+  ...defaultRelayReadinessDependencies,
+};
 
 export async function checkStrictOnboardingReadiness(
   input: StrictReadinessInput,
   overrides: Partial<StrictReadinessDependencies> = {},
 ): Promise<StrictReadinessResult> {
-  const deps = resolveReadinessDependencies(overrides);
-  const checks: StrictReadinessResult['checks'] = [];
-  const add = (
-    id: StrictReadinessResult['checks'][number]['id'],
-    ready: boolean,
-    code?: string,
-    message?: string,
-  ): boolean => {
-    checks.push({
-      id,
-      ready,
-      ...(ready || !code ? {} : { code }),
-      ...(ready || !message ? {} : { message }),
-    });
-    return ready;
-  };
+  const deps = { ...defaultDependencies, ...overrides };
 
-  add(
-    'stable-cli',
-    stableCliMatches(input),
-    'ERR_STABLE_CLI_PATH',
-    'Stable Ariava CLI path or version evidence does not match the executing CLI.',
-  );
-  add(
-    'persisted-config',
-    persistedConfigReady(input),
-    'ERR_RELAY_CONFIG_REQUIRED',
-    'Persisted Host configuration is incomplete, or ambient environment overrides are present.',
-  );
-  add(
-    'identity',
-    identityReady(input),
-    'ERR_IDENTITY_INVALID',
-    'Host identity is not ready (invalid, pending rotation, or integrity checks failed).',
-  );
+  const stable: HostReadinessCheck[] = [
+    readinessCheck(
+      'stable-cli',
+      stableCliMatches(input),
+      'ERR_STABLE_CLI_PATH',
+      'Stable Ariava CLI path or version evidence does not match the executing CLI.',
+    ),
+    readinessCheck(
+      'persisted-config',
+      persistedConfigReady(input),
+      'ERR_RELAY_CONFIG_REQUIRED',
+      'Persisted Host configuration is incomplete, or ambient environment overrides are present.',
+    ),
+    readinessCheck(
+      'identity',
+      identityReady(input),
+      'ERR_IDENTITY_INVALID',
+      'Host identity is not ready (invalid, pending rotation, or integrity checks failed).',
+    ),
+  ];
 
-  const service = await pollForService(input, deps);
-  add(
-    'service-support',
-    service.support.supported,
-    'ERR_UNSUPPORTED_PLATFORM',
-    service.support.message ?? 'A supported user service backend is not available.',
-  );
-  add('service-installed', service.installed, 'ERR_SERVICE_NOT_INSTALLED', 'Bridge service is not installed.');
-  add('service-enabled', service.enabled, 'ERR_ONBOARDING_NOT_READY', 'Bridge service is installed but not enabled.');
-  add('service-loaded', service.loaded, 'ERR_ONBOARDING_NOT_READY', 'Bridge service is not loaded by the user service manager.');
-  add('service-running', service.processRunning, 'ERR_ONBOARDING_NOT_READY', 'Bridge service process is not running.');
-  add(
-    'service-paths',
-    servicePathsReady(input, service),
-    'ERR_SERVICE_METADATA',
-    'Bridge service runtime or CLI paths do not match the current stable install.',
-  );
-  add(
-    'service-references',
-    serviceReferencesReady(input),
-    'ERR_SERVICE_METADATA',
-    'Bridge service metadata does not reference the current config or Host identity storage.',
-  );
+  const serviceStatus = await pollForService(input, deps);
+  const service: HostReadinessCheck[] = [
+    readinessCheck(
+      'service-support',
+      serviceStatus.support.supported,
+      'ERR_UNSUPPORTED_PLATFORM',
+      serviceStatus.support.message ?? 'A supported user service backend is not available.',
+    ),
+    readinessCheck('service-installed', serviceStatus.installed, 'ERR_SERVICE_NOT_INSTALLED', 'Bridge service is not installed.'),
+    readinessCheck('service-enabled', serviceStatus.enabled, 'ERR_ONBOARDING_NOT_READY', 'Bridge service is installed but not enabled.'),
+    readinessCheck('service-loaded', serviceStatus.loaded, 'ERR_ONBOARDING_NOT_READY', 'Bridge service is not loaded by the user service manager.'),
+    readinessCheck('service-running', serviceStatus.processRunning, 'ERR_ONBOARDING_NOT_READY', 'Bridge service process is not running.'),
+    readinessCheck(
+      'service-paths',
+      servicePathsReady(input, serviceStatus),
+      'ERR_SERVICE_METADATA',
+      'Bridge service runtime or CLI paths do not match the current stable install.',
+    ),
+    readinessCheck(
+      'service-references',
+      serviceReferencesReady(input),
+      'ERR_SERVICE_METADATA',
+      'Bridge service metadata does not reference the current config or Host identity storage.',
+    ),
+  ];
 
+  const localAdapter: HostReadinessCheck[] = [];
   try {
     const evidence = await pollForDiscoveryAndHealth(input, deps);
-    add('agent-adapter-discovery', true);
-    add('agent-adapter-health', true);
-    add(
-      'bridge-runtime-health',
-      evidence.health.status === 'healthy',
-      'ERR_BRIDGE_DEGRADED',
-      'Bridge is reachable but Driver or Relay presence reconciliation is degraded.',
+    localAdapter.push(
+      readinessCheck('agent-adapter-discovery', true),
+      readinessCheck('agent-adapter-health', true),
+      readinessCheck(
+        'bridge-runtime-health',
+        evidence.health.status === 'healthy',
+        'ERR_BRIDGE_DEGRADED',
+        'Bridge is reachable but Driver or Relay presence reconciliation is degraded.',
+      ),
     );
   } catch (error) {
     const code = errorCode(error, 'ERR_AGENT_ADAPTER_DISCOVERY');
     const message = errorMessage(error, 'Agent Adapter discovery or authenticated health failed.');
-    add('agent-adapter-discovery', false, code, message);
-    add('agent-adapter-health', false, code, message);
-    add('bridge-runtime-health', false, code, message);
+    localAdapter.push(
+      readinessCheck('agent-adapter-discovery', false, code, message),
+      readinessCheck('agent-adapter-health', false, code, message),
+      readinessCheck('bridge-runtime-health', false, code, message),
+    );
   }
 
+  const relay: HostReadinessCheck[] = [];
   try {
     await checkRelayHealth(input, deps);
-    add('relay-health', true);
+    relay.push(readinessCheck('relay-health', true));
     try {
       await checkRelayEnrollment(input, deps);
-      add('relay-enrollment', true);
+      relay.push(readinessCheck('relay-enrollment', true));
     } catch (error) {
       const code = errorCode(error, 'ERR_RELAY_UNREACHABLE');
-      add('relay-enrollment', false, code, errorMessage(error, 'Relay signed Host enrollment failed.'));
+      relay.push(readinessCheck(
+        'relay-enrollment',
+        false,
+        code,
+        errorMessage(error, 'Relay signed Host enrollment failed.'),
+      ));
     }
   } catch (error) {
     const code = errorCode(error, 'ERR_RELAY_UNREACHABLE');
     const message = errorMessage(error, 'Relay health is unavailable.');
-    add('relay-health', false, code, message);
-    add('relay-enrollment', false, code, message);
+    relay.push(
+      readinessCheck('relay-health', false, code, message),
+      readinessCheck('relay-enrollment', false, code, message),
+    );
   }
 
+  return assembleStrictReadiness({
+    domains: { stable, service, localAdapter, relay },
+    piStatus: input.piStatus,
+    cliVersion: input.cliVersion,
+  }, input.target);
+}
+
+export function assembleStrictReadiness(
+  evidence: ReadinessEvidence,
+  target: OnboardingTarget,
+): StrictReadinessResult {
+  const checks = [
+    ...evidence.domains.stable,
+    ...evidence.domains.service,
+    ...evidence.domains.localAdapter,
+    ...evidence.domains.relay,
+  ];
   const hostReady = checks.every((check) => check.ready);
   if (!hostReady) {
     return {
@@ -180,16 +205,23 @@ export async function checkStrictOnboardingReadiness(
       nextActions: readinessFailureActions(checks),
     };
   }
-  if (input.target === 'host-ready') return { ready: true, readiness: 'host-ready', checks, nextActions: [] };
+  if (target === 'host-ready') return { ready: true, readiness: 'host-ready', checks, nextActions: [] };
 
-  if (!exactPiPackageReady(input.piStatus, input.cliVersion)) {
+  if (!exactPiPackageReady(evidence.piStatus, evidence.cliVersion)) {
+    const message = piPackageNotReadyMessage(evidence.piStatus, evidence.cliVersion);
     return {
       ready: false,
       readiness: 'failed',
       checks,
-      nextActions: [piPackageNotReadyAction(input.piStatus, input.cliVersion)],
+      nextActions: [{
+        id: 'retry-onboarding',
+        message,
+        command: 'ariava setup --extension pi',
+      }],
     };
   }
+  // Current session registration contains neither extension version nor capability
+  // evidence, so even a visible Pi provider session cannot prove adapter readiness.
   return {
     ready: true,
     readiness: 'reload-pending',
@@ -198,16 +230,16 @@ export async function checkStrictOnboardingReadiness(
   };
 }
 
-async function pollForService(input: StrictReadinessInput, deps: StrictReadinessDependencies): Promise<ServiceStatus> {
-  const timeoutMs = boundedPositive(input.timeoutMs, 10_000);
-  const intervalMs = boundedPositive(input.pollIntervalMs, 100);
-  const deadline = deps.clock.now() + timeoutMs;
-  let status = deps.serviceStatus();
-  throwIfAborted(input.signal);
-  while (status.support.supported && status.installed && !status.processRunning && deps.clock.now() < deadline) {
-    throwIfAborted(input.signal);
-    await deps.clock.sleep(Math.min(intervalMs, Math.max(1, deadline - deps.clock.now())));
-    status = deps.serviceStatus();
-  }
-  return status;
+function readinessCheck(
+  id: HostReadinessCheck['id'],
+  ready: boolean,
+  code?: string,
+  message?: string,
+): HostReadinessCheck {
+  return {
+    id,
+    ready,
+    ...(ready || !code ? {} : { code }),
+    ...(ready || !message ? {} : { message }),
+  };
 }
