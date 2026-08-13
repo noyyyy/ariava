@@ -6,15 +6,17 @@ set -euo pipefail
 export HOME="${HOME:-/home/ariava-test}"
 export PATH="$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 export npm_config_prefix="$HOME/.npm-global"
+TEST_TMPDIR="${ARIAVA_SYSTEMD_TEST_TMPDIR:-/tmp}"
+mkdir -p "$TEST_TMPDIR"
 
 record_json() {
   local name="$1" expected="$2"; shift 2
   set +e
-  "$@" > "/tmp/$name.json" 2> "/tmp/$name.err"
+  "$@" > "$TEST_TMPDIR/$name.json" 2> "$TEST_TMPDIR/$name.err"
   local exit_code=$?
   set -e
-  cat "/tmp/$name.json"
-  cat "/tmp/$name.err" >&2
+  cat "$TEST_TMPDIR/$name.json"
+  cat "$TEST_TMPDIR/$name.err" >&2
   [[ "$exit_code" == "$expected" ]] || {
     echo "$name exited $exit_code, expected $expected" >&2
     exit 1
@@ -31,8 +33,8 @@ record_json post-upgrade-status 0 ariava service status --json
 
 node <<'NODE'
 const fs = require('fs');
-const status = JSON.parse(fs.readFileSync('/tmp/post-upgrade-status.json', 'utf8'));
-const before = JSON.parse(fs.readFileSync('/tmp/ariava-identity-before.json', 'utf8'));
+const status = JSON.parse(fs.readFileSync(process.env.ARIAVA_SYSTEMD_TEST_TMPDIR + '/post-upgrade-status.json', 'utf8'));
+const before = JSON.parse(fs.readFileSync(process.env.ARIAVA_SYSTEMD_TEST_TMPDIR + '/ariava-identity-before.json', 'utf8'));
 const config = JSON.parse(fs.readFileSync(process.env.HOME + '/.config/ariava/config.json', 'utf8'));
 if (config.identity?.hostId !== before.hostId || config.identity?.keyId !== before.keyId) {
   throw new Error('hostId/keyId changed across restart or reconciliation-only upgrade');
@@ -52,7 +54,7 @@ record_json final-status 0 ariava service status --json
 
 node <<'NODE'
 const fs = require('fs');
-const status = JSON.parse(fs.readFileSync('/tmp/final-status.json', 'utf8'));
+const status = JSON.parse(fs.readFileSync(process.env.ARIAVA_SYSTEMD_TEST_TMPDIR + '/final-status.json', 'utf8'));
 if (status.data.installed !== false) throw new Error('final installed !== false');
 const metadataPath = process.env.HOME + '/.config/ariava/install.json';
 if (fs.existsSync(metadataPath)) {

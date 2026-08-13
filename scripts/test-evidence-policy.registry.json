@@ -1,0 +1,93 @@
+[
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/dev-profile-npm-script.test.ts",
+    "testName": "detects forbidden lifecycle modules through $name",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/dev-profile-npm-script.test.ts",
+    "testName": "parsed manifest exposes only the reviewed built entrypoints",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/dev-profile-npm-script.test.ts",
+    "testName": "keeps the canonical dev lifecycle graph outside production lifecycle modules",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/dev-profile-npm-script.test.ts",
+    "testName": "keeps the built dev entrypoint outside production lifecycle implementations",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "scripts/test-lane-policy.test.ts",
+    "testName": "the reviewed repository inventory is classified and shared files contain no host skip wrappers",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "scripts/test-linux-systemd.test.ts",
+    "testName": "is not part of the default test or verify commands",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "scripts/verify-linux-docker.test.ts",
+    "testName": "pins the reviewed image/toolchain and keeps verification non-root and disposable",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "scripts/verify-linux-docker.test.ts",
+    "testName": "policy rejects unsafe or weaker mutations",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "scripts/workflow-policy.test.ts",
+    "testName": "CI has separate exact-toolchain Linux/macOS host jobs and publication remains Ubuntu/OIDC-only",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "scripts/workflow-policy.test.ts",
+    "testName": "negative mutation: adding OIDC or publication credentials to CI is rejected",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "scripts/workflow-policy.test.ts",
+    "testName": "negative mutation: swapping runners, weakening commands, or drifting toolchains is rejected",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "scripts/workflow-policy.test.ts",
+    "testName": "negative mutation: introducing a publication token is rejected",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "scripts/workflow-policy.test.ts",
+    "testName": "negative mutation: rebuilding in the publish job is rejected",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  }
+]

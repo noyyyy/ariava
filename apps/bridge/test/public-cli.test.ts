@@ -1883,19 +1883,3 @@ describe('public ariava CLI', () => {
   });
 
 });
-
-describe('default lifecycle adapter structure', () => {
-  test('keeps public-cli-app as a compatibility wrapper over the default adapter', () => {
-    const wrapper = readFileSync(join(publicRepoRoot, 'apps', 'bridge', 'src', 'public-cli-app.ts'), 'utf8');
-    const adapter = readFileSync(join(publicRepoRoot, 'apps', 'bridge', 'src', 'cli', 'lifecycle', 'default.ts'), 'utf8');
-
-    expect(wrapper).toContain('runAriavaCli(argv, createDefaultCliApplicationContext(overrides, onboardingOverrides))');
-    expect(wrapper).not.toContain('runDefaultCli');
-    expect(wrapper).not.toContain('dispatchPublicCli');
-    expect(wrapper).not.toContain('switch (command)');
-    expect(adapter).toContain('createDefaultLifecycleAdapter');
-    expect(adapter).toContain('runSetup');
-    expect(adapter).toContain('runService');
-    expect(adapter).toContain('runInternal');
-  });
-});

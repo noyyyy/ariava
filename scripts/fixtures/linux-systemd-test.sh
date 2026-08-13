@@ -8,15 +8,17 @@ export PATH="$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 export npm_config_prefix="$HOME/.npm-global"
 export ARIAVA_RELAY_BASE_URL=http://127.0.0.1:9
 export ARIAVA_HOST_NAME='Linux systemd integration test'
+TEST_TMPDIR="${ARIAVA_SYSTEMD_TEST_TMPDIR:-/tmp}"
+mkdir -p "$TEST_TMPDIR"
 
 record_json() {
   local name="$1" expected="$2"; shift 2
   set +e
-  "$@" > "/tmp/$name.json" 2> "/tmp/$name.err"
+  "$@" > "$TEST_TMPDIR/$name.json" 2> "$TEST_TMPDIR/$name.err"
   local exit_code=$?
   set -e
-  cat "/tmp/$name.json"
-  cat "/tmp/$name.err" >&2
+  cat "$TEST_TMPDIR/$name.json"
+  cat "$TEST_TMPDIR/$name.err" >&2
   [[ "$exit_code" == "$expected" ]] || {
     echo "$name exited $exit_code, expected $expected" >&2
     exit 1
@@ -35,7 +37,7 @@ node - <<'NODE'
 const fs = require('fs');
 const config = JSON.parse(fs.readFileSync(process.env.HOME + '/.config/ariava/config.json', 'utf8'));
 if (!config.identity?.hostId || !config.identity?.keyId) throw new Error('persisted identity missing');
-fs.writeFileSync('/tmp/ariava-identity-before.json', JSON.stringify({ hostId: config.identity.hostId, keyId: config.identity.keyId }));
+fs.writeFileSync(process.env.ARIAVA_SYSTEMD_TEST_TMPDIR + '/ariava-identity-before.json', JSON.stringify({ hostId: config.identity.hostId, keyId: config.identity.keyId }));
 NODE
 
 UNIT="$HOME/.config/systemd/user/ariava.service"
@@ -63,12 +65,12 @@ record_json logs 0 ariava logs --json
 
 node <<'NODE'
 const fs = require('fs');
-const status = JSON.parse(fs.readFileSync('/tmp/service-status.json', 'utf8'));
+const status = JSON.parse(fs.readFileSync(process.env.ARIAVA_SYSTEMD_TEST_TMPDIR + '/service-status.json', 'utf8'));
 if (!status.ok || status.data.backend !== 'systemd-user') throw new Error('unexpected service backend');
 if (!status.data.installed || !status.data.enabled || !status.data.loaded || !status.data.processRunning) {
   throw new Error('installed service state is incomplete');
 }
-const logs = JSON.parse(fs.readFileSync('/tmp/logs.json', 'utf8'));
+const logs = JSON.parse(fs.readFileSync(process.env.ARIAVA_SYSTEMD_TEST_TMPDIR + '/logs.json', 'utf8'));
 if (!logs.ok || logs.data.backend !== 'systemd-user') throw new Error('journald logs were not returned');
 NODE
 

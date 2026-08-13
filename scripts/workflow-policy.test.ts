@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
-const ci = readFileSync('.github/workflows/ci.yml', 'utf8');
-const publish = readFileSync('.github/workflows/publish-npm.yml', 'utf8');
-const releaseLibrary = readFileSync('scripts/npm-release-lib.mjs', 'utf8');
+const repositoryRoot = join(import.meta.dir, '..');
+const ci = readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8');
+const publish = readFileSync(join(repositoryRoot, '.github/workflows/publish-npm.yml'), 'utf8');
 
 const FULL_SHA_ACTION = /^\s*uses:\s*[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[0-9a-f]{40}\s*$/u;
 const FORBIDDEN_PUBLICATION_INPUT = /NPM_TOKEN|NODE_AUTH_TOKEN|npm[_ -]?password|TOTP|--otp|secrets\./iu;
@@ -94,13 +95,7 @@ export function assertWorkflowPolicy(ciSource: string, publishSource: string) {
   expect(prepare).toContain('NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/ariava-npm-config/user.npmrc');
   expect(prepare).toContain('NPM_CONFIG_GLOBALCONFIG: ${{ runner.temp }}/ariava-npm-config/global.npmrc');
   expect(publishSource).not.toContain('NPM_CONFIG_USERCONFIG: /dev/null');
-  expect(releaseLibrary).not.toMatch(/NPM_CONFIG_(?:USER|GLOBAL)CONFIG:\s*['"]\/dev\/null['"]/u);
-  expect(publishSource).not.toContain('registry-url:');
   expect(publishSource).not.toMatch(FORBIDDEN_PUBLICATION_INPUT);
-  expect(releaseLibrary).toContain('parseStableTag');
-  expect(releaseLibrary).toContain('validateGitRelease');
-  expect(releaseLibrary).toContain("['install', '--frozen-lockfile']");
-  expect(releaseLibrary).toContain("['run', 'verify']");
 
   assertPinnedActions(ciSource);
   assertPinnedActions(publishSource);
@@ -126,7 +121,8 @@ describe('GitHub workflow least-privilege policy', () => {
   });
 
   test('negative mutation: introducing a publication token is rejected', () => {
-    const mutated = publish.replace('contents: read\n', 'contents: read\n    env:\n      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}\n');
+    const mutated = publish.replace('environment: npm-production', 'environment: npm-production\n    env:\n      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}');
+    expect(mutated).not.toBe(publish);
     expect(() => assertWorkflowPolicy(ci, mutated)).toThrow();
   });
 

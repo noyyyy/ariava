@@ -19,6 +19,7 @@ const built = spawnSync('bun', [
   resolve(bridgeRoot, 'src', 'cli.ts'),
   resolve(bridgeRoot, 'src', 'public-cli.ts'),
   resolve(bridgeRoot, 'src', 'dev-profile-cli.ts'),
+  resolve(bridgeRoot, 'src', 'ui', 'onboarding-renderer.ts'),
   resolve(bridgeRoot, 'src', 'e2e', 'node-crypto.ts'),
   resolve(bridgeRoot, 'src', 'e2e', 'node-crypto-self-test.ts'),
   resolve(bridgeRoot, 'src', 'daemon.ts'),

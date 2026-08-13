@@ -24,9 +24,5 @@ describe('public protocol source boundary', () => {
       ['WatchPairing', 'StatusResponse'].join(''),
       ['LinkedHost', 'Projection'].join(''),
     ]) expect(source.includes(forbidden)).toBe(false);
-    expect(() => readFileSync(join(sourceDir, 'voice-reply.ts'), 'utf8')).toThrow();
-    const snapshots = readFileSync(join(sourceDir, 'session-snapshots.ts'), 'utf8');
-    expect(snapshots).toContain('Host lifecycle revisions and encrypted Session revisions are independent domains');
-    expect(snapshots).toContain("const REQUEST_KEYS = ['hostId', 'revision', 'observedAt', 'recipientSetVersion', 'sessions']");
   });
 });

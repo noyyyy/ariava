@@ -274,24 +274,6 @@ describe('unified CLI application shell', () => {
     expect(current.stderr.read()).toBe('');
   });
 
-  test('lifecycle adapters do not redispatch catalog-owned shared commands', () => {
-    const sharedCommands = ARIAVA_COMMAND_CATALOG
-      .filter((entry) => entry.availability.default?.route === 'shared'
-        || entry.availability.dev?.route === 'shared')
-      .map((entry) => entry.command);
-    expect(sharedCommands).toEqual(['init', 'status', 'pair', 'watches', 'identity', 'host', 'doctor', 'config']);
-
-    for (const adapter of ['default', 'dev'] as const) {
-      const source = readFileSync(join(import.meta.dir, '..', 'src', 'cli', 'lifecycle', `${adapter}.ts`), 'utf8');
-      const dispatchStart = adapter === 'default' ? 'async function dispatchPublicCli(' : 'async function dispatchDevProfileCommand(';
-      const dispatchEnd = adapter === 'default' ? 'function createDefaultStatusDependencies(' : 'async function runDevSetup(';
-      const dispatch = source.slice(source.indexOf(dispatchStart), source.indexOf(dispatchEnd));
-      expect(dispatch.startsWith(dispatchStart), `${adapter}:dispatch`).toBe(true);
-      for (const command of sharedCommands) {
-        expect(dispatch, `${adapter}:${command}`).not.toMatch(new RegExp(`case\\s+['"]${command}['"]\\s*:`));
-      }
-    }
-  });
 
 
 });

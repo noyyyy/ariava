@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { collectNodeBridgeTests, runNodeBridgeTests } from './run-node-bridge-tests.mjs';
 import { resolveBunExecutable } from './bun-executable.mjs';
 import { runHostVerification } from './verify-host.mjs';
 import {
@@ -170,13 +171,16 @@ describe('Public Repo test lane collection policy', () => {
     }
   });
 
-  test('local host verification is Darwin-only dispatch and never starts Docker or OrbStack', () => {
-    const source = readFileSync(join(repositoryRoot, 'scripts', 'verify-host.mjs'), 'utf8');
-    expect(source).toContain("process.platform");
-    expect(source).toContain("['run', 'verify:macos']");
-    expect(source).toContain('shell: false');
-    expect(source).not.toContain('process.execPath');
-    expect(source).not.toMatch(/docker|orbstack|verify:linux/iu);
+  test('local host verification is Darwin-only dispatch with controlled argv and diagnostics', () => {
+    const errors: string[] = [];
+    let spawnCount = 0;
+    expect(runHostVerification({
+      platform: 'linux',
+      consoleError: (message: string) => errors.push(message),
+      spawnSync: () => { spawnCount += 1; return { status: 0 }; },
+    })).toBe(1);
+    expect(spawnCount).toBe(0);
+    expect(errors.join('\n')).toContain('Linux verification is owned by the Public Repo CI lane');
   });
 
   test('Bun executable resolution and launchers honor explicit overrides with argument arrays', () => {
@@ -239,21 +243,45 @@ describe('Public Repo test lane collection policy', () => {
   });
 
   test('collector uses reviewed roots, sorted argument arrays, and no shell execution', () => {
-    const source = readFileSync(join(repositoryRoot, 'scripts', 'run-test-lane.mjs'), 'utf8');
-    for (const root of REVIEWED_TEST_ROOTS) expect(source).toContain(`'${root}'`);
-    expect(source).toContain("spawn(bunPath, ['test', ...group.map");
-    expect(source).toContain('shell: false');
-    expect(source).not.toContain('process.execPath');
-    expect(source).not.toMatch(/execSync|\bshell:\s*true/u);
+    const root = fixture([
+      'scripts/zeta.test.ts',
+      'scripts/alpha.test.ts',
+      'apps/bridge/test/beta.test.ts',
+    ]);
+    const launches: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
+    expect(runTestLane('shared', {
+      repositoryRoot: root,
+      reviewedRoots: ['scripts', 'apps/bridge/test'],
+      bunPath: '/fake/bun',
+      stdio: 'pipe',
+      spawnSync: (command: string, args: string[], options: Record<string, unknown>) => {
+        launches.push({ command, args, options });
+        return { status: 0 };
+      },
+    })).toBe(0);
+    expect(launches.map((entry) => entry.args)).toEqual([
+      ['test', './scripts/alpha.test.ts', './scripts/zeta.test.ts'],
+      ['test', './apps/bridge/test/beta.test.ts'],
+    ]);
+    expect(launches.every((entry) => entry.command === '/fake/bun' && entry.options.shell === false)).toBe(true);
   });
 
   test('authoritative Node Bridge lane includes every portable production suite without shell execution', () => {
-    const source = readFileSync(join(repositoryRoot, 'scripts', 'run-node-bridge-tests.mjs'), 'utf8');
-    const nodeTests = [...new Bun.Glob('apps/bridge/test-node/*.test.mjs').scanSync({ cwd: repositoryRoot })].sort();
-    expect(nodeTests).toHaveLength(7);
-    expect(source).toContain("entry.name.endsWith('.test.mjs')");
-    expect(source).toContain("spawn(process.execPath, ['--test'");
-    expect(source).toContain('shell: false');
-    expect(source).not.toMatch(/execSync|\bshell:\s*true/u);
+    const expected = [...new Bun.Glob('apps/bridge/test-node/*.test.mjs').scanSync({ cwd: repositoryRoot })]
+      .map((path) => `./${path}`)
+      .sort();
+    expect(collectNodeBridgeTests()).toEqual(expected);
+    const launches: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
+    expect(runNodeBridgeTests({
+      stdio: 'pipe',
+      spawnSync: (command: string, args: string[], options: Record<string, unknown>) => {
+        launches.push({ command, args, options });
+        return { status: 0 };
+      },
+    })).toBe(0);
+    expect(launches).toHaveLength(1);
+    expect(launches[0]?.command).toBe(process.execPath);
+    expect(launches[0]?.args).toEqual(['--test', ...expected]);
+    expect(launches[0]?.options).toMatchObject({ cwd: repositoryRoot, shell: false, stdio: 'pipe' });
   });
 });

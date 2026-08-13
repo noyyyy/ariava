@@ -49,32 +49,86 @@ const { resolveAriavaDevProfilePaths } = await import('../src/host-manager/dev-p
 const { createDevProfile } = await import('../src/cli/profiles/dev');
 
 const root = resolve(import.meta.dir, '../../..');
+const nodeExecutable = Bun.which('node');
+if (!nodeExecutable) throw new Error('Node executable is required for built Bridge artifact tests.');
 
 describe('Node-backed dev setup', () => {
-  test('builds a Node dev-profile entrypoint and runs setup through it', () => {
+  test('parsed manifest exposes only the reviewed built entrypoints', () => {
     const manifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       scripts: Record<string, string>;
       bin: Record<string, string>;
     };
-    const buildScript = readFileSync(resolve(root, 'scripts/build-bridge.mjs'), 'utf8');
 
     expect(manifest.scripts['dev:cli']).toBe('node ./scripts/build-bridge.mjs && node ./apps/bridge/dist/dev-profile-cli.js');
     expect(manifest.scripts['dev:setup']).toBe('node ./scripts/build-bridge.mjs && node ./apps/bridge/dist/dev-profile-cli.js setup');
     expect(Object.keys(manifest.scripts).filter((name) => name.startsWith('dev:'))).toEqual(['dev:cli', 'dev:setup']);
-    expect(manifest.scripts['build:protocol']).toBeUndefined();
-    expect(manifest.scripts['build:shared-utils']).toBeUndefined();
-    expect(manifest.scripts['build:bridge']).toBeUndefined();
-    expect(buildScript).toContain("resolve(bridgeRoot, 'src', 'dev-profile-cli.ts')");
     expect(manifest.bin).toEqual({ ariava: 'apps/bridge/dist/public-cli.js' });
-    expect(buildScript).toContain("resolve(bridgeRoot, 'src', 'public-cli.ts')");
   });
 
-  test('resolves Public Repo assets from the built dev entrypoint', () => {
-    const artifact = readFileSync(resolve(root, 'apps/bridge/dist/dev-profile-cli.js'), 'utf8');
-    expect(artifact).toContain('function resolvePublicRepoRoot(modulePath)');
-    expect(artifact).toContain('SOURCE_PI_EXTENSION_PATH');
-    for (const segment of ['extensions', 'pi', 'index.ts']) expect(artifact).toContain(`"${segment}"`);
-    expect(existsSync(resolve(root, 'extensions', 'pi', 'index.ts'))).toBe(true);
+  async function captureChildOutput(child: ReturnType<typeof Bun.spawn>): Promise<[number, string, string]> {
+    return Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+  }
+
+  test.each([
+    { entrypoint: 'public-cli.js', heading: 'Ariava — Apple Watch-first collaboration for coding agents' },
+    { entrypoint: 'dev-profile-cli.js', heading: 'Ariava — source development profile' },
+  ])('executes built $entrypoint through production dispatch from an unrelated cwd', async ({ entrypoint, heading }) => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'ariava-built-entrypoint-'));
+    const home = join(fixtureRoot, 'home');
+    const cwd = join(fixtureRoot, 'unrelated-cwd');
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    mkdirSync(cwd, { recursive: true, mode: 0o700 });
+    try {
+      const child = Bun.spawn({
+        cmd: [nodeExecutable, resolve(root, 'apps/bridge/dist', entrypoint), 'help'],
+        cwd,
+        env: { HOME: home, XDG_CONFIG_HOME: join(home, '.config'), PATH: '/usr/bin:/bin' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await captureChildOutput(child);
+      expect(exitCode).toBe(0);
+      expect(stderr).toBe('');
+      expect(stdout).toContain(heading);
+      expect(stdout).toContain('identity status');
+      expect(stdout).toContain('pair <PAIRING_CODE>');
+      expect(existsSync(join(home, '.config', 'ariava'))).toBe(false);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('loads the packaged onboarding-success asset through the built production renderer from an unrelated cwd under Node', async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'ariava-built-renderer-asset-'));
+    const cwd = join(fixtureRoot, 'unrelated-cwd');
+    mkdirSync(cwd, { recursive: true, mode: 0o700 });
+    try {
+      const rendererUrl = new URL(`file://${resolve(root, 'apps/bridge/dist/ui/onboarding-renderer.js')}`).href;
+      const script = [
+        `const { renderOnboardingResult } = await import(${JSON.stringify(rendererUrl)});`,
+        "const result = { target: 'host-ready', readiness: 'host-ready', steps: [{ id: 'completion', status: 'ready' }], nextActions: [] };",
+        "const terminal = { stdout: process.stdout, stderr: process.stderr, interactive: true, color: false, columns: 80 };",
+        'process.stdout.write(`${renderOnboardingResult(result, { terminal })}\\n`);',
+      ].join('\n');
+      const child = Bun.spawn({
+        cmd: [nodeExecutable, '--input-type=module', '--eval', script],
+        cwd,
+        env: { PATH: dirname(nodeExecutable) },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await captureChildOutput(child);
+      const asset = readFileSync(resolve(root, 'apps/bridge/dist/ui/assets/ariava-success-wide.txt'), 'utf8').trimEnd();
+      expect(exitCode).toBe(0);
+      expect(stderr).toBe('');
+      expect(stdout).toBe(`${asset}\nHost ready\n`);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   });
 
   test('delegates spawnSync outside recording and records it exactly while active', async () => {
@@ -157,33 +211,6 @@ describe('Node-backed dev setup', () => {
     ]) {
       expect(artifact).not.toContain(forbidden);
     }
-    expect(artifact).toContain('deps.spawn("pi", ["--no-extensions", "-e", deps.sourcePiExtensionPath, ...args]');
-  });
-
-  test('keeps both executable entrypoints as direct unified-app wrappers', () => {
-    const sourceRoot = resolve(root, 'apps/bridge/src');
-    const entrypoints = [
-      { file: 'public-cli.ts', contextFactory: 'createDefaultCliApplicationContext' },
-      { file: 'dev-profile-cli.ts', contextFactory: 'createDevCliApplicationContext' },
-    ];
-
-    for (const entrypoint of entrypoints) {
-      const source = readFileSync(resolve(sourceRoot, entrypoint.file), 'utf8');
-      expect(source).toContain("import { runAriavaCli } from './cli/app';");
-      expect(source).toContain(entrypoint.contextFactory);
-      expect(source).toContain(`runAriavaCli(process.argv.slice(2), ${entrypoint.contextFactory}())`);
-      expect(source).not.toContain('console.error');
-    }
-  });
-
-  test('keeps dev-profile-app as compatibility-only glue', () => {
-    const source = readFileSync(resolve(root, 'apps/bridge/src/dev-profile-app.ts'), 'utf8');
-    expect(source).not.toContain('dispatchDevProfileCommand');
-    expect(source).not.toContain('runDevSetup');
-    expect(source).not.toContain('runDevBridge');
-    expect(source).not.toContain('runDevPi');
-    expect(source).not.toContain('runSharedHostCommand');
-    expect(source).not.toContain('switch (');
   });
   test.each([
     {
