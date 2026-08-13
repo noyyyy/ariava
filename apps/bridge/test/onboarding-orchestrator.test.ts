@@ -14,7 +14,6 @@ import {
   type PiExtensionStatus,
   type ServiceManager,
   type ServiceStatus,
-  AriavaCliError,
 } from '../src/host-manager';
 
 const version = '1.2.3';
@@ -31,6 +30,10 @@ const inspection: HostIdentityInspection = {
   hostId: identity.hostId, keyId: identity.keyId, algorithm: 'Ed25519', publicKeyFingerprint: identity.publicKeyFingerprint,
   ownerIntegrity: true, permissionIntegrity: true, metadataIntegrity: true, pendingRotation: false,
 };
+const onboardingStepIds = [
+  'preflight', 'stable-cli', 'relay-config', 'host-init', 'bridge-service',
+  'adapter-detect', 'adapter-install', 'strict-readiness', 'completion',
+] as const;
 
 function serviceRecord(backend: 'launchd' | 'systemd-user' = 'systemd-user'): AriavaServiceInstallRecord {
   return {
@@ -77,7 +80,6 @@ function fixture(options: {
   stalePaths?: boolean;
   piAction?: 'reused' | 'installed' | 'upgraded';
   piFailure?: boolean;
-  cancelAt?: string;
   sourceDev?: OnboardingDetection['sourceDev'];
 } = {}) {
   const calls: string[] = [];
@@ -139,11 +141,11 @@ function fixture(options: {
       locked = true;
       return { path: '/lock', record: {} as never, release() { calls.push('lock.release'); locked = false; } };
     },
-    loadUserConfig: () => userConfig,
+    loadUserConfig() { calls.push('config.load'); return userConfig; },
     saveUserConfig(config) { calls.push('config.save'); userConfig = config; },
     async initializeHost() { calls.push('host.initialize'); state = hostState(); return { config: state.config, identityCreated: true }; },
     async loadHostState() { calls.push('host.load'); return state; },
-    loadInstallMetadata: () => metadata,
+    loadInstallMetadata() { calls.push('metadata.load'); return metadata; },
     saveInstallMetadata(value) { calls.push('metadata.save'); metadata = value; },
     serviceManager: manager,
     adapterProbe() { calls.push('adapter.detect'); return { present: true, version: version }; },
@@ -160,7 +162,7 @@ function fixture(options: {
       calls.push('readiness');
       return { ready: true, readiness: target === 'host-ready' ? 'host-ready' : 'reload-pending', checks: [], nextActions: [] };
     },
-    cancellation: { throwIfCancelled() { calls.push('cancel.check'); if (options.cancelAt && calls.includes(options.cancelAt)) throw new Error('cancelled'); } },
+    cancellation: { throwIfCancelled() { calls.push('cancel.check'); } },
     sleep: async () => {}, serviceTimeoutMs: 5, servicePollIntervalMs: 1,
   };
   const input: OnboardingOrchestratorInput = {
@@ -231,6 +233,57 @@ describe('onboarding orchestrator', () => {
     expect(result.readiness).toBe('failed');
     expect(unavailable.calls).toEqual(['detect']);
     expect(result.steps[0]).toMatchObject({ id: 'preflight', status: 'failed' });
+  });
+
+  test.each([
+    {
+      name: 'unsupported manager',
+      mutateManager(manager: ServiceManager): ServiceManager {
+        return {
+          ...manager,
+          support: {
+            ...manager.support,
+            supported: false,
+            reason: 'systemd-user-manager-unavailable',
+          },
+        };
+      },
+    },
+    {
+      name: 'missing manager backend',
+      mutateManager(manager: ServiceManager): ServiceManager {
+        return { ...manager, backend: undefined };
+      },
+    },
+    {
+      name: 'mismatched manager backend',
+      mutateManager(manager: ServiceManager): ServiceManager {
+        return { ...manager, backend: 'launchd' };
+      },
+    },
+  ])('supported detection with $name fails at preflight before every effect', async ({ mutateManager }) => {
+    const scenario = fixture({ existingHost: false, existingService: false });
+    scenario.deps.serviceManager = mutateManager(scenario.deps.serviceManager);
+
+    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
+
+    expect(result.readiness).toBe('failed');
+    expect(result.steps[0]).toEqual({
+      id: 'preflight',
+      status: 'failed',
+      detail: {
+        step: 'preflight',
+        retryable: false,
+        remediation: { message: 'No supported service backend is available.' },
+        code: 'ERR_UNSUPPORTED_PLATFORM',
+        message: 'No supported service backend is available.',
+      },
+    });
+    expect(result.nextActions).toEqual([{
+      id: 'resolve-failure',
+      message: 'No supported service backend is available.',
+    }]);
+    expect(scenario.calls).toEqual(['detect']);
   });
 
   test('healthy rerun is reality-derived no-op and Bridge-only skips Pi', async () => {
@@ -330,38 +383,34 @@ describe('onboarding orchestrator', () => {
     });
   });
 
-  test('strict-readiness failure preserves current first-check translation and reconstructs one action', async () => {
+  test('strict-readiness failure preserves check detail, skipped completion, and every readiness action exactly', async () => {
     const scenario = fixture();
+    const checks = [
+      { id: 'stable-cli' as const, ready: true },
+      {
+        id: 'relay-health' as const,
+        ready: false,
+        code: 'ERR_RELAY_UNREACHABLE',
+        message: 'Relay health could not be reached.',
+      },
+    ];
+    const readinessNextActions: OnboardingResult['nextActions'] = [
+      {
+        id: 'repair-relay-enrollment',
+        message: 'Re-enroll this Host with the Relay.',
+        command: 'ariava pair <PAIRING_CODE>',
+      },
+      {
+        id: 'inspect-relay-health',
+        message: 'Inspect the signed Relay health evidence.',
+        command: 'ariava doctor --json',
+      },
+    ];
     scenario.deps.checkReadiness = async () => ({
       ready: false,
       readiness: 'failed',
-      checks: [
-        { id: 'stable-cli', ready: true },
-        {
-          id: 'relay-health',
-          ready: false,
-          code: 'ERR_RELAY_UNREACHABLE',
-          message: 'Relay health could not be reached.',
-        },
-        {
-          id: 'relay-enrollment',
-          ready: false,
-          code: 'ERR_RELAY_AUTH_FAILED',
-          message: 'Relay enrollment was rejected.',
-        },
-      ],
-      nextActions: [
-        {
-          id: 'readiness-owned-action',
-          message: 'Readiness supplied first action.',
-          command: 'ariava doctor',
-        },
-        {
-          id: 'readiness-secondary-action',
-          message: 'Readiness supplied second action.',
-          command: 'ariava setup --resume',
-        },
-      ],
+      checks,
+      nextActions: readinessNextActions,
     });
     const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
     expect(result.readiness).toBe('failed');
@@ -369,141 +418,20 @@ describe('onboarding orchestrator', () => {
       id: 'strict-readiness',
       status: 'failed',
       detail: {
-        checks: [
-          { id: 'stable-cli', ready: true },
-          { id: 'relay-health', ready: false, code: 'ERR_RELAY_UNREACHABLE', message: 'Relay health could not be reached.' },
-          { id: 'relay-enrollment', ready: false, code: 'ERR_RELAY_AUTH_FAILED', message: 'Relay enrollment was rejected.' },
-        ],
+        checks,
         code: 'ERR_RELAY_UNREACHABLE',
         message: 'Relay health could not be reached.',
-        remediation: { message: 'Readiness supplied first action.', command: 'ariava doctor' },
-      },
-    });
-    expect(result.nextActions).toEqual([{
-      id: 'retry-onboarding',
-      message: 'Readiness supplied first action.',
-      command: 'ariava doctor',
-    }]);
-  });
-
-  test('strict-readiness exceptions derive remediation from the shared code policy', async () => {
-    const scenario = fixture();
-    scenario.deps.checkReadiness = async () => {
-      throw new AriavaCliError(
-        'ERR_SERVICE_METADATA',
-        'Service metadata became unreadable.',
-        { step: 'strict-readiness', retryable: true, evidence: 'preserved' },
-      );
-    };
-
-    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
-
-    expect(result.readiness).toBe('failed');
-    expect(result.steps.find((step) => step.id === 'strict-readiness')).toEqual({
-      id: 'strict-readiness',
-      status: 'failed',
-      detail: {
-        step: 'strict-readiness',
-        retryable: true,
-        evidence: 'preserved',
         remediation: {
-          message: 'Service metadata became unreadable.',
-          command: 'ariava service reinstall',
+          message: 'Re-enroll this Host with the Relay.',
+          command: 'ariava pair <PAIRING_CODE>',
         },
-        code: 'ERR_SERVICE_METADATA',
-        message: 'Service metadata became unreadable.',
       },
     });
-    expect(result.nextActions).toEqual([{
-      id: 'retry-onboarding',
-      message: 'Service metadata became unreadable.',
-      command: 'ariava service reinstall',
-    }]);
-  });
-
-  test.each([
-    {
-      code: 'ERR_AGENT_ADAPTER_DISCOVERY' as const,
-      message: 'Agent Adapter discovery remained unavailable.',
-      command: 'ariava service restart',
-    },
-    {
-      code: 'ERR_AGENT_ADAPTER_NOT_LOOPBACK' as const,
-      message: 'Agent Adapter discovery was not loopback-only.',
-      command: 'ariava service restart',
-    },
-    {
-      code: 'ERR_BRIDGE_DEGRADED' as const,
-      message: 'Bridge runtime health was degraded.',
-      command: 'ariava doctor',
-    },
-    {
-      code: 'ERR_RELAY_UNREACHABLE' as const,
-      message: 'Relay health could not be reached.',
-      command: 'ariava doctor',
-    },
-  ])('strict-readiness exception $code uses strict-readiness remediation', async ({ code, message, command }) => {
-    const scenario = fixture();
-    scenario.deps.checkReadiness = async () => {
-      throw new AriavaCliError(code, message, {
-        step: 'strict-readiness',
-        retryable: true,
-        evidence: 'preserved',
-      });
-    };
-
-    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
-
-    expect(result.readiness).toBe('failed');
-    expect(result.steps.find((step) => step.id === 'strict-readiness')).toEqual({
-      id: 'strict-readiness',
-      status: 'failed',
-      detail: {
-        step: 'strict-readiness',
-        retryable: true,
-        evidence: 'preserved',
-        remediation: { message, command },
-        code,
-        message,
-      },
+    expect(result.steps.find((step) => step.id === 'completion')).toEqual({
+      id: 'completion',
+      status: 'skipped',
     });
-    expect(result.nextActions).toEqual([{
-      id: 'retry-onboarding',
-      message,
-      command,
-    }]);
-  });
-
-  test('strict-readiness exceptions preserve explicit remediation over code defaults', async () => {
-    const scenario = fixture();
-    scenario.deps.checkReadiness = async () => {
-      throw new AriavaCliError(
-        'ERR_SERVICE_METADATA',
-        'Service metadata became unreadable.',
-        {
-          step: 'strict-readiness',
-          retryable: false,
-          remediation: { message: 'Use the recorded repair.', command: 'ariava repair recorded-service' },
-        },
-      );
-    };
-
-    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
-
-    expect(result.steps.find((step) => step.id === 'strict-readiness')).toMatchObject({
-      status: 'failed',
-      detail: {
-        code: 'ERR_SERVICE_METADATA',
-        message: 'Service metadata became unreadable.',
-        retryable: false,
-        remediation: { message: 'Use the recorded repair.', command: 'ariava repair recorded-service' },
-      },
-    });
-    expect(result.nextActions).toEqual([{
-      id: 'resolve-failure',
-      message: 'Use the recorded repair.',
-      command: 'ariava repair recorded-service',
-    }]);
+    expect(result.nextActions).toEqual(readinessNextActions);
   });
 
   test('HostIdentityError from initializeHost keeps concrete code and message', async () => {
@@ -554,15 +482,92 @@ describe('onboarding orchestrator', () => {
     expect(JSON.stringify(result)).not.toContain('ariava host reset --confirm');
   });
 
+  test.each([
+    {
+      name: 'stable bootstrap before the onboarding lock',
+      cancelAfter: 'bootstrap',
+      useBootstrapLock: true,
+      nextEffect: 'lock.acquire',
+      expectedStatuses: ['reused', 'reused', 'skipped', 'skipped', 'skipped', 'skipped', 'skipped', 'skipped', 'skipped'],
+    },
+    {
+      name: 'onboarding lock before Relay effects',
+      cancelAfter: 'lock.acquire',
+      useBootstrapLock: false,
+      nextEffect: 'config.load',
+      expectedStatuses: ['reused', 'reused', 'failed', 'skipped', 'skipped', 'skipped', 'skipped', 'skipped', 'skipped'],
+    },
+    {
+      name: 'Relay persistence before Host effects',
+      cancelAfter: 'config.save',
+      useBootstrapLock: false,
+      nextEffect: 'host.load',
+      expectedStatuses: ['reused', 'reused', 'installed', 'failed', 'skipped', 'skipped', 'skipped', 'skipped', 'skipped'],
+    },
+    {
+      name: 'Host load before service reconciliation',
+      cancelAfter: 'host.load',
+      useBootstrapLock: false,
+      nextEffect: 'metadata.load',
+      expectedStatuses: ['reused', 'reused', 'reused', 'reused', 'failed', 'skipped', 'skipped', 'skipped', 'skipped'],
+    },
+    {
+      name: 'authenticated Bridge health before adapter effects',
+      cancelAfter: 'bridge.health',
+      useBootstrapLock: false,
+      nextEffect: 'adapter.detect',
+      expectedStatuses: ['reused', 'reused', 'reused', 'reused', 'reused', 'skipped', 'skipped', 'skipped', 'skipped'],
+    },
+    {
+      name: 'adapter detection before Pi installation',
+      cancelAfter: 'adapter.detect',
+      useBootstrapLock: false,
+      nextEffect: 'pi.install',
+      expectedStatuses: ['reused', 'reused', 'reused', 'reused', 'reused', 'ready', 'failed', 'skipped', 'skipped'],
+    },
+    {
+      name: 'Pi installation before strict readiness',
+      cancelAfter: 'pi.install',
+      useBootstrapLock: false,
+      nextEffect: 'readiness',
+      expectedStatuses: ['reused', 'reused', 'reused', 'reused', 'reused', 'ready', 'installed', 'skipped', 'skipped'],
+    },
+    {
+      name: 'strict readiness completion before the post-check',
+      cancelAfter: 'readiness',
+      useBootstrapLock: false,
+      nextEffect: 'completion',
+      expectedStatuses: ['reused', 'reused', 'reused', 'reused', 'reused', 'ready', 'installed', 'failed', 'skipped'],
+    },
+  ] as const)('cancellation after $name preserves the ordered coordinator boundary', async ({
+    cancelAfter,
+    useBootstrapLock,
+    nextEffect,
+    expectedStatuses,
+  }) => {
+    const scenario = fixture({ existingHost: cancelAfter === 'config.save' ? false : undefined });
+    if (useBootstrapLock) scenario.input.bootstrapVersion = undefined;
+    scenario.deps.cancellation = {
+      throwIfCancelled() {
+        scenario.calls.push('cancel.check');
+        if (scenario.calls.includes(cancelAfter)) throw new Error('cancelled');
+      },
+    };
 
-  test('cancellation releases only its lock and leaves completed service state intact', async () => {
-    const scenario = fixture({ existingService: false, running: false, cancelAt: 'service.start' });
     const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
-    expect(result.readiness).toBe('failed');
+    expect(result.steps.map(({ id }) => id)).toEqual(onboardingStepIds);
+    expect(result.steps.map(({ status }) => status)).toEqual(expectedStatuses);
+    expect(result.nextActions).toEqual([{ id: 'retry-onboarding', message: 'cancelled' }]);
     expect(scenario.locked).toBe(false);
-    expect(scenario.metadata.service).toBeDefined();
-    expect(scenario.calls).not.toContain('service.stop');
-    expect(scenario.calls).not.toContain('service.uninstall');
+    expect(scenario.bootstrapLocked).toBe(false);
+    if (useBootstrapLock) {
+      expect(scenario.calls.slice(-2)).toEqual(['bootstrap-lock.release', 'cancel.check']);
+      expect(scenario.calls).not.toContain('lock.acquire');
+    } else {
+      expect(scenario.calls).not.toContain('bootstrap-lock.acquire');
+      expect(scenario.calls.slice(-2)).toEqual(['cancel.check', 'lock.release']);
+    }
+    if (nextEffect !== 'completion') expect(scenario.calls).not.toContain(nextEffect);
   });
 
   test('bootstrap re-entry is enclosed by the ephemeral lock and returns before product-state writes', async () => {

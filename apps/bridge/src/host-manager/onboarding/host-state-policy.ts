@@ -5,32 +5,39 @@ import {
   type AriavaUserConfig,
   type ResolvedAriavaConfig,
 } from '../config';
-import type { StableBootstrapResult } from './bootstrap';
+
+type LoadedHostIdentityInspection = HostIdentityInspection & {
+  status: Exclude<HostIdentityInspection['status'], 'not-initialized'>;
+};
 
 export interface OnboardingHostState {
   config: ResolvedAriavaConfig;
-  identityInspection: HostIdentityInspection;
+  identityInspection: LoadedHostIdentityInspection;
   identity: HostIdentity;
 }
 
-export interface HostIdentityReadinessFailure {
-  reason: string;
-  identityStatus: HostIdentityInspection['status'];
-  pendingRotation: boolean;
-}
-
-export type ReusableHostState =
-  | { reusable: true }
-  | { reusable: false; identityFailure?: HostIdentityReadinessFailure };
-
-export type ReadyHostState =
+export type HostIdentityReadiness =
   | { ready: true }
-  | { ready: false; identityFailure?: HostIdentityReadinessFailure };
+  | {
+    ready: false;
+    reason: string;
+    identityStatus: HostIdentityInspection['status'];
+    pendingRotation: boolean;
+  };
+
+export type OnboardingHostStateDecision =
+  | { kind: 'reuse' }
+  | { kind: 'initialize'; reason: 'missing-state' | 'incomplete-config' }
+  | {
+    kind: 'reject';
+    reason: string;
+    identityStatus: HostIdentityInspection['status'];
+    pendingRotation: boolean;
+  };
 
 export interface RelaySelectionProposal {
   value: string;
   changed: boolean;
-  config: AriavaUserConfig;
 }
 
 export interface StableInstallerMetadataProposal {
@@ -38,40 +45,66 @@ export interface StableInstallerMetadataProposal {
   changed: boolean;
 }
 
+export function evaluateHostIdentityReadiness(
+  inspection: HostIdentityInspection,
+  identity: Pick<HostIdentity, 'hostId' | 'keyId'>,
+): HostIdentityReadiness {
+  const ready = inspection.status === 'ready'
+    && !inspection.pendingRotation
+    && inspection.ownerIntegrity
+    && inspection.permissionIntegrity
+    && inspection.metadataIntegrity
+    && inspection.hostId === identity.hostId
+    && inspection.keyId === identity.keyId;
+  if (ready) return { ready: true };
+
+  return {
+    ready: false,
+    reason: identityNotReadyReason(inspection, identity),
+    identityStatus: inspection.status,
+    pendingRotation: inspection.pendingRotation,
+  };
+}
+
+export function decideOnboardingHostState(
+  state: OnboardingHostState | undefined,
+): OnboardingHostStateDecision {
+  if (!state) return { kind: 'initialize', reason: 'missing-state' };
+
+  const identityReadiness = evaluateHostIdentityReadiness(state.identityInspection, state.identity);
+  if (!identityReadiness.ready) {
+    return {
+      kind: 'reject',
+      reason: identityReadiness.reason,
+      identityStatus: identityReadiness.identityStatus,
+      pendingRotation: identityReadiness.pendingRotation,
+    };
+  }
+
+  const config = state.config;
+  if (config.relayBaseUrl && config.hostName && config.agentAdapterSecret && config.identity
+    && config.identity.hostId === state.identity.hostId) {
+    return { kind: 'reuse' };
+  }
+  return { kind: 'initialize', reason: 'incomplete-config' };
+}
+
 export function proposeRelaySelection(
-  config: AriavaUserConfig,
+  config: Pick<AriavaUserConfig, 'relayBaseUrl'>,
   requested: string | undefined,
 ): RelaySelectionProposal {
   const persisted = config.relayBaseUrl?.trim();
   const value = persisted || requested?.trim() || ARIAVA_PRODUCTION_RELAY_BASE_URL;
-  if (persisted) return { value, changed: false, config };
-  return { value, changed: true, config: { ...config, relayBaseUrl: value } };
-}
-
-export function evaluateReusableHostState(state: OnboardingHostState): ReusableHostState {
-  if (state.identityInspection.status === 'not-initialized') return { reusable: false };
-  const identityFailure = inspectIdentityReadiness(state.identityInspection, state.identity);
-  if (identityFailure) return { reusable: false, identityFailure };
-  return { reusable: completeHostConfiguration(state) };
-}
-
-export function evaluateReadyHostState(state: OnboardingHostState): ReadyHostState {
-  const identityFailure = inspectIdentityReadiness(state.identityInspection, state.identity);
-  if (identityFailure) return { ready: false, identityFailure };
-  return { ready: completeHostConfiguration(state) };
+  return { value, changed: !persisted };
 }
 
 export function proposeStableInstallerMetadata(
   metadata: AriavaInstallMetadata,
-  bootstrap: StableBootstrapResult,
+  ariavaBinRealPath: string,
   cliVersion: string,
   recordedAt: string,
 ): StableInstallerMetadataProposal {
-  const installer = {
-    manager: 'npm' as const,
-    ariavaBinRealPath: bootstrap.evidence.executablePath,
-    recordedAt,
-  };
+  const installer = { manager: 'npm' as const, ariavaBinRealPath, recordedAt };
   const bridgeSource = metadata.bridgeSource ?? {
     kind: 'npm-package' as const,
     package: `ariava@${cliVersion}`,
@@ -85,29 +118,10 @@ export function proposeStableInstallerMetadata(
   return { metadata: { ...metadata, installer, bridgeSource }, changed: true };
 }
 
-function completeHostConfiguration(state: OnboardingHostState): boolean {
-  const config = state.config;
-  return Boolean(config.relayBaseUrl && config.hostName && config.agentAdapterSecret && config.identity
-    && config.identity.hostId === state.identity.hostId);
-}
-
-function inspectIdentityReadiness(
+function identityNotReadyReason(
   inspection: HostIdentityInspection,
-  identity: HostIdentity,
-): HostIdentityReadinessFailure | undefined {
-  if (inspection.status === 'ready' && !inspection.pendingRotation && inspection.ownerIntegrity
-    && inspection.permissionIntegrity && inspection.metadataIntegrity
-    && inspection.hostId === identity.hostId && inspection.keyId === identity.keyId) {
-    return undefined;
-  }
-  return {
-    reason: identityNotReadyReason(inspection, identity),
-    identityStatus: inspection.status,
-    pendingRotation: inspection.pendingRotation,
-  };
-}
-
-function identityNotReadyReason(inspection: HostIdentityInspection, identity: HostIdentity): string {
+  identity: Pick<HostIdentity, 'hostId' | 'keyId'>,
+): string {
   if (inspection.status === 'rotation-pending' || inspection.pendingRotation) {
     return 'Host identity key rotation is pending and must be completed or explicitly reset before onboarding can continue.';
   }

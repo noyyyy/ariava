@@ -1,14 +1,21 @@
 import type { HostPrivateKeyStorage } from '../../identity/types';
 import type { AriavaInstallMetadata } from '../config';
 import { AriavaCliError } from '../service/errors';
-import type { AriavaServiceInstallRecord, ServiceManager, ServiceStatus } from '../service/types';
-
-export type OnboardingServiceManager = Pick<
+import type {
+  AriavaServiceInstallRecord,
+  ServiceBackend,
   ServiceManager,
-  'support' | 'backend' | 'install' | 'status'
->;
+  ServiceStatus,
+} from '../service/types';
 
-export interface ServiceReconcileInput {
+export type OnboardingServiceManager = Pick<ServiceManager, 'support' | 'backend' | 'install' | 'status'>;
+
+export type OnboardingServiceAction = 'reused' | 'started' | 'installed' | 'reconciled';
+export type OnboardingServiceManagerPort = Pick<ServiceManager, 'status' | 'install' | 'start'> & {
+  readonly backend: ServiceBackend;
+};
+
+export interface OnboardingServiceReconcileInput {
   runtimePath: string;
   ariavaBinPath: string;
   configPath: string;
@@ -16,111 +23,102 @@ export interface ServiceReconcileInput {
   metadata: AriavaInstallMetadata;
 }
 
-export interface ServiceReconcileDependencies {
-  serviceManager: OnboardingServiceManager;
+export interface OnboardingServiceReconcileDependencies {
+  serviceManager: OnboardingServiceManagerPort;
+  persistServiceInstallMetadata(metadata: AriavaInstallMetadata): void;
+  throwIfCancelled(): void;
   now?(): string;
+  sleep?(milliseconds: number): Promise<void>;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
 }
 
-export interface ServiceReconcilePlan {
-  existing?: AriavaServiceInstallRecord;
-  status: ServiceStatus;
-  installRequired: boolean;
-  reused: boolean;
-  action: 'reused' | 'started' | 'installed' | 'reconciled';
-}
-
-export interface InstalledServiceResult {
+interface OnboardingServiceReconcileResultBase {
   record: AriavaServiceInstallRecord;
   metadata: AriavaInstallMetadata;
-  action: 'installed' | 'reconciled';
 }
 
-export function inspectOnboardingService(
-  input: ServiceReconcileInput,
-  deps: ServiceReconcileDependencies,
-): ServiceReconcilePlan {
+export type OnboardingServiceReconcileResult =
+  | OnboardingServiceReconcileResultBase & { reused: true; action: 'reused' }
+  | OnboardingServiceReconcileResultBase & {
+    reused: false;
+    action: Exclude<OnboardingServiceAction, 'reused'>;
+  };
+
+export async function reconcileOnboardingService(
+  input: OnboardingServiceReconcileInput,
+  deps: OnboardingServiceReconcileDependencies,
+): Promise<OnboardingServiceReconcileResult> {
   const manager = deps.serviceManager;
-  if (!manager.support.supported || !manager.backend) {
-    throw serviceError('ERR_UNSUPPORTED_PLATFORM', 'No supported service backend is available.', false);
-  }
   const existing = input.metadata.service;
   if (existing && existing.backend !== manager.backend) {
     throw serviceError('ERR_SERVICE_METADATA', 'Service metadata belongs to a different backend.', false);
   }
 
-  const status = serviceStatus(input, existing, manager);
+  let metadata = input.metadata;
+  let status = manager.status(existing, input.runtimePath, input.ariavaBinPath);
   const referencesMatch = serviceReferencesMatch(existing, input.configPath, input.identityReference);
-  const pathsMatch = servicePathsMatch(status, input.runtimePath, input.ariavaBinPath);
-  const reused = Boolean(existing && referencesMatch && pathsMatch && serviceStatusReady(status));
-  if (reused) {
-    return { existing, status, installRequired: false, reused: true, action: 'reused' };
-  }
+  const pathsMatch = status.runtimePath === input.runtimePath
+    && status.ariavaBinPath === input.ariavaBinPath
+    && status.runtimePathMatchesCurrent === true
+    && status.ariavaBinPathMatchesCurrent === true;
+  const fullyReady = Boolean(existing && referencesMatch && pathsMatch && serviceStatusReady(status));
+  if (fullyReady) return { record: existing!, metadata, reused: true, action: 'reused' };
 
-  if (existing && (!referencesMatch || !pathsMatch) && !releaseOwnershipProven(input.metadata, input.ariavaBinPath)) {
+  if (existing && (!referencesMatch || !pathsMatch) && !releaseOwnershipProven(metadata, input.ariavaBinPath)) {
     throw serviceError('ERR_SERVICE_METADATA', 'Stale service state cannot be reconciled without proven release ownership.', false);
   }
 
-  const installRequired = !existing || !status.installed || !referencesMatch || !pathsMatch || !status.enabled || !status.loaded;
-  return {
-    ...(existing ? { existing } : {}),
-    status,
-    installRequired,
-    reused: false,
-    action: installRequired ? (existing ? 'reconciled' : 'installed') : 'started',
-  };
-}
-
-export function installOnboardingService(
-  input: ServiceReconcileInput,
-  deps: ServiceReconcileDependencies,
-): InstalledServiceResult {
-  const record = deps.serviceManager.install({
-    runtimePath: input.runtimePath,
-    ariavaBinPath: input.ariavaBinPath,
-    configPath: input.configPath,
-    identityReference: input.identityReference,
-    installedAt: deps.now?.(),
-  });
-  return {
-    record,
-    metadata: { ...input.metadata, service: record },
-    action: input.metadata.service ? 'reconciled' : 'installed',
-  };
-}
-
-export function serviceStatus(
-  input: Pick<ServiceReconcileInput, 'runtimePath' | 'ariavaBinPath'>,
-  record: AriavaServiceInstallRecord | undefined,
-  manager: OnboardingServiceManager,
-): ServiceStatus {
-  return manager.status(record, input.runtimePath, input.ariavaBinPath);
-}
-
-export function servicePollWait(
-  elapsed: number,
-  timeoutMs: number | undefined,
-  pollIntervalMs: number | undefined,
-): number | undefined {
-  const timeout = timeoutMs ?? 10_000;
-  if (elapsed >= timeout) return undefined;
-  return Math.min(pollIntervalMs ?? 100, timeout - elapsed);
-}
-
-export function requireReadyOnboardingService(status: ServiceStatus): void {
+  deps.throwIfCancelled();
+  let record = existing;
+  let action: Exclude<OnboardingServiceAction, 'reused'> = 'started';
+  if (!existing || !status.installed || !referencesMatch || !pathsMatch || !status.enabled || !status.loaded) {
+    record = manager.install({
+      runtimePath: input.runtimePath,
+      ariavaBinPath: input.ariavaBinPath,
+      configPath: input.configPath,
+      identityReference: input.identityReference,
+      installedAt: deps.now?.(),
+    });
+    metadata = { ...metadata, service: record };
+    deps.persistServiceInstallMetadata(metadata);
+    action = existing ? 'reconciled' : 'installed';
+    status = manager.status(record, input.runtimePath, input.ariavaBinPath);
+  }
+  if (!status.processRunning) {
+    deps.throwIfCancelled();
+    manager.start(record);
+    action = action === 'started' ? 'started' : action;
+  }
+  status = await waitForReadyService(record!, input.runtimePath, deps);
   if (!serviceStatusReady(status)) {
     throw serviceError('ERR_ONBOARDING_NOT_READY', 'Bridge service did not reach running state.', true);
   }
+  return { record: record!, metadata, reused: false, action };
 }
 
-export function serviceStatusReady(status: ServiceStatus): boolean {
+async function waitForReadyService(
+  record: AriavaServiceInstallRecord,
+  runtimePath: string,
+  deps: OnboardingServiceReconcileDependencies,
+): Promise<ServiceStatus> {
+  const timeout = deps.timeoutMs ?? 10_000;
+  const interval = deps.pollIntervalMs ?? 100;
+  const sleep = deps.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  let elapsed = 0;
+  let status = deps.serviceManager.status(record, runtimePath, record.ariavaBinPath);
+  while (!serviceStatusReady(status) && elapsed < timeout) {
+    deps.throwIfCancelled();
+    const wait = Math.min(interval, timeout - elapsed);
+    await sleep(wait);
+    elapsed += wait;
+    status = deps.serviceManager.status(record, runtimePath, record.ariavaBinPath);
+  }
+  return status;
+}
+
+function serviceStatusReady(status: ServiceStatus): boolean {
   return status.support.supported && status.installed && status.enabled && status.loaded && status.processRunning;
-}
-
-function servicePathsMatch(status: ServiceStatus, runtimePath: string, ariavaBinPath: string): boolean {
-  return status.runtimePath === runtimePath
-    && status.ariavaBinPath === ariavaBinPath
-    && status.runtimePathMatchesCurrent === true
-    && status.ariavaBinPathMatchesCurrent === true;
 }
 
 function serviceReferencesMatch(
@@ -140,10 +138,6 @@ function releaseOwnershipProven(metadata: AriavaInstallMetadata, ariavaBinPath: 
     && (!source || source === 'release-bundle' || source === 'npm-package'));
 }
 
-function serviceError(
-  code: 'ERR_UNSUPPORTED_PLATFORM' | 'ERR_SERVICE_METADATA' | 'ERR_ONBOARDING_NOT_READY',
-  message: string,
-  retryable: boolean,
-): AriavaCliError {
+function serviceError(code: AriavaCliError['code'], message: string, retryable: boolean): AriavaCliError {
   return new AriavaCliError(code, message, { step: 'bridge-service', retryable });
 }

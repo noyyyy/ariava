@@ -2,28 +2,20 @@ import type { AriavaInstallMetadata, AriavaUserConfig } from '../config';
 import type { HostInitializationResult } from '../initialization';
 import type { PiPackageLifecycleResult } from '../pi-extension';
 import { AriavaCliError } from '../service/errors';
-import type { AriavaServiceInstallRecord } from '../service/types';
+import type { AriavaServiceInstallRecord, ServiceManager } from '../service/types';
 import type { StableBootstrapInput, StableBootstrapResult } from './bootstrap';
 import {
-  evaluateReadyHostState,
-  evaluateReusableHostState,
+  decideOnboardingHostState,
   proposeRelaySelection,
   proposeStableInstallerMetadata,
-  type HostIdentityReadinessFailure,
+  type OnboardingHostStateDecision,
   type OnboardingHostState,
 } from './host-state-policy';
 import type { OwnedOnboardingLock } from './lock';
-import { failureFromOnboardingError } from './onboarding-failure';
-import { completionActions, onboardingStep } from './onboarding-result';
-import { defaultReadinessRemediation } from './readiness/remediation';
+import { failureFromError } from './onboarding-failure';
 import {
-  inspectOnboardingService,
-  installOnboardingService,
-  requireReadyOnboardingService,
-  servicePollWait,
-  serviceStatus,
-  serviceStatusReady,
-  type OnboardingServiceManager,
+  reconcileOnboardingService,
+  type OnboardingServiceManagerPort,
 } from './service-reconcile';
 import type {
   OnboardingDetection,
@@ -63,7 +55,7 @@ export interface OnboardingOrchestratorDependencies {
   loadHostState(): Promise<OnboardingHostState | undefined>;
   loadInstallMetadata(): AriavaInstallMetadata;
   saveInstallMetadata(metadata: AriavaInstallMetadata): void;
-  serviceManager: OnboardingServiceManager & Pick<import('../service/types').ServiceManager, 'start'>;
+  serviceManager: ServiceManager;
   adapterProbe(): RuntimeProbe;
   proveBridgeHealth(state: OnboardingHostState, service: AriavaServiceInstallRecord): Promise<void>;
   installPi(cliVersion: string): PiPackageLifecycleResult;
@@ -93,13 +85,14 @@ export async function runOnboardingOrchestrator(
   deps: OnboardingOrchestratorDependencies,
 ): Promise<OnboardingResult> {
   const steps: OnboardingStepResult[] = [];
-  let currentStep: Exclude<OnboardingStepId, 'completion'> = 'preflight';
+  let currentStep: OnboardingStepId = 'preflight';
   const cancellation = deps.cancellation ?? noCancellation;
 
   try {
     const detection = deps.detect();
     requireSupportedPreflight(detection);
-    steps.push(onboardingStep('preflight', 'reused', preflightDetail(detection)));
+    requireConsistentServiceManager(detection, deps.serviceManager);
+    steps.push(step('preflight', 'reused', preflightDetail(detection)));
 
     currentStep = 'stable-cli';
     let bootstrap: StableBootstrapResult;
@@ -122,95 +115,72 @@ export async function runOnboardingOrchestrator(
     } finally {
       bootstrapLock?.release();
     }
-    steps.push(onboardingStep('stable-cli', 'reused', { version: input.cliVersion }));
+    steps.push(step('stable-cli', 'reused', { version: input.cliVersion }));
 
     cancellation.throwIfCancelled();
     const lock = deps.acquireLock();
     try {
       currentStep = 'relay-config';
       cancellation.throwIfCancelled();
-      const relay = proposeRelaySelection(deps.loadUserConfig(), input.relayBaseUrl);
-      if (relay.changed) deps.saveUserConfig(relay.config);
-      steps.push(onboardingStep('relay-config', relay.changed ? 'installed' : 'reused'));
+      const userConfig = deps.loadUserConfig();
+      const relay = proposeRelaySelection(userConfig, input.relayBaseUrl);
+      if (relay.changed) deps.saveUserConfig({ ...userConfig, relayBaseUrl: relay.value });
+      steps.push(step('relay-config', relay.changed ? 'installed' : 'reused'));
 
       currentStep = 'host-init';
       cancellation.throwIfCancelled();
       let state = await deps.loadHostState();
-      const reusableState = state ? evaluateReusableHostState(state) : { reusable: false as const };
-      if (reusableState.identityFailure) throwIdentityNotReady(reusableState.identityFailure);
-      const hostWasReady = reusableState.reusable;
+      const hostDecision = decideOnboardingHostState(state);
+      if (hostDecision.kind === 'reject') throwIdentityNotReady(hostDecision);
+      const hostWasReady = hostDecision.kind === 'reuse';
       if (!hostWasReady) {
         await deps.initializeHost(relay.value);
         state = await deps.loadHostState();
         if (!state) throw onboardingError('ERR_IDENTITY_INVALID', 'Host initialization did not produce readable identity state.', currentStep, false);
-        const readyState = evaluateReadyHostState(state);
-        if (readyState.identityFailure) throwIdentityNotReady(readyState.identityFailure);
-        if (!readyState.ready) {
-          throw onboardingError('ERR_ONBOARDING_NOT_READY', 'Host initialization did not produce complete persisted configuration.', currentStep, false);
+        const initializedHostDecision = decideOnboardingHostState(state);
+        if (initializedHostDecision.kind === 'reject') throwIdentityNotReady(initializedHostDecision);
+        if (initializedHostDecision.kind !== 'reuse') {
+          throw onboardingError('ERR_ONBOARDING_NOT_READY', 'Host initialization did not produce complete persisted configuration.', 'host-init', false);
         }
       }
-      steps.push(onboardingStep('host-init', hostWasReady ? 'reused' : 'installed'));
+      steps.push(step('host-init', hostWasReady ? 'reused' : 'installed'));
 
       currentStep = 'bridge-service';
       cancellation.throwIfCancelled();
       let metadata = deps.loadInstallMetadata();
-      const recordedAt = deps.now?.() ?? new Date().toISOString();
-      const stableMetadata = proposeStableInstallerMetadata(metadata, bootstrap, input.cliVersion, recordedAt);
+      const metadataRecordedAt = deps.now?.() ?? new Date().toISOString();
+      const stableMetadata = proposeStableInstallerMetadata(
+        metadata,
+        bootstrap.evidence.executablePath,
+        input.cliVersion,
+        metadataRecordedAt,
+      );
       if (stableMetadata.changed) deps.saveInstallMetadata(stableMetadata.metadata);
       metadata = stableMetadata.metadata;
-      const serviceInput = {
+      const serviceResult = await reconcileOnboardingService({
         runtimePath: input.runtimePath,
         ariavaBinPath: bootstrap.evidence.executablePath,
         configPath: state.config.configPath,
         identityReference: state.identity.privateKeyStorage,
         metadata,
-      };
-      const serviceDependencies = {
+      }, {
         serviceManager: deps.serviceManager,
-        ...(deps.now ? { now: deps.now } : {}),
-      };
-      const servicePlan = inspectOnboardingService(serviceInput, serviceDependencies);
-      let serviceRecord = servicePlan.existing;
-      let serviceAction = servicePlan.action;
-      let serviceStatusResult = servicePlan.status;
-
-      if (!servicePlan.reused) {
-        cancellation.throwIfCancelled();
-        if (servicePlan.installRequired) {
-          const installed = installOnboardingService(serviceInput, serviceDependencies);
-          serviceRecord = installed.record;
-          serviceAction = installed.action;
-          metadata = installed.metadata;
-          deps.saveInstallMetadata(metadata);
-          serviceStatusResult = serviceStatus(serviceInput, serviceRecord, deps.serviceManager);
-        }
-        if (!serviceStatusResult.processRunning) {
-          cancellation.throwIfCancelled();
-          deps.serviceManager.start(serviceRecord);
-        }
-
-        let elapsed = 0;
-        serviceStatusResult = serviceStatus(serviceInput, serviceRecord, deps.serviceManager);
-        while (!serviceStatusReady(serviceStatusResult)) {
-          const wait = servicePollWait(elapsed, deps.serviceTimeoutMs, deps.servicePollIntervalMs);
-          if (wait === undefined) break;
-          cancellation.throwIfCancelled();
-          await (deps.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds))))(wait);
-          elapsed += wait;
-          serviceStatusResult = serviceStatus(serviceInput, serviceRecord, deps.serviceManager);
-        }
-        requireReadyOnboardingService(serviceStatusResult);
-      }
-
-      const readyServiceRecord = serviceRecord!;
-      steps.push(onboardingStep('bridge-service', servicePlan.reused ? 'reused' : 'ready', {
-        backend: readyServiceRecord.backend,
-        action: serviceAction,
+        persistServiceInstallMetadata: (nextMetadata) => deps.saveInstallMetadata(nextMetadata),
+        throwIfCancelled: () => cancellation.throwIfCancelled(),
+        ...(deps.now ? { now: () => deps.now!() } : {}),
+        ...(deps.sleep ? { sleep: (milliseconds: number) => deps.sleep!(milliseconds) } : {}),
+        ...(deps.serviceTimeoutMs !== undefined ? { timeoutMs: deps.serviceTimeoutMs } : {}),
+        ...(deps.servicePollIntervalMs !== undefined ? { pollIntervalMs: deps.servicePollIntervalMs } : {}),
+      });
+      metadata = serviceResult.metadata;
+      steps.push(step('bridge-service', serviceResult.reused ? 'reused' : 'ready', {
+        backend: serviceResult.record.backend,
+        action: serviceResult.action,
       }));
 
       // Adapter operations are deliberately unreachable until manager status and
       // authenticated local Adapter health both prove the Bridge is healthy.
-      await deps.proveBridgeHealth(state, readyServiceRecord);
+      await deps.proveBridgeHealth(state, serviceResult.record);
       cancellation.throwIfCancelled();
 
       currentStep = 'adapter-detect';
@@ -218,7 +188,7 @@ export async function runOnboardingOrchestrator(
       if (input.target === 'adapter-installed' && !adapter.present) {
         throw onboardingError('ERR_AGENT_RUNTIME_NOT_FOUND', 'Pi is not available for adapter installation.', currentStep, true);
       }
-      steps.push(onboardingStep('adapter-detect', 'ready', { pi: adapter.present }));
+      steps.push(step('adapter-detect', 'ready', { pi: adapter.present }));
 
       currentStep = 'adapter-install';
       let pi: PiPackageLifecycleResult | undefined;
@@ -229,9 +199,9 @@ export async function runOnboardingOrchestrator(
           metadata = { ...metadata, piExtension: pi.record };
           deps.saveInstallMetadata(metadata);
         }
-        steps.push(onboardingStep('adapter-install', pi.action === 'reused' ? 'reused' : 'installed', { action: pi.action }));
+        steps.push(step('adapter-install', pi.action === 'reused' ? 'reused' : 'installed', { action: pi.action }));
       } else {
-        steps.push(onboardingStep('adapter-install', 'skipped'));
+        steps.push(step('adapter-install', 'skipped'));
       }
 
       cancellation.throwIfCancelled();
@@ -241,7 +211,7 @@ export async function runOnboardingOrchestrator(
         stableCli: bootstrap.evidence,
         state,
         installMetadata: metadata,
-        service: readyServiceRecord,
+        service: serviceResult.record,
         ...(pi ? { pi: pi.status } : {}),
       });
       cancellation.throwIfCancelled();
@@ -257,29 +227,26 @@ export async function runOnboardingOrchestrator(
               ...(readiness.nextActions[0].command ? { command: readiness.nextActions[0].command } : {}),
             }
           : undefined;
-        steps.push(onboardingStep('strict-readiness', 'failed', {
+        steps.push(step('strict-readiness', 'failed', {
           checks: readiness.checks,
           ...(failedCode ? { code: failedCode } : { code: 'ERR_ONBOARDING_NOT_READY' }),
           message: failedMessage,
           ...(remediation ? { remediation } : {}),
         }));
-        steps.push(onboardingStep('completion', 'skipped'));
+        steps.push(step('completion', 'skipped'));
         return {
           target: input.target,
           readiness: 'failed',
           steps,
-          nextActions: [{
-            id: 'retry-onboarding',
-            message: remediation?.message ?? failedMessage,
-            ...(remediation?.command ? { command: remediation.command } : {}),
-          }],
+          nextActions: readiness.nextActions,
         };
       }
-      steps.push(onboardingStep('strict-readiness', readiness.readiness === 'reload-pending' ? 'reload-pending' : 'ready', {
+      steps.push(step('strict-readiness', readiness.readiness === 'reload-pending' ? 'reload-pending' : 'ready', {
         checks: readiness.checks,
       }));
 
-      steps.push(onboardingStep('completion', 'ready'));
+      currentStep = 'completion';
+      steps.push(step('completion', 'ready'));
       return {
         target: input.target,
         readiness: readiness.readiness,
@@ -290,10 +257,7 @@ export async function runOnboardingOrchestrator(
       lock.release();
     }
   } catch (error) {
-    if (currentStep === 'strict-readiness') {
-      return strictReadinessFailureFromError(input.target, steps, error);
-    }
-    return failureFromOnboardingError(input.target, steps, currentStep, error);
+    return failureFromError(input.target, steps, currentStep, error);
   }
 }
 
@@ -312,6 +276,20 @@ function requireSupportedPreflight(detection: OnboardingDetection): void {
   });
 }
 
+function requireConsistentServiceManager(
+  detection: OnboardingDetection,
+  serviceManager: ServiceManager,
+): asserts serviceManager is OnboardingServiceManagerPort {
+  const detectedBackend = detection.serviceSupport.backend;
+  if (serviceManager.support.supported && serviceManager.backend && serviceManager.backend === detectedBackend) return;
+  throw onboardingError(
+    'ERR_UNSUPPORTED_PLATFORM',
+    'No supported service backend is available.',
+    'preflight',
+    false,
+  );
+}
+
 function preflightDetail(detection: OnboardingDetection): Record<string, unknown> {
   return {
     backend: detection.serviceSupport.backend,
@@ -319,15 +297,28 @@ function preflightDetail(detection: OnboardingDetection): Record<string, unknown
   };
 }
 
-function throwIdentityNotReady(failure: HostIdentityReadinessFailure): never {
-  throw onboardingError('ERR_IDENTITY_INVALID', failure.reason, 'host-init', false, {
-    identityStatus: failure.identityStatus,
-    pendingRotation: failure.pendingRotation,
+function throwIdentityNotReady(readiness: Extract<OnboardingHostStateDecision, { kind: 'reject' }>): never {
+  throw onboardingError('ERR_IDENTITY_INVALID', readiness.reason, 'host-init', false, {
+    identityStatus: readiness.identityStatus,
+    pendingRotation: readiness.pendingRotation,
     remediation: {
-      message: failure.reason,
+      message: readiness.reason,
       command: 'ariava host reset --confirm',
     },
   });
+}
+
+function completionActions(target: OnboardingTarget): OnboardingResult['nextActions'] {
+  return target === 'adapter-installed'
+    ? [
+        { id: 'reload-pi', command: '/reload' },
+        { id: 'pair-watch', command: 'ariava pair <PAIRING_CODE>' },
+      ]
+    : [{ id: 'pair-watch', command: 'ariava pair <PAIRING_CODE>' }];
+}
+
+function step(id: OnboardingStepId, status: OnboardingStepResult['status'], detail?: Record<string, unknown>): OnboardingStepResult {
+  return { id, status, ...(detail && Object.keys(detail).length > 0 ? { detail } : {}) };
 }
 
 function firstFailedCheck(checks: StrictReadinessResult['checks']): StrictReadinessResult['checks'][number] | undefined {
@@ -339,47 +330,6 @@ function firstFailedCheckCode(checks: StrictReadinessResult['checks']): string |
     if (!check.ready && typeof check.code === 'string' && check.code.length > 0) return check.code;
   }
   return undefined;
-}
-
-function strictReadinessFailureFromError(
-  target: OnboardingTarget,
-  completed: OnboardingStepResult[],
-  error: unknown,
-): OnboardingResult {
-  const code = error instanceof AriavaCliError ? error.code : 'ERR_ONBOARDING_NOT_READY';
-  const message = error instanceof Error ? error.message : String(error);
-  const retryable = error instanceof AriavaCliError ? error.data.retryable !== false : true;
-  const detail = error instanceof AriavaCliError ? { ...error.data } : { step: 'strict-readiness' };
-  const remediation = remediationFromUnknown(detail.remediation)
-    ?? (error instanceof AriavaCliError ? defaultReadinessRemediation(code, message) : undefined);
-  if (remediation) detail.remediation = remediation;
-  const steps = [...completed];
-  steps.push(onboardingStep('strict-readiness', 'failed', {
-    ...detail,
-    code,
-    message,
-    retryable,
-  }));
-  steps.push(onboardingStep('completion', 'skipped'));
-  return {
-    target,
-    readiness: 'failed',
-    steps,
-    nextActions: [{
-      id: retryable ? 'retry-onboarding' : 'resolve-failure',
-      message: remediation?.message ?? message,
-      ...(remediation?.command ? { command: remediation.command } : {}),
-    }],
-  };
-}
-
-function remediationFromUnknown(value: unknown): { message?: string; command?: string } | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const entry = value as { message?: unknown; command?: unknown };
-  const remediation: { message?: string; command?: string } = {};
-  if (typeof entry.message === 'string' && entry.message.length > 0) remediation.message = entry.message;
-  if (typeof entry.command === 'string' && entry.command.length > 0) remediation.command = entry.command;
-  return remediation.message || remediation.command ? remediation : undefined;
 }
 
 function onboardingError(
