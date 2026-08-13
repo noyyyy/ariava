@@ -50,7 +50,14 @@ export class AgentAdapterClient implements AgentAdapter {
   }
 
   async registerSession(session: PiSessionInfo): Promise<{ sessionId: string; registeredAt: string }> {
-    const response = await this.fetch('POST', '/v1/agent/sessions', session);
+    const {
+      sessionId, provider, projectName, cwd, nameText, openingText, latestActivityText,
+      hbaseSessionKey, harnessProvider, pid, status,
+    } = session;
+    const response = await this.fetch('POST', '/v1/agent/sessions', {
+      sessionId, provider, projectName, cwd, nameText, openingText, latestActivityText,
+      hbaseSessionKey, harnessProvider, pid, status,
+    });
     return (await response.json()) as { sessionId: string; registeredAt: string };
   }
 

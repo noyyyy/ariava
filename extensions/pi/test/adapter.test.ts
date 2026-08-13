@@ -69,8 +69,9 @@ describe('AgentAdapterClient', () => {
     };
   }
 
-  test('registerSession', async () => {
-    const result = await client.registerSession(makeSession('sess-1'));
+  test('registerSession omits extension-only session fields', async () => {
+    const session = { ...makeSession('sess-1'), rawSessionName: 'Local Pi branch name' };
+    const result = await client.registerSession(session);
     expect(result.sessionId).toBe('sess-1');
     expect(typeof result.registeredAt).toBe('string');
   });
