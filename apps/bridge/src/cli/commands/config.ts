@@ -1,8 +1,8 @@
 import {
   resolveProfileUserConfig,
   type AriavaUserConfig,
-  type ResolvedAriavaConfig,
 } from '../../host-manager/config';
+import { redactResolvedConfig, redactUserConfig } from '../config-redaction';
 import {
   loadResolvedProfileConfig,
   type AriavaCliCommandSuccess,
@@ -133,15 +133,6 @@ function parseConfigValue(value: string): string | number | boolean {
   return Number.isFinite(asNumber) && value.trim() !== '' ? asNumber : value;
 }
 
-function redactUserConfig(config: AriavaUserConfig): AriavaUserConfig {
-  const { agentAdapterSecret: _agentAdapterSecret, ...rest } = config;
-  return rest;
-}
-
-function redactResolvedConfig(config: ResolvedAriavaConfig): ResolvedAriavaConfig {
-  if (!config.agentAdapterSecret) return config;
-  return { ...config, agentAdapterSecret: '<redacted>' };
-}
 
 function success(
   message: string,

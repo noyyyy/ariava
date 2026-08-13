@@ -1,3 +1,4 @@
+import { redactUserConfig } from '../config-redaction';
 import type { AriavaCliCommandSuccess, AriavaProfileCliContext } from '../context';
 import type { ProfileIdentityResetDependencies } from '../operations/identity';
 import type { PairProfileDependencies } from '../operations/pair';
@@ -47,7 +48,7 @@ export async function runSharedHostCommand(
           message: result.identityCreated ? 'Ariava identity initialized.' : 'Ariava identity already initialized.',
           data: {
             configPath: result.resolved.configPath,
-            config: redactInitializedConfig(result.config),
+            config: redactUserConfig(result.config),
             identity: result.inspection,
             created: result.identityCreated,
           },
@@ -64,9 +65,4 @@ export async function runSharedHostCommand(
     case 'watches': return runWatchesCommand(argv.slice(1), dependencies);
     default: throw new Error(`Unknown shared command: ${argv[0] ?? ''}`);
   }
-}
-
-function redactInitializedConfig(config: import('../../host-manager/config').AriavaUserConfig) {
-  const { agentAdapterSecret: _agentAdapterSecret, ...rest } = config;
-  return rest;
 }

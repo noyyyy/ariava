@@ -2,7 +2,10 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createDefaultHostDomainResetLifecycle } from '../src/cli/lifecycle/default';
+import {
+  createDefaultHostDomainResetLifecycle,
+  type PublicCliDependencies,
+} from '../src/cli/lifecycle/default';
 import {
   LaunchdServiceManager,
   type CommandResult,
@@ -42,6 +45,54 @@ class ResetLaunchdRunner implements CommandRunner {
   }
 }
 
+function publicCliDependencies(
+  overrides: Partial<PublicCliDependencies>,
+): PublicCliDependencies {
+  const unexpected = (): never => { throw new Error('Unexpected PublicCliDependencies call'); };
+  return {
+    createServiceManager: unexpected,
+    currentRuntimePath: () => '/usr/bin/node',
+    currentAriavaBinPath: () => '/usr/bin/ariava',
+    stdout: process.stdout,
+    stderr: process.stderr,
+    loadUserConfig: () => ({}),
+    saveUserConfig: unexpected,
+    resolveAriavaConfig: unexpected,
+    loadInstallMetadata: () => ({}),
+    loadInstallMetadataDetailed: () => ({
+      metadata: {},
+      diagnostics: { serviceMetadataValid: true, installerMetadataValid: true, documentMetadataValid: true },
+    }),
+    mergeInstallMetadata: (patch) => patch,
+    saveInstallMetadata: unexpected,
+    commandExists: () => false,
+    pathExists: () => false,
+    removePath: unexpected,
+    realpath: (path) => path,
+    spawn: unexpected,
+    spawnAsync: unexpected,
+    createHostIdentityStore: unexpected,
+    createProfile: unexpected,
+    inspectRuntime: () => ({
+      runtimeName: 'node',
+      runtimeVersion: 'v22.0.0',
+      runtimePath: '/usr/bin/node',
+      runtimeNameIsNode: true,
+      runtimeVersionSupported: true,
+    }),
+    probeRuntimePath: (path) => ({
+      runtimeName: 'node',
+      runtimeVersion: 'v22.0.0',
+      runtimePath: path,
+      runtimeNameIsNode: true,
+      runtimeVersionSupported: true,
+    }),
+    cryptoSelfTest: () => true,
+    createPairDependencies: unexpected,
+    ...overrides,
+  };
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -64,7 +115,7 @@ describe('default Host-domain reset service lifecycle', () => {
       definitionPath: '/home/test/.config/systemd/user/ariava.service',
       serviceId: 'ariava.service',
     };
-    const lifecycle = createDefaultHostDomainResetLifecycle({
+    const lifecycle = createDefaultHostDomainResetLifecycle(publicCliDependencies({
       createServiceManager: () => ({
         backend: 'systemd-user',
         support: { platform: 'linux', backend: 'systemd-user', supported: true, isWsl: false, reason: 'supported' },
@@ -72,16 +123,13 @@ describe('default Host-domain reset service lifecycle', () => {
           backend: 'systemd-user', support: { platform: 'linux', backend: 'systemd-user', supported: true, isWsl: false, reason: 'supported' },
           installed: false, enabled, loaded: processRunning, processRunning, logBackend: 'journald',
         }),
-      }),
+      } as never),
       loadInstallMetadataDetailed: () => ({
         metadata: { service: record },
         diagnostics: { serviceMetadataValid: true, installerMetadataValid: true, documentMetadataValid: true },
       }),
-      currentRuntimePath: () => '/usr/bin/node',
-      currentAriavaBinPath: () => '/usr/bin/ariava',
-      realpath: (path: string) => path,
       mergeInstallMetadata: () => { metadataWrites += 1; return {}; },
-    } as never);
+    }));
 
     expect(() => lifecycle.prepare({})).toThrow(/metadata|installed|repair/i);
     expect(metadataWrites).toBe(0);
@@ -132,28 +180,42 @@ describe('default Host-domain reset service lifecycle', () => {
       service: 'io.noyx.ariava.host-identity' as const,
       account: 'host_new',
     };
-    const lifecycle = createDefaultHostDomainResetLifecycle({
+    const lifecycle = createDefaultHostDomainResetLifecycle(publicCliDependencies({
       createServiceManager: () => manager,
       loadInstallMetadataDetailed: () => ({
         metadata: { service: currentRecord },
         diagnostics: { serviceMetadataValid: true, installerMetadataValid: true, documentMetadataValid: true },
       }),
-      currentRuntimePath: () => '/usr/bin/node',
-      currentAriavaBinPath: () => '/usr/bin/ariava',
-      realpath: (path: string) => path,
       resolveAriavaConfig: () => ({
-        configPath: join(root, 'config.json'),
+        relayBaseUrl: 'https://ariava-relay.noyx.io',
+        hostName: 'Test Host',
+        agentAdapterPort: 7272,
+        agentAdapterConfigPath: join(root, 'agent-adapter.json'),
+        statePath: join(root, 'state.json'),
         identityPath: join(root, 'identity.json'),
-        identity: { privateKeyStorage: replacementReference },
-      }),
-      probeRuntimePath: () => ({
-        runtimeName: 'node', runtimeVersion: 'v22.0.0', runtimeNameIsNode: true, runtimeVersionSupported: true,
+        configPath: join(root, 'config.json'),
+        installPath: join(root, 'install.json'),
+        logDir: join(root, 'logs'),
+        stdoutLogPath: join(root, 'logs', 'stdout.log'),
+        stderrLogPath: join(root, 'logs', 'stderr.log'),
+        tmpDir: join(root, 'tmp'),
+        environmentOverrides: [],
+        identity: {
+          identityVersion: 2,
+          hostId: 'host_new',
+          keyId: 'key_new',
+          algorithm: 'Ed25519',
+          publicKey: 'public',
+          publicKeyFingerprint: 'fingerprint',
+          createdAt: '2026-08-11T00:00:00.000Z',
+          privateKeyStorage: replacementReference,
+        },
       }),
       mergeInstallMetadata: ({ service }) => {
         currentRecord = service!;
         return { service: currentRecord };
       },
-    } as never);
+    }));
 
     const snapshot = lifecycle.prepare({});
     lifecycle.stopAndConfirm(snapshot);

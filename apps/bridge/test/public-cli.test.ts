@@ -6,6 +6,8 @@ import { AriavaCliError, type OnboardingDetection, type OnboardingResult, type S
 import { HostIdentityError } from '../src/identity';
 import { RelayClientError } from '../src/relay-client';
 import { formatHumanCliFailure, normalizeCliFailure, runPublicCli } from '../src/public-cli-app';
+import { runSetupCommand } from '../src/cli/lifecycle/setup-command';
+import { decodeStableOnboardingChild } from '../src/cli/lifecycle/onboarding-adapter';
 import { createIsolatedPublicCliEnvironment } from './fixtures/isolated-public-cli-env';
 import { createProfileCliHarness } from './fixtures/profile-cli-harness';
 
@@ -72,6 +74,42 @@ describe('public ariava CLI', () => {
         message: 'Unknown command: definitely-unknown',
         data: {},
       });
+
+    });
+    test('internal command surface is closed and rejects invalid arguments exactly', async () => {
+      const cases = [
+        { argv: ['internal'], message: 'Unknown internal command: undefined' },
+        { argv: ['internal', 'not-a-command'], message: 'Unknown internal command: not-a-command' },
+        { argv: ['internal', 'render-onboarding-success'], message: 'internal render-onboarding-success accepts only --target and --columns' },
+        { argv: ['internal', 'render-onboarding-success', '--target', 'invalid', '--columns', '80'], message: 'internal render-onboarding-success requires --target <host-ready|adapter-installed>' },
+        { argv: ['internal', 'render-onboarding-success', '--target', 'host-ready', '--columns', '0'], message: 'internal render-onboarding-success requires --columns <positive-integer>' },
+        { argv: ['internal', 'render-onboarding-success', '--target', 'host-ready', '--columns', '80', '--extra'], message: 'internal render-onboarding-success accepts only --target and --columns' },
+        { argv: ['internal', 'bridge-daemon'], message: 'internal bridge-daemon requires --config <absolute-config-path>' },
+        { argv: ['internal', 'bridge-daemon', '--config', 'relative.json'], message: 'internal bridge-daemon requires --config <absolute-config-path>' },
+      ];
+      for (const { argv, message } of cases) {
+        const stdout = captureStream();
+        const stderr = captureStream();
+        expect(await runPublicCli([...argv, '--json'], { stdout: stdout.stream, stderr: stderr.stream })).toBe(1);
+        expect(stdout.read()).toBe('');
+        expect(JSON.parse(stderr.read())).toEqual({ ok: false, code: 'ERR_CLI', message, data: {} });
+      }
+    });
+
+    test('internal onboarding success renderer preserves target-specific human output', async () => {
+      for (const [target, ending] of [
+        ['host-ready', 'Host ready\n'],
+        ['adapter-installed', 'Ariava ready\nReload Pi: run /reload in an existing session\n'],
+      ] as const) {
+        const stdout = captureStream();
+        const stderr = captureStream();
+        expect(await runPublicCli(
+          ['internal', 'render-onboarding-success', '--target', target, '--columns', '80'],
+          { stdout: stdout.stream, stderr: stderr.stream },
+        )).toBe(0);
+        expect(stderr.read()).toBe('');
+        expect(stdout.read().endsWith(ending)).toBe(true);
+      }
     });
 
 
@@ -699,30 +737,172 @@ describe('public ariava CLI', () => {
     expect(body.data.managed).toBe(false);
   });
 
-  test('install pi delegates to Pi package management and persists the npm package', async () => {
+  test('public Pi install, upgrade, and remove preserve exact baseline outputs', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-cli-home-'));
     const workdir = mkdtempSync(join(tmpdir(), 'ariava-random-cwd-'));
     roots.push(home, workdir);
     const isolated = createIsolatedPublicCliEnvironment(home);
-
-    const proc = Bun.spawn({
-      cmd: [bunPath, cliPath, 'install', 'pi', '--json'],
-      cwd: workdir,
-      env: isolated.env,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-
-    const [exitCode, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    expect(exitCode, stderr).toBe(0);
-    const body = JSON.parse(stdout);
-    expect(body.ok).toBe(true);
-    expect(body.data.managedPath).toBe(join(home, '.pi', 'agent', 'npm', 'node_modules', '@ariava', 'pi-extension'));
     const expectedVersion = JSON.parse(readFileSync(join(publicRepoRoot, 'package.json'), 'utf8')).version;
     const exactSource = `npm:@ariava/pi-extension@${expectedVersion}`;
-    expect(body.data.source).toMatchObject({ kind: 'npm-package', package: exactSource });
-    expect(readFileSync(isolated.piLogPath, 'utf8')).toContain(`install ${exactSource}`);
-    expect(JSON.parse(readFileSync(join(home, '.pi', 'agent', 'settings.json'), 'utf8')).packages).toContain(exactSource);
+    const managedPath = join(home, '.pi', 'agent', 'npm', 'node_modules', '@ariava', 'pi-extension');
+    const retainedBridgeSource = { kind: 'release-bundle', updatedAt: 'old' };
+    secureJsonFixture(join(home, '.config', 'ariava', 'install.json'), { bridgeSource: retainedBridgeSource });
+
+    const run = async (args: string[], json: boolean) => {
+      const proc = Bun.spawn({
+        cmd: [bunPath, cliPath, ...args, ...(json ? ['--json'] : [])],
+        cwd: workdir,
+        env: isolated.env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      expect(exitCode, stderr).toBe(0);
+      expect(stderr).toBe('');
+      return stdout;
+    };
+
+    for (const [args, verb, message] of [
+      [['install', 'pi'], 'Installed', 'Installed Ariava pi package.'],
+      [['upgrade', 'pi'], 'Upgraded', 'Upgraded Ariava pi package.'],
+    ] as const) {
+      const json = JSON.parse(await run([...args], true));
+      expect(json).toEqual({
+        ok: true,
+        code: 'ok',
+        message,
+        data: {
+          installedAt: expect.any(String),
+          version: expectedVersion,
+          managedPath,
+          source: { kind: 'npm-package', package: exactSource, updatedAt: expect.any(String) },
+        },
+      });
+      const persisted = JSON.parse(readFileSync(join(home, '.config', 'ariava', 'install.json'), 'utf8'));
+      expect(persisted.piExtension).toEqual(json.data);
+      expect(persisted.piSource).toEqual(json.data.source);
+      expect(Object.keys(json.data).sort()).toEqual(['installedAt', 'managedPath', 'source', 'version']);
+      expect(json.data).not.toHaveProperty('readiness');
+      expect(json.data).not.toHaveProperty('status');
+      expect(await run([...args], false)).toBe(`${verb} ${exactSource} through pi at ${managedPath}. Reload pi or run /reload.\n`);
+    }
+
+    expect(readFileSync(isolated.piLogPath, 'utf8').trim()).toBe(`install ${exactSource}`);
+    expect(JSON.parse(readFileSync(join(home, '.pi', 'agent', 'settings.json'), 'utf8')).packages).toEqual([exactSource]);
+
+    const removed = JSON.parse(await run(['remove', 'pi'], true));
+    expect(removed).toEqual({ ok: true, code: 'ok', message: 'Removed Ariava pi package.', data: {} });
+    expect(readFileSync(isolated.piLogPath, 'utf8').trim().split('\n')).toEqual([
+      `install ${exactSource}`,
+      'remove npm:@ariava/pi-extension',
+    ]);
+    const removeHuman = await run(['remove', 'pi'], false);
+    expect(removeHuman).toBe('Removed Ariava pi package through pi.\n');
+    expect(removeHuman).not.toContain('/reload');
+    const retained = JSON.parse(readFileSync(join(home, '.config', 'ariava', 'install.json'), 'utf8'));
+    expect(retained.piExtension).toBeUndefined();
+    expect(retained.piSource).toBeUndefined();
+    expect(retained.bridgeSource).toEqual(retainedBridgeSource);
+  });
+
+  test('public Pi package-manager failures preserve metadata and exact error envelopes', async () => {
+    const expectedVersion = JSON.parse(readFileSync(join(publicRepoRoot, 'package.json'), 'utf8')).version;
+    const exactSource = `npm:@ariava/pi-extension@${expectedVersion}`;
+    const managedPath = (home: string) => join(home, '.pi', 'agent', 'npm', 'node_modules', '@ariava', 'pi-extension');
+    for (const { command, packageArgs, seedPackage } of [
+      { command: 'install', packageArgs: ['install', exactSource], seedPackage: false },
+      { command: 'upgrade', packageArgs: ['install', exactSource], seedPackage: true },
+      { command: 'remove', packageArgs: ['remove', 'npm:@ariava/pi-extension'], seedPackage: true },
+    ] as const) {
+      const home = mkdtempSync(join(tmpdir(), `ariava-cli-pi-${command}-failure-`));
+      roots.push(home);
+      const isolated = createIsolatedPublicCliEnvironment(home);
+      const piPath = join(home, '.ariava-test-bin', 'pi');
+      writeFileSync(piPath, '#!/bin/sh\nprintf "fixture pi failure\\n" >&2\nexit 23\n');
+      chmodSync(piPath, 0o755);
+      if (seedPackage) {
+        const registeredSource = command === 'upgrade' ? 'npm:@ariava/pi-extension@0.1.0' : exactSource;
+        secureJsonFixture(join(home, '.pi', 'agent', 'settings.json'), { packages: [registeredSource] });
+        secureJsonFixture(join(managedPath(home), 'package.json'), {
+          name: '@ariava/pi-extension',
+          version: command === 'upgrade' ? '0.1.0' : expectedVersion,
+        });
+      }
+      const metadata = { bridgeSource: { kind: 'release-bundle', updatedAt: 'old' } };
+      const installPath = join(home, '.config', 'ariava', 'install.json');
+      secureJsonFixture(installPath, metadata);
+      const proc = Bun.spawn({
+        cmd: [bunPath, cliPath, command, 'pi', '--json'],
+        cwd: process.cwd(),
+        env: isolated.env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stdout).toBe('');
+      expect(JSON.parse(stderr)).toEqual({
+        ok: false,
+        code: 'ERR_EXTENSION_INSTALL',
+        message: 'Pi package command failed.',
+        data: { command: 'pi', args: packageArgs, exitCode: 23, detail: 'fixture pi failure' },
+      });
+      expect(JSON.parse(readFileSync(installPath, 'utf8'))).toEqual(metadata);
+    }
+  });
+
+  test('public Pi metadata failures occur after package effects without new error fields', async () => {
+    const expectedVersion = JSON.parse(readFileSync(join(publicRepoRoot, 'package.json'), 'utf8')).version;
+    const exactSource = `npm:@ariava/pi-extension@${expectedVersion}`;
+    const record = {
+      installedAt: '2026-08-13T00:00:00.000Z',
+      version: expectedVersion,
+      managedPath: '/isolated/pi/npm/node_modules/@ariava/pi-extension',
+      source: { kind: 'npm-package' as const, package: exactSource, updatedAt: '2026-08-13T00:00:00.000Z' },
+    };
+    for (const command of ['install', 'upgrade', 'remove'] as const) {
+      const events: string[] = [];
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const metadata = command === 'remove' ? { piExtension: record, piSource: record.source } : {};
+      const exitCode = await runPublicCli([command, 'pi', '--json'], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        inspectRuntime: () => ({
+          runtimeName: 'node', runtimeVersion: 'v22.0.0', runtimePath: '/node',
+          runtimeNameIsNode: true, runtimeVersionSupported: true,
+        }),
+        loadInstallMetadata: () => metadata,
+        mergeInstallMetadata: () => {
+          events.push('metadata.merge');
+          throw new Error('fixture Pi metadata persistence failed');
+        },
+        piPackageLifecycle: {
+          install(version) { expect(version).toBe(expectedVersion); events.push('pi.install'); return record; },
+          upgrade(version) { expect(version).toBe(expectedVersion); events.push('pi.upgrade'); return record; },
+          remove() { events.push('pi.remove'); },
+          status() { throw new Error('status should not run'); },
+        },
+      });
+      expect(exitCode).toBe(1);
+      expect(events).toEqual([`pi.${command}`, 'metadata.merge']);
+      expect(stdout.read()).toBe('');
+      expect(JSON.parse(stderr.read())).toEqual({
+        ok: false,
+        code: 'ERR_CLI',
+        message: 'fixture Pi metadata persistence failed',
+        data: {},
+      });
+      expect(metadata).toEqual(command === 'remove' ? { piExtension: record, piSource: record.source } : {});
+    }
   });
 
 
@@ -975,6 +1155,182 @@ describe('public ariava CLI', () => {
       expect(received).toMatchObject({ resumed: true, bootstrapVersion: undefined, publicArgs: ['--no-extensions'] });
     });
 
+    test('setup option parsing preserves validation, precedence, and internal marker forwarding', async () => {
+      const cliVersion = JSON.parse(readFileSync(join(publicRepoRoot, 'package.json'), 'utf8')).version as string;
+      const invalidCases = [
+        { args: ['--extension'], code: 'ERR_ONBOARDING_NOT_READY', message: '--extension requires a value.', detected: false },
+        { args: ['--relay-base-url', '--yes'], code: 'ERR_ONBOARDING_NOT_READY', message: '--relay-base-url requires a value.', detected: false },
+        { args: ['--bootstrap-version'], code: 'ERR_ONBOARDING_NOT_READY', message: '--bootstrap-version requires a value.', detected: false },
+        { args: ['--unknown'], code: 'ERR_ONBOARDING_NOT_READY', message: 'Unknown onboarding option: --unknown', detected: false },
+        { args: ['--extension', 'pi', '--no-extensions'], code: 'ERR_ONBOARDING_NOT_READY', message: 'Conflicting extension selection: use either --extension or --no-extensions.', detected: true },
+        { args: ['--no-extensions', '--relay-base-url', 'https://relay.example/path'], code: 'ERR_RELAY_CONFIG_REQUIRED', detected: false },
+        { args: ['--no-extensions', '--bootstrap-version', cliVersion, '--bootstrap-once'], code: 'ERR_STABLE_CLI_PATH', detected: false },
+      ];
+      for (const invalid of invalidCases) {
+        const stdout = captureStream();
+        const stderr = captureStream();
+        let detected = false;
+        const exitCode = await runPublicCli(['setup', ...invalid.args, '--json'], {
+          stdout: stdout.stream,
+          stderr: stderr.stream,
+        }, {
+          terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+          detect: () => { detected = true; return detection(); },
+          run: async () => result('host-ready', 'host-ready'),
+        });
+        expect(exitCode).toBe(1);
+        expect(detected).toBe(invalid.detected);
+        expect(stdout.read()).toBe('');
+        expect(JSON.parse(stderr.read())).toMatchObject({
+          ok: false,
+          code: invalid.code,
+          ...(invalid.message ? { message: invalid.message } : {}),
+        });
+      }
+
+      const stdout = captureStream();
+      const stderr = captureStream();
+      let received: Parameters<NonNullable<Parameters<typeof runPublicCli>[2]['run']>>[0] | undefined;
+      const exitCode = await runPublicCli([
+        'setup',
+        '--no-extensions',
+        '--relay-base-url', 'https://first.example',
+        '--relay-base-url', 'https://relay.example:443',
+        '--resume',
+        '--bootstrap-version', cliVersion,
+        '--bootstrap-once',
+        '--json',
+      ], { stdout: stdout.stream, stderr: stderr.stream }, {
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+        detect: () => detection(),
+        run: async (input) => { received = input; return result('host-ready', 'host-ready'); },
+      });
+      expect(exitCode).toBe(0);
+      expect(received).toMatchObject({
+        target: 'host-ready',
+        resumed: true,
+        bootstrapVersion: cliVersion,
+        relayBaseUrl: 'https://relay.example',
+        publicArgs: [
+          '--no-extensions',
+          '--relay-base-url', 'https://first.example',
+          '--relay-base-url', 'https://relay.example:443',
+        ],
+      });
+      expect(stderr.read()).toBe('');
+    });
+
+    test('setup command invokes injected selection validation before adapter execution', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      let validationCalls = 0;
+      let runCalls = 0;
+      const failure = new AriavaCliError(
+        'ERR_AGENT_RUNTIME_NOT_FOUND',
+        'Pi is not installed. Install Pi, then rerun `ariava setup --extension pi`.',
+        { step: 'adapter-detect', retryable: true, remediation: { command: 'ariava setup --extension pi' } },
+      );
+      const exitCode = await runSetupCommand(['--extension', 'pi'], true, {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        cliVersion: '0.2.6',
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+        detect: () => detection(false),
+        validateSelection(selection, detected) {
+          validationCalls += 1;
+          expect(selection).toMatchObject({ target: 'adapter-installed', extensions: ['pi'] });
+          expect(detected.pi.present).toBe(false);
+          throw failure;
+        },
+        normalizeError: (error) => normalizeCliFailure(error),
+        run: async () => { runCalls += 1; return result('adapter-installed', 'reload-pending'); },
+      });
+      expect(exitCode).toBe(1);
+      expect(validationCalls).toBe(1);
+      expect(runCalls).toBe(0);
+      expect(stdout.read()).toBe('');
+      expect(JSON.parse(stderr.read())).toEqual({
+        ok: false,
+        code: failure.code,
+        message: failure.message,
+        data: failure.data,
+      });
+    });
+
+    test('missing Pi validation preserves exact failure and blocks adapter execution', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      let runCalls = 0;
+      const exitCode = await runPublicCli(['setup', '--extension', 'pi', '--json'], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      }, {
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+        detect: () => detection(false),
+        run: async () => { runCalls += 1; return result('adapter-installed', 'reload-pending'); },
+      });
+      expect(exitCode).toBe(1);
+      expect(runCalls).toBe(0);
+      expect(stdout.read()).toBe('');
+      expect(JSON.parse(stderr.read())).toEqual({
+        ok: false,
+        code: 'ERR_AGENT_RUNTIME_NOT_FOUND',
+        message: 'Pi is not installed. Install Pi, then rerun `ariava setup --extension pi`.',
+        data: {
+          step: 'adapter-detect',
+          retryable: true,
+          remediation: { command: 'ariava setup --extension pi' },
+        },
+      });
+    });
+
+    test('interactive adapter errors restore the terminal exactly once and remove listeners', async () => {
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const sigintListeners = process.listenerCount('SIGINT');
+      const sigtermListeners = process.listenerCount('SIGTERM');
+      const exitCode = await runPublicCli(['setup', '--no-extensions'], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      }, {
+        terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: true, color: false },
+        detect: () => detection(),
+        run: async () => { throw new Error('adapter failed'); },
+      });
+      expect(exitCode).toBe(1);
+      expect(stdout.read().split('\u001b[?25h').length - 1).toBe(1);
+      expect(stderr.read()).toBe('ariava: adapter failed\n');
+      expect(process.listenerCount('SIGINT')).toBe(sigintListeners);
+      expect(process.listenerCount('SIGTERM')).toBe(sigtermListeners);
+    });
+
+    test('signal cancellation restores once and returns both listener counts to baseline', async () => {
+      for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+        const stdout = captureStream();
+        const stderr = captureStream();
+        const sigintListeners = process.listenerCount('SIGINT');
+        const sigtermListeners = process.listenerCount('SIGTERM');
+        const exitCodePromise = runPublicCli(['setup', '--no-extensions'], {
+          stdout: stdout.stream,
+          stderr: stderr.stream,
+        }, {
+          terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: true, color: false },
+          detect: () => detection(),
+          run: (input) => new Promise((resolve) => {
+            input.signal?.addEventListener('abort', () => {
+              resolve(result('host-ready', 'failed', [{ id: 'retry-onboarding', command: 'ariava setup --resume' }]));
+            }, { once: true });
+            queueMicrotask(() => process.emit(signal));
+          }),
+        });
+        expect(await exitCodePromise).toBe(1);
+        expect(stdout.read().split('\u001b[?25h').length - 1).toBe(1);
+        expect(stderr.read()).toBe('');
+        expect(process.listenerCount('SIGINT')).toBe(sigintListeners);
+        expect(process.listenerCount('SIGTERM')).toBe(sigtermListeners);
+      }
+    });
+
     test('SIGINT abort produces failed JSON, nonzero exit, and closes the onboarding prompt', async () => {
       const stdout = captureStream();
       const stderr = captureStream();
@@ -994,6 +1350,50 @@ describe('public ariava CLI', () => {
       expect(JSON.parse(stdout.read())).toMatchObject({ ok: false, data: { readiness: 'failed', nextActions: [{ id: 'retry-onboarding', command: 'ariava setup --resume' }] } });
       expect(stderr.read()).toBe('');
     });
+
+    test('malformed stable child output fails closed through public setup JSON and human channels', async () => {
+      const malformedChild = {
+        status: 0,
+        stdout: JSON.stringify({
+          ok: true,
+          code: 'ok',
+          message: 'Ariava onboarding completed.',
+          data: {
+            target: 'host-ready',
+            readiness: 'adapter-ready',
+            steps: [],
+            nextActions: [],
+          },
+        }),
+        stderr: 'child diagnostic',
+      };
+      for (const json of [false, true]) {
+        const stdout = captureStream();
+        const stderr = captureStream();
+        const exitCode = await runPublicCli(
+          ['setup', '--no-extensions', ...(json ? ['--json'] : [])],
+          { stdout: stdout.stream, stderr: stderr.stream },
+          {
+            terminal: { stdout: stdout.stream, stderr: stderr.stream, interactive: false, color: false },
+            detect: () => detection(),
+            run: async () => decodeStableOnboardingChild(malformedChild),
+          },
+        );
+        expect(exitCode).toBe(1);
+        expect(stdout.read()).toBe('');
+        if (json) {
+          expect(JSON.parse(stderr.read())).toEqual({
+            ok: false,
+            code: 'ERR_STABLE_CLI_PATH',
+            message: 'Stable Ariava CLI re-entry returned malformed output.',
+            data: { step: 'stable-cli', retryable: true },
+          });
+        } else {
+          expect(stderr.read()).toBe('ariava: Stable Ariava CLI re-entry returned malformed output.\n');
+        }
+      }
+    });
+
 
     test('onboarding errors preserve structured remediation in JSON', async () => {
       const stdout = captureStream();
@@ -1757,6 +2157,98 @@ describe('public ariava CLI', () => {
       expect(managerCalls(home).at(-1)?.operation).toBe('uninstall');
       expect(existsSync(managedPi)).toBe(false);
       expect(JSON.parse(readFileSync(installPath, 'utf8')).service).toBeUndefined();
+    });
+
+    test('top-level uninstall stops after Pi removal failure and retains metadata', async () => {
+      const home = mkdtempSync(join(tmpdir(), 'ariava-cli-uninstall-pi-failure-'));
+      const failBin = join(home, 'fail-bin');
+      const markerPath = join(home, 'pi-remove-order.txt');
+      roots.push(home);
+      secureDirectory(failBin);
+      const exactVersion = JSON.parse(readFileSync(join(publicRepoRoot, 'package.json'), 'utf8')).version;
+      const exactSource = `npm:@ariava/pi-extension@${exactVersion}`;
+      const managedPi = join(home, '.pi', 'agent', 'npm', 'node_modules', '@ariava', 'pi-extension');
+      secureJsonFixture(join(home, '.pi', 'agent', 'settings.json'), { packages: [exactSource] });
+      secureJsonFixture(join(managedPi, 'package.json'), { name: '@ariava/pi-extension', version: exactVersion });
+      const metadata = {
+        service: { backend: 'systemd-user', installedAt: 'old', runtimePath: '/old/node', ariavaBinPath: '/old/ariava', definitionPath: '/fixture/home/.config/systemd/user/ariava.service', serviceId: 'ariava.service' },
+        piExtension: { installedAt: 'old', version: exactVersion, managedPath: managedPi, source: { kind: 'npm-package', package: exactSource, updatedAt: 'old' } },
+        piSource: { kind: 'npm-package', package: exactSource, updatedAt: 'old' },
+      };
+      const installPath = writeInstall(home, metadata);
+      const piPath = join(failBin, 'pi');
+      writeFileSync(piPath, `#!/bin/sh\nset -eu\ngrep -q '\"operation\":\"uninstall\"' "$ARIAVA_TEST_MANAGER_CALLS_PATH"\nprintf 'service-before-pi\\n' > "${markerPath}"\nexit 23\n`);
+      chmodSync(piPath, 0o755);
+      const isolated = createIsolatedPublicCliEnvironment(home);
+      const proc = Bun.spawn({
+        cmd: [bunPath, harnessPath, 'uninstall', '--remove-pi', '--json'],
+        cwd: process.cwd(),
+        env: {
+          ...isolated.env,
+          PATH: `${failBin}:${isolated.env.PATH}`,
+          ARIAVA_TEST_SCENARIO: 'linux-supported',
+          ARIAVA_TEST_MANAGER_CALLS_PATH: retainedManagerCallsPath(home),
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stdout).toBe('');
+      expect(JSON.parse(stderr)).toEqual({
+        ok: false,
+        code: 'ERR_EXTENSION_INSTALL',
+        message: 'Pi package command failed.',
+        data: {
+          command: 'pi',
+          args: ['remove', 'npm:@ariava/pi-extension'],
+          exitCode: 23,
+          detail: 'pi remove npm:@ariava/pi-extension failed.',
+        },
+      });
+      expect(readFileSync(markerPath, 'utf8')).toBe('service-before-pi\n');
+      expect(managerCalls(home)).toEqual([{ operation: 'uninstall' }]);
+      expect(JSON.parse(readFileSync(installPath, 'utf8'))).toEqual(metadata);
+    });
+
+    test('top-level uninstall runs metadata cleanup only after service removal', async () => {
+      const events: string[] = [];
+      const stdout = captureStream();
+      const stderr = captureStream();
+      const support = { platform: 'linux' as const, backend: 'systemd-user' as const, supported: true, isWsl: false, reason: 'supported' as const };
+      const metadata = { service: { backend: 'systemd-user' as const } } as any;
+      const exitCode = await runPublicCli(['uninstall', '--json'], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        inspectRuntime: () => ({ runtimeName: 'node', runtimeVersion: 'v22.0.0', runtimePath: '/node', runtimeNameIsNode: true, runtimeVersionSupported: true }),
+        createServiceManager: () => ({
+          backend: 'systemd-user',
+          support,
+          install() { throw new Error('unused'); },
+          uninstall() { events.push('service.uninstall'); },
+          start() { throw new Error('unused'); },
+          stop() { throw new Error('unused'); },
+          restart() { throw new Error('unused'); },
+          status() { throw new Error('unused'); },
+          logsAvailable() { return false; },
+          logs() { throw new Error('unused'); },
+        }),
+        loadInstallMetadata: () => metadata,
+        saveInstallMetadata() {
+          events.push('metadata.save');
+          throw new Error('fixture metadata save failed');
+        },
+      });
+      expect(exitCode).toBe(1);
+      expect(events).toEqual(['service.uninstall', 'metadata.save']);
+      expect(stdout.read()).toBe('');
+      expect(JSON.parse(stderr.read())).toEqual({
+        ok: false, code: 'ERR_CLI', message: 'fixture metadata save failed', data: {},
+      });
     });
 
     test('top-level uninstall invokes the adapter even without service metadata', async () => {

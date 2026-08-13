@@ -14,6 +14,7 @@ import {
   type PiExtensionStatus,
   type ServiceManager,
   type ServiceStatus,
+  AriavaCliError,
 } from '../src/host-manager';
 
 const version = '1.2.3';
@@ -329,7 +330,7 @@ describe('onboarding orchestrator', () => {
     });
   });
 
-  test('strict-readiness failure exposes first failed check message and next action', async () => {
+  test('strict-readiness failure preserves current first-check translation and reconstructs one action', async () => {
     const scenario = fixture();
     scenario.deps.checkReadiness = async () => ({
       ready: false,
@@ -342,27 +343,167 @@ describe('onboarding orchestrator', () => {
           code: 'ERR_RELAY_UNREACHABLE',
           message: 'Relay health could not be reached.',
         },
+        {
+          id: 'relay-enrollment',
+          ready: false,
+          code: 'ERR_RELAY_AUTH_FAILED',
+          message: 'Relay enrollment was rejected.',
+        },
       ],
-      nextActions: [{
-        id: 'retry-onboarding',
-        message: 'Relay health could not be reached.',
-        command: 'ariava doctor',
-      }],
+      nextActions: [
+        {
+          id: 'readiness-owned-action',
+          message: 'Readiness supplied first action.',
+          command: 'ariava doctor',
+        },
+        {
+          id: 'readiness-secondary-action',
+          message: 'Readiness supplied second action.',
+          command: 'ariava setup --resume',
+        },
+      ],
     });
     const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
     expect(result.readiness).toBe('failed');
+    expect(result.steps.find((step) => step.id === 'strict-readiness')).toEqual({
+      id: 'strict-readiness',
+      status: 'failed',
+      detail: {
+        checks: [
+          { id: 'stable-cli', ready: true },
+          { id: 'relay-health', ready: false, code: 'ERR_RELAY_UNREACHABLE', message: 'Relay health could not be reached.' },
+          { id: 'relay-enrollment', ready: false, code: 'ERR_RELAY_AUTH_FAILED', message: 'Relay enrollment was rejected.' },
+        ],
+        code: 'ERR_RELAY_UNREACHABLE',
+        message: 'Relay health could not be reached.',
+        remediation: { message: 'Readiness supplied first action.', command: 'ariava doctor' },
+      },
+    });
+    expect(result.nextActions).toEqual([{
+      id: 'retry-onboarding',
+      message: 'Readiness supplied first action.',
+      command: 'ariava doctor',
+    }]);
+  });
+
+  test('strict-readiness exceptions derive remediation from the shared code policy', async () => {
+    const scenario = fixture();
+    scenario.deps.checkReadiness = async () => {
+      throw new AriavaCliError(
+        'ERR_SERVICE_METADATA',
+        'Service metadata became unreadable.',
+        { step: 'strict-readiness', retryable: true, evidence: 'preserved' },
+      );
+    };
+
+    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
+
+    expect(result.readiness).toBe('failed');
+    expect(result.steps.find((step) => step.id === 'strict-readiness')).toEqual({
+      id: 'strict-readiness',
+      status: 'failed',
+      detail: {
+        step: 'strict-readiness',
+        retryable: true,
+        evidence: 'preserved',
+        remediation: {
+          message: 'Service metadata became unreadable.',
+          command: 'ariava service reinstall',
+        },
+        code: 'ERR_SERVICE_METADATA',
+        message: 'Service metadata became unreadable.',
+      },
+    });
+    expect(result.nextActions).toEqual([{
+      id: 'retry-onboarding',
+      message: 'Service metadata became unreadable.',
+      command: 'ariava service reinstall',
+    }]);
+  });
+
+  test.each([
+    {
+      code: 'ERR_AGENT_ADAPTER_DISCOVERY' as const,
+      message: 'Agent Adapter discovery remained unavailable.',
+      command: 'ariava service restart',
+    },
+    {
+      code: 'ERR_AGENT_ADAPTER_NOT_LOOPBACK' as const,
+      message: 'Agent Adapter discovery was not loopback-only.',
+      command: 'ariava service restart',
+    },
+    {
+      code: 'ERR_BRIDGE_DEGRADED' as const,
+      message: 'Bridge runtime health was degraded.',
+      command: 'ariava doctor',
+    },
+    {
+      code: 'ERR_RELAY_UNREACHABLE' as const,
+      message: 'Relay health could not be reached.',
+      command: 'ariava doctor',
+    },
+  ])('strict-readiness exception $code uses strict-readiness remediation', async ({ code, message, command }) => {
+    const scenario = fixture();
+    scenario.deps.checkReadiness = async () => {
+      throw new AriavaCliError(code, message, {
+        step: 'strict-readiness',
+        retryable: true,
+        evidence: 'preserved',
+      });
+    };
+
+    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
+
+    expect(result.readiness).toBe('failed');
+    expect(result.steps.find((step) => step.id === 'strict-readiness')).toEqual({
+      id: 'strict-readiness',
+      status: 'failed',
+      detail: {
+        step: 'strict-readiness',
+        retryable: true,
+        evidence: 'preserved',
+        remediation: { message, command },
+        code,
+        message,
+      },
+    });
+    expect(result.nextActions).toEqual([{
+      id: 'retry-onboarding',
+      message,
+      command,
+    }]);
+  });
+
+  test('strict-readiness exceptions preserve explicit remediation over code defaults', async () => {
+    const scenario = fixture();
+    scenario.deps.checkReadiness = async () => {
+      throw new AriavaCliError(
+        'ERR_SERVICE_METADATA',
+        'Service metadata became unreadable.',
+        {
+          step: 'strict-readiness',
+          retryable: false,
+          remediation: { message: 'Use the recorded repair.', command: 'ariava repair recorded-service' },
+        },
+      );
+    };
+
+    const result = await runOnboardingOrchestrator(scenario.input, scenario.deps);
+
     expect(result.steps.find((step) => step.id === 'strict-readiness')).toMatchObject({
       status: 'failed',
       detail: {
-        code: 'ERR_RELAY_UNREACHABLE',
-        message: 'Relay health could not be reached.',
-        remediation: { command: 'ariava doctor' },
+        code: 'ERR_SERVICE_METADATA',
+        message: 'Service metadata became unreadable.',
+        retryable: false,
+        remediation: { message: 'Use the recorded repair.', command: 'ariava repair recorded-service' },
       },
     });
-    expect(result.nextActions[0]).toMatchObject({
-      message: 'Relay health could not be reached.',
-      command: 'ariava doctor',
-    });
+    expect(result.nextActions).toEqual([{
+      id: 'resolve-failure',
+      message: 'Use the recorded repair.',
+      command: 'ariava repair recorded-service',
+    }]);
   });
 
   test('HostIdentityError from initializeHost keeps concrete code and message', async () => {

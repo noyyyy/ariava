@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { detectPackageManager } from '../src/public-cli-app';
+import { detectPackageManager as detectPackageManagerFromDefault } from '../src/cli/lifecycle/default';
 
 const priorForced = process.env.ARIAVA_UPGRADE_PACKAGE_MANAGER;
 afterEach(() => {
@@ -12,6 +13,32 @@ function detect(shim: string, realPath: string, metadata = {}) {
 }
 
 describe('package manager detection', () => {
+  test('compatibility exports preserve the same detection behavior', () => {
+    const cases = [
+      { shim: '/usr/local/bin/ariava', realPath: '/usr/local/lib/node_modules/ariava/apps/bridge/dist/public-cli.js', metadata: {} },
+      { shim: '/usr/local/bin/ariava', realPath: '/usr/local/lib/node_modules/.pnpm/ariava@0.1.4/node_modules/ariava/apps/bridge/dist/public-cli.js', metadata: {} },
+      { shim: '/home/test/.bun/bin/ariava', realPath: '/home/test/.bun/install/global/node_modules/ariava/apps/bridge/dist/public-cli.js', metadata: {} },
+      { shim: '/opt/homebrew/bin/ariava', realPath: '/opt/homebrew/Cellar/ariava/0.1.4/libexec/apps/bridge/dist/public-cli.js', metadata: {} },
+      { shim: '/fake/pnpm/bin/ariava', realPath: '/opt/custom/ariava/public-cli.js', metadata: {} },
+      {
+        shim: '/new/bin/ariava',
+        realPath: '/new/layout/public-cli.js',
+        metadata: { installer: { manager: 'pnpm' as const, ariavaBinRealPath: '/old/path', recordedAt: '2026-07-15T00:00:00.000Z' } },
+      },
+      {
+        shim: '/new/bin/ariava',
+        realPath: '/new/layout/public-cli.js',
+        metadata: { installer: { manager: 'npm' as const, ariavaBinRealPath: 'relative/path', recordedAt: '2026-07-15T00:00:00.000Z' } },
+      },
+    ];
+    for (const { shim, realPath, metadata } of cases) {
+      const dependencies = { currentAriavaBinPath: () => shim, realpath: () => realPath };
+      expect(detectPackageManager(dependencies, metadata)).toEqual(
+        detectPackageManagerFromDefault(dependencies, metadata),
+      );
+    }
+  });
+
   test.each([
     ['/usr/local/bin/ariava', '/usr/local/lib/node_modules/ariava/apps/bridge/dist/public-cli.js', 'npm'],
     ['/Users/test/.nvm/versions/node/v22.0.0/bin/ariava', '/Users/test/.nvm/versions/node/v22.0.0/lib/node_modules/ariava/apps/bridge/dist/public-cli.js', 'npm'],

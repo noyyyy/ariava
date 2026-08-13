@@ -1,6 +1,83 @@
 [
   {
     "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "resolves multiline imports, re-exports, indexes, and type-only edges",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "masks multiline template contents that resemble static declarations",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "namespace re-exports participate in runtime cycle detection",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "distinguishes type-only cycles from runtime cycles",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "keeps dependency contracts and runtime constants as leaves",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "prevents onboarding and readiness from importing the default lifecycle",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "prevents handlers from importing composition or handler-importing modules",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "keeps default setup policy behind injected ports",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "has no runtime cycles within the governed import graph",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "keeps the documented context-reset-initialize SCC outside governed modules",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/default-lifecycle-import-graph.test.ts",
+    "testName": "discovers all extracted handlers instead of relying on a fixed handler list",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
     "path": "apps/bridge/test/dev-profile-npm-script.test.ts",
     "testName": "detects forbidden lifecycle modules through $name",
     "ruleId": "STRUCT001",

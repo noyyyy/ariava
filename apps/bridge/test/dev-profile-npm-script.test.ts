@@ -375,6 +375,7 @@ const SAFE_DEV_LIFECYCLE_MODULES = [
   'agent-adapter/server.ts',
   'cli/app.ts',
   'cli/catalog.ts',
+  'cli/config-redaction.ts',
   'cli/context.ts',
   'cli/commands/doctor.ts',
   'cli/commands/config.ts',

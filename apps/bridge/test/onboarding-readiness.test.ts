@@ -128,6 +128,14 @@ describe('strict onboarding readiness', () => {
 
     const timed = fixture({}, { readDiscovery: () => null });
     await expect(pollForDiscoveryAndHealth(timed.input, timed.deps)).rejects.toMatchObject({ code: 'ERR_AGENT_ADAPTER_DISCOVERY' });
+
+    const controller = new AbortController();
+    controller.abort();
+    const cancelled = fixture({ signal: controller.signal });
+    await expect(pollForDiscoveryAndHealth(cancelled.input, cancelled.deps)).rejects.toMatchObject({
+      name: 'AbortError',
+      message: 'Onboarding cancelled',
+    });
   });
 
   test('keeps authenticated reachability ready while degraded runtime health blocks strict readiness', async () => {
@@ -176,6 +184,23 @@ describe('strict onboarding readiness', () => {
     expect(result.ready).toBe(true);
     expect(result.checks.every((check) => check.ready)).toBe(true);
     expect(result.readiness).toBe('reload-pending');
+    expect(result.checks.map((check) => check.id)).toEqual([
+      'stable-cli',
+      'persisted-config',
+      'identity',
+      'service-support',
+      'service-installed',
+      'service-enabled',
+      'service-loaded',
+      'service-running',
+      'service-paths',
+      'service-references',
+      'agent-adapter-discovery',
+      'agent-adapter-health',
+      'bridge-runtime-health',
+      'relay-health',
+      'relay-enrollment',
+    ]);
 
     const cases: Array<[string, Partial<StrictReadinessInput>, RegExp]> = [
       ['stable-cli', { stableCli: { ...healthy.input.stableCli, packageVersion: 'old' } }, /Stable Ariava CLI/i],
@@ -192,6 +217,33 @@ describe('strict onboarding readiness', () => {
       expect(check?.message).toMatch(messagePattern);
       expect(failed.nextActions[0]?.message).toMatch(messagePattern);
     }
+  });
+
+  test('first failed check controls exact remediation in complete readiness order', async () => {
+    const candidate = fixture({
+      stableCli: { ...fixture().input.stableCli, packageVersion: 'old' },
+      config: { ...config, environmentOverrides: ['ARIAVA_RELAY_BASE_URL'] },
+    });
+    const failed = await checkStrictOnboardingReadiness(candidate.input, candidate.deps);
+    expect(failed.checks.slice(0, 2)).toEqual([
+      {
+        id: 'stable-cli',
+        ready: false,
+        code: 'ERR_STABLE_CLI_PATH',
+        message: 'Stable Ariava CLI path or version evidence does not match the executing CLI.',
+      },
+      {
+        id: 'persisted-config',
+        ready: false,
+        code: 'ERR_RELAY_CONFIG_REQUIRED',
+        message: 'Persisted Host configuration is incomplete, or ambient environment overrides are present.',
+      },
+    ]);
+    expect(failed.nextActions).toEqual([{
+      id: 'retry-onboarding',
+      message: 'Stable Ariava CLI path or version evidence does not match the executing CLI.',
+      command: 'npx --yes ariava@latest setup',
+    }]);
   });
 
   test('classifies Relay network, auth, identity, rate limit, server, and malformed responses without changing identity', async () => {
@@ -278,6 +330,25 @@ describe('strict onboarding readiness', () => {
       message: expect.stringMatching(/Pi extension|manifest|version/i),
       command: 'ariava setup --extension pi',
     });
+  });
+
+  test('malformed runtime health remains a concrete authenticated-health failure', async () => {
+    const candidate = fixture({}, {
+      fetch: async (request) => String(request).includes('127.0.0.1')
+        ? Response.json({ ok: true, hostId: 'host-1', health: { status: 'healthy', drivers: [], extra: true } })
+        : Response.json({ ok: true }),
+    });
+    const failed = await checkStrictOnboardingReadiness(candidate.input, candidate.deps);
+    expect(failed.checks.slice(10, 13)).toEqual([
+      { id: 'agent-adapter-discovery', ready: false, code: 'ERR_AGENT_ADAPTER_DISCOVERY', message: 'Agent Adapter returned mismatched health evidence.' },
+      { id: 'agent-adapter-health', ready: false, code: 'ERR_AGENT_ADAPTER_DISCOVERY', message: 'Agent Adapter returned mismatched health evidence.' },
+      { id: 'bridge-runtime-health', ready: false, code: 'ERR_AGENT_ADAPTER_DISCOVERY', message: 'Agent Adapter returned mismatched health evidence.' },
+    ]);
+    expect(failed.nextActions).toEqual([{
+      id: 'retry-onboarding',
+      message: 'Agent Adapter returned mismatched health evidence.',
+      command: 'ariava service restart',
+    }]);
   });
 
   test('adapter discovery failures preserve concrete message on both related checks', async () => {
