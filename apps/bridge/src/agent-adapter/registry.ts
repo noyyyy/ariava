@@ -67,7 +67,7 @@ const EVENT_REQUIRED_KEYS = [
 const PROMPT_KEYS = ['promptId', 'type', 'label', 'options', 'expiresAt'] as const;
 
 type PendingTerminal = { event: CanonicalEvent; session: CanonicalSessionState };
-export type RegistryMutationReason = 'register' | 'semantic' | 'unregister' | 'ttl';
+export type RegistryMutationReason = 'register' | 'semantic' | 'handle' | 'unregister' | 'ttl';
 export type RegistryMutationCallback = (reason: RegistryMutationReason) => void;
 export interface RegistryRetryScheduler {
   schedule(callback: () => void, delayMs: number): unknown;
@@ -270,6 +270,7 @@ export class AgentAdapterRegistry {
     this.stateStore.queuePendingSessionHandle({ hostId: session.hostId, sessionId,
       handledThroughEventId: request.handledThroughEventId, handledThroughEventCreatedAt: request.handledThroughEventCreatedAt,
       handledAt, action: request.action === 'bridge_recovery' ? 'bridge_recovery' : 'pi_input', updatedAt: isoNow() });
+    this.onMutation('handle');
     return { ok: true, hostId: session.hostId, sessionId, handledThroughEventId: request.handledThroughEventId };
   }
 

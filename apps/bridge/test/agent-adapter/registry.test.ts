@@ -303,6 +303,50 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     } finally { cleanup(); }
   });
 
+  test('emits a handle mutation only after the durable handle is persisted', () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const mutationReasons: string[] = [];
+      const registry = new AgentAdapterRegistry('host-1', store, (reason) => mutationReasons.push(reason));
+      register(registry);
+      const eventId = registry.pushEvent('sess-1', doneEvent());
+      mutationReasons.length = 0;
+
+      registry.handleSession('sess-1', { handledThroughEventId: eventId, action: 'pi_input' });
+
+      expect(store.peekPendingSessionHandles()).toHaveLength(1);
+      expect(mutationReasons).toEqual(['handle']);
+    } finally { cleanup(); }
+  });
+
+  test('does not mutate or commit a pending handle when state persistence fails', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-handle-failure-'));
+    const statePath = join(dir, 'state.json');
+    let shouldFailWrites = false;
+    try {
+      const store = new BridgeStateStore(statePath, (path, value) => {
+        if (shouldFailWrites) throw new Error('handle persistence failed');
+        writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+      });
+      store.initializeEncryptedSpool('host-1', join(dir, 'identity.json'), 'linux', {
+        loadOrCreate: () => new Uint8Array(32).fill(7),
+      });
+      const mutationReasons: string[] = [];
+      const registry = new AgentAdapterRegistry('host-1', store, (reason) => mutationReasons.push(reason));
+      register(registry);
+      const eventId = registry.pushEvent('sess-1', doneEvent());
+      mutationReasons.length = 0;
+      const persistedStateBeforeFailure = readFileSync(statePath, 'utf8');
+      shouldFailWrites = true;
+
+      expect(() => registry.handleSession('sess-1', { handledThroughEventId: eventId, action: 'pi_input' }))
+        .toThrow('handle persistence failed');
+      expect(mutationReasons).toEqual([]);
+      expect(store.peekPendingSessionHandles()).toEqual([]);
+      expect(readFileSync(statePath, 'utf8')).toBe(persistedStateBeforeFailure);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('binds need_human to a need_human terminal Session and preserves protected reason', () => {
     const { store, cleanup } = makeStore();
     try {

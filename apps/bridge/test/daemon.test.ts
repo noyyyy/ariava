@@ -500,36 +500,83 @@ describe('BridgeDaemon', () => {
     daemon.stop();
   });
 
-  test('does not request reconciliation until the scheduled delay elapses', async () => {
-    let scheduledCallback: (() => void) | undefined;
-    const scheduler = {
-      schedule: (callback: () => void, delayMs: number) => {
-        expect(delayMs).toBe(300);
-        scheduledCallback = callback;
-        return Symbol('reconciliation');
+  test('wakes single-flight reconciliation after a real debounced handle mutation', async () => {
+    const templateDaemon = await createLongPollingDaemon('http://127.0.0.1:1');
+    const config = (templateDaemon as any).config;
+    const identityStore = (templateDaemon as any).identityStore;
+    templateDaemon.stop();
+    const scheduler = new ControllableScheduler();
+    const pollCallbacks: Array<() => void> = [];
+    let canceledPollCount = 0;
+    const pollScheduler = {
+      schedule(callback: () => void, delayMs: number) {
+        expect(delayMs).toBe(60_000);
+        const handle = Symbol('poll');
+        pollCallbacks.push(callback);
+        return handle;
       },
-      cancel: () => {},
+      cancel() { canceledPollCount += 1; },
     };
-    const daemon = await createLongPollingDaemon('http://127.0.0.1:1');
-    const daemonConfig = (daemon as any).config;
-    const daemonIdentityStore = (daemon as any).identityStore;
-    daemon.stop();
-    const scheduledDaemon = new BridgeDaemon(
-      daemonConfig,
+    const daemon = new BridgeDaemon(
+      config,
       [{ name: 'test', listSessions: async () => [] }],
-      daemonIdentityStore,
+      identityStore,
       undefined,
       scheduler,
+      pollScheduler,
     );
-    (scheduledDaemon as any).reconciliationRequested = false;
+    const daemonInternals = daemon as any;
+    const { adapterRegistry: registry, stateStore } = daemonInternals;
+    stateStore.initializeEncryptedSpool(
+      daemonInternals.config.hostId, daemonInternals.config.identityPath, 'linux',
+      { loadOrCreate: () => new Uint8Array(32).fill(7) },
+    );
+    registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/' });
+    stateStore.appendRecentEvent({
+      eventId: 'evt-handle', hostId: daemonInternals.config.hostId, sessionId: 'sess-handle', provider: 'pi',
+      type: 'done', status: 'idle', agentText: 'Done', createdAt: '2026-08-07T00:00:00.000Z',
+    });
+    scheduler.run(0);
+    const reconciliationScheduleIndex = scheduler.scheduled.length;
+    const blockedSecondSync = deferred<unknown>();
+    let syncCallCount = 0;
+    daemonInternals.startupValidated = true;
+    daemonInternals.performSyncOnce = async () => {
+      syncCallCount += 1;
+      daemonInternals.reconciliationRequested = false;
+      if (syncCallCount === 2) return blockedSecondSync.promise;
+      return {};
+    };
 
-    (scheduledDaemon as any).scheduleRegistryReconciliation();
+    const run = daemon.runForever();
+    try {
+      await waitFor(() => pollCallbacks.length === 1, 'initial poll wait');
+      expect(syncCallCount).toBe(1);
 
-    expect((scheduledDaemon as any).reconciliationRequested).toBe(false);
-    expect(scheduledCallback).toBeDefined();
-    scheduledCallback!();
-    expect((scheduledDaemon as any).reconciliationRequested).toBe(true);
-    scheduledDaemon.stop();
+      registry.handleSession('sess-handle', { handledThroughEventId: 'evt-handle', action: 'pi_input' });
+      registry.handleSession('sess-handle', { handledThroughEventId: 'evt-handle', action: 'pi_input' });
+
+      expect(scheduler.scheduled).toHaveLength(reconciliationScheduleIndex + 1);
+      expect(scheduler.scheduled[reconciliationScheduleIndex]?.delayMs).toBe(300);
+      expect(syncCallCount).toBe(1);
+      scheduler.run(reconciliationScheduleIndex);
+      await waitFor(() => syncCallCount === 2, 'handle-triggered reconciliation');
+      expect(canceledPollCount).toBe(1);
+
+      registry.handleSession('sess-handle', { handledThroughEventId: 'evt-handle', action: 'pi_input' });
+      expect(scheduler.scheduled).toHaveLength(reconciliationScheduleIndex + 2);
+      expect(scheduler.scheduled[reconciliationScheduleIndex + 1]?.delayMs).toBe(300);
+      scheduler.run(reconciliationScheduleIndex + 1);
+      await Bun.sleep(0);
+      expect(syncCallCount).toBe(2);
+
+      blockedSecondSync.resolve({});
+      await waitFor(() => syncCallCount === 3, 'queued reconciliation after active sync');
+    } finally {
+      daemon.stop();
+      blockedSecondSync.resolve({});
+      await waitForPromise(run, 'handle reconciliation cleanup');
+    }
   });
 
   test('stop disposes Registry retry lifecycle', async () => {
