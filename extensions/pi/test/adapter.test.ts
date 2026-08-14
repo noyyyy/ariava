@@ -175,8 +175,8 @@ describe('AgentAdapterClient', () => {
       sessionId: 'sess-1',
       type: 'reply',
       payload: { text: 'Continue' },
-      issuedAt: '2026-06-30T10:00:00Z',
-      expiresAt: '2026-06-30T10:05:00Z',
+      issuedAt: '2026-06-30T10:00:00.000Z',
+      expiresAt: '2026-06-30T10:05:00.000Z',
       nonce: 'n1',
       watchDeviceId: 'watch-1',
     };
@@ -200,8 +200,7 @@ describe('AgentAdapterClient', () => {
       sessionId: 'sess-1',
       accepted: true,
       status: 'executed',
-      message: 'done',
-      updatedAt: '2026-06-30T10:00:00Z',
+      updatedAt: '2026-06-30T10:00:00.000Z',
     };
 
     const command: CommandEnvelope = {
@@ -212,6 +211,24 @@ describe('AgentAdapterClient', () => {
     await client.submitResult('cmd-1', result);
     const resolved = await registry.waitForResult('cmd-1', { timeoutMs: 100 });
     expect(resolved).toEqual(result);
+  });
+
+  test.each([
+    ['message', { message: 'private result text' }],
+    ['reason', { reason: 'private reason' }],
+    ['queued', { accepted: true, status: 'queued' }],
+    ['delivered', { accepted: true, status: 'delivered' }],
+    ['unknown', { accepted: true, status: 'unknown' }],
+    ['expired', { accepted: false, status: 'expired' }],
+    ['correlationId', { correlationId: 'correlation-1' }],
+  ])('submitResult rejects non-exact result field or status: %s', async (_label, override) => {
+    const result = {
+      commandId: 'cmd-invalid', hostId: 'host-1', sessionId: 'sess-1',
+      accepted: true, status: 'executed', updatedAt: '2026-06-30T10:00:00.000Z', ...override,
+    };
+    await expect(client.submitResult('cmd-invalid', result as CommandResult)).rejects.toThrow(
+      'Agent Adapter command result is invalid',
+    );
   });
 
   const discovery = (value: string) => ({

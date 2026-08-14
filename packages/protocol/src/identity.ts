@@ -31,29 +31,6 @@ export interface EntityKeyProjection {
   revokedAt?: string;
 }
 
-export interface RotationPayload {
-  operationId: string;
-  entityId: string;
-  oldKeyId: string;
-  newKeyId: string;
-  newPublicKey: string;
-  issuedAt: string;
-}
-
-export interface KeyRotationRequest {
-  rotation: RotationPayload;
-  oldKeyAuthorizationSignature: string;
-  newKeyProofSignature: string;
-}
-
-export interface KeyRotationResponse {
-  operationId: string;
-  entityId: string;
-  oldKeyId: string;
-  newKeyId: string;
-  status: 'completed';
-  completedAt: string;
-}
 
 /** Revoke is deliberately an exact empty JSON object; the signed body is required. */
 export type IdentityRevokeRequest = Record<string, never>;

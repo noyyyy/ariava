@@ -165,35 +165,23 @@ export const ARIAVA_COMMAND_CATALOG: readonly AriavaCommandCatalogEntry[] = [
       default: { capability: 'host-domain', route: 'shared' },
       dev: { capability: 'host-domain', route: 'shared' },
     },
-    summaries: { default: ['ariava identity status'], dev: ['ariava identity status'] },
-    help: {
-      default: [{ section: 'host-identity', lines: ['  identity status                 Inspect the Host identity'] }],
-      dev: [{ section: 'host-commands', lines: ['  identity status                 Inspect the dev Host identity'] }],
-    },
-  },
-  {
-    command: 'host',
-    availability: {
-      default: { capability: 'host-domain', route: 'shared' },
-      dev: { capability: 'host-domain', route: 'shared' },
-    },
     summaries: {
-      default: ['ariava host rotate-key', 'ariava host reset --confirm'],
-      dev: ['ariava host rotate-key', 'ariava host reset --confirm'],
+      default: ['ariava identity status', 'ariava identity reset --confirm'],
+      dev: ['ariava identity status', 'ariava identity reset --confirm'],
     },
     help: {
       default: [{
         section: 'host-identity',
         lines: [
-          '  host rotate-key                 Rotate the Host signing key',
-          '  host reset --confirm            Replace the Host identity and remove all links',
+          '  identity status                 Inspect the Host identity',
+          '  identity reset --confirm        Replace the Host identity and remove all links',
         ],
       }],
       dev: [{
         section: 'host-commands',
         lines: [
-          '  host rotate-key                 Rotate the dev Host signing key',
-          '  host reset --confirm            Replace the dev Host identity and links',
+          '  identity status                 Inspect the dev Host identity',
+          '  identity reset --confirm        Replace the dev Host identity and links',
         ],
       }],
     },
@@ -249,8 +237,8 @@ export const ARIAVA_COMMAND_CATALOG: readonly AriavaCommandCatalogEntry[] = [
       dev: { capability: 'host-domain', route: 'shared' },
     },
     summaries: {
-      default: ['ariava config path|show|get|set', 'ariava config agent-secret ensure|rotate'],
-      dev: ['ariava config path|show|get|set', 'ariava config agent-secret ensure|rotate'],
+      default: ['ariava config path|show|get|set'],
+      dev: ['ariava config path|show|get|set'],
     },
     help: {
       default: [{
@@ -260,8 +248,6 @@ export const ARIAVA_COMMAND_CATALOG: readonly AriavaCommandCatalogEntry[] = [
           '  config show                     Show configuration with secrets redacted',
           '  config get <KEY>                Read a configuration value',
           '  config set <KEY> <VALUE>        Set a configuration value',
-          '  config agent-secret ensure      Create the Agent Adapter secret if absent',
-          '  config agent-secret rotate      Replace the Agent Adapter secret',
         ],
       }],
       dev: [{
@@ -271,8 +257,6 @@ export const ARIAVA_COMMAND_CATALOG: readonly AriavaCommandCatalogEntry[] = [
           '  config show                     Show dev configuration with secrets redacted',
           '  config get <KEY>                Read a dev configuration value',
           '  config set <KEY> <VALUE>        Set a mutable dev configuration value',
-          '  config agent-secret ensure      Create the dev Adapter secret if absent',
-          '  config agent-secret rotate      Replace the dev Adapter secret',
         ],
       }],
     },

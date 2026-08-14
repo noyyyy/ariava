@@ -126,7 +126,8 @@ describe('unified CLI application shell', () => {
     expect(await runAriavaCli(['help'], help.context)).toBe(0);
     const text = help.stdout.read();
     expect(text).toContain('identity status');
-    expect(text).toContain('host reset --confirm');
+    expect(text).toContain('identity reset --confirm');
+    expect(text).not.toContain('host reset --confirm');
     expect(text).toContain('pair <PAIRING_CODE>');
     if (profile === 'default') {
       expect(text).toContain('service install');

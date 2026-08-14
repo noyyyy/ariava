@@ -3,6 +3,7 @@ import { spawn as spawnChild } from 'node:child_process';
 import { accessSync, constants, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
+import { createHostEncryptionBinding } from '../../identity/host-encryption-key';
 import { createRuntimeHostEncryptionIdentityStore } from '../../identity/runtime-store';
 import type { HostIdentityStore } from '../../identity/types';
 import { probeHostPlatform } from '../../host-platform';
@@ -348,7 +349,23 @@ async function loadOnboardingHostState(
   if (identityInspection.status === 'not-initialized') return undefined;
   const identity = await store.load();
   if (!identity) return undefined;
-  return { config, identityInspection, identity };
+  const encryptionIdentity = runtime.createEncryptionIdentityStore(
+    config.identityPath,
+    manager.support.platform,
+  ).load();
+  if (!encryptionIdentity || encryptionIdentity.hostId !== identity.hostId) {
+    throw new AriavaCliError(
+      'ERR_IDENTITY_INVALID',
+      'Persisted Host encryption identity is missing or belongs to another Host.',
+      { step: 'host-init', retryable: false, remediation: { command: 'ariava identity reset --confirm' } },
+    );
+  }
+  return {
+    config,
+    identityInspection,
+    identity,
+    encryptionBinding: await createHostEncryptionBinding(identity, encryptionIdentity),
+  };
 }
 
 function buildReadinessInput(
@@ -370,6 +387,7 @@ function buildReadinessInput(
     config: state.config,
     identityInspection: state.identityInspection,
     identity: state.identity,
+    encryptionBinding: state.encryptionBinding,
     serviceRecord: service,
     expectedRuntimePath: deps.realpath(deps.currentRuntimePath()),
     expectedAriavaBinPath: stableCli.executablePath,

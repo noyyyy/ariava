@@ -1,6 +1,8 @@
+import type { EncryptedCommandEnvelopeV1 } from './commands.js';
+import { COMMAND_LIMITS, validateEncryptedCommandEnvelopeV1 } from './commands.js';
 import { base64UrlDecode, contentSha256 } from './request-signing.js';
 import { SESSION_STATUSES, type EventType, type NeedHumanContext, type SessionStatus } from './events.js';
-import { validateCanonicalEventInvariant } from './validation.js';
+import { isCanonicalTimestamp, validateCanonicalEventInvariant } from './validation.js';
 
 export const E2E_SUITE_V1 = 'x25519-hkdf-sha256-chachapoly-v1' as const;
 export const E2E_EPOCH_STATES = [
@@ -27,6 +29,8 @@ export type ProtectedPayloadKind =
   | 'event-content-v2'
   | 'session-content-v2'
   | 'reply-content-v1'
+  | 'interrupt-content-v1'
+  | 'command-receipt-content-v1'
   | 'notification-preview-v2';
 
 export const E2E_LIMITS = {
@@ -38,6 +42,7 @@ export const E2E_LIMITS = {
   eventPlaintextBytes: 32 * 1024,
   sessionPlaintextBytes: 16 * 1024,
   replyPlaintextBytes: 4_000,
+  commandReceiptPlaintextBytes: 128,
   notificationPreviewPlaintextBytes: 4_000,
   notificationPreviewProjectNameBytes: 256,
   notificationPreviewBodyTextBytes: 4_000,
@@ -183,6 +188,33 @@ export interface ProtectedSessionContentV2 {
 
 export interface ProtectedReplyContentV1 { version: 1; text: string }
 
+export interface ProtectedInterruptContentV1 {
+  version: 1;
+  action: 'interrupt';
+}
+
+export interface ProtectedCommandReceiptV1 {
+  version: 1;
+  accepted: boolean;
+  status: 'executed' | 'expired' | 'rejected' | 'failed';
+}
+
+export interface CommandReceiptEnvelopeV1 {
+  version: 1;
+  hostId: string;
+  watchDeviceId: string;
+  sessionId: string;
+  commandId: string;
+  commandType: 'reply' | 'interrupt';
+  commandDigest: string;
+  completedAt: string;
+  linkId: string;
+  linkGeneration: number;
+  epoch: number;
+  content: EncryptedContentV1 & { payloadKind: 'command-receipt-content-v1' };
+  keyWrap: RecipientKeyWrapV1;
+}
+
 export interface EncryptedNotificationPreviewPlaintextV2 {
   version: 2;
   projectName: string;
@@ -260,6 +292,26 @@ export interface ReplyContentAADInput {
   nonce: string;
   contentId: string;
 }
+export interface InterruptContentAADInput {
+  hostId: string;
+  watchDeviceId: string;
+  sessionId: string;
+  commandId: string;
+  issuedAt: string;
+  expiresAt: string;
+  nonce: string;
+  contentId: string;
+}
+export interface CommandReceiptContentAADInput {
+  hostId: string;
+  watchDeviceId: string;
+  sessionId: string;
+  commandId: string;
+  commandType: 'reply' | 'interrupt';
+  commandDigest: string;
+  completedAt: string;
+  contentId: string;
+}
 export interface NotificationPreviewAADInput {
   hostId: string;
   watchDeviceId: string;
@@ -315,7 +367,6 @@ function isWellFormedUnicode(value: string): boolean {
   return true;
 }
 
-const CANONICAL_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const ID_PATTERNS = {
   host: /^host_[A-Za-z0-9_-]{43}$/u,
   watch: /^watch_[A-Za-z0-9_-]{43}$/u,
@@ -386,6 +437,39 @@ export function buildProtectedReplyContentBytes(content: ProtectedReplyContentV1
     throw new TypeError('protected reply content is invalid');
   }
   return encoder.encode(JSON.stringify({ version: 1, text: content.text }));
+}
+
+export function buildProtectedInterruptContentBytes(content: ProtectedInterruptContentV1): Uint8Array {
+  assertExactKeys(content, ['version', 'action'], 'protected interrupt content', ['version', 'action']);
+  if (!validateProtectedInterruptContentV1(content)) throw new TypeError('protected interrupt content is invalid');
+  return encoder.encode('{"version":1,"action":"interrupt"}');
+}
+
+export function validateProtectedInterruptContentV1(value: unknown): value is ProtectedInterruptContentV1 {
+  return isExactRecord(value, ['version', 'action']) && value.version === 1 && value.action === 'interrupt';
+}
+
+export function buildProtectedCommandReceiptBytes(content: ProtectedCommandReceiptV1): Uint8Array {
+  assertProtectedCommandReceipt(content);
+  const canonical = encoder.encode(JSON.stringify({ version: 1, accepted: content.accepted, status: content.status }));
+  if (canonical.byteLength > E2E_LIMITS.commandReceiptPlaintextBytes) throw new TypeError('protected command receipt is invalid');
+  const padded = new Uint8Array(E2E_LIMITS.commandReceiptPlaintextBytes);
+  padded.fill(0x20);
+  padded.set(canonical);
+  return padded;
+}
+
+export function validateProtectedCommandReceiptBytes(bytes: Uint8Array): ProtectedCommandReceiptV1 | undefined {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength !== E2E_LIMITS.commandReceiptPlaintextBytes) return undefined;
+  let end = bytes.byteLength;
+  while (end > 0 && bytes[end - 1] === 0x20) end -= 1;
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, end));
+    const value: unknown = JSON.parse(text);
+    if (!validateProtectedCommandReceiptV1(value)) return undefined;
+    if (!equalBytes(buildProtectedCommandReceiptBytes(value), bytes)) return undefined;
+    return value;
+  } catch { return undefined; }
 }
 
 function canonicalNotificationPreviewPlaintextBytes(content: unknown): Uint8Array | undefined {
@@ -493,6 +577,32 @@ export function buildReplyContentAAD(input: ReplyContentAADInput): Uint8Array {
   ]);
 }
 
+export function buildInterruptContentAAD(input: InterruptContentAADInput): Uint8Array {
+  assertCommandAADBase(input, 'interrupt content AAD input');
+  return encodeLengthPrefixedFields([
+    'ariava-interrupt-content-aad-v1', 'watch-to-bridge', input.hostId, input.watchDeviceId, input.sessionId,
+    input.commandId, 'interrupt', input.issuedAt, input.expiresAt, input.nonce,
+    input.contentId, 'interrupt-content-v1',
+  ]);
+}
+
+export function buildCommandReceiptContentAAD(input: CommandReceiptContentAADInput): Uint8Array {
+  if ((input.commandType !== 'reply' && input.commandType !== 'interrupt')
+    || !isCanonicalDigest(input.commandDigest) || !isCanonicalTimestamp(input.completedAt)) {
+    throw new TypeError('command receipt content AAD input is invalid');
+  }
+  for (const value of [input.hostId, input.watchDeviceId, input.sessionId, input.commandId, input.contentId]) {
+    if (!isBoundedWellFormedString(value, E2E_LIMITS.notificationPreviewIdentifierBytes)) {
+      throw new TypeError('command receipt content AAD input is invalid');
+    }
+  }
+  return encodeLengthPrefixedFields([
+    'ariava-command-receipt-content-aad-v1', 'bridge-to-watch', input.hostId, input.watchDeviceId, input.sessionId,
+    input.commandId, input.commandType, input.commandDigest, input.completedAt, input.contentId,
+    'command-receipt-content-v1',
+  ]);
+}
+
 export function buildNotificationPreviewAAD(input: NotificationPreviewAADInput): Uint8Array {
   if (input.payloadKind !== 'notification-preview-v2'
     || (input.eventType !== 'done' && input.eventType !== 'need_human')
@@ -516,7 +626,10 @@ export function buildNotificationPreviewAAD(input: NotificationPreviewAADInput):
 
 export function buildWrapAAD(input: WrapAADInput): Uint8Array {
   if ((input.direction !== 'bridge-to-watch' && input.direction !== 'watch-to-bridge')
-    || !(['event-content-v2', 'session-content-v2', 'reply-content-v1', 'notification-preview-v2'] as readonly unknown[]).includes(input.payloadKind)
+    || !([
+      'event-content-v2', 'session-content-v2', 'reply-content-v1', 'interrupt-content-v1',
+      'command-receipt-content-v1', 'notification-preview-v2',
+    ] as readonly unknown[]).includes(input.payloadKind)
     || !isBoundedWellFormedString(input.linkId, E2E_LIMITS.notificationPreviewIdentifierBytes)
     || !isPositiveInteger(input.linkGeneration) || !isPositiveInteger(input.epoch)
     || !isBoundedWellFormedString(input.hostId, E2E_LIMITS.notificationPreviewIdentifierBytes)
@@ -526,7 +639,9 @@ export function buildWrapAAD(input: WrapAADInput): Uint8Array {
     || !isBoundedWellFormedString(input.contentId, E2E_LIMITS.notificationPreviewContentIdBytes)) {
     throw new TypeError('wrap AAD input is invalid');
   }
-  const domain = input.payloadKind === 'reply-content-v1' ? 'ariava-wrap-aad-v1' : 'ariava-wrap-aad-v2';
+  const domain = input.payloadKind === 'reply-content-v1' || input.payloadKind === 'interrupt-content-v1'
+    ? 'ariava-wrap-aad-v1'
+    : 'ariava-wrap-aad-v2';
   return encodeLengthPrefixedFields([
     domain, input.direction, input.linkId, String(input.linkGeneration), String(input.epoch),
     input.hostId, input.watchDeviceId, input.senderEncryptionKeyId, input.recipientEncryptionKeyId,
@@ -577,7 +692,13 @@ export function validateEncryptedContentV1(value: unknown): value is EncryptedCo
       maxPlaintextBytes = E2E_LIMITS.sessionPlaintextBytes;
       break;
     case 'reply-content-v1':
-      maxPlaintextBytes = E2E_LIMITS.replyPlaintextBytes;
+      maxPlaintextBytes = COMMAND_LIMITS.replyCanonicalPlaintextBytes;
+      break;
+    case 'interrupt-content-v1':
+      maxPlaintextBytes = 34;
+      break;
+    case 'command-receipt-content-v1':
+      maxPlaintextBytes = E2E_LIMITS.commandReceiptPlaintextBytes;
       break;
     case 'notification-preview-v2':
       maxPlaintextBytes = E2E_LIMITS.notificationPreviewPlaintextBytes;
@@ -622,6 +743,109 @@ export function validateRecipientKeyWrapV1(value: unknown): value is RecipientKe
     && isBoundedWellFormedString(value.senderEncryptionKeyId, E2E_LIMITS.notificationPreviewIdentifierBytes)
     && isBoundedWellFormedString(value.recipientEncryptionKeyId, E2E_LIMITS.notificationPreviewIdentifierBytes)
     && decodeBase64Url(value.nonce, 12) && decodeBase64Url(value.ciphertext, 48);
+}
+
+export function validateProtectedCommandReceiptV1(value: unknown): value is ProtectedCommandReceiptV1 {
+  if (!isExactRecord(value, ['version', 'accepted', 'status'])) return false;
+  return value.version === 1 && ((value.accepted === true && value.status === 'executed')
+    || (value.accepted === false && (value.status === 'expired' || value.status === 'rejected' || value.status === 'failed')));
+}
+
+export function validateCommandReceiptEnvelopeV1(value: unknown): value is CommandReceiptEnvelopeV1 {
+  if (!isExactRecord(value, [
+    'version', 'hostId', 'watchDeviceId', 'sessionId', 'commandId', 'commandType', 'commandDigest', 'completedAt',
+    'linkId', 'linkGeneration', 'epoch', 'content', 'keyWrap',
+  ])) return false;
+  if (value.version !== 1 || (value.commandType !== 'reply' && value.commandType !== 'interrupt')
+    || !isCanonicalDigest(value.commandDigest) || typeof value.completedAt !== 'string'
+    || !isCanonicalTimestamp(value.completedAt) || !isPositiveInteger(value.linkGeneration)
+    || !isPositiveInteger(value.epoch)) return false;
+  for (const field of ['hostId', 'watchDeviceId', 'sessionId', 'commandId', 'linkId'] as const) {
+    if (!isBoundedWellFormedString(value[field], E2E_LIMITS.notificationPreviewIdentifierBytes)) return false;
+  }
+  if (!validateEncryptedContentV1(value.content) || value.content.payloadKind !== 'command-receipt-content-v1'
+    || !validateRecipientKeyWrapV1(value.keyWrap)
+    || !ID_PATTERNS.encryptionKey.test(value.keyWrap.senderEncryptionKeyId)
+    || !ID_PATTERNS.encryptionKey.test(value.keyWrap.recipientEncryptionKeyId)
+    || value.content.contentId !== value.keyWrap.contentId
+    || value.linkId !== value.keyWrap.linkId || value.linkGeneration !== value.keyWrap.linkGeneration
+    || value.epoch !== value.keyWrap.epoch) return false;
+  try {
+    return base64UrlDecode(value.content.ciphertext).byteLength
+      === E2E_LIMITS.commandReceiptPlaintextBytes + E2E_LIMITS.authenticationTagBytes;
+  } catch { return false; }
+}
+
+export function buildEncryptedCommandEnvelopeBindingBytes(command: EncryptedCommandEnvelopeV1): Uint8Array {
+  if (!validateEncryptedCommandShape(command)) throw new TypeError('encrypted command envelope is invalid');
+  return encodeLengthPrefixedFields([
+    'ariava-encrypted-command-binding-v1', command.hostId, command.watchDeviceId, command.sessionId, command.commandId,
+    command.type, command.type === 'reply' ? command.targetAlertEventId : '', command.issuedAt, command.expiresAt,
+    command.nonce, command.linkId, String(command.linkGeneration), String(command.epoch),
+    ...contentBindingFields(command.payload.content), ...wrapBindingFields(command.payload.keyWrap),
+  ]);
+}
+
+export async function deriveEncryptedCommandDigest(command: EncryptedCommandEnvelopeV1): Promise<string> {
+  return contentSha256(buildEncryptedCommandEnvelopeBindingBytes(command));
+}
+
+export function buildCommandReceiptEnvelopeBindingBytes(receipt: CommandReceiptEnvelopeV1): Uint8Array {
+  if (!validateCommandReceiptEnvelopeV1(receipt)) throw new TypeError('command receipt envelope is invalid');
+  return encodeLengthPrefixedFields([
+    'ariava-command-receipt-binding-v1', String(receipt.version), receipt.hostId, receipt.watchDeviceId, receipt.sessionId,
+    receipt.commandId, receipt.commandType, receipt.commandDigest, receipt.completedAt, receipt.linkId,
+    String(receipt.linkGeneration), String(receipt.epoch), ...contentBindingFields(receipt.content),
+    ...wrapBindingFields(receipt.keyWrap),
+  ]);
+}
+
+export async function deriveCommandReceiptDigest(receipt: CommandReceiptEnvelopeV1): Promise<string> {
+  return contentSha256(buildCommandReceiptEnvelopeBindingBytes(receipt));
+}
+
+function assertProtectedCommandReceipt(content: ProtectedCommandReceiptV1): void {
+  assertExactKeys(content, ['version', 'accepted', 'status'], 'protected command receipt', ['version', 'accepted', 'status']);
+  if (!validateProtectedCommandReceiptV1(content)) throw new TypeError('protected command receipt is invalid');
+}
+
+function assertCommandAADBase(input: InterruptContentAADInput, label: string): void {
+  for (const value of [input.hostId, input.watchDeviceId, input.sessionId, input.commandId, input.contentId]) {
+    if (!isBoundedWellFormedString(value, E2E_LIMITS.notificationPreviewIdentifierBytes)) throw new TypeError(`${label} is invalid`);
+  }
+  if (!isCanonicalTimestamp(input.issuedAt) || !isCanonicalTimestamp(input.expiresAt)
+    || new Date(input.expiresAt).getTime() <= new Date(input.issuedAt).getTime()
+    || new Date(input.expiresAt).getTime() > new Date(input.issuedAt).getTime() + COMMAND_LIMITS.maxTtlMs
+    || !isBoundedWellFormedString(input.nonce, E2E_LIMITS.notificationPreviewIdentifierBytes)) {
+    throw new TypeError(`${label} is invalid`);
+  }
+}
+
+function validateEncryptedCommandShape(command: EncryptedCommandEnvelopeV1): boolean {
+  return validateEncryptedCommandEnvelopeV1(command);
+}
+
+function contentBindingFields(content: EncryptedContentV1): string[] {
+  return [String(content.version), content.suite, content.contentId, content.payloadKind, content.nonce, content.ciphertext];
+}
+
+function wrapBindingFields(wrap: RecipientKeyWrapV1): string[] {
+  return [
+    String(wrap.version), wrap.suite, wrap.contentId, wrap.linkId, String(wrap.linkGeneration), String(wrap.epoch),
+    wrap.senderEncryptionKeyId, wrap.recipientEncryptionKeyId, wrap.nonce, wrap.ciphertext,
+  ];
+}
+
+function isCanonicalDigest(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  try { base64UrlDecode(value, E2E_LIMITS.digestBytes); return true; } catch { return false; }
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  let difference = 0;
+  for (let index = 0; index < left.byteLength; index += 1) difference |= left[index]! ^ right[index]!;
+  return difference === 0;
 }
 
 function assertValidEncryptionBinding(binding: Omit<EncryptionKeyBindingV1, 'bindingSignature'>): void {
@@ -730,6 +954,8 @@ function assertExactKeys(
   required: readonly string[] = [],
 ): void {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object`);
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError(`${label} has an unsupported prototype`);
   const supported = new Set(allowed);
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== 'string') throw new TypeError(`${label} contains unsupported fields`);
@@ -747,11 +973,6 @@ function assertExactKeys(
   }
 }
 
-function isCanonicalTimestamp(value: string): boolean {
-  if (!CANONICAL_TIMESTAMP_RE.test(value)) return false;
-  const parsed = new Date(value);
-  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
-}
 
 function base64UrlZeros(bytes: number): string {
   const binary = String.fromCharCode(...new Uint8Array(bytes));
@@ -765,6 +986,8 @@ function decodeBase64Url(value: unknown, bytes: number): boolean {
 function isPositiveInteger(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) > 0; }
 function isExactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
   const actual = Reflect.ownKeys(value);
   if (actual.length !== keys.length) return false;
   const supported = new Set(keys);

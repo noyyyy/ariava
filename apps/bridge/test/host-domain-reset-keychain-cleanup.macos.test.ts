@@ -78,6 +78,38 @@ function fixture() {
 }
 
 describe('macOS Host-domain reset exact Keychain cleanup', () => {
+  test('confirmed reset blocks on selected-profile index-only evidence without overwrite or downstream effects', async () => {
+    const value = fixture();
+    await initializeProfile(value.context);
+    const metadataPath = value.profile.resources.identityMetadataPath;
+    rmSync(metadataPath);
+    const accountsBefore = new Map(
+      [...value.keychain.items].map(([account, bytes]) => [account, new Uint8Array(bytes)]),
+    );
+    value.keychain.resetCalls();
+    let revokeCalls = 0;
+    let enrollCalls = 0;
+
+    await expect(resetHostDomain(value.context, {
+      ...value.dependencies,
+      revoke: async () => { revokeCalls += 1; return 'revoked'; },
+      enroll: async () => { enrollCalls += 1; },
+    })).rejects.toMatchObject({
+      code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',
+      data: { phase: 'quarantined', retryable: true },
+    });
+
+    expect(existsSync(metadataPath)).toBe(false);
+    expect(value.keychain.items).toEqual(accountsBefore);
+    expect(value.keychain.calls.filter((call) => call.action === 'write' || call.action === 'delete')).toEqual([]);
+    expect({ revokeCalls, enrollCalls }).toEqual({ revokeCalls: 0, enrollCalls: 0 });
+    expect(value.counts()).toEqual({ signingReplacements: 0, encryptionReplacements: 0 });
+    expect(loadHostDomainResetJournal(value.profile.resources)).toMatchObject({
+      phase: 'quarantined', oldHostId: null, oldKeyId: null, signingCleanup: null,
+      revoke: { state: 'not-attempted', outcome: null },
+    });
+  });
+
   test('retries exact old Ed25519 account deletion before journal completion', async () => {
     const value = fixture();
     await initializeProfile(value.context);
@@ -143,18 +175,25 @@ describe('macOS Host-domain reset exact Keychain cleanup', () => {
     [{ status: 44, stderr: 'security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.' }, undefined],
     [{ status: 1, stderr: 'authorization denied; item could not be found' }, 'ERR_IDENTITY_PERMISSIONS'],
     [{ status: 44, stderr: 'authorization denied' }, 'ERR_IDENTITY_PERMISSIONS'],
-  ] as const)('strictly classifies exact Ed25519 deletion result %#', (deleteResult, expectedCode) => {
+  ] as const)('strictly classifies exact Ed25519 deletion result %#', async (deleteResult, expectedCode) => {
     const value = fixture();
-    const account = `host_${'A'.repeat(43)}`;
-    value.keychain.deleteResultForAccount = (candidate) => candidate === account ? deleteResult : undefined;
     const store = new MacOSKeychainHostIdentityStore(
       value.profile.resources.identityMetadataPath, value.keychain, {}, 'dev',
     );
+    const identity = await store.createFirstRun();
+    const account = identity.hostId;
+    const previousKey = value.keychain.snapshot(account);
+    value.keychain.deleteResultForAccount = (candidate) => candidate === account ? deleteResult : undefined;
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(inspectResetOnlyLegacyIdentityEvidence(store)).toMatchObject({
+      classification: 'old-identity-unreadable', oldHostId: identity.hostId, oldKeyId: identity.keyId,
+    });
 
     if (expectedCode === undefined) {
-      expect(() => store.deleteAfterHostReplacement(account)).not.toThrow();
+      await expect(store.resetAfterExplicitConfirmation('reset_delete_classification')).resolves.toBeDefined();
     } else {
-      expect(() => store.deleteAfterHostReplacement(account)).toThrow(expect.objectContaining({ code: expectedCode }));
+      await expect(store.resetAfterExplicitConfirmation('reset_delete_classification')).rejects.toMatchObject({ code: expectedCode });
+      expect(value.keychain.snapshot(account)).toEqual(previousKey);
     }
     expect(value.keychain.callsFor(account).filter((call) => call.action === 'delete')).toHaveLength(1);
   });

@@ -31,9 +31,14 @@ function needHumanEvent(overrides: Partial<CanonicalEvent> = {}): CanonicalEvent
 }
 
 function recipient(index: number) {
+  const hostIdentity = { version: 1 as const, hostId: 'host-test', encryptionKeyId: 'ekey-host', publicKey: '',
+    privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' };
   return {
     linkId: `link-${index}`, linkGeneration: 1, watchDeviceId: `watch-${index}`, epoch: index, state: 'active' as const,
-    transcriptDigest: 'A'.repeat(43),
+    transcriptDigest: 'A'.repeat(43), hostIdentity,
+    hostBinding: { version: 1 as const, entityType: 'host' as const, entityId: hostIdentity.hostId, identityKeyId: 'key-host',
+      encryptionKeyId: hostIdentity.encryptionKeyId, publicKey: hostIdentity.publicKey, sequence: hostIdentity.sequence,
+      createdAt: hostIdentity.createdAt, bindingSignature: 'B'.repeat(86) },
     watchBinding: { version: 1 as const, entityType: 'watch' as const, entityId: `watch-${index}`, identityKeyId: `key-${index}`,
       encryptionKeyId: `ekey-watch-${index}`, publicKey: 'A'.repeat(43), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z',
       bindingSignature: 'B'.repeat(86) },
@@ -81,13 +86,20 @@ describe('notification preview v2', () => {
     expect(normalizeNotificationPreviewBody(exact + 'Z')).toEqual({ bodyText: `${exact}…`, truncated: true });
   });
 
+  test('rejects per-pin sender identity substitution before generating notification wraps', async () => {
+    const { encryptNotificationPreviews } = await import('../src/e2e/envelope');
+    const plaintext = buildNotificationPreview(doneEvent(), session)!;
+    const material = recipient(1);
+    material.hostIdentity = { ...material.hostIdentity, encryptionKeyId: 'ekey-substituted' };
+    expect(() => encryptNotificationPreviews({ event: doneEvent(), plaintext, recipients: [material] }))
+      .toThrow(/sender identity/);
+  });
+
   test('binds outer preview eventType and v2 payload kind for each recipient', async () => {
     const { encryptNotificationPreviews } = await import('../src/e2e/envelope');
     const plaintext = buildNotificationPreview(doneEvent(), session)!;
     const envelopes = encryptNotificationPreviews({
       event: doneEvent(), plaintext, recipients: [recipient(1), recipient(2)],
-      hostIdentity: { version: 1, hostId: 'host-test', encryptionKeyId: 'ekey-host', publicKey: '',
-        privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' },
     });
     expect(envelopes.map((item) => item.eventType)).toEqual(['done', 'done']);
     expect(envelopes.every((item) => item.content.payloadKind === 'notification-preview-v2')).toBe(true);

@@ -4,11 +4,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runPublicCli } from '../src/public-cli-app';
 import {
+  createHostEncryptionBinding,
   HostIdentityError,
+  LinuxEncryptionKeyStore,
   LinuxJsonHostIdentityStore,
   MacOSKeychainHostIdentityStore,
   publicIdentityMetadata,
 } from '../src/identity';
+import {
+  buildEncryptionBindingBytes,
+  buildLinkTranscriptBytes,
+  contentSha256,
+  type EncryptionKeyBindingV1,
+} from '@ariava/protocol';
+import commandFixture from '../../../packages/protocol/test/fixtures/command-e2e-v1-vectors.json';
 import type { ServiceManager } from '../src/host-manager';
 import { createDefaultProfile } from '../src/cli/profiles/default';
 import { FakeKeychain } from './fixtures/fake-keychain';
@@ -81,7 +90,7 @@ describe('identity-safe public CLI', () => {
     deps.createServiceManager = () => { serviceCalls += 1; throw new Error('service access'); };
     globalThis.fetch = (async () => { relayCalls += 1; throw new Error('relay access'); }) as typeof fetch;
 
-    expect(await runPublicCli(['host', 'reset', '--json'], deps)).toBe(1);
+    expect(await runPublicCli(['identity', 'reset', '--json'], deps)).toBe(1);
     expect(JSON.parse(errors[0]!)).toMatchObject({ code: 'ERR_CONFIRMATION_REQUIRED' });
     expect(identityCalls).toBe(0);
     expect(serviceCalls).toBe(0);
@@ -211,42 +220,40 @@ describe('identity-safe public CLI', () => {
   test.each([
     [['pair', 'peyx7k'], '/v2/bridge/pair-watch'],
     [['watches', 'list'], '/v2/bridge/watches'],
-    [['watches', 'remove', `watch_${'C'.repeat(43)}`], `/v2/bridge/watches/watch_${'C'.repeat(43)}`],
+    [['watches', 'remove', commandFixture.link.watchDeviceId], `/v2/bridge/watches/${commandFixture.link.watchDeviceId}`],
   ] as const)('public %s ensures metadata/enrollment before link API', async (argv, finalPath) => {
     const root = mkdtempSync(join(tmpdir(), 'ariava-link-cli-')); roots.push(root);
     const profile = withProfileHome(root, createDefaultProfile);
     mkdirSync(profile.resources.root, { recursive: true, mode: 0o700 });
     const identityPath = profile.resources.identityMetadataPath;
     const identity = await new LinuxJsonHostIdentityStore(identityPath).createFirstRun();
+    const removingWatch = argv[0] === 'watches' && argv[1] === 'remove';
+    if (removingWatch) await seedLinkedWatchPin(identityPath, identity, commandFixture.bindings.watch as EncryptionKeyBindingV1);
     let config: any = { identity: publicIdentityMetadata(identity), identityPath, hostName: 'Linux host' };
     const paths: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       const path = new URL(request.url).pathname; paths.push(path);
-      if (path === '/v2/bridge/enroll') return Response.json({ host: hostProjection(identity.hostId) });
-      if (path === '/v2/bridge/watches') return Response.json({ watches: [] });
+      if (path === '/v2/bridge/enroll') {
+        const body = await request.json() as { hostId: string; hostName: string; platform: 'macos' | 'linux'; bridgeVersion: string };
+        return Response.json({ host: hostProjection(body) });
+      }
+      if (path === '/v2/bridge/watches') {
+        const now = new Date().toISOString();
+        return Response.json({ watches: removingWatch ? [{
+          watchDeviceId: commandFixture.link.watchDeviceId,
+          pairedAt: now,
+          lastSeenAt: now,
+          linkGeneration: commandFixture.link.linkGeneration,
+        }] : [] });
+      }
       if (path === '/v2/bridge/pair-watch') {
         expect(await request.json()).toEqual({ pairingCode: 'PEYX7K' });
-        const now = new Date().toISOString();
-        const watchDeviceId = `watch_${'C'.repeat(43)}`;
-        return Response.json({
-          host: hostProjection(identity.hostId),
-          watchDevice: {
-            watchDeviceId,
-            selectedHostIds: [identity.hostId],
-            registeredAt: now,
-            lastSeenAt: now,
-            pairingStatus: 'paired',
-          },
-          link: {
-            hostId: identity.hostId,
-            watchDeviceId,
-            pairedAt: now,
-            generation: 1,
-            updatedAt: now,
-          },
-          alreadyPaired: false,
-        });
+        return Response.json(pairResponse(identity.hostId));
+      }
+      if (request.method === 'DELETE' && path === finalPath) {
+        expect(await request.json()).toEqual({ linkGeneration: commandFixture.link.linkGeneration });
+        return Response.json({ ok: true });
       }
       return Response.json({ ok: true });
     }) as typeof fetch;
@@ -255,7 +262,15 @@ describe('identity-safe public CLI', () => {
     deps.createProfile = () => profile;
     const code = await runPublicCli([...argv, '--json'], deps);
     expect(code, errors.join('')).toBe(0);
-    expect(paths).toEqual(['/v2/bridge/enroll', finalPath]);
+    expect(paths).toEqual(['/v2/bridge/enroll', ...(removingWatch ? ['/v2/bridge/watches'] : []), finalPath]);
+    if (removingWatch) {
+      const keyring = JSON.parse(readFileSync(profile.resources.linkKeyringPath, 'utf8'));
+      expect(keyring.pins).toMatchObject([{
+        watchDeviceId: commandFixture.link.watchDeviceId,
+        linkGeneration: commandFixture.link.linkGeneration,
+        status: 'revoked',
+      }]);
+    }
   });
 
   test('rejects invalid pair codes before identity loading, enrollment, or Relay requests', async () => {
@@ -304,9 +319,13 @@ describe('identity-safe public CLI', () => {
     const identityPath = join(root, 'identity.json');
     const store = new LinuxJsonHostIdentityStore(identityPath);
     const identity = await store.createFirstRun();
-    const { generateHostRotationIdentity } = await import('../src/identity');
-    const next = await generateHostRotationIdentity(identity.hostId, identity.privateKeyStorage);
-    await store.stageRotation({ operationId: 'op_pending', issuedAt: new Date().toISOString(), identity: next.identity });
+    const persisted = JSON.parse(readFileSync(identityPath, 'utf8'));
+    persisted.pendingRotation = {
+      operationId: 'op_pending',
+      issuedAt: new Date().toISOString(),
+      identity: { ...persisted },
+    };
+    writeFileSync(identityPath, JSON.stringify(persisted), { mode: 0o600 });
     const config: any = { identity: publicIdentityMetadata(identity), hostName: 'Linux host' };
     const output: string[] = []; const errors: string[] = [];
     const deps = cliDeps(root, identityPath, () => config, () => {}, output, errors);
@@ -332,16 +351,15 @@ describe('identity-safe public CLI', () => {
     const result = JSON.parse(output[0]!);
     expect(result).toMatchObject({ ok: false, code: 'ERR_DOCTOR', data: {
       identityReady: false,
-      identityWarning: 'Host key rotation is pending; recover it before normal operation.',
-      identity: { status: 'rotation-pending', pendingRotation: true, pendingOperationId: 'op_pending' },
+      identityWarning: 'Host identity signing state requires reset; run `ariava identity reset --confirm` and re-pair Watches.',
+      identity: { status: 'invalid' },
     } });
   });
 
-  test('public Host reset repairs corrupt macOS Keychain metadata and enrolls the replacement', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'ariava-reset-enroll-')); roots.push(home);
+  test('public Host reset blocks malformed macOS metadata before Relay or replacement effects', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'ariava-reset-malformed-')); roots.push(home);
     const profile = withProfileHome(home, createDefaultProfile);
-    const root = profile.resources.root;
-    mkdirSync(root, { recursive: true, mode: 0o700 });
+    mkdirSync(profile.resources.root, { recursive: true, mode: 0o700 });
     const identityPath = profile.resources.identityMetadataPath;
     const keychain = new FakeKeychain();
     const store = new MacOSKeychainHostIdentityStore(identityPath, keychain);
@@ -349,28 +367,50 @@ describe('identity-safe public CLI', () => {
     const originalKey = keychain.snapshot(original.hostId);
     await Bun.write(identityPath, '{bad json');
     let config: any = { identity: publicIdentityMetadata(original), identityPath, hostName: 'macOS host' };
-    const paths: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init); paths.push(new URL(request.url).pathname);
-      const body = await request.json() as any;
-      expect(body.hostId).not.toBe(original.hostId);
-      return Response.json({ host: hostProjection(body.hostId) });
-    }) as typeof fetch;
+    let relayCalls = 0;
+    globalThis.fetch = (async () => { relayCalls += 1; throw new Error('must not call Relay'); }) as typeof fetch;
     const output: string[] = []; const errors: string[] = [];
-    const deps = cliDeps(root, identityPath, () => config, (next) => { config = next; }, output, errors);
+    const deps = cliDeps(profile.resources.root, identityPath, () => config, (next) => { config = next; }, output, errors);
     deps.createProfile = () => profile;
     deps.createHostIdentityStore = (path: string) => new MacOSKeychainHostIdentityStore(path, keychain);
     deps.hostIdentityOperationLock = { run: (_resources, operation) => operation() };
-    const code = await runPublicCli(['host', 'reset', '--confirm', '--json'], deps);
-    expect(code, errors.join('')).toBe(0);
-    expect(paths).toEqual(['/v2/bridge/enroll']);
-    expect(JSON.parse(output[0]!).data).toMatchObject({ hostId: config.identity.hostId, links: [], revokedOldIdentity: false });
-    expect(JSON.parse(output[0]!).data.warning).toContain('ERR_IDENTITY_INVALID');
-    expect(config.identity.hostId).not.toBe(original.hostId);
+    expect(await runPublicCli(['identity', 'reset', '--confirm', '--json'], deps)).toBe(1);
+    expect(JSON.parse(errors[0]!)).toMatchObject({
+      code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',
+      data: { phase: 'quarantined', retryable: true },
+    });
+    expect(relayCalls).toBe(0);
+    expect(config.identity.hostId).toBe(original.hostId);
     expect(keychain.snapshot(original.hostId)).toEqual(originalKey);
-    expect((await store.load())?.hostId).toBe(config.identity.hostId);
   });
 });
+
+async function seedLinkedWatchPin(
+  identityPath: string,
+  identity: Awaited<ReturnType<LinuxJsonHostIdentityStore['createFirstRun']>>,
+  watchBinding: EncryptionKeyBindingV1,
+): Promise<void> {
+  const encryptionStore = new LinuxEncryptionKeyStore(`${identityPath}.e2e.json`);
+  const hostBinding = await createHostEncryptionBinding(identity, encryptionStore.loadOrCreate(identity.hostId));
+  const { bindingSignature: _hostSignature, canonicalBytes: _hostCanonicalBytes, ...unsignedHostBinding } = hostBinding as EncryptionKeyBindingV1 & { canonicalBytes?: string };
+  const { bindingSignature: _watchSignature, canonicalBytes: _watchCanonicalBytes, ...unsignedWatchBinding } = watchBinding as EncryptionKeyBindingV1 & { canonicalBytes?: string };
+  const canonicalWatchBinding = { ...unsignedWatchBinding, bindingSignature: watchBinding.bindingSignature };
+  const hostBindingDigest = await contentSha256(buildEncryptionBindingBytes(unsignedHostBinding));
+  const watchBindingDigest = await contentSha256(buildEncryptionBindingBytes(unsignedWatchBinding));
+  const link = { ...commandFixture.link, hostId: identity.hostId };
+  const transcriptDigest = await contentSha256(buildLinkTranscriptBytes({
+    ...link, hostBindingDigest, watchBindingDigest,
+  }));
+  const peerProofDigest = await contentSha256(new Uint8Array([7]));
+  writeFileSync(`${identityPath}.e2e-keyring.json`, `${JSON.stringify({
+    version: 2,
+    pins: [{
+      version: 2, status: 'active', ...link, transcriptDigest, hostBinding, hostBindingDigest,
+      watchBinding: canonicalWatchBinding, watchBindingDigest, peerProofDigest, activatedAt: '2026-08-12T00:00:00.000Z',
+    }],
+    pendingActivations: [],
+  })}\n`, { mode: 0o600 });
+}
 
 function pairResponse(hostId: string) {
   const now = new Date().toISOString();
@@ -389,8 +429,15 @@ function pairResponse(hostId: string) {
   };
 }
 
-function hostProjection(hostId: string) {
-  return { hostId, hostName: 'Linux host', platform: 'linux', bridgeVersion: '1.0.0', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' };
+function hostProjection(input: string | { hostId: string; hostName: string; platform: 'macos' | 'linux'; bridgeVersion: string }) {
+  const metadata = typeof input === 'string'
+    ? { hostId: input, hostName: 'Linux host', platform: 'linux' as const, bridgeVersion: '1.0.0' }
+    : input;
+  return {
+    hostId: metadata.hostId, hostName: metadata.hostName, platform: metadata.platform,
+    bridgeVersion: metadata.bridgeVersion, registeredAt: new Date().toISOString(),
+    lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' as const, status: 'active' as const,
+  };
 }
 
 function cliDeps(root: string, identityPath: string, loadConfig: () => any, saveConfig: (next: any) => void, out: string[], err: string[]) {

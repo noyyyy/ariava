@@ -42,10 +42,12 @@ function dependencies(profileId: 'default' | 'dev', phase: typeof HOST_DOMAIN_RE
   mkdirSync(profile.resources.root, { recursive: true, mode: 0o700 });
   writeHostDomainResetJournal(profile.resources, {
     version: HOST_DOMAIN_RESET_JOURNAL_VERSION, operationId: 'reset_0123456789abcdef', profile: profileId, phase,
-    oldHostId: `host_${'A'.repeat(43)}`, oldKeyId: `key_${'B'.repeat(43)}`,
+    oldHostId: ['quarantine-pending', 'quarantined'].includes(phase) ? null : `host_${'A'.repeat(43)}`,
+    oldKeyId: ['quarantine-pending', 'quarantined'].includes(phase) ? null : `key_${'B'.repeat(43)}`,
     newHostId: HOST_DOMAIN_RESET_PHASES.indexOf(phase) >= HOST_DOMAIN_RESET_PHASES.indexOf('signing-identity-replaced') ? `host_${'C'.repeat(43)}` : null,
     newKeyId: HOST_DOMAIN_RESET_PHASES.indexOf(phase) >= HOST_DOMAIN_RESET_PHASES.indexOf('signing-identity-replaced') ? `key_${'D'.repeat(43)}` : null,
     oldEncryptionKeyId: null,
+    signingCleanup: null,
     signingReplacementAttemptedAt: phaseTimestamp(phase, 'signing-replacement-pending'),
     encryptionIdentityReplacedAt: phaseTimestamp(phase, 'encryption-identity-replaced'),
     runtimeArtifactsClearedAt: phaseTimestamp(phase, 'runtime-artifacts-cleared'),
@@ -53,7 +55,8 @@ function dependencies(profileId: 'default' | 'dev', phase: typeof HOST_DOMAIN_RE
     enrolledAt: phaseTimestamp(phase, 'enrolled'),
     serviceMetadataSynchronizedAt: phaseTimestamp(phase, 'service-metadata-synchronized'),
     resourceDigest: hostDomainResourceDigest(profile.resources), createdAt: '2026-08-11T00:00:00.000Z', updatedAt: '2026-08-11T00:00:00.000Z',
-    revoke: phase === 'prepared' ? { state: 'not-attempted', outcome: null }
+    revoke: phase === 'quarantine-pending' || phase === 'quarantined' || phase === 'prepared'
+      ? { state: 'not-attempted', outcome: null }
       : phase === 'revoke-pending' ? { state: 'pending', outcome: null }
         : { state: 'complete', outcome: 'revoked' },
     service: profileId === 'default'
@@ -63,7 +66,7 @@ function dependencies(profileId: 'default' | 'dev', phase: typeof HOST_DOMAIN_RE
   const context = createProfileCliContext({
     profile, platform: 'linux', hostName: () => 'Host', generateSecret: () => 'secret',
     config: { load: () => ({}), save: () => {} },
-    identity: { create: () => ({ inspect: async () => ({ status: 'not-initialized', storageType: 'linux-json', storageReference: { type: 'linux-json', path: profile.resources.identityMetadataPath }, path: profile.resources.identityMetadataPath, ownerIntegrity: false, permissionIntegrity: false, metadataIntegrity: false, pendingRotation: false }) }) as never },
+    identity: { create: () => ({ inspect: async () => ({ status: 'not-initialized', storageType: 'linux-json', storageReference: { type: 'linux-json', path: profile.resources.identityMetadataPath }, path: profile.resources.identityMetadataPath, ownerIntegrity: false, permissionIntegrity: false, metadataIntegrity: false }) }) as never },
   });
   const common = {
     context: () => context, pathExists: () => true,
@@ -95,7 +98,7 @@ describe('Host-domain reset status and doctor evidence', () => {
       const result = await runStatusCommand([], value.status);
       expect(result.envelope.data).toMatchObject({ hostDomainReset: { pending: true, phase } });
       expect(result.human).toContain(phase);
-      expect(result.human).toContain(profileId === 'dev' ? 'bun run dev:cli -- host reset --confirm' : 'ariava host reset --confirm');
+      expect(result.human).toContain(profileId === 'dev' ? 'bun run dev:cli -- identity reset --confirm' : 'ariava identity reset --confirm');
       expect(JSON.stringify(result)).not.toMatch(/secret|identity\.json|host-domain-reset\.json/i);
     }
   });
@@ -105,6 +108,6 @@ describe('Host-domain reset status and doctor evidence', () => {
     const result = await runDoctorCommand([], value.doctor);
     expect(result).toMatchObject({ envelope: { ok: true, code: 'ok', data: { hostDomainReset: { pending: true, phase: 'service-restore-pending' } } }, exitCode: 0 });
     expect(result.human).toContain('service-restore-pending');
-    expect(result.human).toContain(profileId === 'dev' ? 'bun run dev:cli -- host reset --confirm' : 'ariava host reset --confirm');
+    expect(result.human).toContain(profileId === 'dev' ? 'bun run dev:cli -- identity reset --confirm' : 'ariava identity reset --confirm');
   });
 });

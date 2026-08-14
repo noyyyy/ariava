@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { inspectResetOnlyLegacyIdentityEvidence } from '../src/cli/operations/identity-reset-legacy-evidence';
 import { MacOSEncryptionKeyStore } from '../src/identity/macos-encryption-key-store';
 import {
   MACOS_IDENTITY_EVIDENCE_ACCOUNTS,
@@ -19,6 +20,46 @@ function pathFor(name: string): string {
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe('macOS reset store crash recovery', () => {
+  test('Ed25519 crash before candidate insertion regenerates a new operation-bound candidate safely', async () => {
+    const keychain = new FakeKeychain();
+    const path = pathFor('identity-before-insert.json');
+    const initial = new MacOSKeychainHostIdentityStore(path, keychain);
+    const oldIdentity = await initial.createFirstRun();
+    const crashing = new MacOSKeychainHostIdentityStore(path, keychain, {
+      afterResetSentinel() { throw new Error('crash before reset key insertion'); },
+    });
+    inspectResetOnlyLegacyIdentityEvidence(crashing);
+    await expect(crashing.resetAfterExplicitConfirmation('reset_before_insert_1')).rejects.toThrow('crash before reset key insertion');
+    expect([...keychain.items.keys()].filter((account) => account.startsWith('host_') && account !== oldIdentity.hostId)).toEqual([]);
+
+    const restarted = new MacOSKeychainHostIdentityStore(path, keychain);
+    const replacement = await restarted.resetAfterExplicitConfirmation('reset_before_insert_1');
+    expect(replacement.hostId).not.toBe(oldIdentity.hostId);
+    expect(keychain.items.has(oldIdentity.hostId)).toBe(false);
+    expect(keychain.items.has(replacement.hostId)).toBe(true);
+  });
+
+  test('X25519 crash before candidate insertion regenerates a new operation-bound candidate safely', () => {
+    const keychain = new FakeKeychain();
+    const path = pathFor('identity-before-insert.e2e.json');
+    const oldHostId = `host_${'A'.repeat(43)}`;
+    const newHostId = `host_${'B'.repeat(43)}`;
+    const initial = new MacOSEncryptionKeyStore(path, keychain);
+    const oldIdentity = initial.loadOrCreate(oldHostId);
+    const crashing = new MacOSEncryptionKeyStore(path, keychain, {
+      afterResetSentinel() { throw new Error('crash before encryption key insertion'); },
+    });
+    expect(() => crashing.replaceForReset(newHostId, 'reset_before_insert_2')).toThrow('crash before encryption key insertion');
+    expect([...keychain.items.keys()].filter((account) => account.startsWith('host-e2e:')
+      && account !== `host-e2e:${oldIdentity.encryptionKeyId}`)).toEqual([]);
+
+    const restarted = new MacOSEncryptionKeyStore(path, keychain);
+    const replacement = restarted.replaceForReset(newHostId, 'reset_before_insert_2');
+    expect(replacement.hostId).toBe(newHostId);
+    expect(keychain.items.has(`host-e2e:${oldIdentity.encryptionKeyId}`)).toBe(false);
+    expect(keychain.items.has(`host-e2e:${replacement.encryptionKeyId}`)).toBe(true);
+  });
+
   test('Ed25519 retry adopts the operation-bound candidate inserted before metadata', async () => {
     const keychain = new FakeKeychain();
     const path = pathFor('identity.json');
@@ -29,6 +70,7 @@ describe('macOS reset store crash recovery', () => {
       afterResetKeyWrite() { interrupted = true; throw new Error('crash after reset key insertion'); },
     });
 
+    inspectResetOnlyLegacyIdentityEvidence(crashing);
     await expect(crashing.resetAfterExplicitConfirmation('reset_operation_1')).rejects.toThrow('crash after reset key insertion');
     expect(interrupted).toBe(true);
     const candidateAccounts = [...keychain.items.keys()].filter((account) => account.startsWith('host_') && account !== oldIdentity.hostId);

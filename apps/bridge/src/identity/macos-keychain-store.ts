@@ -5,17 +5,16 @@ import { pathHasFilesystemEvidence, readSecureJson, removeSecureFile, SecureFile
 import { HostIdentityError } from './errors';
 import {
   generateHostIdentity,
-  getHostIdentityPrivateKey,
   importHostIdentityPrivateKey,
-  rebindHostIdentity,
+  rebindHostIdentityStorage,
 } from './host-identity';
-import type {
-  HostIdentity,
-  HostIdentityInspection,
-  HostIdentityMetadata,
-  HostIdentityStore,
-  PendingHostIdentity,
-} from './types';
+import type { HostIdentity, HostIdentityInspection, HostIdentityMetadata, HostIdentityStore } from './types';
+import {
+  PREPARE_RESET_ONLY_IDENTITY_CLEANUP,
+  RESET_ONLY_IDENTITY_EVIDENCE_SOURCE,
+  type ResetOnlyIdentityCleanupPlan,
+  type ResetOnlyIdentityEvidenceSource,
+} from './reset-only-evidence-source';
 
 export const MACOS_IDENTITY_KEYCHAIN_SERVICE = 'io.noyx.ariava.host-identity' as const;
 export const MACOS_SECURITY_PATH = '/usr/bin/security' as const;
@@ -61,8 +60,8 @@ export class SpawnKeychainCommandRunner implements KeychainCommandRunner {
 interface MacIdentityMetadataFile {
   evidenceAccount?: MacOSIdentityEvidenceAccount;
   current: HostIdentityMetadata;
-  pending?: { operationId: string; issuedAt: string; identity: HostIdentityMetadata };
 }
+
 
 interface MacIdentityCreationSentinel {
   schema: typeof CREATION_SENTINEL_SCHEMA;
@@ -95,6 +94,7 @@ export interface MacOSIdentityCreationHooks {
 export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
   readonly metadataPath: string;
   readonly evidenceAccount: MacOSIdentityEvidenceAccount;
+  private resetOnlyCleanupPlan: ResetOnlyIdentityCleanupPlan | undefined;
 
   constructor(
     metadataPath: string,
@@ -117,7 +117,6 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
       ownerIntegrity: false,
       permissionIntegrity: false,
       metadataIntegrity: false,
-      pendingRotation: false,
     };
     if (!this.metadataEvidence()) {
       return this.hasCreationSentinel() || this.hasIndexEvidence()
@@ -126,21 +125,12 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     }
     try {
       const metadata = this.readMetadata();
-      const identity = await this.loadItem(metadata.current);
-      if (metadata.pending) await this.loadItem(metadata.pending.identity);
+      const identity = await this.loadItem(metadata.current, true);
       return {
-        ...base,
-        status: metadata.pending ? 'rotation-pending' : 'ready',
-        storageReference: metadata.current.privateKeyStorage,
-        ownerIntegrity: true,
-        permissionIntegrity: true,
-        metadataIntegrity: true,
-        pendingRotation: Boolean(metadata.pending),
-        hostId: identity.hostId,
-        keyId: identity.keyId,
-        algorithm: identity.algorithm,
+        ...base, status: 'ready' as const, storageReference: metadata.current.privateKeyStorage,
+        ownerIntegrity: true, permissionIntegrity: true, metadataIntegrity: true,
+        hostId: identity.hostId, keyId: identity.keyId, algorithm: identity.algorithm,
         publicKeyFingerprint: identity.publicKeyFingerprint,
-        pendingOperationId: metadata.pending?.operationId,
       };
     } catch (error) {
       if (error instanceof HostIdentityError && error.code === 'ERR_IDENTITY_KEYCHAIN_LOCKED') throw error;
@@ -159,7 +149,6 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     try {
       const metadata = this.readMetadata();
       const current = await this.loadItem(metadata.current, true);
-      if (metadata.pending) await this.loadItem(metadata.pending.identity);
       if (creationInterrupted) this.deleteCreationSentinel();
       return current;
     } catch (error) {
@@ -171,16 +160,6 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     }
   }
 
-  async loadPending(): Promise<PendingHostIdentity | null> {
-    if (!this.metadataEvidence()) return null;
-    const metadata = this.readMetadata();
-    if (!metadata.pending) return null;
-    return {
-      operationId: metadata.pending.operationId,
-      issuedAt: metadata.pending.issuedAt,
-      identity: await this.loadItem(metadata.pending.identity),
-    };
-  }
 
   async createFirstRun(): Promise<HostIdentity> {
     if (this.metadataEvidence() || this.hasCreationSentinel() || this.hasIndexEvidence()) {
@@ -206,7 +185,7 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
       metadataCreated = true;
       this.creationHooks.afterMetadataWrite?.();
       this.deleteCreationSentinel();
-      return rebindHostIdentity(verified, metadata);
+      return rebindHostIdentityStorage(verified, metadata.privateKeyStorage);
     } catch (error) {
       if (!metadataCreated) {
         // Roll back only if every created Keychain item can be removed. Otherwise retain the
@@ -221,64 +200,22 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     }
   }
 
-  async stageRotation(next: PendingHostIdentity): Promise<void> {
-    const metadata = this.readMetadata();
-    if (next.identity.hostId !== metadata.current.hostId) throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Rotation must preserve the Host entity ID');
-    const pendingAccount = `${metadata.current.hostId}.pending`;
-    const pending = withKeychainStorage(next.identity, pendingAccount);
-    if (metadata.pending) {
-      if (metadata.pending.operationId !== next.operationId) throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'A different Host key rotation is already pending');
-      if (!samePending(metadata.pending, { operationId: next.operationId, issuedAt: next.issuedAt, identity: publicMetadata(pending) })) {
-        throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Rotation retry payload does not match the pending operation');
-      }
-      await this.loadItem(metadata.pending.identity);
-      return;
-    }
-    const bytes = getHostIdentityPrivateKey(next.identity);
-    // Validate the exact payload before creating or replacing any pending evidence.
-    await importHostIdentityPrivateKey(bytes, pending.privateKeyStorage, pending.createdAt, pending);
-    if (this.itemExists(pendingAccount)) throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'Orphan pending Keychain item requires explicit reset');
-    this.writeItem(pendingAccount, bytes, false);
-    try {
-      await this.loadItem(pending);
-      this.writeProfileMetadata(metadata.current, {
-        pending: { operationId: next.operationId, issuedAt: next.issuedAt, identity: publicMetadata(pending) },
-      });
-    } catch (error) {
-      this.tryDeleteItem(pendingAccount);
-      throw error;
-    }
+
+  [RESET_ONLY_IDENTITY_EVIDENCE_SOURCE](): ResetOnlyIdentityEvidenceSource {
+    return {
+      kind: 'macos-keychain',
+      metadataPath: this.metadataPath,
+      evidenceAccount: this.evidenceAccount,
+      profile: this.evidenceAccount === MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev ? 'dev' : 'default',
+      itemExists: (account) => this.itemExists(account),
+    };
   }
 
-  async abortRotation(operationId: string): Promise<void> {
-    const metadata = this.readMetadata();
-    if (!metadata.pending || metadata.pending.operationId !== operationId) throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Pending Host key rotation does not match operation ID');
-    this.writeProfileMetadata(metadata.current);
-    const storage = metadata.pending.identity.privateKeyStorage;
-    if (storage.type !== 'macos-keychain') throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Pending Keychain storage reference is invalid');
-    this.deleteItem(storage.account);
-  }
-
-  async promoteRotation(operationId: string): Promise<HostIdentity> {
-    const metadata = this.readMetadata();
-    if (!metadata.pending || metadata.pending.operationId !== operationId) throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Pending Host key rotation does not match operation ID');
-    const pendingStorage = metadata.pending.identity.privateKeyStorage;
-    if (pendingStorage.type !== 'macos-keychain') throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Pending Keychain storage reference is invalid');
-    const pendingKey = this.readItem(pendingStorage.account);
-    const promotedMetadata = withKeychainStorage(metadata.pending.identity, metadata.current.hostId);
-    await importHostIdentityPrivateKey(pendingKey, promotedMetadata.privateKeyStorage, promotedMetadata.createdAt, promotedMetadata);
-    // Preserve metadata+pending if replacing current or metadata persistence fails.
-    const oldKey = this.readItem(metadata.current.hostId);
-    this.writeItem(metadata.current.hostId, pendingKey, true);
-    try {
-      const promoted = await this.loadItem(promotedMetadata, true);
-      this.writeProfileMetadata(publicMetadata(promoted));
-      this.deleteItem(pendingStorage.account);
-      return promoted;
-    } catch (error) {
-      try { this.writeItem(metadata.current.hostId, oldKey, true); } catch {}
-      throw error;
+  [PREPARE_RESET_ONLY_IDENTITY_CLEANUP](plan: ResetOnlyIdentityCleanupPlan): void {
+    if (!isApprovedCleanupPlan(plan)) {
+      throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'macOS Host identity cleanup plan is invalid');
     }
+    this.resetOnlyCleanupPlan = structuredClone(plan);
   }
 
   async resetAfterExplicitConfirmation(operationId?: string): Promise<HostIdentity> {
@@ -293,18 +230,21 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
       return recovered;
     }
     const hasMetadata = this.metadataEvidence();
-    const previous = hasMetadata ? this.readMetadataForReset() : undefined;
     const interrupted = this.readCreationSentinelIfPresent();
+    const cleanup = this.resetOnlyCleanupPlan;
+    if ((hasMetadata || interrupted) && !cleanup) {
+      throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'macOS Host identity reset cleanup was not exact-decoded');
+    }
     const generated = await generateHostIdentity({ type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: 'pending-reset' });
     const candidate = withKeychainStorage(generated.identity, generated.identity.hostId);
     const sentinel = { schema: RESET_SENTINEL_SCHEMA, phase: 'prepared', operationId: resetOperationId,
       candidate: publicMetadata(candidate),
-      previousAccount: previous?.current.hostId ?? null,
-      previousPendingAccount: previous?.pending?.identity.privateKeyStorage.type === 'macos-keychain'
-        ? previous.pending.identity.privateKeyStorage.account : null,
-      interruptedCreationAccount: interrupted?.hostId ?? null,
+      previousAccount: cleanup?.previousAccount ?? null,
+      previousPendingAccount: cleanup?.previousPendingAccount ?? null,
+      interruptedCreationAccount: cleanup?.interruptedCreationAccount ?? null,
     } satisfies MacIdentityResetSentinel;
     this.writeResetSentinel(sentinel);
+    this.resetOnlyCleanupPlan = undefined;
     this.creationHooks.afterResetSentinel?.();
     this.writeItem(candidate.hostId, generated.privateKeyPkcs8, false);
     this.creationHooks.afterResetKeyWrite?.();
@@ -333,28 +273,31 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
   }
 
   private async finishReset(sentinel: MacIdentityResetSentinel): Promise<HostIdentity> {
-    if (!this.itemExists(sentinel.candidate.hostId)) {
-      throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'macOS Host identity reset candidate is missing');
+    let effective = sentinel;
+    if (!this.itemExists(effective.candidate.hostId)) {
+      const generated = await generateHostIdentity({
+        type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: 'pending-reset',
+      });
+      const candidate = withKeychainStorage(generated.identity, generated.identity.hostId);
+      effective = { ...effective, candidate: publicMetadata(candidate) };
+      this.rewriteResetSentinel(effective);
+      this.creationHooks.afterResetSentinel?.();
+      this.writeItem(candidate.hostId, generated.privateKeyPkcs8, false);
+      this.creationHooks.afterResetKeyWrite?.();
     }
-    const verified = await this.loadItem(sentinel.candidate, true);
+    const verified = await this.loadItem(effective.candidate, true);
     this.writeItem(this.evidenceAccount, KEYCHAIN_EVIDENCE_VALUE, true);
     this.writeProfileMetadata(publicMetadata(verified), { exclusive: !this.metadataEvidence() });
     this.creationHooks.afterResetMetadataWrite?.();
-    if (sentinel.previousAccount && sentinel.previousAccount !== sentinel.candidate.hostId) this.deleteItem(sentinel.previousAccount);
-    if (sentinel.previousPendingAccount) this.deleteItem(sentinel.previousPendingAccount);
-    if (sentinel.interruptedCreationAccount && sentinel.interruptedCreationAccount !== sentinel.candidate.hostId) {
-      this.tryDeleteItem(sentinel.interruptedCreationAccount);
+    if (effective.previousAccount && effective.previousAccount !== effective.candidate.hostId) this.deleteItem(effective.previousAccount);
+    if (effective.previousPendingAccount) this.deleteItem(effective.previousPendingAccount);
+    if (effective.interruptedCreationAccount && effective.interruptedCreationAccount !== effective.candidate.hostId) {
+      this.tryDeleteItem(effective.interruptedCreationAccount);
     }
-    if (sentinel.interruptedCreationAccount) this.deleteCreationSentinel();
+    if (effective.interruptedCreationAccount) this.deleteCreationSentinel();
     return verified;
   }
 
-  deleteAfterHostReplacement(account: string): void {
-    if (!/^host_[A-Za-z0-9_-]{43}$/u.test(account)) {
-      throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Invalid old Host Keychain account');
-    }
-    this.deleteItem(account);
-  }
 
   private async loadItem(metadata: HostIdentityMetadata, current = false): Promise<HostIdentity> {
     if (metadata.privateKeyStorage.type !== 'macos-keychain') throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Host identity storage reference is invalid');
@@ -429,6 +372,11 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     catch (error) { throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'Could not durably mark macOS Host identity reset', error); }
   }
 
+  private rewriteResetSentinel(value: MacIdentityResetSentinel): void {
+    try { writeSecureJson(this.resetSentinelPath(), value); }
+    catch (error) { throw new HostIdentityError('ERR_IDENTITY_PERMISSIONS', 'Could not rewrite macOS Host identity reset candidate', error); }
+  }
+
   private creationSentinelPath(): string {
     return `${this.metadataPath}.creating`;
   }
@@ -441,10 +389,7 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     try {
       if (!pathHasFilesystemEvidence(this.creationSentinelPath())) return undefined;
       const value = readSecureJson<MacIdentityCreationSentinel>(this.creationSentinelPath());
-      if (value?.schema !== CREATION_SENTINEL_SCHEMA || value.phase !== 'creating'
-        || typeof value.hostId !== 'string' || typeof value.keyId !== 'string') {
-        throw new Error('invalid creation sentinel');
-      }
+      if (!isCreationSentinel(value)) throw new Error('invalid creation sentinel');
       return value;
     } catch (error) {
       throw new HostIdentityError('ERR_IDENTITY_RESET_REQUIRED', 'macOS identity creation sentinel requires explicit reset', error);
@@ -487,29 +432,9 @@ export class MacOSKeychainHostIdentityStore implements HostIdentityStore {
     }
   }
 
-  private readMetadataForReset(): MacIdentityMetadataFile | undefined {
-    try {
-      return this.readMetadata();
-    } catch (error) {
-      if (error instanceof HostIdentityError
-        && error.code === 'ERR_IDENTITY_INVALID'
-        && this.hasIndexEvidence()) {
-        return undefined;
-      }
-      throw error;
-    }
-  }
 
-  private writeProfileMetadata(
-    current: HostIdentityMetadata,
-    options: { pending?: MacIdentityMetadataFile['pending']; exclusive?: boolean } = {},
-  ): void {
-    const metadata: MacIdentityMetadataFile = {
-      evidenceAccount: this.evidenceAccount,
-      current,
-      ...(options.pending ? { pending: options.pending } : {}),
-    };
-    this.writeMetadata(metadata, options.exclusive);
+  private writeProfileMetadata(current: HostIdentityMetadata, options: { exclusive?: boolean } = {}): void {
+    this.writeMetadata({ evidenceAccount: this.evidenceAccount, current }, options.exclusive);
   }
 
   private writeMetadata(metadata: MacIdentityMetadataFile, exclusive = false): void {
@@ -534,6 +459,23 @@ function publicMetadata(identity: HostIdentityMetadata): HostIdentityMetadata {
   };
 }
 
+function isApprovedCleanupPlan(plan: ResetOnlyIdentityCleanupPlan): boolean {
+  const current = plan.previousAccount;
+  if (current !== null && !/^host_[A-Za-z0-9_-]{43}$/u.test(current)) return false;
+  if (plan.previousPendingAccount !== null && plan.previousPendingAccount !== `${current}.pending`) return false;
+  return plan.interruptedCreationAccount === null
+    || (/^host_[A-Za-z0-9_-]{43}$/u.test(plan.interruptedCreationAccount)
+      && (current === null || plan.interruptedCreationAccount === current));
+}
+
+function isCreationSentinel(value: unknown): value is MacIdentityCreationSentinel {
+  return isExactObject(value, ['schema', 'phase', 'hostId', 'keyId'])
+    && value.schema === CREATION_SENTINEL_SCHEMA && value.phase === 'creating'
+    && typeof value.hostId === 'string' && /^host_[A-Za-z0-9_-]{43}$/u.test(value.hostId)
+    && typeof value.keyId === 'string' && /^key_[A-Za-z0-9_-]{43}$/u.test(value.keyId);
+}
+
+
 function isResetSentinel(value: unknown): value is MacIdentityResetSentinel {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -545,31 +487,41 @@ function isResetSentinel(value: unknown): value is MacIdentityResetSentinel {
     && isPublicIdentityMetadata(record.candidate as HostIdentityMetadata)
     && (record.candidate as HostIdentityMetadata).privateKeyStorage.account === (record.candidate as HostIdentityMetadata).hostId
     && validAccount(record.previousAccount) && validAccount(record.previousPendingAccount, true)
-    && validAccount(record.interruptedCreationAccount);
+    && validAccount(record.interruptedCreationAccount)
+    && (record.previousPendingAccount === null || record.previousPendingAccount === `${record.previousAccount}.pending`)
+    && (record.interruptedCreationAccount === null || record.previousAccount === null
+      || record.interruptedCreationAccount === record.previousAccount);
 }
 
-function isMetadata(value: MacIdentityMetadataFile): boolean {
-  if (!value || typeof value !== 'object' || !isEvidenceAccount(value.evidenceAccount) || !isPublicIdentityMetadata(value.current)) return false;
-  if (value.current.privateKeyStorage.account !== value.current.hostId) return false;
-  if (!value.pending) return true;
-  return typeof value.pending.operationId === 'string' && typeof value.pending.issuedAt === 'string'
-    && isPublicIdentityMetadata(value.pending.identity) && value.pending.identity.hostId === value.current.hostId
-    && value.pending.identity.privateKeyStorage.account === `${value.current.hostId}.pending`;
+function isMetadata(value: unknown): value is MacIdentityMetadataFile {
+  return isExactObject(value, ['evidenceAccount', 'current']) && isEvidenceAccount(value.evidenceAccount)
+    && isPublicIdentityMetadata(value.current) && value.current.privateKeyStorage.account === value.current.hostId;
+}
+
+
+function isMetadataProfile(value: unknown, evidenceAccount: MacOSIdentityEvidenceAccount): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const account = (value as Record<string, unknown>).evidenceAccount;
+  return account === evidenceAccount || (account === undefined && evidenceAccount === MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default);
+}
+
+function isExactObject(value: unknown, keys: readonly string[]): value is Record<string, any> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype
+    && Object.keys(value).sort().join(',') === [...keys].sort().join(','));
 }
 
 function isEvidenceAccount(value: unknown): value is MacOSIdentityEvidenceAccount | undefined {
   return value === undefined || Object.values(MACOS_IDENTITY_EVIDENCE_ACCOUNTS).includes(value as MacOSIdentityEvidenceAccount);
 }
 
-function isPublicIdentityMetadata(value: HostIdentityMetadata): boolean {
-  return Boolean(value && value.identityVersion === 2 && value.algorithm === 'Ed25519'
+function isPublicIdentityMetadata(value: unknown): value is HostIdentityMetadata {
+  if (!isExactObject(value, ['identityVersion', 'hostId', 'keyId', 'algorithm', 'publicKey', 'publicKeyFingerprint', 'createdAt', 'privateKeyStorage'])) return false;
+  const storage = value.privateKeyStorage;
+  return value.identityVersion === 2 && value.algorithm === 'Ed25519'
     && typeof value.hostId === 'string' && typeof value.keyId === 'string' && typeof value.publicKey === 'string'
     && typeof value.publicKeyFingerprint === 'string' && typeof value.createdAt === 'string'
-    && value.privateKeyStorage?.type === 'macos-keychain' && value.privateKeyStorage.service === MACOS_IDENTITY_KEYCHAIN_SERVICE);
-}
-
-function samePending(left: MacIdentityMetadataFile['pending'], right: NonNullable<MacIdentityMetadataFile['pending']>): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+    && isExactObject(storage, ['type', 'service', 'account']) && storage.type === 'macos-keychain'
+    && storage.service === MACOS_IDENTITY_KEYCHAIN_SERVICE && typeof storage.account === 'string';
 }
 function decodeSecurityPassword(stdout: Uint8Array): Uint8Array {
   const encoded = Buffer.from(stdout).toString('utf8').trimEnd();

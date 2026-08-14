@@ -21,9 +21,9 @@
 
 - [x] Human Attention and Intervention
 - [x] APN Notification
+- [x] End-to-end encrypted reply/interrupt and receipts
 - [ ] **In progress:** Smart Alert
 - [ ] **In progress:** Session Management
-- [ ] End-to-end encryption
 - [ ] Project management
 - [ ] Invoke a new Pi session
 - [ ] Codex/Claude Code/Cursor integration
@@ -84,6 +84,19 @@ Ariava uses one encrypted, versioned Session/Event model across Pi and the local
 - Driver failures are Bridge health/log/retry concerns, not canonical Event types. Host availability is a Relay-presence concern, not a Session status.
 - Protected envelopes use `event-content-v2`, `session-content-v2`, and `notification-preview-v2`; notification routing uses only `agent.done` and `agent.need_human`.
 - This is an intentional breaking cutover. There is no compatibility decoder, negotiation, dual read/write, or fallback for the active model. The Bridge recognizes valid prior schema 2 runtime only to atomically reset it to empty schema 3 state; obsolete Sessions and Events are not replayed.
+
+## Encrypted commands and identity recovery
+
+The Watch sends only encrypted `reply` and `interrupt` envelopes. The Relay stores opaque transport and returns exactly `{ commandId, receivedAt }`; this acknowledgment does not mean queued, accepted by Pi, or executed. The Bridge decrypts locally, durably claims at most once, and uploads one fixed-length encrypted Host receipt. Only the Watch can bind, decrypt, verify, and immutably archive terminal `executed | expired | rejected | failed` evidence. Relay/D1 never store plaintext terminal messages, reasons, or details; an acknowledgment without a receipt remains unverified.
+
+Ariava does not rotate identity signing keys in place. Replace the identity with `ariava identity reset --confirm`, then re-pair Watches.
+
+```bash
+ariava identity status
+ariava identity reset --confirm
+```
+
+Confirmed reset removes the old signing/E2E identity domain, pins, command journal/outbox, runtime state, and links, then creates one canonical zero-link replacement. Canonical load failures fail closed; exact recognized legacy evidence is reset-only. Network, `401`, `5xx`, and normal configuration errors are not reset triggers. X25519 link epochs/reattestation and `ariava config agent-secret rotate` remain separate supported lifecycles.
 
 ## Build from Source
 

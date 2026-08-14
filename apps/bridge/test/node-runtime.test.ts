@@ -34,8 +34,7 @@ describe('production Node runtime contract', () => {
   test.each([
     { command: 'init', argv: ['init', '--json'] },
     { command: 'identity status', argv: ['identity', 'status', '--json'] },
-    { command: 'host rotate-key', argv: ['host', 'rotate-key', '--json'] },
-    { command: 'host reset --confirm', argv: ['host', 'reset', '--confirm', '--json'] },
+    { command: 'identity reset --confirm', argv: ['identity', 'reset', '--confirm', '--json'] },
     { command: 'pair', argv: ['pair', 'PEYX7K', '--json'] },
   ])('$command fails its production runtime precondition before shared domain or effects', async ({ argv }) => {
     const fixture = preconditionFixture(unsupportedRuntime);
@@ -46,6 +45,22 @@ describe('production Node runtime contract', () => {
     expect(fixture.effects).toEqual(zeroEffects());
     expect(fixture.errors.text()).toContain('ERR_NODE_RUNTIME_UNSUPPORTED');
     expect(fixture.errors.text()).toContain('Current runtime: bun 1.3.14');
+  });
+
+
+  test.each([
+    ['host', 'rotate-key'],
+    ['identity', 'rotate-key'],
+    ['identity', 'rotate-signing-key'],
+  ])('removed %s %s bypasses the production runtime gate and remains effect-free', async (...argv) => {
+    const fixture = preconditionFixture(unsupportedRuntime);
+
+    expect(await runPublicCli([...argv, '--json'], fixture.deps)).toBe(1);
+    expect(fixture.runtimeInspections).toBe(0);
+    expect(fixture.serviceManagerCreations).toBe(0);
+    expect(fixture.effects).toEqual(zeroEffects());
+    expect(fixture.errors.text()).toContain('Signing keys cannot be rotated in place');
+    expect(fixture.errors.text()).toContain('ariava identity reset --confirm');
   });
 
 

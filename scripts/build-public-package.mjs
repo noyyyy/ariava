@@ -43,6 +43,7 @@ if (packageName === 'protocol') {
   const fixtureDir = resolve(dist, 'fixtures');
   mkdirSync(fixtureDir, { recursive: true });
   for (const fixture of [
+    'command-e2e-v1-vectors.json',
     'ed25519-request-vectors.json',
     'e2e-v2-vectors.json',
     'notification-preview-v2-vector.json',

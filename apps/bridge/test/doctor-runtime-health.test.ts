@@ -18,7 +18,7 @@ function dependencies(runtimeHealth: 'healthy' | 'degraded') {
           status: 'not-initialized', storageType: 'linux-json',
           storageReference: { type: 'linux-json', path: profile.resources.identityMetadataPath },
           path: profile.resources.identityMetadataPath, ownerIntegrity: false, permissionIntegrity: false,
-          metadataIntegrity: false, pendingRotation: false,
+          metadataIntegrity: false,
         }),
       }) as never,
     },

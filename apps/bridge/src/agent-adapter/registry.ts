@@ -16,6 +16,7 @@ import {
 } from '@ariava/protocol';
 import { createId, isoNow } from '@ariava/shared-utils';
 import type { BridgeStateStore } from '../state-store';
+import { asCommandResult, parseAgentAdapterCommandResult } from './result';
 
 export type AgentAdapterEventInput = CanonicalEvent extends infer Event
   ? Event extends CanonicalEvent ? Omit<Event, 'eventId' | 'hostId'> : never
@@ -155,6 +156,7 @@ export class AgentAdapterRegistry {
     this.cancelCommandPolls(sessionId);
     for (const [commandId, binding] of this.commandSessions) {
       if (binding.sessionId === sessionId) this.settleResultWaiters(commandId, undefined);
+      if (binding.sessionId === sessionId) this.commandSessions.delete(commandId);
     }
     this.commandQueues.delete(sessionId); this.inFlightCommands.delete(sessionId);
     this.sessions.delete(sessionId);
@@ -180,6 +182,9 @@ export class AgentAdapterRegistry {
     this.delayedTerminalEvents.clear();
     this.cancelCommandPolls();
     for (const commandId of [...this.resultWaiters.keys()]) this.settleResultWaiters(commandId, undefined);
+    this.commandQueues.clear();
+    this.inFlightCommands.clear();
+    this.results.clear();
     this.commandSessions.clear();
   }
 
@@ -275,12 +280,17 @@ export class AgentAdapterRegistry {
   }
 
 
-  enqueueCommand(command: CommandEnvelope): void {
-    if (this.disposed) return;
+  assertCommandDispatchReady(command: CommandEnvelope): void {
+    if (this.disposed) throw new TypeError('Agent Adapter registry is disposed');
     const session = this.sessions.get(command.sessionId);
     if (command.hostId !== this.hostId || !session || session.hostId !== command.hostId) {
       throw new TypeError('command does not match a registered adapter Session and Host');
     }
+  }
+
+  enqueueCommand(command: CommandEnvelope): void {
+    this.assertCommandDispatchReady(command);
+    const session = this.sessions.get(command.sessionId)!;
     this.commandSessions.set(command.commandId, {
       hostId: command.hostId, sessionId: command.sessionId, provider: session.provider,
     });
@@ -329,17 +339,29 @@ export class AgentAdapterRegistry {
     });
   }
 
-  resolveCommand(commandId: string, result: CommandResult, submittedSessionId = result.sessionId): void {
-    if (this.disposed) return;
+  resolveCommand(commandId: string, value: unknown, submittedSessionId?: string): void {
+    const result = parseAgentAdapterCommandResult(value);
+    if (this.disposed) throw new TypeError('command result does not match its queued adapter command and registered Session');
     const binding = this.commandSessions.get(commandId);
-    const session = this.sessions.get(submittedSessionId);
-    if (!binding || commandId !== result.commandId || submittedSessionId !== result.sessionId
+    const resultSessionId = submittedSessionId ?? result.sessionId;
+    const session = this.sessions.get(resultSessionId);
+    if (!binding || commandId !== result.commandId || resultSessionId !== result.sessionId
       || binding.hostId !== result.hostId || binding.sessionId !== result.sessionId
       || !session || session.hostId !== binding.hostId || session.provider !== binding.provider) {
       throw new TypeError('command result does not match its queued adapter command and registered Session');
     }
-    this.results.set(commandId, result); this.clearCommandInFlight(binding.sessionId, commandId);
-    this.settleResultWaiters(commandId, result);
+    const commandResult = asCommandResult(result);
+    this.results.set(commandId, commandResult); this.clearCommandInFlight(binding.sessionId, commandId);
+    this.settleResultWaiters(commandId, commandResult);
+    this.commandSessions.delete(commandId);
+  }
+
+  abandonCommand(commandId: string): void {
+    const binding = this.commandSessions.get(commandId);
+    if (!binding) return;
+    this.results.delete(commandId);
+    this.clearCommandInFlight(binding.sessionId, commandId);
+    this.settleResultWaiters(commandId, undefined);
     this.commandSessions.delete(commandId);
   }
 
@@ -450,7 +472,6 @@ export class AgentAdapterRegistry {
     const waiters = [...(this.resultWaiters.get(commandId) ?? [])];
     for (const waiter of waiters) waiter(result);
     this.resultWaiters.delete(commandId);
-    if (result === undefined) this.commandSessions.delete(commandId);
   }
 }
 

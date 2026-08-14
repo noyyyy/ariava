@@ -1,51 +1,63 @@
-import type { CommandEnvelope, EncryptedCommandEnvelopeV1 } from '@ariava/protocol';
+import {
+  SIGNED_REQUEST_LIMITS,
+  deriveEncryptedCommandDigest,
+  validateEncryptedCommandEnvelopeV1,
+  type CommandEnvelope,
+  type EncryptedCommandEnvelopeV1,
+} from '@ariava/protocol';
+import type { PersistedCommandPinReferenceV1 } from '../types';
+
+export interface PreparedEncryptedCommand {
+  originalEncryptedCommand: EncryptedCommandEnvelopeV1;
+  commandDigest: string;
+  pinReference: PersistedCommandPinReferenceV1;
+  loopbackCommand: CommandEnvelope;
+}
 
 export interface EncryptedCommandKeyring {
-  authorize(command: EncryptedCommandEnvelopeV1): Promise<boolean>;
-  decodeReply(command: Extract<EncryptedCommandEnvelopeV1, { type: 'reply' }>): Promise<CommandEnvelope>;
+  prepare(command: EncryptedCommandEnvelopeV1, now?: Date): Promise<{
+    pinReference: PersistedCommandPinReferenceV1;
+    loopbackCommand: CommandEnvelope;
+  }>;
 }
 
 export type EncryptedCommandPreparation =
-  | { ok: true; command: CommandEnvelope }
+  | { ok: true; prepared: PreparedEncryptedCommand }
   | { ok: false; code: 'e2e_key_unavailable' | 'e2e_epoch_unauthorized' | 'e2e_payload_invalid' };
 
-/**
- * Converts Relay wire commands into the loopback-only Agent Adapter shape.
- * Every encrypted command is authorized against the local active pin before
- * either reply decryption or interrupt execution. The default production path
- * fails closed until the local keyring and pin verifier are configured.
- */
+/** Converts a strict Relay wire command into a pin-bound loopback command. */
 export async function prepareCommandForExecution(
-  command: CommandEnvelope | EncryptedCommandEnvelopeV1,
+  command: EncryptedCommandEnvelopeV1,
   keyring?: EncryptedCommandKeyring,
-): Promise<EncryptedCommandPreparation> {
-  if (!('linkId' in command)) return { ok: true, command };
-  if (!keyring) return { ok: false, code: 'e2e_key_unavailable' };
-  try {
-    if (!await keyring.authorize(command)) return { ok: false, code: 'e2e_epoch_unauthorized' };
-  } catch {
+  now: () => Date = () => new Date(Date.now()),
+ ): Promise<EncryptedCommandPreparation> {
+  if (!validateEncryptedCommandEnvelopeV1(command)) return { ok: false, code: 'e2e_payload_invalid' };
+  const observedAt = now();
+  if (!Number.isFinite(observedAt.getTime())
+    || Date.parse(command.issuedAt) > observedAt.getTime() + SIGNED_REQUEST_LIMITS.clockSkewMs) {
     return { ok: false, code: 'e2e_epoch_unauthorized' };
   }
-  if (command.type === 'interrupt') {
-    return { ok: true, command: {
-      commandId: command.commandId,
-      hostId: command.hostId,
-      sessionId: command.sessionId,
-      type: 'interrupt',
-      payload: {},
-      issuedAt: command.issuedAt,
-      expiresAt: command.expiresAt,
-      nonce: command.nonce,
-      watchDeviceId: command.watchDeviceId,
-    } };
-  }
+  if (!keyring) return { ok: false, code: 'e2e_key_unavailable' };
   try {
-    const decoded = await keyring.decodeReply(command);
-    if (decoded.type !== 'reply' || typeof decoded.payload.text !== 'string' || !decoded.payload.text.trim()) {
+    const decoded = await keyring.prepare(command, observedAt);
+    if (decoded.loopbackCommand.type !== command.type
+      || decoded.loopbackCommand.commandId !== command.commandId
+      || decoded.loopbackCommand.hostId !== command.hostId
+      || decoded.loopbackCommand.sessionId !== command.sessionId
+      || decoded.loopbackCommand.nonce !== command.nonce
+      || decoded.loopbackCommand.watchDeviceId !== command.watchDeviceId) {
       return { ok: false, code: 'e2e_payload_invalid' };
     }
-    return { ok: true, command: decoded };
-  } catch {
-    return { ok: false, code: 'e2e_payload_invalid' };
+    return { ok: true, prepared: {
+      originalEncryptedCommand: structuredClone(command),
+      commandDigest: await deriveEncryptedCommandDigest(command),
+      pinReference: structuredClone(decoded.pinReference),
+      loopbackCommand: structuredClone(decoded.loopbackCommand),
+    } };
+  } catch (error) {
+    return { ok: false, code: error instanceof CommandEpochAuthorizationError
+      ? 'e2e_epoch_unauthorized' : 'e2e_payload_invalid' };
   }
 }
+
+export class CommandEpochAuthorizationError extends TypeError {}

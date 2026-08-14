@@ -4,11 +4,11 @@ import {
   AGENT_ADAPTER_PROTOCOL_HEADER,
   AGENT_ADAPTER_PROTOCOL_VERSION,
   SESSION_STATUSES,
-  type CommandResult,
   type SessionStatus,
 } from '@ariava/protocol';
 import type { AgentAdapterRegistry, RegisterSessionInput } from './registry';
 import type { BridgeRuntimeHealth } from '../types';
+import { parseAgentAdapterCommandResult, type AgentAdapterCommandResult } from './result';
 
 export interface AgentAdapterServerConfig {
   port: number;
@@ -280,27 +280,10 @@ function optionalStatus(obj: Record<string, unknown>, key: string): SessionStatu
   return value as SessionStatus;
 }
 
-function parseResultInput(value: unknown, expectedCommandId: string): CommandResult {
-  if (typeof value !== 'object' || value === null) {
-    throw new Error('Request body must be an object');
-  }
-
-  const obj = value as Record<string, unknown>;
-  const commandId = requireString(obj, 'commandId');
-  if (commandId !== expectedCommandId) {
-    throw new TypeError('commandId in result does not match URL');
-  }
-
-  return {
-    commandId,
-    hostId: requireString(obj, 'hostId'),
-    sessionId: requireString(obj, 'sessionId'),
-    accepted: requireBoolean(obj, 'accepted'),
-    status: requireResultStatus(obj),
-    message: requireString(obj, 'message'),
-    correlationId: optionalString(obj, 'correlationId'),
-    updatedAt: requireString(obj, 'updatedAt'),
-  };
+function parseResultInput(value: unknown, expectedCommandId: string): AgentAdapterCommandResult {
+  const result = parseAgentAdapterCommandResult(value);
+  if (result.commandId !== expectedCommandId) throw new TypeError('commandId in result does not match URL');
+  return result;
 }
 
 function requireString(obj: Record<string, unknown>, key: string): string {
@@ -348,13 +331,4 @@ function requireBoolean(obj: Record<string, unknown>, key: string): boolean {
     throw new Error(`Missing or invalid field: ${key}`);
   }
   return value;
-}
-
-function requireResultStatus(obj: Record<string, unknown>): CommandResult['status'] {
-  const value = requireString(obj, 'status');
-  const valid: CommandResult['status'][] = ['queued', 'delivered', 'executed', 'expired', 'rejected', 'failed'];
-  if (!valid.includes(value as CommandResult['status'])) {
-    throw new Error(`Invalid result status: ${value}`);
-  }
-  return value as CommandResult['status'];
 }

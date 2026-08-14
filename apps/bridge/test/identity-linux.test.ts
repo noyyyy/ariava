@@ -1,9 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HostIdentityError } from '../src/identity/errors';
-import { generateHostRotationIdentity } from '../src/identity/host-identity';
 import { LinuxJsonHostIdentityStore } from '../src/identity/linux-json-store';
 
 const roots: string[] = [];
@@ -22,7 +21,7 @@ describe('LinuxJsonHostIdentityStore', () => {
       status: 'ready', hostId: identity.hostId, keyId: identity.keyId, algorithm: 'Ed25519',
       publicKeyFingerprint: identity.publicKeyFingerprint, storageType: 'linux-json',
       storageReference: { type: 'linux-json', path }, path, ownerIntegrity: true,
-      permissionIntegrity: true, metadataIntegrity: true, pendingRotation: false,
+      permissionIntegrity: true, metadataIntegrity: true,
     });
     const record = JSON.parse(readFileSync(path, 'utf8'));
     record.keyId = `key_${'A'.repeat(43)}`;
@@ -30,36 +29,68 @@ describe('LinuxJsonHostIdentityStore', () => {
     await expect(store.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_INVALID' });
   });
 
-  test('preserves current and pending keys until promote', async () => {
+  test('normal load rejects exact pending evidence while reset-only inspection recognizes it', async () => {
     const path = join(root(), 'host-identity.json');
     const store = new LinuxJsonHostIdentityStore(path);
-    const current = await store.createFirstRun();
-    const pending = await generateHostRotationIdentity(current.hostId, { type: 'linux-json', path });
-    await store.stageRotation({ operationId: 'rotation-1', issuedAt: new Date().toISOString(), identity: pending.identity });
+    await store.createFirstRun();
     const record = JSON.parse(readFileSync(path, 'utf8'));
-    expect(record.privateKeyPkcs8).toBeString();
-    expect(record.pendingRotation.identity.privateKeyPkcs8).toBeString();
-    expect((await store.inspect()).status).toBe('rotation-pending');
-    expect((await store.load())?.keyId).toBe(current.keyId);
-    expect((await store.promoteRotation('rotation-1')).keyId).toBe(pending.identity.keyId);
-    expect(JSON.parse(readFileSync(path, 'utf8')).pendingRotation).toBeUndefined();
-
-    const secondPending = await generateHostRotationIdentity(pending.identity.hostId, { type: 'linux-json', path });
-    await store.stageRotation({ operationId: 'rotation-2', issuedAt: new Date().toISOString(), identity: secondPending.identity });
-    await store.abortRotation('rotation-2');
-    expect((await store.inspect()).status).toBe('ready');
+    record.pendingRotation = {
+      operationId: 'op_pending', issuedAt: new Date().toISOString(), identity: { ...record },
+    };
+    writeFileSync(path, JSON.stringify(record), { mode: 0o600 });
+    await expect(store.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_INVALID' });
+    expect(await store.inspect()).toMatchObject({ status: 'invalid' });
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(inspectResetOnlyLegacyIdentityEvidence(store)).toMatchObject({
+      classification: 'old-identity-unreadable', oldHostId: record.hostId, oldKeyId: record.keyId,
+      source: { kind: 'linux-json', resourcePath: path }, cleanup: null,
+    });
   });
 
-  test('same operationId with a different key is rejected and original pending remains', async () => {
+  test('missing private key in the exact known schema is reset-only old-identity-unreadable', async () => {
     const path = join(root(), 'host-identity.json');
     const store = new LinuxJsonHostIdentityStore(path);
-    const current = await store.createFirstRun();
-    const first = await generateHostRotationIdentity(current.hostId, { type: 'linux-json', path });
-    const second = await generateHostRotationIdentity(current.hostId, { type: 'linux-json', path });
-    const issuedAt = new Date().toISOString();
-    await store.stageRotation({ operationId: 'same-op', issuedAt, identity: first.identity });
-    await expect(store.stageRotation({ operationId: 'same-op', issuedAt, identity: second.identity })).rejects.toMatchObject({ code: 'ERR_IDENTITY_INVALID' });
-    expect(JSON.parse(readFileSync(path, 'utf8')).pendingRotation.identity.keyId).toBe(first.identity.keyId);
+    await store.createFirstRun();
+    const record = JSON.parse(readFileSync(path, 'utf8'));
+    delete record.privateKeyPkcs8;
+    writeFileSync(path, JSON.stringify(record), { mode: 0o600 });
+    await expect(store.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_INVALID' });
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(inspectResetOnlyLegacyIdentityEvidence(store)).toMatchObject({
+      classification: 'old-identity-unreadable', oldHostId: record.hostId, oldKeyId: record.keyId,
+      source: { kind: 'linux-json', resourcePath: path }, cleanup: null,
+    });
+  });
+
+  test('reset-only inspection blocks unknown and malformed evidence without changing bytes', async () => {
+    const path = join(root(), 'host-identity.json');
+    const store = new LinuxJsonHostIdentityStore(path);
+    await store.createFirstRun();
+    const record = JSON.parse(readFileSync(path, 'utf8'));
+    record.unknown = 'not-approved';
+    const bytes = JSON.stringify(record);
+    writeFileSync(path, bytes, { mode: 0o600 });
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(() => inspectResetOnlyLegacyIdentityEvidence(store)).toThrow();
+    expect(readFileSync(path, 'utf8')).toBe(bytes);
+  });
+
+  test('reset-only inspection rejects a Host ID not derived from the bound public key without effects', async () => {
+    const base = root();
+    const path = join(base, 'host-identity.json');
+    const store = new LinuxJsonHostIdentityStore(path);
+    await store.createFirstRun();
+    const record = JSON.parse(readFileSync(path, 'utf8'));
+    record.hostId = `host_${'A'.repeat(43)}`;
+    const bytes = JSON.stringify(record);
+    writeFileSync(path, bytes, { mode: 0o600 });
+    const entries = readdirSync(base);
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(() => inspectResetOnlyLegacyIdentityEvidence(store)).toThrow(expect.objectContaining({
+      code: 'ERR_IDENTITY_RESET_REQUIRED',
+    }));
+    expect(readFileSync(path, 'utf8')).toBe(bytes);
+    expect(readdirSync(base)).toEqual(entries);
   });
 
   test('dangling symlink is identity evidence and cannot be first-created over', async () => {

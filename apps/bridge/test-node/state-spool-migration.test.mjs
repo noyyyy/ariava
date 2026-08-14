@@ -9,14 +9,18 @@ import {
   BRIDGE_RUNTIME_STATE_SCHEMA_VERSION,
   BridgeStateStore,
   runtimeResetIntentPathForState,
+  runtimeSchemaFloorPathForState,
 } from '../dist/state-store.js';
-import { base64UrlEncode } from '../../../packages/protocol/dist/index.js';
+import {
+  base64UrlEncode, buildEncryptedCommandEnvelopeBindingBytes,
+} from '../../../packages/protocol/dist/index.js';
+import commandVectors from '../../../packages/protocol/test/fixtures/command-e2e-v1-vectors.json' with { type: 'json' };
 import { LinuxSpoolKeyStore, spoolKeyIdForKey, spoolPathForState } from '../dist/e2e/local-spool.js';
 import { BridgeDaemon } from '../dist/daemon.js';
 import { EncryptedUploadOrchestrator } from '../dist/e2e/upload-orchestrator.js';
 import { generateHostEncryptionIdentity } from '../dist/identity/host-encryption-key.js';
 
-const HOST_ID = 'host-test';
+const HOST_ID = commandVectors.link.hostId;
 const CREATED_AT = '2026-08-07T00:00:00.000Z';
 const OLD_KINDS = [
   'event-source-v1',
@@ -172,6 +176,48 @@ function setupObsoleteRuntime() {
   return fixture;
 }
 
+function setupPriorV3Runtime() {
+  const dir = mkdtempSync(join(tmpdir(), 'ariava-runtime-v3-'));
+  const statePath = join(dir, 'state.json'); const identityPath = join(dir, 'identity.json');
+  const store = new BridgeStateStore(statePath);
+  store.initializeEncryptedSpool(HOST_ID, identityPath, 'linux');
+  store.setHost({ hostId: HOST_ID, hostName: 'Host', platform: 'linux', bridgeVersion: '1',
+    registeredAt: CREATED_AT, lastSeenAt: CREATED_AT, bridgeStatus: 'online' });
+  store.replaceDriverSessions('pi', [{ sessionId: 'session', hostId: HOST_ID, provider: 'pi', projectName: 'project',
+    nameText: 'name', status: 'idle', updatedAt: CREATED_AT }]);
+  store.dispose();
+  rmSync(runtimeSchemaFloorPathForState(statePath), { force: true });
+  const state = JSON.parse(readFileSync(statePath, 'utf8')); state.schemaVersion = 3; delete state.commandExecutions;
+  state.commandResults = { legacy: { commandId: 'legacy', hostId: HOST_ID, sessionId: 'session', accepted: true,
+    status: 'executed', message: 'must disappear', updatedAt: CREATED_AT } }; state.seenCommands = { legacy: CREATED_AT };
+  const spoolPath = spoolPathForState(statePath); const spool = JSON.parse(readFileSync(spoolPath, 'utf8'));
+  spool.runtimeStateSchemaVersion = 3;
+  writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  writeFileSync(spoolPath, `${JSON.stringify(spool)}\n`, { mode: 0o600 });
+  return { dir, statePath, identityPath, spoolPath, preserved: {}, preservedBytes: {} };
+}
+
+function claimCommand(store, commandId) {
+  const command = structuredClone(commandVectors.interrupt.envelope);
+  command.commandId = commandId;
+  command.sessionId = 'session';
+  command.nonce = `nonce-${commandId}`;
+  const commandDigest = base64UrlEncode(new Uint8Array(createHash('sha256')
+    .update(buildEncryptedCommandEnvelopeBindingBytes(command)).digest()));
+  const pinReference = {
+    version: 1, linkId: command.linkId, linkGeneration: command.linkGeneration, epoch: command.epoch,
+    transcriptDigest: 'T'.repeat(43),
+    hostEncryptionKeyId: command.payload.keyWrap.recipientEncryptionKeyId,
+    watchEncryptionKeyId: command.payload.keyWrap.senderEncryptionKeyId,
+  };
+  store.validateCommandExecutionPins({ resolvePinReference: () => pinReference });
+  const claim = store.claimCommandExecution({
+    originalEncryptedCommand: command, commandDigest, pinReference, claimedAt: CREATED_AT,
+  });
+  assert.equal(claim.status, 'claimed');
+  return claim.execution;
+}
+
 function openDeferred(statePath) {
   return new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
 }
@@ -195,8 +241,10 @@ function assertReset(fixture, store) {
   assert.equal(state.runtimeResetEpoch, spool.runtimeResetEpoch);
   assert.equal(state.host, null);
   for (const key of [
-    'sessions', 'sessionDrivers', 'reconciledDrivers', 'sessionRevisions', 'pendingHandles', 'commandResults', 'seenCommands',
+    'sessions', 'sessionDrivers', 'reconciledDrivers', 'sessionRevisions', 'pendingHandles', 'commandExecutions',
   ]) assert.deepEqual(state[key], {}, key);
+  assert.equal(state.commandResults, undefined);
+  assert.equal(state.seenCommands, undefined);
   for (const key of ['recipientSetVersion', 'eventUploadCompletions', 'producerEventReservations', 'terminalCancellations']) {
     assert.equal(state[key], undefined, key);
   }
@@ -206,25 +254,82 @@ function assertReset(fixture, store) {
   assert.deepEqual(store.listSessions(), []);
   assert.deepEqual(store.peekPendingEvents(), []);
   assert.deepEqual(store.peekPendingSessionHandles(), []);
-  assert.equal(store.getCommandResult('command'), undefined);
-  assert.equal(store.hasSeenCommand('command'), false);
+  assert.equal(store.getCommandExecution('command'), undefined);
   assert.equal(store.getRecipientSetVersion(), undefined);
   assert.equal(store.getCurrentSessionsSnapshotState().lastAllocatedRevision, 0);
   assert.equal(lstatSync(runtimeResetIntentPathForState(fixture.statePath), { throwIfNoEntry: false }), undefined);
+  const floor = JSON.parse(readFileSync(runtimeSchemaFloorPathForState(fixture.statePath), 'utf8'));
+  assert.equal(floor.minSchemaVersion, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION);
   for (const [name, path] of Object.entries(fixture.preserved)) {
     assert.deepEqual(readFileSync(path), fixture.preservedBytes[name], name);
   }
 }
 
-test('valid schema 2 runtime is recognized only to reset atomically to empty schema 3', () => {
-  const fixture = setupObsoleteRuntime();
+test('valid schema 3 runtime migrates exactly to v4 without a pre-existing floor', () => {
+  const fixture = setupPriorV3Runtime();
   try {
+    assert.equal(lstatSync(runtimeSchemaFloorPathForState(fixture.statePath), { throwIfNoEntry: false }), undefined);
     const store = initialize(fixture);
-    assertReset(fixture, store);
-    assert.doesNotMatch(readFileSync(fixture.statePath, 'utf8'), /OBSOLETE_EVENT|obsolete/);
-    assert.doesNotMatch(readFileSync(fixture.spoolPath, 'utf8'), /event-source-v2/);
+    const state = JSON.parse(readFileSync(fixture.statePath, 'utf8'));
+    assert.equal(state.schemaVersion, 4);
+    assert.deepEqual(state.commandExecutions, {});
+    assert.equal(state.commandResults, undefined);
+    assert.equal(state.seenCommands, undefined);
+    assert.equal(store.listSessions()[0]?.sessionId, 'session');
+    assert.equal(JSON.parse(readFileSync(runtimeSchemaFloorPathForState(fixture.statePath), 'utf8')).minSchemaVersion, 4);
   } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
 });
+
+test('established v4 floor rejects restored byte-valid v3 runtime and preserves every byte', () => {
+  const fixture = setupPriorV3Runtime();
+  try {
+    const v3StateBytes = readFileSync(fixture.statePath);
+    const v3SpoolBytes = readFileSync(fixture.spoolPath);
+    const migrated = initialize(fixture);
+    migrated.dispose();
+    const floorPath = runtimeSchemaFloorPathForState(fixture.statePath);
+    const floorBytes = readFileSync(floorPath);
+
+    writeFileSync(fixture.statePath, v3StateBytes, { mode: 0o600 });
+    writeFileSync(fixture.spoolPath, v3SpoolBytes, { mode: 0o600 });
+    let keyAccessed = false;
+    assert.throws(() => openDeferred(fixture.statePath).initializeEncryptedSpool(HOST_ID, fixture.identityPath, 'linux', {
+      loadOrCreate: () => { keyAccessed = true; return new Uint8Array(32).fill(7); },
+    }), /preflight failed closed/i);
+    assert.equal(keyAccessed, false);
+    assert.deepEqual(readFileSync(fixture.statePath), v3StateBytes);
+    assert.deepEqual(readFileSync(fixture.spoolPath), v3SpoolBytes);
+    assert.deepEqual(readFileSync(floorPath), floorBytes);
+  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+for (const [name, floorBytes] of [
+  ['corrupt', Buffer.from('{"version":1')],
+  ['foreign', Buffer.from(`${JSON.stringify({
+    version: 1, minSchemaVersion: 4, hostId: 'host_foreign',
+    statePath: '/foreign/state.json', spoolPath: '/foreign/state.json.spool.json',
+  })}\n`)],
+]) {
+  test(`${name} schema floor fails closed and preserves current runtime bytes`, () => {
+    const fixture = setupPriorV3Runtime();
+    try {
+      const migrated = initialize(fixture);
+      migrated.dispose();
+      const floorPath = runtimeSchemaFloorPathForState(fixture.statePath);
+      const stateBytes = readFileSync(fixture.statePath);
+      const spoolBytes = readFileSync(fixture.spoolPath);
+      writeFileSync(floorPath, floorBytes, { mode: 0o600 });
+      let keyAccessed = false;
+      assert.throws(() => openDeferred(fixture.statePath).initializeEncryptedSpool(HOST_ID, fixture.identityPath, 'linux', {
+        loadOrCreate: () => { keyAccessed = true; return new Uint8Array(32).fill(7); },
+      }), /preflight failed closed/i);
+      assert.equal(keyAccessed, false);
+      assert.deepEqual(readFileSync(fixture.statePath), stateBytes);
+      assert.deepEqual(readFileSync(fixture.spoolPath), spoolBytes);
+      assert.deepEqual(readFileSync(floorPath), floorBytes);
+    } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+  });
+}
 
 for (const [name, mutate] of [
   ['typeLabel missing', ({ state }) => { delete state.recentEvents[0].typeLabel; }],
@@ -256,7 +361,7 @@ for (const [name, mutate] of [
   });
 }
 
-test('interrupted schema 2 to 3 reset resumes without preserving obsolete records', () => {
+test('interrupted schema 2 reset and v3 migration resume without preserving obsolete records', () => {
   const fixture = setupObsoleteRuntime();
   try {
     assert.throws(() => initialize(fixture, (phase) => {
@@ -454,7 +559,7 @@ test('unknown state schema fails closed before key access and preserves exact by
   } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
-test('malformed current v2 state fails before key access and preserves state and spool bytes', () => {
+test('malformed current v4 state fails before key access and preserves state and spool bytes', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ariava-runtime-malformed-current-'));
   const statePath = join(dir, 'state.json');
   const identityPath = join(dir, 'identity.json');
@@ -561,7 +666,7 @@ test('fresh install creates matching current empty state and spool', () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('current v2 restart preserves valid runtime and uses key-verifier behavior', () => {
+test('current v4 restart preserves valid runtime and uses key-verifier behavior', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ariava-runtime-current-'));
   const statePath = join(dir, 'state.json');
   const identityPath = join(dir, 'identity.json');
@@ -676,9 +781,7 @@ for (const lifecycle of ['unregister', 'ttl']) {
       const event = { eventId: 'event', hostId: HOST_ID, sessionId: 'session', provider: 'pi', type: 'done', status: 'idle',
         agentText: 'done', createdAt: CREATED_AT };
       store.queuePendingEvent(event, terminal); store.commitSessionRevision('session', 1); store.removePendingEvent('event');
-      const commandResult = { commandId: `command-${lifecycle}`, hostId: HOST_ID, sessionId: 'session', accepted: true,
-        status: 'executed', message: lifecycle, updatedAt: CREATED_AT };
-      store.rememberCommandResult(commandResult, commandResult);
+      const execution = claimCommand(store, `command-${lifecycle}`);
       if (lifecycle === 'unregister') assert.equal(store.removeSession('session', 'pi'), true);
       else store.replaceDriverSessions('pi', []);
       const before = readFileSync(statePath);
@@ -687,8 +790,8 @@ for (const lifecycle of ['unregister', 'ttl']) {
       assert.deepEqual(restarted.listSessions(), []);
       assert.equal(restarted.currentSessionRevision('session'), 1);
       assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).recentEvents[0].eventId, 'event');
-      assert.deepEqual(restarted.getCommandResult(commandResult.commandId), commandResult);
-      assert.equal(restarted.hasSeenCommand(commandResult.commandId), true);
+      restarted.validateCommandExecutionPins({ resolvePinReference: () => execution.pinReference });
+      assert.deepEqual(restarted.getCommandExecution(execution.originalEncryptedCommand.commandId), execution);
       assert.deepEqual(readFileSync(statePath), before);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -717,10 +820,16 @@ test('current state Host and relationship adversarial matrix fails before key ac
     ['handle map mismatch', (state) => { state.pendingHandles.wrong = state.pendingHandles[`${HOST_ID}:session`]; delete state.pendingHandles[`${HOST_ID}:session`]; }],
     ['foreign handle Host', (state) => { state.pendingHandles[`${HOST_ID}:session`].hostId = 'foreign'; }],
     ['orphan handle Event', (state) => { state.pendingHandles[`${HOST_ID}:session`].handledThroughEventId = 'orphan'; }],
-    ['command result key mismatch', (state) => { state.commandResults.other = state.commandResults.command; delete state.commandResults.command; }],
-    ['foreign command result Host', (state) => { state.commandResults.command.hostId = 'foreign'; }],
-    ['seen command mismatch', (state) => { state.seenCommands.command = 'different'; }],
-    ['orphan seen command', (state) => { state.seenCommands.orphan = CREATED_AT; }],
+    ['command execution key mismatch', (state) => { state.commandExecutions.other = state.commandExecutions.command; delete state.commandExecutions.command; }],
+    ['foreign command execution Host', (state) => { state.commandExecutions.command.originalEncryptedCommand.hostId = 'foreign'; }],
+    ['command execution digest mismatch', (state) => { state.commandExecutions.command.commandDigest = 'Z'.repeat(43); }],
+    ['duplicate command nonce binding', (state) => {
+      const duplicate = structuredClone(state.commandExecutions.command);
+      duplicate.originalEncryptedCommand.commandId = 'other';
+      duplicate.commandDigest = base64UrlEncode(new Uint8Array(createHash('sha256')
+        .update(buildEncryptedCommandEnvelopeBindingBytes(duplicate.originalEncryptedCommand)).digest()));
+      state.commandExecutions.other = duplicate;
+    }],
     ['reservation fingerprint key mismatch', (state) => { state.producerEventReservations = { wrong: { version: 1, eventId: 'event', sessionId: 'session', fingerprint: 'fingerprint', createdAt: CREATED_AT } }; }],
     ['orphan reservation Session', (state) => { state.producerEventReservations = { ['orphan\nfingerprint']: { version: 1, eventId: 'event', sessionId: 'orphan', fingerprint: 'fingerprint', createdAt: CREATED_AT } }; }],
     ['cancellation map key mismatch', (state) => { state.terminalCancellations = { wrong: { version: 1, eventId: 'event', sessionId: 'session', fingerprint: 'fingerprint', removeSession: false, createdAt: CREATED_AT } }; }],
@@ -740,9 +849,7 @@ test('current state Host and relationship adversarial matrix fails before key ac
       store.queuePendingEvent(event, terminal);
       store.queuePendingSessionHandle({ hostId: HOST_ID, sessionId: 'session', handledThroughEventId: 'event',
         handledAt: CREATED_AT, action: 'pi_input', updatedAt: CREATED_AT });
-      const commandResult = { commandId: 'command', hostId: HOST_ID, sessionId: 'session', accepted: true,
-        status: 'executed', message: 'done', updatedAt: CREATED_AT };
-      store.rememberCommandResult(commandResult, commandResult);
+      claimCommand(store, 'command');
       const state = JSON.parse(readFileSync(statePath, 'utf8')); mutate(state);
       const stateBytes = Buffer.from(`${JSON.stringify(state)}\n`); writeFileSync(statePath, stateBytes, { mode: 0o600 });
       const spoolBytes = readFileSync(spoolPathForState(statePath)); let keyAccessed = false;
@@ -783,7 +890,7 @@ test('recognized reset repopulates only live v2 Agent Adapter Sessions through p
     assert.deepEqual(published.map((item) => item.sessionId).sort(), ['live-1', 'live-2']);
     assert.ok(published.every((item) => item.hostId === HOST_ID && item.provider === 'pi'));
     assert.deepEqual(state.listSessions().map((item) => item.sessionId).sort(), ['live-1', 'live-2']);
-    assert.deepEqual(state.peekPendingEvents(), []); assert.equal(state.getCommandResult('command'), undefined);
+    assert.deepEqual(state.peekPendingEvents(), []); assert.equal(state.getCommandExecution('command'), undefined);
     assert.doesNotMatch(readFileSync(fixture.statePath, 'utf8'), /legacy protected event|pending-digest|"command":/);
     registry.dispose();
   } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
@@ -795,7 +902,7 @@ const secureWriteCrashChild = String.raw`
   const store = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
   const suffix = member === 'intent' ? '.runtime-reset.json' : member === 'spool' ? '.spool.json' : 'state.json';
   const crash = (path) => { if (path.endsWith(suffix)) process.kill(process.pid, 'SIGKILL'); };
-  store.initializeEncryptedSpool('host-test', identityPath, 'linux', undefined, undefined, { write: { [boundary]: crash } });
+  store.initializeEncryptedSpool('host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk', identityPath, 'linux', undefined, undefined, { write: { [boundary]: crash } });
 `;
 
 for (const member of ['intent', 'spool', 'state']) {
@@ -819,7 +926,7 @@ const secureCleanupCrashChild = String.raw`
   import { BridgeStateStore } from './apps/bridge/dist/state-store.js';
   const [statePath, identityPath, boundary] = process.argv.slice(1);
   const store = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
-  store.initializeEncryptedSpool('host-test', identityPath, 'linux', undefined, undefined, {
+  store.initializeEncryptedSpool('host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk', identityPath, 'linux', undefined, undefined, {
     remove: { [boundary]: () => process.kill(process.pid, 'SIGKILL') },
   });
 `;

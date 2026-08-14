@@ -325,8 +325,7 @@ describe('AgentAdapterServer', () => {
       sessionId: 'sess-1',
       accepted: true,
       status: 'executed',
-      message: 'Done',
-      updatedAt: '2026-06-30T10:00:00Z',
+      updatedAt: '2026-06-30T10:00:00.000Z',
     };
 
     const response = await fetch(url('/v1/agent/sessions/sess-1/commands/cmd-1/result'), {
@@ -338,6 +337,28 @@ describe('AgentAdapterServer', () => {
     expect(response.status).toBe(200);
     const resolved = await registry.waitForResult('cmd-1', { timeoutMs: 50 });
     expect(resolved).toEqual(result);
+  });
+
+  test('unauthenticated result submission cannot mutate pending command state', async () => {
+    registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', nameText: 'p', cwd: '/' });
+    const command: CommandEnvelope = {
+      commandId: 'cmd-unauth-result', hostId: 'host-1', sessionId: 'sess-1', type: 'interrupt', payload: {},
+      issuedAt: '2026-06-30T09:59:00Z', expiresAt: '2026-06-30T10:05:00Z', nonce: 'n-unauth', watchDeviceId: 'watch-1',
+    };
+    registry.enqueueCommand(command);
+    await registry.dequeueCommand(command.sessionId, 0);
+    const result = { commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId,
+      accepted: true, status: 'executed', updatedAt: '2026-06-30T10:00:00.000Z' };
+    const response = await fetch(url(`/v1/agent/sessions/${command.sessionId}/commands/${command.commandId}/result`), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [AGENT_ADAPTER_PROTOCOL_HEADER]: String(AGENT_ADAPTER_PROTOCOL_VERSION) },
+      body: JSON.stringify(result),
+    });
+
+    expect(response.status).toBe(401);
+    expect(registry.hasPendingCommandWork(command.sessionId)).toBe(true);
+    expect(() => registry.resolveCommand(command.commandId, result, command.sessionId)).not.toThrow();
+    expect(await registry.waitForResult(command.commandId, { timeoutMs: 50 })).toEqual(result);
   });
 
   test.each([
@@ -355,12 +376,12 @@ describe('AgentAdapterServer', () => {
     await registry.dequeueCommand('sess-1', 0);
     const response = await fetch(url(path), { method: 'POST', headers: headers(), body: JSON.stringify({
       commandId: path.includes('cmd-other') ? 'cmd-other' : 'cmd-1', ...binding, accepted: true, status: 'executed',
-      message: 'Done', updatedAt: '2026-06-30T10:00:00Z',
+      updatedAt: '2026-06-30T10:00:00.000Z',
     }) });
     expect(response.status).toBe(400);
     expect(registry.hasPendingCommandWork('sess-1')).toBe(true);
     const valid = { commandId: 'cmd-1', hostId: 'host-1', sessionId: 'sess-1', accepted: true,
-      status: 'executed' as const, message: 'Done', updatedAt: '2026-06-30T10:00:00Z' };
+      status: 'executed' as const, updatedAt: '2026-06-30T10:00:00.000Z' };
     registry.resolveCommand('cmd-1', valid, 'sess-1');
     expect(await registry.waitForResult('cmd-1', { timeoutMs: 50 })).toEqual(valid);
   });
@@ -374,12 +395,38 @@ describe('AgentAdapterServer', () => {
     await registry.dequeueCommand('sess-1', 0);
     registry.register({ sessionId: 'sess-1', provider: 'other', projectName: 'p', nameText: 'p', cwd: '/' });
     const result = { commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId, accepted: true,
-      status: 'executed' as const, message: 'Done', updatedAt: '2026-06-30T10:00:00Z' };
+      status: 'executed' as const, updatedAt: '2026-06-30T10:00:00.000Z' };
     expect(() => registry.resolveCommand(command.commandId, result, 'sess-1')).toThrow(/registered Session/u);
     expect(registry.hasPendingCommandWork('sess-1')).toBe(true);
     registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', nameText: 'p', cwd: '/' });
     expect(() => registry.resolveCommand(command.commandId, result, 'sess-1')).not.toThrow();
     expect(await registry.waitForResult(command.commandId, { timeoutMs: 50 })).toEqual(result);
+  });
+
+  test.each([
+    ['message', { message: 'internal detail' }],
+    ['reason', { reason: 'driver detail' }],
+    ['detail', { detail: 'private detail' }],
+    ['error', { error: 'private error' }],
+    ['queued', { accepted: true, status: 'queued' }],
+    ['delivered', { accepted: true, status: 'delivered' }],
+    ['illegal combination', { accepted: false, status: 'executed' }],
+  ])('rejects non-terminal or diagnostic command result: %s', async (_label, override) => {
+    registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', nameText: 'p', cwd: '/' });
+    const command: CommandEnvelope = {
+      commandId: 'cmd-exact', hostId: 'host-1', sessionId: 'sess-1', type: 'interrupt', payload: {},
+      issuedAt: '2026-06-30T09:59:00.000Z', expiresAt: '2026-06-30T10:05:00.000Z', nonce: 'n-exact', watchDeviceId: 'watch-1',
+    };
+    registry.enqueueCommand(command);
+    await registry.dequeueCommand('sess-1', 0);
+    const response = await fetch(url('/v1/agent/sessions/sess-1/commands/cmd-exact/result'), {
+      method: 'POST', headers: headers(), body: JSON.stringify({
+        commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId, accepted: true,
+        status: 'executed', updatedAt: '2026-06-30T10:00:00.000Z', ...override,
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect(registry.hasPendingCommandWork('sess-1')).toBe(true);
   });
 
   test('awaits bind readiness and reports an occupied port', async () => {

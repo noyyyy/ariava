@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash, createHmac, createPrivateKey, createPublicKey, diffieHellman, hkdfSync, verify } from 'node:crypto';
 import vectors from './fixtures/e2e-v2-vectors.json';
 import previewVector from './fixtures/notification-preview-v2-vector.json';
+import commandVectors from './fixtures/command-e2e-v1-vectors.json';
 
 function openChaChaPoly(key: Uint8Array, nonce: string, ciphertext: string, aad: Uint8Array): Uint8Array {
   const script = `
@@ -592,8 +593,8 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
     const inheritedToJSON = Object.assign(Object.create({
       toJSON: () => ({ version: 2, projectName: 'x', eventType: 'done', bodyText: '', truncated: false }),
     }), valid) as typeof valid;
-    expect(validateNotificationPreviewPlaintextV2(inheritedToJSON)).toBe(true);
-    expect(buildNotificationPreviewPlaintextBytes(inheritedToJSON)).toEqual(canonical);
+    expect(validateNotificationPreviewPlaintextV2(inheritedToJSON)).toBe(false);
+    expect(() => buildNotificationPreviewPlaintextBytes(inheritedToJSON)).toThrow();
 
     const oneByte = { ...valid, projectName: 'p', bodyText: 'x' };
     const overhead = buildNotificationPreviewPlaintextBytes(oneByte).byteLength - 1;
@@ -616,13 +617,11 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
     expect(getterCalls).toBe(0);
   });
 
-  test('keeps reply encrypted and interrupt exactly payload-free at the type boundary', () => {
+  test('keeps reply encrypted and requires interrupt encrypted content', () => {
     expect(COMMAND_TYPES).toEqual(['reply', 'interrupt']);
-    const interrupt: EncryptedCommandEnvelopeV1 = {
-      commandId: 'cmd_1', hostId: 'host_1', sessionId: 'session_1', type: 'interrupt', payload: {},
-      issuedAt: '2026-07-20T00:00:00.000Z', expiresAt: '2026-07-20T00:05:00.000Z', nonce: 'nonce_1',
-      watchDeviceId: 'watch_1', linkId: 'link_1', linkGeneration: 1, epoch: 1,
-    };
-    expect(Object.keys(interrupt.payload)).toEqual([]);
+    const interrupt: EncryptedCommandEnvelopeV1 = commandVectors.interrupt.envelope as EncryptedCommandEnvelopeV1;
+    expect(interrupt.type).toBe('interrupt');
+    expect(interrupt.payload.content.payloadKind).toBe('interrupt-content-v1');
+    expect(interrupt.payload.keyWrap.contentId).toBe(interrupt.payload.content.contentId);
   });
 });

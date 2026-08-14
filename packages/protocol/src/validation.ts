@@ -191,9 +191,6 @@ export function isCanonicalTimestamp(value: unknown): value is string {
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
-export function isRotationOperationId(value: unknown): value is string {
-  return typeof value === 'string' && /^op_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value);
-}
 
 export function validateSignedRequestHeaders(headers: Headers | SignedRequestHeaders | Record<string, string | undefined>): ValidationResult<SignedRequestHeaders> {
   const get = (name: string): string | undefined => {

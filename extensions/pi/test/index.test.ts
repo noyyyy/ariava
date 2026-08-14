@@ -385,8 +385,9 @@ describe('ariavaPiExtension settled lifecycle', () => {
 
       await expect(harness.emit('agent_settled')).resolves.toBeUndefined();
       await waitForFile(logPath);
-      expect(readFileSync(logPath, 'utf8')).toContain('heartbeat aborted session');
-      expect(readFileSync(logPath, 'utf8')).toContain('local bridge unavailable');
+      expect(readFileSync(logPath, 'utf8')).toContain('"event":"heartbeat_failed"');
+      expect(readFileSync(logPath, 'utf8')).not.toContain('heartbeat aborted session');
+      expect(readFileSync(logPath, 'utf8')).not.toContain('local bridge unavailable');
       expect(harness.terminalEvents()).toEqual([]);
       await harness.shutdown();
     } finally {

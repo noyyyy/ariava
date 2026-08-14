@@ -8,6 +8,7 @@ import {
   HOST_DOMAIN_RESET_JOURNAL_VERSION,
   HOST_DOMAIN_RESET_PHASES,
   hostDomainResourceDigest,
+  loadHostDomainResetJournal,
   removeHostDomainResetJournal,
   writeHostDomainResetJournal,
 } from '../src/cli/operations/host-domain-reset-journal';
@@ -56,10 +57,12 @@ async function fixture(phase: typeof HOST_DOMAIN_RESET_PHASES[number]) {
   writeHostDomainResetJournal(resources, {
     version: HOST_DOMAIN_RESET_JOURNAL_VERSION,
     operationId: 'reset_0123456789abcdef', profile: 'default', phase,
-    oldHostId: identity.hostId, oldKeyId: identity.keyId,
+    oldHostId: ['quarantine-pending', 'quarantined'].includes(phase) ? null : identity.hostId,
+    oldKeyId: ['quarantine-pending', 'quarantined'].includes(phase) ? null : identity.keyId,
     newHostId: phaseAtLeast(phase, 'signing-identity-replaced') ? `host_${'C'.repeat(43)}` : null,
     newKeyId: phaseAtLeast(phase, 'signing-identity-replaced') ? `key_${'D'.repeat(43)}` : null,
     oldEncryptionKeyId: null,
+    signingCleanup: null,
     signingReplacementAttemptedAt: phaseTimestamp(phase, 'signing-replacement-pending'),
     encryptionIdentityReplacedAt: phaseTimestamp(phase, 'encryption-identity-replaced'),
     runtimeArtifactsClearedAt: phaseTimestamp(phase, 'runtime-artifacts-cleared'),
@@ -68,7 +71,8 @@ async function fixture(phase: typeof HOST_DOMAIN_RESET_PHASES[number]) {
     serviceMetadataSynchronizedAt: phaseTimestamp(phase, 'service-metadata-synchronized'),
     resourceDigest: hostDomainResourceDigest(resources),
     createdAt: '2026-08-11T00:00:00.000Z', updatedAt: '2026-08-11T00:00:00.000Z',
-    revoke: phase === 'prepared' ? { state: 'not-attempted', outcome: null }
+    revoke: phase === 'quarantine-pending' || phase === 'quarantined' || phase === 'prepared'
+      ? { state: 'not-attempted', outcome: null }
       : phase === 'revoke-pending' ? { state: 'pending', outcome: null }
         : { state: 'complete', outcome: 'revoked' },
     service: { managed: true, installed: false, enabled: false, wasRunning: false, backend: 'systemd-user' },
@@ -92,6 +96,21 @@ describe('BridgeDaemon Host-domain reset guard', () => {
       expect(existsSync(value.resources.agentAdapterConfigPath)).toBe(false);
     },
   );
+
+  test('running daemon releases runtime ownership when quarantine intent appears', async () => {
+    const value = await fixture('quarantine-pending');
+    const pendingJournal = loadHostDomainResetJournal(value.resources)!;
+    removeHostDomainResetJournal(value.resources);
+    const daemon = new BridgeDaemon(value.config, [], value.identityStore);
+    expect(existsSync(value.resources.runtimeLockPath)).toBe(true);
+    writeHostDomainResetJournal(value.resources, pendingJournal);
+
+    await expect(daemon.syncOnce()).rejects.toMatchObject({
+      code: 'ERR_HOST_RESET_RECOVERY_REQUIRED', phase: 'quarantine-pending',
+    });
+    expect(existsSync(value.resources.runtimeLockPath)).toBe(false);
+    removeHostDomainResetJournal(value.resources);
+  });
 
   test('service-restore-pending is allowed through construction without external effects', async () => {
     const value = await fixture('service-restore-pending');

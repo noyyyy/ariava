@@ -1,3 +1,4 @@
+import type { EncryptionKeyBindingV1 } from '@ariava/protocol';
 import type { HostIdentity, HostIdentityInspection } from '../../identity/types';
 import {
   ARIAVA_PRODUCTION_RELAY_BASE_URL,
@@ -14,6 +15,7 @@ export interface OnboardingHostState {
   config: ResolvedAriavaConfig;
   identityInspection: LoadedHostIdentityInspection;
   identity: HostIdentity;
+  encryptionBinding: EncryptionKeyBindingV1;
 }
 
 export type HostIdentityReadiness =
@@ -22,7 +24,6 @@ export type HostIdentityReadiness =
     ready: false;
     reason: string;
     identityStatus: HostIdentityInspection['status'];
-    pendingRotation: boolean;
   };
 
 export type OnboardingHostStateDecision =
@@ -32,7 +33,6 @@ export type OnboardingHostStateDecision =
     kind: 'reject';
     reason: string;
     identityStatus: HostIdentityInspection['status'];
-    pendingRotation: boolean;
   };
 
 export interface RelaySelectionProposal {
@@ -50,7 +50,6 @@ export function evaluateHostIdentityReadiness(
   identity: Pick<HostIdentity, 'hostId' | 'keyId'>,
 ): HostIdentityReadiness {
   const ready = inspection.status === 'ready'
-    && !inspection.pendingRotation
     && inspection.ownerIntegrity
     && inspection.permissionIntegrity
     && inspection.metadataIntegrity
@@ -62,7 +61,6 @@ export function evaluateHostIdentityReadiness(
     ready: false,
     reason: identityNotReadyReason(inspection, identity),
     identityStatus: inspection.status,
-    pendingRotation: inspection.pendingRotation,
   };
 }
 
@@ -77,7 +75,6 @@ export function decideOnboardingHostState(
       kind: 'reject',
       reason: identityReadiness.reason,
       identityStatus: identityReadiness.identityStatus,
-      pendingRotation: identityReadiness.pendingRotation,
     };
   }
 
@@ -122,9 +119,6 @@ function identityNotReadyReason(
   inspection: HostIdentityInspection,
   identity: Pick<HostIdentity, 'hostId' | 'keyId'>,
 ): string {
-  if (inspection.status === 'rotation-pending' || inspection.pendingRotation) {
-    return 'Host identity key rotation is pending and must be completed or explicitly reset before onboarding can continue.';
-  }
   if (inspection.status === 'invalid') {
     return 'Host identity evidence exists but is invalid or unreadable (for example a locked or inaccessible Keychain private key). Explicit reset is required.';
   }

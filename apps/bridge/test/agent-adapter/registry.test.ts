@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { CommandEnvelope, CommandResult } from '@ariava/protocol';
 import { AgentAdapterRegistry, type AgentAdapterEventInput } from '../../src/agent-adapter/registry';
 import { BridgeStateStore } from '../../src/state-store';
+import { spoolPathForState } from '../../src/e2e/local-spool';
 
 mock.module('../../src/e2e/node-crypto', () => ({
   chachaPolySeal: (_key: Uint8Array, plaintext: Uint8Array) => ({
@@ -229,7 +230,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       await registry.dequeueCommand('sess-1', 0);
       store.queuePendingEvent = (() => { throw new Error('unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,
-        sessionId: command.sessionId, accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z' });
+        sessionId: command.sessionId, accepted: true, status: 'executed', updatedAt: '2026-08-07T00:00:03.000Z' });
       expect(callbacks).toHaveLength(1);
       registry.dispose();
       expect(canceled).toEqual([1]);
@@ -266,11 +267,17 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       callbacks.forEach((callback) => callback());
       const lateResult = {
         commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId, accepted: true,
-        status: 'executed' as const, message: 'late', updatedAt: '2026-08-07T00:00:03.000Z',
+        status: 'executed' as const, updatedAt: '2026-08-07T00:00:03.000Z',
       };
-      if (action === 'dispose') expect(() => registry.resolveCommand(command.commandId, lateResult)).not.toThrow();
-      else expect(() => registry.resolveCommand(command.commandId, lateResult)).toThrow(/queued adapter command/u);
+      expect(() => registry.resolveCommand(command.commandId, lateResult)).toThrow(/queued adapter command/u);
       expect((registry as any).results.size).toBe(0);
+      expect((registry as any).resultWaiters.size).toBe(0);
+      expect((registry as any).resultWaiterTimers.size).toBe(0);
+      expect((registry as any).commandSessions.size).toBe(0);
+      if (action === 'dispose') {
+        expect((registry as any).commandQueues.size).toBe(0);
+        expect((registry as any).inFlightCommands.size).toBe(0);
+      }
     } finally { cleanup(); }
   });
   test('registers, heartbeats, and lists a canonical Session', () => {
@@ -433,7 +440,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       await registry.dequeueCommand('sess-1', 0);
       const result: CommandResult = {
         commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId,
-        accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z',
+        accepted: true, status: 'executed', updatedAt: '2026-08-07T00:00:03.000Z',
       };
       registry.resolveCommand(command.commandId, result);
       expect(store.peekPendingEvents()).toEqual([
@@ -529,7 +536,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, {
         commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId,
-        accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z',
+        accepted: true, status: 'executed', updatedAt: '2026-08-07T00:00:03.000Z',
       });
       expect(callbacks.map(({ delayMs }) => delayMs)).toEqual([100]);
       expect(registry.listSessions()[0]).toEqual(before);
@@ -572,7 +579,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       store.queuePendingEvent = (() => { throw new Error('unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, {
         commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId, accepted: true,
-        status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z',
+        status: 'executed', updatedAt: '2026-08-07T00:00:03.000Z',
       });
       expect(callbacks).toHaveLength(1);
       if (action === 'unregister') registry.unregister('sess-1');
@@ -600,7 +607,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, {
         commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId, accepted: true,
-        status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z',
+        status: 'executed', updatedAt: '2026-08-07T00:00:03.000Z',
       });
       const spool = (store as any).spool;
       const originalEnqueue = spool.enqueue.bind(spool);
@@ -633,7 +640,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       await registry.dequeueCommand('sess-1', 0);
       store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,
-        sessionId: command.sessionId, accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z' });
+        sessionId: command.sessionId, accepted: true, status: 'executed', updatedAt: '2026-08-07T00:00:03.000Z' });
       (store as any).writeState = () => { throw new Error('state commit failed'); };
       expect(() => registry.unregister('sess-1')).toThrow('state commit failed');
       store.dispose();
@@ -645,6 +652,50 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       restarted.dispose();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  test.each(['missing-source', 'wrong-session'] as const)(
+    'restart rejects a terminal cancellation intent with %s reservation evidence without rewriting state',
+    async (mutation) => {
+      const dir = mkdtempSync(join(tmpdir(), `bridge-registry-cancel-${mutation}-`));
+      try {
+        const statePath = join(dir, 'state.json');
+        const store = initializedStore(dir);
+        const registry = new AgentAdapterRegistry('host-1', store, () => {}, () => new Date(), {
+          schedule: () => Symbol('retry'), cancel: () => {},
+        });
+        register(registry);
+        const command = makeCommand('sess-1');
+        registry.enqueueCommand(command);
+        const eventId = registry.pushEvent('sess-1', doneEvent({ correlationId: mutation }));
+        await registry.dequeueCommand('sess-1', 0);
+        store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
+        registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,
+          sessionId: command.sessionId, accepted: true, status: 'executed', updatedAt: '2026-08-07T00:00:03.000Z' });
+        (store as any).writeState = () => { throw new Error('state commit failed'); };
+        expect(() => registry.unregister('sess-1')).toThrow('state commit failed');
+        store.dispose();
+
+        const originalState = readFileSync(statePath, 'utf8');
+        const spoolPath = spoolPathForState(statePath);
+        const spool = JSON.parse(readFileSync(spoolPath, 'utf8')) as {
+          items: Array<{ spoolItemId: string; sessionId: string; eventId?: string; payloadKind: string }>;
+        };
+        if (mutation === 'missing-source') {
+          spool.items = spool.items.filter((item) => item.spoolItemId !== eventId);
+        } else {
+          const source = spool.items.find((item) => item.spoolItemId === eventId);
+          if (!source) throw new Error('expected reservation source');
+          source.sessionId = 'sess-other';
+        }
+        writeFileSync(spoolPath, `${JSON.stringify(spool, null, 2)}\n`, { mode: 0o600 });
+
+        expect(() => initializedStore(dir)).toThrow('Bridge runtime preflight failed closed');
+        expect(readFileSync(statePath, 'utf8')).toBe(originalState);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
 
   test.each(['spool-remove', 'journal-cleanup'] as const)('committed cancellation survives %s failure and restart never replays the Event', async (boundary) => {
     const dir = mkdtempSync(join(tmpdir(), `bridge-registry-cancel-${boundary}-`));
@@ -661,7 +712,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       await registry.dequeueCommand('sess-1', 0);
       store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,
-        sessionId: command.sessionId, accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z' });
+        sessionId: command.sessionId, accepted: true, status: 'executed', updatedAt: '2026-08-07T00:00:03.000Z' });
       const spool = (store as any).spool;
       let cleanupFailureInjected = false;
       if (boundary === 'spool-remove') spool.removeMany = () => { throw new Error('spool remove failed'); };
@@ -706,7 +757,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       await registry.dequeueCommand('sess-1', 0);
       store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId,
-        accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z' });
+        accepted: true, status: 'executed', updatedAt: '2026-08-07T00:00:03.000Z' });
       failAfterWrite = true;
       expect(registry.unregister('sess-1')).toBe(true);
       expect(registry.hasSession('sess-1')).toBe(false);
@@ -731,7 +782,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       await registry.dequeueCommand('sess-1', 0);
       store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,
-        sessionId: command.sessionId, accepted: true, status: 'executed', message: 'ok', updatedAt: '2026-08-07T00:00:03.000Z' });
+        sessionId: command.sessionId, accepted: true, status: 'executed', updatedAt: '2026-08-07T00:00:03.000Z' });
       const spool = (store as any).spool;
       const originalRemoveMany = spool.removeMany.bind(spool);
       spool.removeMany = () => { throw new Error('cleanup unavailable'); };
@@ -745,6 +796,24 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       expect(restarted.getSession('sess-1')).toBeUndefined();
       expect(JSON.stringify(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')))).not.toContain(eventId);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('abandon clears in-flight work and rejects late results without storing terminal evidence', async () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const registry = new AgentAdapterRegistry('host-1', store);
+      register(registry);
+      const command = makeCommand('sess-1');
+      registry.enqueueCommand(command);
+      await registry.dequeueCommand('sess-1', 0);
+      expect(registry.hasPendingCommandWork('sess-1')).toBe(true);
+      registry.abandonCommand(command.commandId);
+      expect(registry.hasPendingCommandWork('sess-1')).toBe(false);
+      const late = { commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId,
+        accepted: true as const, status: 'executed' as const, updatedAt: '2026-08-07T00:00:03.000Z' };
+      expect(() => registry.resolveCommand(command.commandId, late)).toThrow(/queued adapter command/u);
+      expect((registry as any).results.size).toBe(0);
+    } finally { cleanup(); }
   });
 
 });

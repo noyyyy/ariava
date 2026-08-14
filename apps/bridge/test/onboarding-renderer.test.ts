@@ -95,21 +95,21 @@ describe('onboarding renderer', () => {
           message: 'Host identity evidence exists but is invalid or unreadable (for example a locked or inaccessible Keychain private key). Explicit reset is required.',
           remediation: {
             message: 'Host identity evidence exists but is invalid or unreadable (for example a locked or inaccessible Keychain private key). Explicit reset is required.',
-            command: 'ariava host reset --confirm',
+            command: 'ariava identity reset --confirm',
           },
         },
       }],
       nextActions: [{
         id: 'resolve-failure',
         message: 'Host identity evidence exists but is invalid or unreadable (for example a locked or inaccessible Keychain private key). Explicit reset is required.',
-        command: 'ariava host reset --confirm',
+        command: 'ariava identity reset --confirm',
       }],
     };
     const output = renderOnboardingResult(failed, { terminal: terminal(80), assetLoader: () => { throw new Error('must not load'); } });
     expect(output).toBe([
       'Onboarding incomplete: ERR_IDENTITY_INVALID',
       'Host identity evidence exists but is invalid or unreadable (for example a locked or inaccessible Keychain private key). Explicit reset is required.',
-      'Next: ariava host reset --confirm',
+      'Next: ariava identity reset --confirm',
     ].join('\n'));
   });
 

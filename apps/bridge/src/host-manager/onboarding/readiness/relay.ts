@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import type { HostEnrollmentResponse, HostPlatform } from '@ariava/protocol';
+import type { EncryptionKeyBindingV1, HostEnrollmentResponse, HostPlatform } from '@ariava/protocol';
 import { base64UrlEncode, isCanonicalTimestamp } from '@ariava/protocol';
 import type { HostIdentity } from '../../../identity/types';
 import { RelayClient, RelayClientError } from '../../../relay-client';
@@ -25,6 +25,7 @@ export interface RelayHealthInput {
 
 export interface RelayEnrollmentInput extends RelayHealthInput {
   identity: Pick<HostIdentity, 'hostId' | 'keyId' | 'algorithm' | 'publicKey' | 'signer'>;
+  encryptionBinding: EncryptionKeyBindingV1;
   hostMetadata: { hostName: string; platform: HostPlatform; bridgeVersion: string };
 }
 
@@ -86,6 +87,7 @@ export async function checkRelayEnrollment(
       keyId: input.identity.keyId,
       algorithm: input.identity.algorithm,
       publicKey: input.identity.publicKey,
+      encryptionBinding: input.encryptionBinding,
       ...input.hostMetadata,
     });
     assertEnrollmentResponse(response, input.identity.hostId, input.hostMetadata);

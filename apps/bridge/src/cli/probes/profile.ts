@@ -87,8 +87,8 @@ export async function probeProfile(
   const resetJournal = loadHostDomainResetJournal(resources);
   const resetPending = resetJournal !== null;
   const resetRemediation = context.profile.id === 'dev'
-    ? 'bun run dev:cli -- host reset --confirm'
-    : 'ariava host reset --confirm';
+    ? 'bun run dev:cli -- identity reset --confirm'
+    : 'ariava identity reset --confirm';
 
   return {
     profile: context.profile.id,
@@ -141,7 +141,6 @@ async function inspectIdentity(
     ownerIntegrity: false,
     permissionIntegrity: false,
     metadataIntegrity: false,
-    pendingRotation: false,
   };
 }
 

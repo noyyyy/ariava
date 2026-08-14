@@ -22,6 +22,14 @@ This repository contains the Ariava Bridge, pi extension, protocol, and shared u
 - Strict onboarding readiness is read-only evidence aggregation and is separate from `ariava doctor`; preserve doctor's current health formula and exit behavior.
 - Services remain per-user launchd on macOS and systemd user services on capable Linux/WSL. Never add root/system units, linger, detached/PID/profile/Task Scheduler fallbacks, or optimistic unsupported-platform behavior.
 
+## Identity and command hardening boundaries
+
+- Ariava does not rotate identity signing keys in place. Replace the identity with `ariava identity reset --confirm`, then re-pair Watches. Public default/dev identity actions are exactly `identity status` and confirmed `identity reset`; the `host` namespace is removed.
+- Canonical identity load failure is fail-closed. Exact recognized legacy evidence is reachable only through confirmed reset; daemon, signer, Relay client, and onboarding readiness must never import its decoder.
+- Confirmed Host reset clears the old signing/E2E domain, pins, execution journal, receipt outbox, runtime state, and links and creates one zero-link replacement. Network/401/5xx/config failures are not reset triggers.
+- Relay commands are encrypted `reply`/`interrupt` envelopes. Submission `{ commandId, receivedAt }` is opaque storage acknowledgment only. At-most-once execution becomes terminal only through a Watch-verified fixed-length encrypted Host receipt; no plaintext result text or legacy interrupt fallback is allowed.
+- Preserve X25519 E2E reattestation/link epochs and `ariava config agent-secret rotate`; neither is identity signing-key rotation.
+
 ## Test lanes and validation
 
 Do not use source-text assertions to claim runtime behavior; execute the Public product flow instead, reserving source scans only for explicit repository-wide policy/static invariants without crossing the Public Repo boundary.

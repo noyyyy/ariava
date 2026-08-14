@@ -1,7 +1,11 @@
 import type { CommandEnvelope } from '@ariava/protocol';
-import type { AgentAdapter } from './adapter-interface';
+import {
+  validateAgentAdapterCommand,
+  validateAgentAdapterCommandResult,
+  type AgentAdapter,
+} from './adapter-interface';
 import type { PiSessionInfo } from './session';
-import { logExtensionErrorThrottled } from './logger';
+import { logExtensionEvent, logExtensionEventThrottled } from './logger';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const IMMEDIATE_POLL_TIMEOUT_MS = 0;
@@ -10,7 +14,7 @@ const POLL_ERROR_BACKOFF_MS = 1_000;
 export interface CommandPollerContext {
   sessionId: string;
   client: AgentAdapter;
-  onCommand: (command: CommandEnvelope) => Promise<void>;
+  onCommand: (command: CommandEnvelope) => Promise<import('./adapter-interface').AgentAdapterCommandResult>;
   getSession?: () => PiSessionInfo | null;
 }
 
@@ -25,17 +29,53 @@ export function startCommandPoller(
   const abort = new AbortController();
   let stopped = false;
 
+  let generation = 0;
+
+  const canceled = (commandGeneration: number) =>
+    stopped || abort.signal.aborted || commandGeneration !== generation;
+
   const run = async () => {
     while (!stopped && !abort.signal.aborted) {
       try {
         const command = await ctx.client.pollCommands(ctx.sessionId, IMMEDIATE_POLL_TIMEOUT_MS, ctx.getSession?.() ?? undefined);
+        if (stopped || abort.signal.aborted) return;
         if (command) {
-          await ctx.onCommand(command);
+          if (!validateAgentAdapterCommand(command) || command.sessionId !== ctx.sessionId) {
+            logExtensionEvent('command_dispatch_failed');
+            await sleep(POLL_ERROR_BACKOFF_MS, abort.signal);
+            continue;
+          }
+          const commandGeneration = generation;
+          try {
+            const result = await ctx.onCommand(structuredClone(command));
+            if (canceled(commandGeneration)) {
+              logExtensionEvent('command_dispatch_canceled', { commandId: command.commandId });
+              return;
+            }
+            if (!validateAgentAdapterCommandResult(result)
+              || result.commandId !== command.commandId
+              || result.hostId !== command.hostId
+              || result.sessionId !== command.sessionId) {
+              logExtensionEvent('command_result_invalid', { commandId: command.commandId });
+              continue;
+            }
+            try {
+              await ctx.client.submitResult(command.commandId, result);
+            } catch {
+              logExtensionEvent('command_result_submit_failed', { commandId: command.commandId });
+            }
+          } catch {
+            if (canceled(commandGeneration)) {
+              logExtensionEvent('command_dispatch_canceled', { commandId: command.commandId });
+              return;
+            }
+            logExtensionEvent('command_dispatch_failed', { commandId: command.commandId });
+          }
           continue;
         }
         await sleep(pollIntervalMs, abort.signal);
-      } catch (error) {
-        logExtensionErrorThrottled('poll commands', error);
+      } catch {
+        logExtensionEventThrottled('command_poll_failed');
         await sleep(POLL_ERROR_BACKOFF_MS, abort.signal);
       }
     }
@@ -45,11 +85,14 @@ export function startCommandPoller(
 
   return {
     stop() {
+      if (stopped) return;
       stopped = true;
+      generation += 1;
       abort.abort();
     },
   };
 }
+
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {

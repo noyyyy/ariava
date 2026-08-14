@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import type { HostEncryptionIdentity } from '../src/identity/host-encryption-key';
 import type { HostIdentity, HostIdentityInspection, HostIdentityStore } from '../src/identity/types';
 import type {
   AriavaInstallMetadata,
@@ -34,19 +35,28 @@ const devConfigPath = '/isolated/dev/config.json';
 const storage = { type: 'linux-json' as const, path: identityPath };
 const identity: HostIdentity = {
   identityVersion: 2,
-  hostId: 'host-isolated',
-  keyId: 'key-isolated',
+  hostId: 'host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+  keyId: 'key_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
   algorithm: 'Ed25519',
   publicKey: 'public-isolated',
   publicKeyFingerprint: 'fingerprint-isolated',
   createdAt: '2026-08-13T00:00:00.000Z',
   privateKeyStorage: storage,
   signer: {
-    entityId: 'host-isolated',
-    keyId: 'key-isolated',
-    sign: async () => 'signature',
+    entityId: 'host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+    keyId: 'key_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+    sign: async () => 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
     signRequest: async () => ({}) as never,
   },
+};
+const encryptionIdentity: HostEncryptionIdentity = {
+  version: 1,
+  hostId: identity.hostId,
+  encryptionKeyId: 'ekey_cs1uhCLEB_ttCYaQ8RMLfe1-wvf14dML2dUh8BU2N5M',
+  publicKey: 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE',
+  privateKeyPkcs8: new Uint8Array(),
+  sequence: 1,
+  createdAt: '2026-08-13T00:00:00.000Z',
 };
 const readyInspection: HostIdentityInspection = {
   status: 'ready',
@@ -60,7 +70,6 @@ const readyInspection: HostIdentityInspection = {
   ownerIntegrity: true,
   permissionIntegrity: true,
   metadataIntegrity: true,
-  pendingRotation: false,
 };
 const notInitializedInspection: HostIdentityInspection = {
   status: 'not-initialized',
@@ -70,7 +79,6 @@ const notInitializedInspection: HostIdentityInspection = {
   ownerIntegrity: false,
   permissionIntegrity: false,
   metadataIntegrity: false,
-  pendingRotation: false,
 };
 
 function resolvedConfig(relayBaseUrl: string, initialized: boolean): ResolvedAriavaConfig {
@@ -249,10 +257,6 @@ function fixture(options: { ephemeralCli?: boolean; initialized?: boolean; persi
       return initialized ? identity : null;
     },
     createFirstRun: async () => identity,
-    loadPending: async () => null,
-    stageRotation: async () => {},
-    abortRotation: async () => {},
-    promoteRotation: async () => identity,
     resetAfterExplicitConfirmation: async () => identity,
   };
   const deps: DefaultOnboardingAdapterDependencies = {
@@ -376,7 +380,7 @@ function fixture(options: { ephemeralCli?: boolean; initialized?: boolean; persi
     },
     createEncryptionIdentityStore(path, platform) {
       calls.push(`encryption.store:${path}:${platform}`);
-      return {} as never;
+      return { load: () => encryptionIdentity } as never;
     },
     hostName: () => 'Isolated Host',
     generateSecret: () => 'generated-isolated-secret',
@@ -572,6 +576,18 @@ describe('default production onboarding adapter', () => {
       },
       identityInspection: readyInspection,
       identity,
+      encryptionBinding: {
+        version: 1,
+        entityType: 'host',
+        entityId: identity.hostId,
+        identityKeyId: identity.keyId,
+        encryptionKeyId: encryptionIdentity.encryptionKeyId,
+        suite: 'x25519-hkdf-sha256-chachapoly-v1',
+        publicKey: encryptionIdentity.publicKey,
+        sequence: encryptionIdentity.sequence,
+        createdAt: encryptionIdentity.createdAt,
+        bindingSignature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      },
       serviceRecord: {
         backend: 'systemd-user',
         runtimePath,

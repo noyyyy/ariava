@@ -43,7 +43,8 @@ test('uses fresh DEKs/content and wrap nonces for every upload attempt', () => {
       protectedSession: { version: 2, projectName: 'p', nameText: 'n' },
       revision: 1, recipientSetVersion: 1, hostIdentity, recipients: [{ linkId: vectors.link.linkId,
         linkGeneration: vectors.link.linkGeneration, watchDeviceId: vectors.link.watchDeviceId, epoch: vectors.link.epoch,
-        state: 'active', transcriptDigest: vectors.transcript.digest, watchBinding: vectors.bindings.watch }] };
+        state: 'active', transcriptDigest: vectors.transcript.digest, hostBinding: vectors.bindings.host,
+        hostIdentity, watchBinding: vectors.bindings.watch }] };
     const first = encryptEventUpload(input); const second = encryptEventUpload(input);
     assert.notEqual(first.event.content.ciphertext, second.event.content.ciphertext);
     assert.notEqual(first.event.keyWraps[0].nonce, second.event.keyWraps[0].nonce);

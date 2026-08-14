@@ -12,7 +12,7 @@ import {
   type StoredTerminalCandidate,
 } from './question-detector';
 import { startCommandPoller, type CommandPollerHandle } from './poller';
-import { logExtensionError } from './logger';
+import { logExtensionEvent } from './logger';
 import {
   clampAssistantText,
   deriveActiveLeafId,
@@ -101,8 +101,8 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     getSession: () => session,
   };
 
-  function runAdapterTask(label: string, task: () => Promise<unknown>): void {
-    void task().catch((error) => logExtensionError(label, error));
+  function runAdapterTask(task: () => Promise<unknown>): void {
+    void task().catch(() => logExtensionEvent('adapter_task_failed'));
   }
 
   function reportPendingHandleAfterLocalInput(loopState: PiReducerState): void {
@@ -118,7 +118,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     loopState: PiReducerState,
     candidate: PendingHandleCandidate,
   ): void {
-    runAdapterTask('handle session from local input', async () => {
+    runAdapterTask(async () => {
       try {
         await adapter.handleSession(candidate.sessionId, {
           handledThroughEventId: candidate.eventId,
@@ -143,7 +143,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     heartbeatContext.status = 'working';
     heartbeatContext.latestActivityText = session.latestActivityText;
     const workingSession = session;
-    runAdapterTask('heartbeat working session', () =>
+    runAdapterTask(() =>
       adapter.heartbeat(workingSession.sessionId, 'working', latestActivityText ?? null, workingSession),
     );
   }
@@ -230,7 +230,6 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     const observedUserInputCursor = state.inputCursor;
     state.terminalDeliveryInFlight = true;
 
-    const alertLabel = alert.type === 'need_human' ? `${alert.type} ${alert.reason}` : alert.type;
     try {
       const pushed = await adapter.pushEvent(event);
       const currentState = state;
@@ -281,7 +280,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
         currentState.terminalDeliveryAttempts = (currentState.terminalDeliveryAttempts ?? 0) + 1;
         scheduleTerminalDeliveryRetry(currentState, alert);
       }
-      logExtensionError(`push ${alertLabel} event`, error);
+      logExtensionEvent('terminal_event_push_failed');
     } finally {
       if (state?.latestPendingAlert === alert) state.terminalDeliveryInFlight = false;
     }
@@ -441,7 +440,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
           clearRegistrationRetryTimer();
         })
         .catch((error) => {
-          logExtensionError('register session', error);
+          logExtensionEvent('session_register_failed');
           if (heartbeatContext.sessionId !== sessionInfo.sessionId || settled) return;
           registrationRetryTimer = setTimeout(attemptRegistration, REGISTRATION_RETRY_MS);
           registrationRetryTimer.unref?.();
@@ -492,7 +491,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     commandPoller = startCommandPoller({
       sessionId,
       client: adapter,
-      onCommand: (command) => handleCommand(pi, ctx, command, adapter),
+      onCommand: (command) => handleCommand(pi, ctx, command),
       getSession: () => session,
     });
     registerSessionInBackground(ctx, session);
@@ -513,7 +512,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       session = withSessionStatus(session, session.status, agentText);
       heartbeatContext.latestActivityText = session.latestActivityText;
     }
-    if (sessionId) runAdapterTask('unregister session', () => adapter.unregisterSession(sessionId));
+    if (sessionId) runAdapterTask(() => adapter.unregisterSession(sessionId));
 
     heartbeatContext.sessionId = '';
     heartbeatContext.status = 'idle';
@@ -597,8 +596,8 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       heartbeatContext.latestActivityText = session.latestActivityText;
       try {
         await adapter.heartbeat(session.sessionId, 'idle', session.latestActivityText ?? null, session);
-      } catch (error) {
-        logExtensionError('heartbeat aborted session', error);
+      } catch {
+        logExtensionEvent('heartbeat_failed');
       }
       return;
     }
@@ -629,7 +628,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     );
     session = currentSession;
     heartbeatContext.latestActivityText = currentSession.latestActivityText;
-    runAdapterTask('refresh active branch session', () =>
+    runAdapterTask(() =>
       adapter.heartbeat(
         currentSession.sessionId, currentSession.status, currentSession.latestActivityText ?? null, currentSession,
       ),
@@ -641,9 +640,6 @@ async function handleCommand(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   command: import('@ariava/protocol').CommandEnvelope,
-  adapter: AgentAdapter,
-): Promise<void> {
-  const result = await executeCommand({ pi, ctx, command, adapter });
-  void adapter.submitResult(command.commandId, result)
-    .catch((error) => logExtensionError('submit command result', error));
+): ReturnType<typeof executeCommand> {
+  return executeCommand({ pi, ctx, command });
 }

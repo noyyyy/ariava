@@ -1,5 +1,4 @@
-import type { CanonicalSessionState, CommandEnvelope, CommandResult } from '@ariava/protocol';
-import { isoNow } from '@ariava/shared-utils';
+import type { CanonicalSessionState, CommandResult } from '@ariava/protocol';
 import type { AgentAdapterClient } from '../agent-adapter/client';
 import type { AgentDriver, DriverCommandContext } from '../types';
 
@@ -19,21 +18,27 @@ export class PaiDriver implements AgentDriver {
     return this.adapter.isAuthoritativeSetReady(persistedSessions);
   }
 
-  async executeCommand(ctx: DriverCommandContext): Promise<CommandResult> {
+  preflightCommandDispatch(ctx: DriverCommandContext): void {
+    this.adapter.assertCommandDispatchReady(ctx.command);
+  }
+
+  releaseCommandDispatch(ctx: DriverCommandContext): void {
     this.adapter.enqueueCommand(ctx.command);
-    const result = await this.adapter.waitForResult(ctx.command.commandId, { timeoutMs: 30_000 });
-    return result ?? timeoutResult(ctx.command);
+  }
+
+  async executeCommand(ctx: DriverCommandContext): Promise<CommandResult> {
+    try {
+      const result = await this.adapter.waitForResult(ctx.command.commandId, { timeoutMs: 30_000 });
+      if (!result) throw new CommandDispatchOutcomeUnknownError();
+      return result;
+    } catch (error) {
+      this.adapter.abandonCommand(ctx.command.commandId);
+      if (error instanceof CommandDispatchOutcomeUnknownError) throw error;
+      throw new CommandDispatchOutcomeUnknownError();
+    }
   }
 }
 
-export function timeoutResult(command: CommandEnvelope): CommandResult {
-  return {
-    commandId: command.commandId,
-    hostId: command.hostId,
-    sessionId: command.sessionId,
-    accepted: false,
-    status: 'failed',
-    message: 'The pi extension did not respond within the timeout window.',
-    updatedAt: isoNow(),
-  };
+export class CommandDispatchOutcomeUnknownError extends Error {
+  constructor() { super('Agent Adapter command outcome is unknown'); }
 }

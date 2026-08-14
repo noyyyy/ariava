@@ -161,6 +161,56 @@ describe('source dev profile commands', () => {
     expect(readFileSync(defaultConfig)).toEqual(sentinel);
   });
 
+  test('bare identity is rejected before profile effects', async () => {
+    const harness = createHarness();
+    let configReads = 0;
+    let identityCalls = 0;
+    harness.deps.loadUserConfig = () => { configReads += 1; throw new Error('config effect'); };
+    harness.deps.createIdentityStore = () => { identityCalls += 1; throw new Error('identity effect'); };
+
+    expect(await runDevProfileCommand(['identity', '--json'], harness.deps)).toBe(1);
+    expect(configReads).toBe(0);
+    expect(identityCalls).toBe(0);
+    expect(JSON.parse(harness.errorOutput())).toMatchObject({
+      code: 'ERR_CLI',
+      message: 'Usage: dev-profile-cli identity status | dev-profile-cli identity reset --confirm',
+    });
+  });
+
+  test.each([
+    { mode: 'human', json: false },
+    { mode: 'JSON', json: true },
+  ])('unconfirmed identity reset is effect-free in $mode mode', async ({ json }) => {
+    const harness = createHarness();
+    let identityCalls = 0;
+    let encryptionCalls = 0;
+    let configReads = 0;
+    harness.deps.loadUserConfig = () => { configReads += 1; throw new Error('config effect'); };
+    harness.deps.createIdentityStore = () => { identityCalls += 1; throw new Error('identity effect'); };
+    harness.deps.createEncryptionIdentityStore = () => { encryptionCalls += 1; throw new Error('encryption effect'); };
+
+    expect(await runDevProfileCommand([
+      'identity',
+      'reset',
+      ...(json ? ['--json'] : []),
+    ], harness.deps)).toBe(1);
+    expect(harness.output()).toBe('');
+    expect(identityCalls).toBe(0);
+    expect(encryptionCalls).toBe(0);
+    expect(configReads).toBe(0);
+    const expectedMessage = 'Usage: dev-profile-cli identity reset --confirm';
+    if (json) {
+      expect(JSON.parse(harness.errorOutput())).toEqual({
+        ok: false,
+        code: 'ERR_CONFIRMATION_REQUIRED',
+        message: expectedMessage,
+        data: {},
+      });
+    } else {
+      expect(harness.errorOutput()).toBe(`ariava: ${expectedMessage}\n`);
+    }
+  });
+
   test.each([
     { mode: 'human', json: false },
     { mode: 'JSON', json: true },
@@ -172,7 +222,7 @@ describe('source dev profile commands', () => {
       ...(json ? ['--json'] : []),
     ], harness.deps)).toBe(1);
     expect(harness.output()).toBe('');
-    const expectedMessage = 'Usage: dev-profile-cli identity status';
+    const expectedMessage = 'Usage: dev-profile-cli identity status | dev-profile-cli identity reset --confirm';
     if (json) {
       expect(JSON.parse(harness.errorOutput())).toEqual({
         ok: false,
@@ -238,9 +288,9 @@ describe('source dev profile commands', () => {
     expect(await runDevProfileCommand(['init', '--json'], harness.deps)).toBe(1);
     expect(JSON.parse(harness.errorOutput())).toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
     const callsAfterInit = keychain.calls.length;
-    expect(await runDevProfileCommand(['host', 'reset', '--json'], harness.deps)).toBe(1);
+    expect(await runDevProfileCommand(['identity', 'reset', '--json'], harness.deps)).toBe(1);
     expect(harness.errorOutput()).toContain('ERR_IDENTITY_RESET_REQUIRED');
-    expect(harness.errorOutput()).toContain('Usage: dev-profile-cli host reset --confirm');
+    expect(harness.errorOutput()).toContain('Usage: dev-profile-cli identity reset --confirm');
     expect(keychain.calls).toHaveLength(callsAfterInit);
     expect(harness.deps.pathExists(harness.deps.paths.configPath)).toBe(false);
     expect(snapshotItems(keychain)).toEqual(unconfirmedItemsBefore);
@@ -253,17 +303,20 @@ describe('source dev profile commands', () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
-      const body = await request.json() as { hostId: string };
+      const body = await request.json() as { hostId: string; hostName: string; platform: 'macos' | 'linux'; bridgeVersion: string };
       relayRequests.push({
         path: new URL(request.url).pathname,
         hostId: body.hostId,
         keyId: request.headers.get('x-ariava-key-id'),
       });
-      return Response.json({ host: hostProjection(body.hostId) });
+      return Response.json({ host: hostProjection(body) });
     }) as typeof fetch;
     let replacementHostId: string;
     try {
-      expect(await runDevProfileCommand(['host', 'reset', '--confirm'], harness.deps)).toBe(0);
+      expect(
+        await runDevProfileCommand(['identity', 'reset', '--confirm'], harness.deps),
+        harness.errorOutput(),
+      ).toBe(0);
       const devConfig = JSON.parse(readFileSync(harness.deps.paths.configPath, 'utf8'));
       replacementHostId = devConfig.identity.hostId;
       expect(replacementHostId).not.toBe(defaultIdentity.hostId);
@@ -279,10 +332,13 @@ describe('source dev profile commands', () => {
       expect(keychain.callsFor(orphanDevHostId).some((call) => call.action === 'delete')).toBe(true);
       const replacementEncryptionMetadata = JSON.parse(
         readFileSync(`${harness.deps.paths.identityPath}.e2e.json`, 'utf8'),
-      ) as { hostId: string; encryptionKeyId: string; account: string };
-      const replacementEncryptionAccount = `host-e2e:${replacementEncryptionMetadata.encryptionKeyId}`;
+      ) as { version: 2; hostId: string; currentKeyId: string; identities: Array<{ encryptionKeyId: string; account: string }> };
+      const replacementEncryptionIdentity = replacementEncryptionMetadata.identities.find(
+        (identity) => identity.encryptionKeyId === replacementEncryptionMetadata.currentKeyId,
+      );
+      const replacementEncryptionAccount = `host-e2e:${replacementEncryptionMetadata.currentKeyId}`;
       expect(replacementEncryptionMetadata.hostId).toBe(replacementHostId);
-      expect(replacementEncryptionMetadata.account).toBe(replacementEncryptionAccount);
+      expect(replacementEncryptionIdentity?.account).toBe(replacementEncryptionAccount);
       expect(keychain.snapshot(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev)).not.toEqual(devEvidenceBefore);
       expect(keychain.snapshot(replacementHostId)).toBeDefined();
       expect(keychain.snapshot(replacementEncryptionAccount)).toBeDefined();
@@ -668,20 +724,10 @@ describe('source dev profile commands', () => {
       expect(url.origin).toBe('http://127.0.0.1:8790');
       paths.push(url.pathname);
       if (url.pathname === '/v2/bridge/enroll') {
-        const body = await request.json() as { hostId: string; hostName: string };
+        const body = await request.json() as { hostId: string; hostName: string; platform: 'macos' | 'linux'; bridgeVersion: string };
         expect(body.hostId).toBe(identity!.hostId);
         expect(body.hostName).toBe('test-host (Dev)');
-        return Response.json({
-          host: {
-            hostId: identity!.hostId,
-            hostName: body.hostName,
-            platform: 'linux',
-            bridgeVersion: '0.0.0-test',
-            status: 'active',
-            enrolledAt: new Date().toISOString(),
-            lastSeenAt: new Date().toISOString(),
-          },
-        });
+        return Response.json({ host: hostProjection(body) });
       }
       if (url.pathname === '/v2/bridge/pair-watch') {
         expect(await request.json()).toEqual({ pairingCode: 'PEYX7K' });
@@ -719,7 +765,7 @@ describe('source dev profile commands', () => {
     }) as typeof fetch;
 
     try {
-      expect(await runDevProfileCommand(['pair', 'peyx7k'], harness.deps)).toBe(0);
+      expect(await runDevProfileCommand(['pair', 'peyx7k'], harness.deps), harness.errorOutput()).toBe(0);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -839,15 +885,19 @@ function snapshotItems(keychain: FakeKeychain): Array<[string, string]> {
     .sort(([left], [right]) => left.localeCompare(right));
 }
 
-function hostProjection(hostId: string) {
+function hostProjection(input: string | { hostId: string; hostName: string; platform: 'macos' | 'linux'; bridgeVersion: string }) {
+  const metadata = typeof input === 'string'
+    ? { hostId: input, hostName: 'test-host (Dev)', platform: 'linux' as const, bridgeVersion: '0.0.0-test' }
+    : input;
   return {
-    hostId,
-    hostName: 'test-host (Dev)',
-    platform: 'macos',
-    bridgeVersion: '0.0.0-test',
+    hostId: metadata.hostId,
+    hostName: metadata.hostName,
+    platform: metadata.platform,
+    bridgeVersion: metadata.bridgeVersion,
     registeredAt: new Date().toISOString(),
     lastSeenAt: new Date().toISOString(),
-    bridgeStatus: 'online',
+    bridgeStatus: 'online' as const,
+    status: 'active' as const,
   };
 }
 

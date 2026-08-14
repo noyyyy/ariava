@@ -12,12 +12,30 @@ export function resolveExtensionLogPath(explicitLogPath?: string): string {
   return environmentLogPath?.trim() ? environmentLogPath : DEFAULT_LOG_PATH;
 }
 
-export function logExtensionError(label: string, error: unknown, logPath?: string): void {
+export type ExtensionLogEventCode =
+  | 'adapter_task_failed'
+  | 'command_dispatch_failed'
+  | 'command_dispatch_canceled'
+  | 'command_poll_failed'
+  | 'command_result_invalid'
+  | 'command_result_submit_failed'
+  | 'heartbeat_failed'
+  | 'session_register_failed'
+  | 'terminal_event_push_failed';
+
+export interface ExtensionLogContext {
+  commandId?: string;
+}
+
+export function logExtensionEvent(
+  event: ExtensionLogEventCode,
+  context: ExtensionLogContext = {},
+  logPath?: string,
+ ): void {
   const resolvedLogPath = resolveExtensionLogPath(logPath);
   const entry = JSON.stringify({
-    timestamp: new Date().toISOString(),
-    label,
-    error: serializeError(error),
+    event,
+    ...(context.commandId ? { commandId: context.commandId } : {}),
   });
 
   void mkdir(dirname(resolvedLogPath), { recursive: true })
@@ -27,21 +45,15 @@ export function logExtensionError(label: string, error: unknown, logPath?: strin
     });
 }
 
-export function logExtensionErrorThrottled(label: string, error: unknown, intervalMs = 60_000): void {
+export function logExtensionEventThrottled(
+  event: ExtensionLogEventCode,
+  context: ExtensionLogContext = {},
+  intervalMs = 60_000,
+): void {
+  const key = `${event}:${context.commandId ?? ''}`;
   const now = Date.now();
-  const lastLoggedAt = lastThrottledLogAt.get(label) ?? 0;
+  const lastLoggedAt = lastThrottledLogAt.get(key) ?? 0;
   if (now - lastLoggedAt < intervalMs) return;
-  lastThrottledLogAt.set(label, now);
-  logExtensionError(label, error);
-}
-
-function serializeError(error: unknown): { name?: string; message: string; stack?: string } {
-  if (error instanceof Error) {
-    return {
-      name: error.name,
-      message: error.message,
-      stack: error.stack,
-    };
-  }
-  return { message: String(error) };
+  lastThrottledLogAt.set(key, now);
+  logExtensionEvent(event, context);
 }

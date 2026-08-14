@@ -43,6 +43,7 @@ export interface LinkedWatchProjection {
   watchDeviceId: string;
   pairedAt: string;
   lastSeenAt: string;
+  linkGeneration: number;
   e2e?: E2EPendingLinkProjectionV1;
 }
 

@@ -7,7 +7,6 @@ import {
   SIGNED_REQUEST_LIMITS,
   base64UrlEncode,
   formatPairingCode,
-  isRotationOperationId,
   normalizePairingCode,
   validateSignedRequestHeaders,
   type SignedRequestHeaders,
@@ -72,18 +71,9 @@ describe('frozen v2 foundation constants', () => {
     expect(normalizePairingCode('peyx7k')).toBe('PEYX7K');
   });
 
-  test('freezes rotation operation ID format and length', () => {
-    const valid = 'op_123e4567-e89b-12d3-a456-426614174000';
-    expect(valid.length).toBe(39);
-    expect(isRotationOperationId(valid)).toBe(true);
-    for (const invalid of [
-      valid.slice(0, -1),
-      `${valid}0`,
-      valid.replace('op_', ''),
-      'op_123E4567-e89b-12d3-a456-426614174000',
-      'op_123e4567-e89b-02d3-a456-426614174000',
-      'op_123e4567-e89b-12d3-c456-426614174000',
-    ]) expect(isRotationOperationId(invalid)).toBe(false);
+  test('does not expose signing-key rotation operation identifiers', async () => {
+    const protocol = await import('../src');
+    expect(protocol).not.toHaveProperty('isRotationOperationId');
   });
 });
 

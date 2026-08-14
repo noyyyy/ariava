@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  COMMAND_LIMITS,
   COMMAND_TYPES,
   EVENT_TYPES,
   NEED_HUMAN_ERROR_KINDS,
@@ -14,6 +15,8 @@ import {
   isUserVisibleActionableAlert,
   normalizePairingCode,
   validateCanonicalEventInvariant,
+  validateCommandResult,
+  validateCommandSubmissionAckV1,
   validateEventTypeStatusPair,
   validateCommandType,
   type CanonicalEvent,
@@ -40,9 +43,44 @@ const validError: NeedHumanError = {
 describe('protocol helpers', () => {
   test('preserves the narrow signed-HTTP command surface', () => {
     expect(COMMAND_TYPES).toEqual(['reply', 'interrupt']);
+    expect(COMMAND_LIMITS).toEqual({
+      maxTtlMs: 300_000, replyTextBytes: 4_000,
+      replyCanonicalPlaintextBytes: 24_023, replyCiphertextBytes: 24_039,
+    });
     expect(validateCommandType('reply')).toBe(true);
     expect(validateCommandType('shell')).toBe(false);
     expect(isCommandExpired({ expiresAt: '2026-06-28T09:59:59Z' }, new Date('2026-06-28T10:00:00Z'))).toBe(true);
+  });
+
+  test('strictly separates local terminal results from Relay submission acknowledgment', () => {
+    const result = {
+      commandId: 'command_1', hostId: 'host_1', sessionId: 'session_1', accepted: true, status: 'executed',
+      updatedAt: '2026-08-12T00:00:00.000Z',
+    } as const;
+    expect(validateCommandResult(result)).toBe(true);
+    expect(validateCommandResult({ ...result, accepted: false })).toBe(false);
+    expect(validateCommandResult({ ...result, status: 'queued' })).toBe(false);
+    for (const field of ['message', 'reason', 'detail', 'error', 'code', 'correlationId'] as const) {
+      expect(validateCommandResult({ ...result, [field]: 'forbidden' }), field).toBe(false);
+    }
+    for (const status of ['expired', 'rejected', 'failed'] as const) {
+      expect(validateCommandResult({ ...result, accepted: false, status })).toBe(true);
+      expect(validateCommandResult({ ...result, accepted: true, status })).toBe(false);
+    }
+
+    const ack = { commandId: 'command_1', receivedAt: '2026-08-12T00:00:00.000Z' };
+    expect(validateCommandSubmissionAckV1(ack)).toBe(true);
+    expect(validateCommandSubmissionAckV1({ ...ack, receivedAt: '2026-08-12T00:00:00Z' })).toBe(false);
+    for (const field of ['accepted', 'status', 'message', 'reason', 'result'] as const) {
+      expect(validateCommandSubmissionAckV1({ ...ack, [field]: true }), field).toBe(false);
+    }
+
+    const nullResult = Object.assign(Object.create(null), result);
+    const nullAck = Object.assign(Object.create(null), ack);
+    expect(validateCommandResult(nullResult)).toBe(true);
+    expect(validateCommandSubmissionAckV1(nullAck)).toBe(true);
+    expect(validateCommandResult(Object.assign(Object.create({ toJSON: () => result }), result))).toBe(false);
+    expect(validateCommandSubmissionAckV1(Object.assign(Object.create({ toJSON: () => ack }), ack))).toBe(false);
   });
 
   test('exposes v2 Host platforms and link constants', () => {

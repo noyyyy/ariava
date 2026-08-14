@@ -3,7 +3,7 @@ import type { AriavaCliCommandSuccess, AriavaProfileCliContext } from '../contex
 import type { ProfileIdentityResetDependencies } from '../operations/identity';
 import type { PairProfileDependencies } from '../operations/pair';
 import type { WatchesProfileDependencies } from '../operations/watches';
-import { runHostCommand, runIdentityCommand } from './identity';
+import { runIdentityCommand } from './identity';
 import { runPairCommand } from './pair';
 import { runWatchesCommand } from './watches';
 import { initializeProfile } from '../operations/initialize';
@@ -60,7 +60,6 @@ export async function runSharedHostCommand(
     case 'status': return runStatusCommand(argv.slice(1), dependencies.status);
     case 'doctor': return runDoctorCommand(argv.slice(1), dependencies.doctor);
     case 'identity': return runIdentityCommand(argv.slice(1), dependencies);
-    case 'host': return runHostCommand(argv.slice(1), dependencies);
     case 'pair': return runPairCommand(argv.slice(1), options.json, dependencies);
     case 'watches': return runWatchesCommand(argv.slice(1), dependencies);
     default: throw new Error(`Unknown shared command: ${argv[0] ?? ''}`);

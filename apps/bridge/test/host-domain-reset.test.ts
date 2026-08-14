@@ -75,8 +75,8 @@ describe('Host-domain reset journal', () => {
     expect(Object.keys(stored).sort()).toEqual([
       'configSavedAt', 'createdAt', 'encryptionIdentityReplacedAt', 'enrolledAt', 'newHostId', 'newKeyId',
       'oldEncryptionKeyId', 'oldHostId', 'oldKeyId', 'operationId', 'phase', 'profile', 'resourceDigest', 'revoke',
-      'runtimeArtifactsClearedAt', 'service', 'serviceMetadataSynchronizedAt', 'signingReplacementAttemptedAt',
-      'updatedAt', 'version',
+      'runtimeArtifactsClearedAt', 'service', 'serviceMetadataSynchronizedAt', 'signingCleanup',
+      'signingReplacementAttemptedAt', 'updatedAt', 'version',
     ]);
     expect(JSON.stringify(stored)).not.toMatch(/private|secret|credential|payload|command|spoolKey/i);
     expect(JSON.stringify(stored)).not.toContain(resources.identityMetadataPath);
@@ -157,7 +157,10 @@ describe('Host-domain reset journal', () => {
 
   test('supports every fixed phase and advances only monotonically with stable binding fields', () => {
     const resources = resourcesFor('dev');
-    let current = journalFor(resources, { profile: 'dev' });
+    let current = journalFor(resources, {
+      profile: 'dev',
+      ...phasePatch(HOST_DOMAIN_RESET_PHASES[0], '2026-08-11T00:00:00.000Z'),
+    });
     writeHostDomainResetJournal(resources, current);
 
     for (const phase of HOST_DOMAIN_RESET_PHASES.slice(1)) {
@@ -542,6 +545,7 @@ function journalFor(
     newHostId: null,
     newKeyId: null,
     oldEncryptionKeyId: `ekey_${'C'.repeat(43)}`,
+    signingCleanup: null,
     signingReplacementAttemptedAt: null,
     encryptionIdentityReplacedAt: null,
     runtimeArtifactsClearedAt: null,
@@ -571,6 +575,12 @@ function phasePatch(
   const evidenceTimestamp = '2026-08-11T00:00:00.000Z';
   return {
     phase,
+    ...(phase === 'quarantine-pending' || phase === 'quarantined'
+      ? { oldHostId: null, oldKeyId: null, oldEncryptionKeyId: null }
+      : {
+        oldHostId: `host_${'A'.repeat(43)}`, oldKeyId: `key_${'B'.repeat(43)}`,
+        oldEncryptionKeyId: `ekey_${'C'.repeat(43)}`,
+      }),
     ...(atLeast('revoke-pending') ? { revoke: { state: 'pending' as const, outcome: null } } : {}),
     ...(atLeast('old-identity-revoked') ? { revoke: { state: 'complete' as const, outcome: 'revoked' as const } } : {}),
     ...(atLeast('signing-replacement-pending') ? { signingReplacementAttemptedAt: evidenceTimestamp } : {}),

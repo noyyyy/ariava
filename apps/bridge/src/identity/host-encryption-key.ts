@@ -28,6 +28,7 @@ export interface HostEncryptionIdentity {
 }
 
 export function generateHostEncryptionIdentity(hostId: string, sequence = 1, createdAt = new Date().toISOString()): HostEncryptionIdentity {
+  assertCanonicalHostId(hostId);
   const pair = generateKeyPairSync('x25519');
   const jwk = pair.publicKey.export({ format: 'jwk' });
   if (jwk.kty !== 'OKP' || jwk.crv !== 'X25519' || typeof jwk.x !== 'string') {
@@ -107,4 +108,10 @@ export async function createHostEncryptionBinding(
     createdAt: encryptionIdentity.createdAt,
   };
   return { ...unsigned, bindingSignature: await identity.signer.sign(buildEncryptionBindingBytes(unsigned)) };
+}
+
+export function assertCanonicalHostId(hostId: string): void {
+  if (!/^host_[A-Za-z0-9_-]{43}$/u.test(hostId)) {
+    throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Host ID must be canonical host_<43 base64url>');
+  }
 }

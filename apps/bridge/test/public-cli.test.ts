@@ -304,13 +304,13 @@ describe('public ariava CLI', () => {
       const error = new AriavaCliError('ERR_HOST_RESET_RECOVERY_REQUIRED', 'Host reset recovery requires attention.', {
         phase: 'service-restore-pending', operationId: 'reset_12345678', retryable: true,
         remediation: {
-          message: 'Retry the profile-specific Host reset recovery command: ariava host reset --confirm',
-          command: 'ariava host reset --confirm',
+          message: 'Retry the profile-specific identity reset recovery command: ariava identity reset --confirm',
+          command: 'ariava identity reset --confirm',
         },
       });
       const failure = normalizeCliFailure(error);
       expect(failure.data).toEqual(error.data);
-      expect(formatHumanCliFailure(failure)).toContain('Next: ariava host reset --confirm');
+      expect(formatHumanCliFailure(failure)).toContain('Next: ariava identity reset --confirm');
     });
 
     test('generic and relay failures normalize to stable codes', () => {
@@ -626,14 +626,12 @@ describe('public ariava CLI', () => {
       'ariava watches list',
       'ariava watches remove <WATCH_DEVICE_ID>',
       'ariava identity status',
-      'ariava host rotate-key',
-      'ariava host reset --confirm',
+      'ariava identity reset --confirm',
       'ariava doctor',
       'ariava logs',
       'ariava upgrade [pi]',
       'ariava uninstall [--purge] [--remove-pi]',
       'ariava config path|show|get|set',
-      'ariava config agent-secret ensure|rotate',
       'ariava service install|reinstall|status|start|stop|restart|uninstall',
       'ariava install pi',
       'ariava remove pi',
@@ -1567,8 +1565,7 @@ describe('public ariava CLI', () => {
               ownerIntegrity: false,
               permissionIntegrity: false,
               metadataIntegrity: false,
-              pendingRotation: false,
-            },
+              },
           },
         },
       });
@@ -1751,7 +1748,7 @@ describe('public ariava CLI', () => {
             status: 'not-initialized', storageType: 'linux-json',
             storageReference: { type: 'linux-json', path: join(home, '.config', 'ariava', 'host-identity.json') },
             path: join(home, '.config', 'ariava', 'host-identity.json'),
-            ownerIntegrity: false, permissionIntegrity: false, metadataIntegrity: false, pendingRotation: false,
+            ownerIntegrity: false, permissionIntegrity: false, metadataIntegrity: false,
           } as any,
           identityReady: false,
           agentAdapterConfigPath: join(home, '.config', 'ariava', 'agent-adapter.json'),
@@ -1844,7 +1841,7 @@ describe('public ariava CLI', () => {
           status: 'not-initialized', storageType: 'linux-json',
           storageReference: { type: 'linux-json', path: join(home, '.config', 'ariava', 'host-identity.json') },
           path: join(home, '.config', 'ariava', 'host-identity.json'),
-          ownerIntegrity: false, permissionIntegrity: false, metadataIntegrity: false, pendingRotation: false,
+          ownerIntegrity: false, permissionIntegrity: false, metadataIntegrity: false,
         } as any,
         identityReady: false,
         agentAdapterConfigPath: join(home, '.config', 'ariava', 'agent-adapter.json'),

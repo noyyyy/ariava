@@ -36,7 +36,7 @@ export function defaultReadinessRemediation(code: string | undefined, message: s
     return { message, command: 'security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"' };
   }
   if (code === 'ERR_IDENTITY_INVALID' || code === 'ERR_IDENTITY_MISSING' || code === 'ERR_IDENTITY_PERMISSIONS' || code === 'ERR_IDENTITY_RESET_REQUIRED') {
-    return { message, command: 'ariava host reset --confirm' };
+    return { message, command: 'ariava identity reset --confirm' };
   }
   if (code === 'ERR_SERVICE_NOT_INSTALLED' || code === 'ERR_SERVICE_METADATA') {
     return { message, command: 'ariava service reinstall' };

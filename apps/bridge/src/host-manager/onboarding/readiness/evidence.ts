@@ -51,7 +51,7 @@ export function persistedConfigReady(input: PersistedConfigInput): boolean {
 export function identityReady(input: IdentityInput): boolean {
   const inspected = input.identityInspection;
   return inspected.status === 'ready' && inspected.ownerIntegrity && inspected.permissionIntegrity
-    && inspected.metadataIntegrity && !inspected.pendingRotation
+    && inspected.metadataIntegrity
     && inspected.hostId === input.identity.hostId && inspected.keyId === input.identity.keyId;
 }
 

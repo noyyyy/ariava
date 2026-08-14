@@ -1,3 +1,4 @@
+import { E2E_SUITE_V1, type EncryptionKeyBindingV1 } from '@ariava/protocol';
 import { describe, expect, test } from 'bun:test';
 import { HostIdentityError } from '../src/identity/errors';
 import type { HostIdentity, HostIdentityInspection } from '../src/identity/types';
@@ -28,7 +29,12 @@ const identity: HostIdentity = {
 const inspection: HostIdentityInspection = {
   status: 'ready', storageType: 'linux-json', storageReference: storage, path: storage.path,
   hostId: identity.hostId, keyId: identity.keyId, algorithm: 'Ed25519', publicKeyFingerprint: identity.publicKeyFingerprint,
-  ownerIntegrity: true, permissionIntegrity: true, metadataIntegrity: true, pendingRotation: false,
+  ownerIntegrity: true, permissionIntegrity: true, metadataIntegrity: true,
+};
+const encryptionBinding: EncryptionKeyBindingV1 = {
+  version: 1, entityType: 'host', entityId: identity.hostId, identityKeyId: identity.keyId,
+  encryptionKeyId: 'ekey-test', suite: E2E_SUITE_V1, publicKey: 'public-encryption-key',
+  sequence: 1, createdAt: identity.createdAt, bindingSignature: 'binding-signature',
 };
 const onboardingStepIds = [
   'preflight', 'stable-cli', 'relay-config', 'host-init', 'bridge-service',
@@ -47,6 +53,7 @@ function serviceRecord(backend: 'launchd' | 'systemd-user' = 'systemd-user'): Ar
 function hostState(): OnboardingHostState {
   return {
     identity, identityInspection: inspection,
+    encryptionBinding,
     config: {
       relayBaseUrl: 'https://ariava-relay.noyx.io', hostName: 'Test Host', agentAdapterPort: 7272,
       agentAdapterConfigPath: '/home/test/.config/ariava/agent-adapter.json', agentAdapterSecret: 'secret',
@@ -373,12 +380,12 @@ describe('onboarding orchestrator', () => {
       detail: {
         code: 'ERR_IDENTITY_INVALID',
         message: expect.stringContaining('invalid or unreadable'),
-        remediation: { command: 'ariava host reset --confirm' },
+        remediation: { command: 'ariava identity reset --confirm' },
       },
     });
     expect(result.nextActions[0]).toMatchObject({
       id: 'resolve-failure',
-      command: 'ariava host reset --confirm',
+      command: 'ariava identity reset --confirm',
       message: expect.stringContaining('invalid or unreadable'),
     });
   });
@@ -449,11 +456,11 @@ describe('onboarding orchestrator', () => {
       detail: {
         code: 'ERR_IDENTITY_RESET_REQUIRED',
         message: 'Host identity evidence already exists; explicit reset is required',
-        remediation: { command: 'ariava host reset --confirm' },
+        remediation: { command: 'ariava identity reset --confirm' },
       },
     });
     expect(result.nextActions[0]).toMatchObject({
-      command: 'ariava host reset --confirm',
+      command: 'ariava identity reset --confirm',
       message: 'Host identity evidence already exists; explicit reset is required',
     });
   });

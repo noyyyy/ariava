@@ -61,7 +61,7 @@ function normalizeOrchestratorFailure(error: unknown, current: OnboardingStepId)
   if (error instanceof HostIdentityError) {
     const remediation = defaultRemediationForCode(error.code, error.message) ?? {
       message: error.message,
-      command: 'ariava host reset --confirm',
+      command: 'ariava identity reset --confirm',
     };
     return {
       code: error.code,
@@ -94,7 +94,7 @@ function defaultRemediationForCode(code: string, message: string): { message: st
     return { message, command: 'security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"' };
   }
   if (code === 'ERR_IDENTITY_INVALID' || code === 'ERR_IDENTITY_MISSING' || code === 'ERR_IDENTITY_PERMISSIONS' || code === 'ERR_IDENTITY_RESET_REQUIRED') {
-    return { message, command: 'ariava host reset --confirm' };
+    return { message, command: 'ariava identity reset --confirm' };
   }
   if (code === 'ERR_IDENTITY_NOT_INITIALIZED') {
     return { message, command: 'ariava setup' };

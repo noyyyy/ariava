@@ -4,11 +4,16 @@ import {
   AGENT_ADAPTER_PROTOCOL_HEADER,
   AGENT_ADAPTER_PROTOCOL_VERSION,
   type CommandEnvelope,
-  type CommandResult,
   type HandleSessionRequest,
   type SessionStatus,
 } from '@ariava/protocol';
-import type { AgentAdapter, AgentAdapterEvent } from './adapter-interface';
+import {
+  validateAgentAdapterCommand,
+  validateAgentAdapterCommandResult,
+  type AgentAdapter,
+  type AgentAdapterCommandResult,
+  type AgentAdapterEvent,
+} from './adapter-interface';
 import type { PiSessionInfo } from './session';
 
 export interface AgentAdapterDiscoveryFile {
@@ -107,16 +112,21 @@ export class AgentAdapterClient implements AgentAdapter {
     }
     await this.requireOk(response, 'GET', path);
     if (response.status === 204) return null;
-    const body = (await response.json()) as { command: CommandEnvelope };
-    return body.command;
+    const body = await response.json() as unknown;
+    if (!isExactCommandResponse(body) || !validateAgentAdapterCommand(body.command)) {
+      throw new TypeError('Agent Adapter command response is invalid');
+    }
+    return structuredClone(body.command);
   }
 
-  async submitResult(commandId: string, result: CommandResult): Promise<void> {
-    const sessionId = result.sessionId;
+  async submitResult(commandId: string, result: AgentAdapterCommandResult): Promise<void> {
+    if (commandId !== result.commandId || !validateAgentAdapterCommandResult(result)) {
+      throw new TypeError('Agent Adapter command result is invalid');
+    }
     await this.fetch(
       'POST',
-      `/v1/agent/sessions/${encodeURIComponent(sessionId)}/commands/${encodeURIComponent(commandId)}/result`,
-      result,
+      `/v1/agent/sessions/${encodeURIComponent(result.sessionId)}/commands/${encodeURIComponent(commandId)}/result`,
+      structuredClone(result),
     );
   }
 
@@ -202,6 +212,16 @@ export class AgentAdapterClient implements AgentAdapter {
 
     throw lastError;
   }
+}
+
+function isExactCommandResponse(value: unknown): value is { command: unknown } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== 1 || keys[0] !== 'command') return false;
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'command');
+  return Boolean(descriptor?.enumerable && 'value' in descriptor);
 }
 
 function isDiscoveryFile(value: unknown): value is AgentAdapterDiscoveryFile {

@@ -2,7 +2,9 @@ import type {
   CanonicalEvent,
   CanonicalSessionState,
   CommandEnvelope,
+  CommandReceiptEnvelopeV1,
   CommandResult,
+  EncryptedCommandEnvelopeV1,
   HostProjection,
   HostPlatform,
   ReplaceE2ECurrentSessionsRequestV1,
@@ -18,6 +20,8 @@ export interface AgentDriver {
   readonly name: string;
   listSessions(hostId: string): Promise<CanonicalSessionState[]>;
   isAuthoritativeSetReady?(persistedSessions: CanonicalSessionState[]): boolean;
+  preflightCommandDispatch?(context: DriverCommandContext): void | Promise<void>;
+  releaseCommandDispatch?(context: DriverCommandContext): void | Promise<void>;
   executeCommand(context: DriverCommandContext): Promise<CommandResult>;
 }
 
@@ -133,8 +137,46 @@ export interface BridgeRuntimeHealth {
   relayPresence?: RelayPresenceRuntimeHealth;
 }
 
+export interface PersistedCommandPinReferenceV1 {
+  version: 1;
+  linkId: string;
+  linkGeneration: number;
+  epoch: number;
+  transcriptDigest: string;
+  hostEncryptionKeyId: string;
+  watchEncryptionKeyId: string;
+}
+
+export interface PersistedCommandReceiptOutboxV1 {
+  version: 1;
+  state: 'pending' | 'acknowledged' | 'undeliverable';
+  canonicalBody: string;
+  receiptDigest: string;
+}
+
+export interface PersistedCommandExecutionV4 {
+  version: 1;
+  originalEncryptedCommand: EncryptedCommandEnvelopeV1;
+  commandDigest: string;
+  pinReference: PersistedCommandPinReferenceV1;
+  watchDeviceId: string;
+  nonce: string;
+  expiresAt: string;
+  state: 'claimed' | 'dispatch_started' | 'outcome_unknown' | 'terminal_receipt_blocked' | 'terminal';
+  claimedAt: string;
+  dispatchStartedAt?: string;
+  terminalResult?: CommandResult;
+  receiptOutbox?: PersistedCommandReceiptOutboxV1;
+}
+
+export interface CommandReceiptOutboxInputV1 {
+  canonicalBody: string;
+  receiptDigest: string;
+  receipt: CommandReceiptEnvelopeV1;
+}
+
 export interface PersistedBridgeState {
-  schemaVersion: 3;
+  schemaVersion: 4;
   runtimeResetEpoch: string;
   host: HostProjection | null;
   sessions: Record<string, CanonicalSessionState>;
@@ -147,8 +189,7 @@ export interface PersistedBridgeState {
   producerEventReservations?: Record<string, PersistedProducerEventReservationV1>;
   terminalCancellations?: Record<string, PersistedTerminalCancellationV1>;
   pendingHandles: Record<string, PendingSessionHandle>;
-  commandResults: Record<string, CommandResult>;
-  seenCommands: Record<string, string>;
+  commandExecutions: Record<string, PersistedCommandExecutionV4>;
   currentSessionsSnapshot: PersistedCurrentSessionsSnapshotState;
   runtimeHealth?: BridgeRuntimeHealth;
 }

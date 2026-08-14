@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { CanonicalSessionState, CommandEnvelope, CommandResult } from '@ariava/protocol';
 import type { AgentAdapterClient } from '../../src/agent-adapter/client';
-import { PaiDriver, timeoutResult } from '../../src/drivers/pi';
+import { CommandDispatchOutcomeUnknownError, PaiDriver } from '../../src/drivers/pi';
 import type { DriverCommandContext } from '../../src/types';
 
 function buildCommand(overrides: Partial<CommandEnvelope> = {}): CommandEnvelope {
@@ -53,13 +53,13 @@ describe('PaiDriver', () => {
       sessionId: command.sessionId,
       accepted: true,
       status: 'executed',
-      message: 'Sent to pi',
-      updatedAt: '2026-06-30T10:00:01Z',
+      updatedAt: '2026-06-30T10:00:01.000Z',
     };
 
     let enqueued: CommandEnvelope | undefined;
     const adapter: AgentAdapterClient = {
       listSessions: async () => [],
+      assertCommandDispatchReady: () => {},
       enqueueCommand: (cmd) => {
         enqueued = cmd;
       },
@@ -68,42 +68,51 @@ describe('PaiDriver', () => {
 
     const driver = new PaiDriver(adapter, 'host-1');
     const ctx: DriverCommandContext = { command, session: buildSession() };
+    driver.preflightCommandDispatch(ctx);
+    driver.releaseCommandDispatch(ctx);
     const result = await driver.executeCommand(ctx);
 
     expect(enqueued).toBe(command);
-    expect(result).toEqual(resolved);
+    expect(result).toBe(resolved);
   });
 
-  test('executeCommand returns timeout result when no result arrives', async () => {
+  test('executeCommand reports outcome unknown when no authenticated result arrives', async () => {
     const command = buildCommand();
     let enqueued: CommandEnvelope | undefined;
+    let abandoned: string | undefined;
     const adapter: AgentAdapterClient = {
       listSessions: async () => [],
-      enqueueCommand: (cmd) => {
-        enqueued = cmd;
-      },
+      assertCommandDispatchReady: () => {},
+      enqueueCommand: (cmd) => { enqueued = cmd; },
       waitForResult: async () => undefined,
+      abandonCommand: (commandId) => { abandoned = commandId; },
     } as unknown as AgentAdapterClient;
-
     const driver = new PaiDriver(adapter, 'host-1');
     const ctx: DriverCommandContext = { command, session: buildSession() };
-    const result = await driver.executeCommand(ctx);
-
+    driver.preflightCommandDispatch(ctx);
+    driver.releaseCommandDispatch(ctx);
+    await expect(driver.executeCommand(ctx)).rejects.toBeInstanceOf(CommandDispatchOutcomeUnknownError);
     expect(enqueued).toBe(command);
-    expect(result.status).toBe('failed');
-    expect(result.accepted).toBe(false);
-    expect(result.message).toContain('did not respond');
+    expect(abandoned).toBe(command.commandId);
   });
 
-  test('timeoutResult helper builds expected failed result', () => {
+  test('executeCommand converts result waiter disconnects and throws to outcome uncertainty', async () => {
     const command = buildCommand();
-    const result = timeoutResult(command);
+    for (const failure of [new Error('adapter disconnected'), new TypeError('poll canceled')]) {
+      let abandoned: string | undefined;
+      const adapter = {
+        assertCommandDispatchReady: () => {},
+        enqueueCommand: () => {},
+        waitForResult: async () => { throw failure; },
+        abandonCommand: (commandId: string) => { abandoned = commandId; },
+      } as unknown as AgentAdapterClient;
+      const driver = new PaiDriver(adapter, 'host-1');
+      const ctx: DriverCommandContext = { command, session: buildSession() };
+      driver.preflightCommandDispatch(ctx);
+      driver.releaseCommandDispatch(ctx);
 
-    expect(result.commandId).toBe(command.commandId);
-    expect(result.hostId).toBe(command.hostId);
-    expect(result.sessionId).toBe(command.sessionId);
-    expect(result.accepted).toBe(false);
-    expect(result.status).toBe('failed');
-    expect(result.updatedAt).toMatch(/\d{4}-/);
+      await expect(driver.executeCommand(ctx)).rejects.toEqual(new CommandDispatchOutcomeUnknownError());
+      expect(abandoned).toBe(command.commandId);
+    }
   });
 });

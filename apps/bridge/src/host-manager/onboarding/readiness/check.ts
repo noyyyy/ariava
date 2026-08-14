@@ -1,4 +1,4 @@
-import type { HostPlatform } from '@ariava/protocol';
+import type { EncryptionKeyBindingV1, HostPlatform } from '@ariava/protocol';
 import type { HostIdentity, HostIdentityInspection } from '../../../identity/types';
 import type { AriavaInstallMetadata, ResolvedAriavaConfig } from '../../config';
 import type { PiExtensionStatus } from '../../pi-extension';
@@ -49,6 +49,7 @@ export interface StrictReadinessInput {
   config: ResolvedAriavaConfig;
   identityInspection: HostIdentityInspection;
   identity: HostIdentity;
+  encryptionBinding: EncryptionKeyBindingV1;
   serviceRecord?: AriavaServiceInstallRecord;
   expectedRuntimePath: string;
   expectedAriavaBinPath: string;
@@ -101,7 +102,7 @@ export async function checkStrictOnboardingReadiness(
       'identity',
       identityReady(input),
       'ERR_IDENTITY_INVALID',
-      'Host identity is not ready (invalid, pending rotation, or integrity checks failed).',
+      'Host identity is not ready (invalid or integrity checks failed).',
     ),
   ];
 

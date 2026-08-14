@@ -8,6 +8,9 @@ import { base64UrlEncode } from '../../../packages/protocol/dist/index.js';
 import { BridgeDaemon } from '../dist/daemon.js';
 import { spoolPathForState } from '../dist/e2e/local-spool.js';
 
+const HOST_ID = `host_${'H'.repeat(43)}`;
+const HOST_KEY_ID = `key_${'H'.repeat(43)}`;
+
 const childScript = String.raw`
   import { mkdtempSync } from 'node:fs';
   import { tmpdir } from 'node:os';
@@ -96,15 +99,15 @@ test('production daemon defers old-state decoding until startup preflight resets
   const oldStateBytes = Buffer.from(`${JSON.stringify({ schemaVersion: 1, pendingEvents: [] })}\n`);
   const key = new Uint8Array(32).fill(7);
   const keyPath = `${identityPath}.spool-key.json`;
-  const keyBytes = Buffer.from(`${JSON.stringify({ version: 1, hostId: 'host-test', key: base64UrlEncode(key) })}\n`);
+  const keyBytes = Buffer.from(`${JSON.stringify({ version: 1, hostId: HOST_ID, key: base64UrlEncode(key) })}\n`);
   writeFileSync(statePath, oldStateBytes, { mode: 0o600 });
   writeFileSync(keyPath, keyBytes, { mode: 0o600 });
   writeFileSync(configPath, '{}\n', { mode: 0o600 });
   const identity = {
-    identityVersion: 2, hostId: 'host-test', keyId: 'key-test', algorithm: 'Ed25519', publicKey: 'public-test',
+    identityVersion: 2, hostId: HOST_ID, keyId: HOST_KEY_ID, algorithm: 'Ed25519', publicKey: 'public-test',
     publicKeyFingerprint: 'fingerprint-test', createdAt: '2026-08-07T00:00:00.000Z',
     privateKeyStorage: { type: 'linux-json', path: identityPath },
-    signer: { entityId: 'host-test', keyId: 'key-test', sign: async () => '', signRequest: async () => ({}) },
+    signer: { entityId: HOST_ID, keyId: HOST_KEY_ID, sign: async () => '', signRequest: async () => ({}) },
   };
   const identityStore = { load: async () => identity };
   const identityMetadata = { ...identity };
@@ -122,7 +125,7 @@ test('production daemon defers old-state decoding until startup preflight resets
     await daemon.validateStartup();
     const state = JSON.parse(readFileSync(statePath, 'utf8'));
     const spool = JSON.parse(readFileSync(spoolPathForState(statePath), 'utf8'));
-    assert.equal(state.schemaVersion, 3);
+    assert.equal(state.schemaVersion, 4);
     assert.equal(state.runtimeResetEpoch, spool.runtimeResetEpoch);
     assert.deepEqual(state.recentEvents, []);
     assert.deepEqual(spool.items, []);

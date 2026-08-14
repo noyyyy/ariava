@@ -12,8 +12,16 @@ export class AgentAdapterClient {
     return this.registry.isAuthoritativeSetReady(persistedSessions);
   }
 
+  assertCommandDispatchReady(command: CommandEnvelope): void {
+    this.registry.assertCommandDispatchReady(command);
+  }
+
   enqueueCommand(command: CommandEnvelope): void {
     this.registry.enqueueCommand(command);
+  }
+
+  abandonCommand(commandId: string): void {
+    this.registry.abandonCommand(commandId);
   }
 
   async waitForResult(commandId: string, options: { timeoutMs: number }): Promise<CommandResult | undefined> {

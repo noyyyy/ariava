@@ -5,25 +5,28 @@ import { join } from 'node:path';
 import { createProfileCliContext, loadResolvedProfileConfig } from '../src/cli/context';
 import { formatHumanCliFailure, normalizeCliFailure } from '../src/cli/failure';
 import { initializeProfile } from '../src/cli/operations/initialize';
-import { rotateProfileIdentity } from '../src/cli/operations/identity';
 import { resetHostDomain, type HostDomainResetHooks } from '../src/cli/operations/host-domain-reset';
 import { HOST_DOMAIN_RESET_PHASES, loadHostDomainResetJournal } from '../src/cli/operations/host-domain-reset-journal';
 import { createDevProfile } from '../src/cli/profiles/dev';
 import { createDefaultProfile } from '../src/cli/profiles/default';
 import { acquireRuntimeCoordinator } from '../src/runtime-lock';
 import { BridgeStateStore } from '../src/state-store';
-import { generateHostRotationIdentity } from '../src/identity/host-identity';
 import type { AriavaUserConfig } from '../src/host-manager/config';
 import { SecureFileError } from '../src/host-manager/secure-files';
 import { AriavaCliError } from '../src/host-manager/service/errors';
 import { acquireOnboardingLock } from '../src/host-manager/onboarding/lock';
 import { hostIdentityOperationLockPath } from '../src/cli/operations/host-identity-operation-lock';
+import { RESET_ONLY_IDENTITY_EVIDENCE_SOURCE } from '../src/identity/reset-only-evidence-source';
+import { HostIdentityError } from '../src/identity/errors';
+import { enrollCurrentIdentity } from '../src/identity/manager';
 
 const roots: string[] = [];
 const originalHome = process.env.HOME;
 const originalXdg = process.env.XDG_CONFIG_HOME;
+const originalFetch = globalThis.fetch;
 
 afterEach(() => {
+  globalThis.fetch = originalFetch;
   if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
   if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = originalXdg;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -120,41 +123,48 @@ function crashOnceAfterEffect(effect: Parameters<NonNullable<HostDomainResetHook
   };
 }
 
-  test('rotation and reset route through the profile lock boundary', async () => {
-    const rotationValue = fixture();
-    const rotationLocks: string[] = [];
-    rotationValue.context.hostIdentityOperationLock = {
-      async run(resources, operation) {
-        rotationLocks.push(resources.hostDomainResetJournalPath);
-        return operation();
-      },
-    };
-    await initializeProfile(rotationValue.context);
-    await rotateProfileIdentity(rotationValue.context, {
-      rotate: async (store) => {
-        const identity = await store.load();
-        return {
-          operationId: 'op_injected_rotation_lock', entityId: identity!.hostId, oldKeyId: identity!.keyId,
-          newKeyId: identity!.keyId, status: 'completed', completedAt: new Date().toISOString(),
-        };
-      },
-    });
-    expect(rotationLocks).toEqual([rotationValue.profile.resources.hostDomainResetJournalPath]);
-
-    const resetValue = fixture();
+  test('reset routes through the profile lock boundary', async () => {
+    const value = fixture();
     const resetLocks: string[] = [];
-    resetValue.context.hostIdentityOperationLock = {
+    value.context.hostIdentityOperationLock = {
       async run(resources, operation) {
         resetLocks.push(resources.hostDomainResetJournalPath);
         return operation();
       },
     };
-    await initializeProfile(resetValue.context);
-    await resetHostDomain(resetValue.context, resetValue.dependencies());
-    expect(resetLocks).toEqual([resetValue.profile.resources.hostDomainResetJournalPath]);
+    await initializeProfile(value.context);
+    await resetHostDomain(value.context, value.dependencies());
+    expect(resetLocks).toEqual([value.profile.resources.hostDomainResetJournalPath]);
   });
 
 describe('Host-domain reset coordinator recovery', () => {
+  test('managed service quarantine failure leaves identity and Relay untouched', async () => {
+    const value = fixture();
+    await initializeProfile(value.context);
+    const identityBefore = readFileSync(value.profile.resources.identityMetadataPath);
+    let identityStoreCreations = 0;
+    let revokeCalls = 0;
+    const originalIdentityCreate = value.context.identity.create;
+    value.context.identity.create = (...args) => {
+      identityStoreCreations += 1;
+      return originalIdentityCreate(...args);
+    };
+    value.context.hostDomainResetLifecycle.stopAndConfirm = () => {
+      throw new AriavaCliError('ERR_SERVICE_COMMAND', 'service quarantine failed');
+    };
+
+    await expect(resetHostDomain(value.context, {
+      ...value.dependencies(),
+      revoke: async () => { revokeCalls += 1; return 'revoked'; },
+    })).rejects.toMatchObject({
+      code: 'ERR_HOST_RESET_RECOVERY_REQUIRED', data: { phase: 'quarantine-pending' },
+    });
+    expect(identityStoreCreations).toBe(0);
+    expect(revokeCalls).toBe(0);
+    expect(readFileSync(value.profile.resources.identityMetadataPath)).toEqual(identityBefore);
+    expect(loadHostDomainResetJournal(value.profile.resources)).toMatchObject({ phase: 'quarantine-pending' });
+  });
+
   test('persists running service intent before stop when initial runtime acquisition fails', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-reset-prepared-before-stop-')); roots.push(home);
     process.env.HOME = home; process.env.XDG_CONFIG_HOME = join(home, 'xdg');
@@ -183,21 +193,33 @@ describe('Host-domain reset coordinator recovery', () => {
       },
     });
     await initializeProfile(context);
+    const identityBefore = readFileSync(profile.resources.identityMetadataPath);
+    const originalIdentityCreate = context.identity.create;
+    let identityStoreCreations = 0;
+    let revokeCalls = 0;
+    context.identity.create = (...args) => {
+      identityStoreCreations += 1;
+      return originalIdentityCreate(...args);
+    };
     const dependencies = {
-      bridgeVersion: 'test', revoke: async () => 'revoked' as const,
+      bridgeVersion: 'test',
+      revoke: async () => { revokeCalls += 1; return 'revoked' as const; },
       replace: async (store: ReturnType<typeof context.identity.create>, operationId: string) => store.resetAfterExplicitConfirmation(operationId),
       enroll: async () => {},
     };
 
     await expect(resetHostDomain(context, dependencies)).rejects.toMatchObject({
       code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',
-      data: { phase: 'prepared', retryable: true },
+      data: { phase: 'quarantine-pending', retryable: true },
     });
     expect(loadHostDomainResetJournal(profile.resources)).toMatchObject({
-      phase: 'prepared',
+      phase: 'quarantine-pending',
       service: { installed: true, wasRunning: true },
     });
     expect(currentRunning).toBe(false);
+    expect(identityStoreCreations).toBe(0);
+    expect(revokeCalls).toBe(0);
+    expect(readFileSync(profile.resources.identityMetadataPath)).toEqual(identityBefore);
 
     const result = await resetHostDomain(context, dependencies);
     expect(result.service.processRunning).toBe(true);
@@ -247,7 +269,7 @@ describe('Host-domain reset coordinator recovery', () => {
 
     const result = await resetHostDomain(context, dependencies);
     expect(result.service.processRunning).toBe(true);
-    expect(calls).toEqual(['restore']);
+    expect(calls).toEqual(['stop', 'restore']);
     expect(existsSync(profile.resources.hostDomainResetJournalPath)).toBe(false);
   });
 
@@ -310,7 +332,7 @@ describe('Host-domain reset coordinator recovery', () => {
       code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',
       data: {
         phase: 'prepared', retryable: true,
-        remediation: { command: 'ariava host reset --confirm' },
+        remediation: { command: 'ariava identity reset --confirm' },
       },
     });
   });
@@ -332,7 +354,7 @@ describe('Host-domain reset coordinator recovery', () => {
     calls.length = 0;
     const result = await resetHostDomain(value.context, value.dependencies());
     expect(result.service.processRunning).toBe(false);
-    expect(calls).toEqual(['restore']);
+    expect(calls).toEqual(['stop', 'restore']);
   });
 
   test('locked initial signing identity fails before journal or Host-domain effects', async () => {
@@ -352,10 +374,10 @@ describe('Host-domain reset coordinator recovery', () => {
     await expect(resetHostDomain(value.context, {
       ...value.dependencies(),
       revoke: async () => { revokeCalls += 1; return 'revoked'; },
-    })).rejects.toMatchObject({ code: 'ERR_IDENTITY_KEYCHAIN_LOCKED' });
+    })).rejects.toMatchObject({ code: 'ERR_HOST_RESET_RECOVERY_REQUIRED', data: { phase: 'quarantined' } });
     expect(revokeCalls).toBe(0);
     expect(value.counts()).toEqual({ signingReplacements: 0, encryptionReplacements: 0 });
-    expect(existsSync(value.profile.resources.hostDomainResetJournalPath)).toBe(false);
+    expect(loadHostDomainResetJournal(value.profile.resources)).toMatchObject({ phase: 'quarantined' });
   });
 
   test('initial X25519 load failure releases unmanaged runtime ownership for same-process retry', async () => {
@@ -376,8 +398,10 @@ describe('Host-domain reset coordinator recovery', () => {
       return store;
     };
 
-    await expect(resetHostDomain(value.context, value.dependencies())).rejects.toThrow(/X25519/);
-    expect(existsSync(value.profile.resources.hostDomainResetJournalPath)).toBe(false);
+    await expect(resetHostDomain(value.context, value.dependencies())).rejects.toMatchObject({
+      code: 'ERR_HOST_RESET_RECOVERY_REQUIRED', data: { phase: 'quarantined' },
+    });
+    expect(loadHostDomainResetJournal(value.profile.resources)).toMatchObject({ phase: 'quarantined' });
     expect(value.counts()).toEqual({ signingReplacements: 0, encryptionReplacements: 0 });
 
     const result = await resetHostDomain(value.context, value.dependencies());
@@ -481,15 +505,154 @@ describe('Host-domain reset coordinator recovery', () => {
     expect(spoolCleanupHostIds).toEqual([undefined]);
   });
 
+  test('unknown unreadable signing evidence blocks before journal, Relay, or replacement', async () => {
+    const value = fixture();
+    await initializeProfile(value.context);
+    const originalCreate = value.context.identity.create;
+    let revokeCalls = 0;
+    value.context.identity.create = (resources, platform) => {
+      const store = originalCreate(resources, platform);
+      store.load = async () => {
+        const { HostIdentityError } = await import('../src/identity/errors');
+        throw new HostIdentityError('ERR_IDENTITY_INVALID', 'corrupt identity evidence');
+      };
+      (store as any)[RESET_ONLY_IDENTITY_EVIDENCE_SOURCE] = () => ({ kind: 'unknown' });
+      return store;
+    };
+    await expect(resetHostDomain(value.context, {
+      ...value.dependencies(), revoke: async () => { revokeCalls += 1; return 'revoked'; },
+    })).rejects.toMatchObject({ code: 'ERR_HOST_RESET_RECOVERY_REQUIRED', data: { phase: 'quarantined' } });
+    expect(revokeCalls).toBe(0);
+    expect(loadHostDomainResetJournal(value.profile.resources)).toMatchObject({ phase: 'quarantined' });
+    expect(value.counts()).toEqual({ signingReplacements: 0, encryptionReplacements: 0 });
+  });
+
+  test('recognized pending identity evidence skips Relay and completes full replacement', async () => {
+    const value = fixture();
+    await initializeProfile(value.context);
+    const path = value.profile.resources.identityMetadataPath;
+    const current = JSON.parse(readFileSync(path, 'utf8'));
+    current.pendingRotation = {
+      operationId: 'op_legacy_pending', issuedAt: new Date().toISOString(), identity: { ...current },
+    };
+    writeFileSync(path, JSON.stringify(current), { mode: 0o600 });
+    let revokeCalls = 0;
+    const result = await resetHostDomain(value.context, {
+      ...value.dependencies(), revoke: async () => { revokeCalls += 1; return 'revoked'; },
+    });
+    expect(revokeCalls).toBe(0);
+    expect(result.revokedOldIdentity).toBe(false);
+    expect(result.warning).toContain('ERR_IDENTITY_INVALID');
+    expect(result.hostId).not.toBe(current.hostId);
+    expect(result.links).toEqual([]);
+    expect(value.counts()).toEqual({ signingReplacements: 1, encryptionReplacements: 1 });
+    expect(existsSync(value.profile.resources.hostDomainResetJournalPath)).toBe(false);
+  });
+
+  test('recognized pending identity resumes after crash at prepared with exact journal binding', async () => {
+    const value = fixture();
+    await initializeProfile(value.context);
+    const path = value.profile.resources.identityMetadataPath;
+    const current = JSON.parse(readFileSync(path, 'utf8'));
+    current.pendingRotation = {
+      operationId: 'op_legacy_pending_crash', issuedAt: new Date().toISOString(), identity: { ...current },
+    };
+    writeFileSync(path, JSON.stringify(current), { mode: 0o600 });
+    let revokeCalls = 0;
+    const dependencies = {
+      ...value.dependencies(crashOnceAtPhase('prepared')),
+      revoke: async () => { revokeCalls += 1; return 'revoked' as const; },
+    };
+    await expect(resetHostDomain(value.context, dependencies)).rejects.toMatchObject({
+      code: 'ERR_HOST_RESET_RECOVERY_REQUIRED', data: { phase: 'prepared' },
+    });
+    expect(loadHostDomainResetJournal(value.profile.resources)).toMatchObject({
+      phase: 'prepared', revoke: { state: 'skipped', outcome: 'old-identity-unreadable' },
+      signingCleanup: {
+        kind: 'linux-json', profile: 'dev', previousAccount: null, previousPendingAccount: null,
+        interruptedCreationAccount: null,
+      },
+    });
+    const result = await resetHostDomain(value.context, { ...value.dependencies(), revoke: dependencies.revoke });
+    expect(result.hostId).not.toBe(current.hostId);
+    expect(revokeCalls).toBe(0);
+    expect(value.counts()).toEqual({ signingReplacements: 1, encryptionReplacements: 1 });
+    expect(existsSync(value.profile.resources.hostDomainResetJournalPath)).toBe(false);
+  });
+
+  test('crash after durable quarantine occurs before identity inspection or Relay revoke', async () => {
+    const value = fixture();
+    await initializeProfile(value.context);
+    const identityBefore = readFileSync(value.profile.resources.identityMetadataPath);
+    const originalIdentityCreate = value.context.identity.create;
+    let identityStoreCreations = 0;
+    let revokeCalls = 0;
+    value.context.identity.create = (...args) => {
+      identityStoreCreations += 1;
+      return originalIdentityCreate(...args);
+    };
+    const dependencies = {
+      ...value.dependencies(crashOnceAtPhase('quarantined')),
+      revoke: async () => { revokeCalls += 1; return 'revoked' as const; },
+    };
+
+    await expect(resetHostDomain(value.context, dependencies)).rejects.toMatchObject({
+      code: 'ERR_HOST_RESET_RECOVERY_REQUIRED', data: { phase: 'quarantined' },
+    });
+    expect(identityStoreCreations).toBe(0);
+    expect(revokeCalls).toBe(0);
+    expect(readFileSync(value.profile.resources.identityMetadataPath)).toEqual(identityBefore);
+    expect(loadHostDomainResetJournal(value.profile.resources)).toMatchObject({ phase: 'quarantined' });
+
+    const result = await resetHostDomain(value.context, { ...value.dependencies(), revoke: dependencies.revoke });
+    expect(result.hostId).not.toBe(JSON.parse(identityBefore.toString()).hostId);
+    expect(revokeCalls).toBe(1);
+  });
+
+  test.each([
+    { name: 'top-level extra', mutate: (response: any) => ({ ...response, extra: true }) },
+    { name: 'Host extra', mutate: (response: any) => ({ host: { ...response.host, extra: true } }) },
+    { name: 'mismatched Host', mutate: (response: any) => ({ host: { ...response.host, hostId: `host_${'Z'.repeat(43)}` } }) },
+    { name: 'revoked status', mutate: (response: any) => ({ host: { ...response.host, status: 'revoked' } }) },
+    { name: 'nonzero links field', mutate: (response: any) => ({ ...response, links: [{ linkId: 'unexpected' }] }) },
+  ])('invalid enrollment response ($name) does not advance reset beyond config-saved', async ({ mutate }) => {
+    const value = fixture();
+    await initializeProfile(value.context);
+    const oldIdentity = await value.context.identity.create(value.profile.resources, 'linux').load();
+    let enrolledHostId: string | undefined;
+    globalThis.fetch = (async (_input, init) => {
+      const body = JSON.parse(new TextDecoder().decode(init?.body as Uint8Array)) as { hostId: string };
+      enrolledHostId = body.hostId;
+      const response = { host: {
+        hostId: body.hostId, hostName: 'reset-test-host (Dev)', platform: 'linux', bridgeVersion: 'test',
+        registeredAt: '2026-08-12T00:00:00.000Z', lastSeenAt: '2026-08-12T00:00:01.000Z',
+        bridgeStatus: 'online', status: 'active',
+      } };
+      return Response.json(mutate(response));
+    }) as typeof fetch;
+
+    await expect(resetHostDomain(value.context, {
+      ...value.dependencies(), enroll: enrollCurrentIdentity,
+    })).rejects.toMatchObject({
+      code: 'ERR_HOST_RESET_RECOVERY_REQUIRED', data: { phase: 'config-saved', retryable: true },
+    });
+    const journal = loadHostDomainResetJournal(value.profile.resources);
+    expect(journal).toMatchObject({
+      phase: 'config-saved', newHostId: enrolledHostId, enrolledAt: null,
+    });
+    expect(enrolledHostId).not.toBe(oldIdentity!.hostId);
+    expect(value.counts()).toEqual({ signingReplacements: 1, encryptionReplacements: 1 });
+  });
+
   test('live dev runtime fails before journal, Relay, signing, E2E, or config effects', async () => {
     const value = fixture();
     await initializeProfile(value.context);
     const { resources } = loadResolvedProfileConfig(value.context);
     const owner = acquireRuntimeCoordinator(resources.statePath, resources.encryptedSpoolPath);
     await expect(resetHostDomain(value.context, value.dependencies())).rejects.toMatchObject({
-      code: 'ERR_HOST_RESET_RUNTIME_ACTIVE', data: { retryable: true },
+      code: 'ERR_HOST_RESET_RECOVERY_REQUIRED', data: { phase: 'quarantine-pending', retryable: true },
     });
-    expect(existsSync(resources.hostDomainResetJournalPath)).toBe(false);
+    expect(loadHostDomainResetJournal(resources)).toMatchObject({ phase: 'quarantine-pending' });
     expect(value.counts()).toEqual({ signingReplacements: 0, encryptionReplacements: 0 });
     owner.dispose();
   });
@@ -569,28 +732,6 @@ describe('Host-domain reset coordinator recovery', () => {
     expect(value.counts()).toEqual({ signingReplacements: 1, encryptionReplacements: 1 });
   });
 
-  test('rotate-key does not create reset journal, acquire runtime, or replace E2E identity', async () => {
-    const value = fixture();
-    await initializeProfile(value.context);
-    let runtimeAcquisitions = 0;
-    value.context.runtimeCoordinator.acquire = () => { runtimeAcquisitions += 1; throw new Error('unexpected'); };
-    const encryptionBefore = value.context.encryptionIdentity.create(
-      loadResolvedProfileConfig(value.context).resources, 'linux',
-    ).load();
-    await rotateProfileIdentity(value.context, {
-      rotate: async (store) => {
-        const identity = await store.load();
-        return {
-          operationId: 'op_rotation', entityId: identity!.hostId, oldKeyId: identity!.keyId,
-          newKeyId: identity!.keyId, status: 'completed', completedAt: new Date().toISOString(),
-        };
-      },
-    });
-    expect(runtimeAcquisitions).toBe(0);
-    expect(value.counts()).toEqual({ signingReplacements: 0, encryptionReplacements: 0 });
-    expect(existsSync(value.profile.resources.hostDomainResetJournalPath)).toBe(false);
-    expect(value.context.encryptionIdentity.create(loadResolvedProfileConfig(value.context).resources, 'linux').load()).toEqual(encryptionBefore);
-  });
 
   test('running managed service retry accepts replacement runtime artifacts without a second lifecycle', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ariava-reset-restored-runtime-')); roots.push(home);
@@ -643,7 +784,8 @@ describe('Host-domain reset coordinator recovery', () => {
         code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',
       });
       expect(loadHostDomainResetJournal(profile.resources)).toEqual(journal);
-      expect(calls).toEqual([]);
+      expect(calls).toEqual(['stop']);
+      calls.length = 0;
       writeFileSync(profile.resources.encryptedSpoolPath, validSpool, { mode: 0o600 });
     }
     writeFileSync(profile.resources.statePath, '{}\n', { mode: 0o600 });
@@ -651,80 +793,15 @@ describe('Host-domain reset coordinator recovery', () => {
       code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',
     });
     expect(loadHostDomainResetJournal(profile.resources)).toEqual(journal);
-    expect(calls).toEqual([]);
+    expect(calls).toEqual(['stop']);
+    calls.length = 0;
     writeFileSync(profile.resources.statePath, validState, { mode: 0o600 });
     const result = await resetHostDomain(context, { ...dependencies, hooks: undefined });
     expect(result.hostId).toBe(journal.newHostId!);
-    expect(calls).toEqual(['restore']);
+    expect(calls).toEqual(['stop', 'restore']);
     expect(existsSync(profile.resources.hostDomainResetJournalPath)).toBe(false);
   });
 
-  test('rotate-key is blocked deterministically after old identity revoke', async () => {
-    const value = fixture();
-    await initializeProfile(value.context);
-    let rotationCalls = 0;
-    const result = await resetHostDomain(value.context, {
-      ...value.dependencies(),
-      replace: async (store) => {
-        await expect(rotateProfileIdentity(value.context, {
-          rotate: async () => { rotationCalls += 1; throw new Error('must not rotate'); },
-        })).rejects.toMatchObject({ code: 'ERR_HOST_RESET_IN_PROGRESS' });
-        return store.resetAfterExplicitConfirmation();
-      },
-    });
-    expect(rotationCalls).toBe(0);
-    expect(result.watchPairingRequired).toBe(true);
-    expect(value.counts().encryptionReplacements).toBe(1);
-  });
-
-  test('same-Host rotated candidate is never adopted as a Host replacement', async () => {
-    const value = fixture();
-    await initializeProfile(value.context);
-    const store = value.context.identity.create(value.profile.resources, 'linux');
-    const original = await store.load();
-    await expect(resetHostDomain(value.context, value.dependencies(crashOnceAtPhase('signing-replacement-pending')))).rejects.toThrow();
-    const current = await store.load();
-    const issuedAt = new Date().toISOString();
-    const generated = await generateHostRotationIdentity(current!.hostId, current!.privateKeyStorage, issuedAt);
-    await store.stageRotation({ operationId: 'op_same_host_interleaving', issuedAt, identity: generated.identity });
-    await store.promoteRotation('op_same_host_interleaving');
-    const result = await resetHostDomain(value.context, value.dependencies());
-    expect(result.hostId).not.toBe(original!.hostId);
-    expect(value.counts()).toEqual({ signingReplacements: 1, encryptionReplacements: 1 });
-  });
-
-  test('rotation and reset are serialized across the complete identity transition', async () => {
-    const value = fixture();
-    await initializeProfile(value.context);
-    let releaseRotation!: () => void;
-    const rotationBarrier = new Promise<void>((resolve) => { releaseRotation = resolve; });
-    let rotationStarted!: () => void;
-    const started = new Promise<void>((resolve) => { rotationStarted = resolve; });
-    let revokeCalls = 0;
-    const rotation = rotateProfileIdentity(value.context, {
-      rotate: async (store) => {
-        const identity = await store.load();
-        rotationStarted();
-        await rotationBarrier;
-        return {
-          operationId: 'op_serialized_rotation', entityId: identity!.hostId, oldKeyId: identity!.keyId,
-          newKeyId: identity!.keyId, status: 'completed', completedAt: new Date().toISOString(),
-        };
-      },
-    });
-    await started;
-
-    await expect(resetHostDomain(value.context, {
-      ...value.dependencies(),
-      revoke: async () => { revokeCalls += 1; return 'revoked'; },
-    })).rejects.toMatchObject({ code: 'ERR_HOST_RESET_IN_PROGRESS', data: { retryable: true } });
-    expect(revokeCalls).toBe(0);
-    expect(value.counts()).toEqual({ signingReplacements: 0, encryptionReplacements: 0 });
-    expect(existsSync(value.profile.resources.hostDomainResetJournalPath)).toBe(false);
-
-    releaseRotation();
-    await rotation;
-  });
 
 
   test('present malformed journal evidence retains original validation error semantics', async () => {
@@ -797,7 +874,7 @@ describe('Host-domain reset coordinator recovery', () => {
         code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',
         data: {
           phase: journal.phase, operationId: journal.operationId, retryable: true,
-          remediation: { command: 'bun run dev:cli -- host reset --confirm' },
+          remediation: { command: 'bun run dev:cli -- identity reset --confirm' },
         },
       });
       expect(JSON.stringify(error)).not.toContain('/secret/path');
@@ -834,15 +911,15 @@ describe('Host-domain reset coordinator recovery', () => {
         data: {
           phase: journal.phase, operationId: journal.operationId, retryable: true,
           remediation: {
-            message: 'Retry the profile-specific Host reset recovery command: bun run dev:cli -- host reset --confirm',
-            command: 'bun run dev:cli -- host reset --confirm',
+            message: 'Retry the profile-specific Host reset recovery command: bun run dev:cli -- identity reset --confirm',
+            command: 'bun run dev:cli -- identity reset --confirm',
           },
         },
       });
       expect(formatHumanCliFailure(failure)).toBe(
         `ariava: Host reset recovery requires attention at phase ${journal.phase}.\n`
-        + 'Retry the profile-specific Host reset recovery command: bun run dev:cli -- host reset --confirm\n'
-        + 'Next: bun run dev:cli -- host reset --confirm\n',
+        + 'Retry the profile-specific Host reset recovery command: bun run dev:cli -- identity reset --confirm\n'
+        + 'Next: bun run dev:cli -- identity reset --confirm\n',
       );
       const serialized = JSON.stringify(error);
       for (const sensitive of ['/secret', 'token=secret', 'raw service output', 'install failed', 'metadata failed', 'command failed', 'boom']) {
@@ -860,24 +937,16 @@ describe('Host-domain reset coordinator recovery', () => {
     await initializeProfile(value.context);
     const lockPath = hostIdentityOperationLockPath(value.profile.resources);
     const live = acquireOnboardingLock(lockPath);
-    await expect(rotateProfileIdentity(value.context, {
-      rotate: async () => { throw new Error('must not rotate'); },
-    })).rejects.toMatchObject({ code: 'ERR_HOST_RESET_IN_PROGRESS', data: { retryable: true } });
+    await expect(resetHostDomain(value.context, value.dependencies())).rejects.toMatchObject({
+      code: 'ERR_HOST_RESET_IN_PROGRESS', data: { retryable: true },
+    });
     live.release();
 
     writeFileSync(lockPath, `${JSON.stringify({
       schemaVersion: 1, pid: 2_147_483_647, processStart: 'definitely-absent',
       createdAt: '2000-01-01T00:00:00.000Z', ownerToken: 'a'.repeat(48),
     })}\n`, { mode: 0o600 });
-    await rotateProfileIdentity(value.context, {
-      rotate: async (store) => {
-        const identity = await store.load();
-        return {
-          operationId: 'op_stale_lock_recovered', entityId: identity!.hostId, oldKeyId: identity!.keyId,
-          newKeyId: identity!.keyId, status: 'completed', completedAt: new Date().toISOString(),
-        };
-      },
-    });
+    await resetHostDomain(value.context, value.dependencies());
     expect(existsSync(lockPath)).toBe(false);
   });
 

@@ -1,3 +1,4 @@
+import { E2E_SUITE_V1, type EncryptionKeyBindingV1 } from '@ariava/protocol';
 import { describe, expect, test } from 'bun:test';
 import type { HostIdentity, HostIdentityInspection } from '../src/identity/types';
 import type {
@@ -44,7 +45,18 @@ const inspection: OnboardingHostState['identityInspection'] = {
   ownerIntegrity: true,
   permissionIntegrity: true,
   metadataIntegrity: true,
-  pendingRotation: false,
+};
+const encryptionBinding: EncryptionKeyBindingV1 = {
+  version: 1,
+  entityType: 'host',
+  entityId: identity.hostId,
+  identityKeyId: identity.keyId,
+  encryptionKeyId: 'ekey-test',
+  suite: E2E_SUITE_V1,
+  publicKey: 'public-encryption-key',
+  sequence: 1,
+  createdAt: identity.createdAt,
+  bindingSignature: 'binding-signature',
 };
 const config: ResolvedAriavaConfig = {
   relayBaseUrl: 'https://persisted.example',
@@ -73,6 +85,7 @@ function hostState(overrides: {
     config: overrides.config ?? config,
     identityInspection: overrides.identityInspection ?? inspection,
     identity: overrides.identity ?? identity,
+    encryptionBinding,
   };
 }
 
@@ -104,21 +117,6 @@ describe('onboarding Host state policy', () => {
       ready: false,
       reason: 'Host identity is not initialized.',
       identityStatus: 'not-initialized',
-      pendingRotation: false,
-    });
-  });
-
-  test('returns the exact rotation-pending reason before other integrity failures', () => {
-    const pending = loadedInspectionWith({
-      status: 'rotation-pending',
-      pendingRotation: true,
-      ownerIntegrity: false,
-    });
-    expect(decideOnboardingHostState(hostState({ identityInspection: pending }))).toEqual({
-      kind: 'reject',
-      reason: 'Host identity key rotation is pending and must be completed or explicitly reset before onboarding can continue.',
-      identityStatus: 'rotation-pending',
-      pendingRotation: true,
     });
   });
 
@@ -143,7 +141,6 @@ describe('onboarding Host state policy', () => {
       ready: false,
       reason,
       identityStatus: unsafeInspection.status,
-      pendingRotation: unsafeInspection.pendingRotation,
     });
   });
 

@@ -28,14 +28,8 @@ export interface HostIdentity extends HostIdentityMetadata {
   signer: HostRequestSigner;
 }
 
-export interface PendingHostIdentity {
-  operationId: string;
-  identity: HostIdentity;
-  issuedAt: string;
-}
-
 export interface HostIdentityInspection {
-  status: 'not-initialized' | 'ready' | 'rotation-pending' | 'invalid';
+  status: 'not-initialized' | 'ready' | 'invalid';
   storageType: HostPrivateKeyStorage['type'];
   storageReference: HostPrivateKeyStorage;
   path?: string;
@@ -46,18 +40,12 @@ export interface HostIdentityInspection {
   ownerIntegrity: boolean;
   permissionIntegrity: boolean;
   metadataIntegrity: boolean;
-  pendingRotation: boolean;
-  pendingOperationId?: string;
 }
 
 export interface HostIdentityStore {
   inspect(): Promise<HostIdentityInspection>;
   load(): Promise<HostIdentity | null>;
   createFirstRun(): Promise<HostIdentity>;
-  loadPending(): Promise<PendingHostIdentity | null>;
-  stageRotation(next: PendingHostIdentity): Promise<void>;
-  abortRotation(operationId: string): Promise<void>;
-  promoteRotation(operationId: string): Promise<HostIdentity>;
   resetAfterExplicitConfirmation(operationId?: string): Promise<HostIdentity>;
   recoverExplicitReset?(operationId: string): Promise<HostIdentity | null>;
   completeExplicitReset?(operationId: string): void;

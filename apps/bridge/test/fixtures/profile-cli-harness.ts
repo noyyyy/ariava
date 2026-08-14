@@ -13,7 +13,6 @@ import type {
   HostIdentity,
   HostIdentityInspection,
   HostIdentityStore,
-  PendingHostIdentity,
 } from '../../src/identity';
 import type { AriavaProfileDescriptor, AriavaProfileId } from '../../src/cli/profile';
 
@@ -204,24 +203,6 @@ function fakeIdentityStore(
       events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainWrites', path: profile.resources.identityMetadataPath });
       return readIdentity();
     },
-    async loadPending(): Promise<PendingHostIdentity | null> {
-      counters.keychainReads += 1;
-      events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainReads', path: `${profile.resources.identityMetadataPath}.pending` });
-      return null;
-    },
-    async stageRotation() {
-      counters.keychainWrites += 1;
-      events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainWrites', path: `${profile.resources.identityMetadataPath}.pending` });
-    },
-    async abortRotation() {
-      counters.keychainDeletes += 1;
-      events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainDeletes', path: `${profile.resources.identityMetadataPath}.pending` });
-    },
-    async promoteRotation() {
-      counters.keychainWrites += 1;
-      events.push({ profile: profile.id, initiatedBy: profile.id, action: 'keychainWrites', path: profile.resources.identityMetadataPath });
-      return readIdentity();
-    },
     async resetAfterExplicitConfirmation() {
       counters.keychainDeletes += 1;
       counters.keychainWrites += 1;
@@ -277,7 +258,6 @@ function fakeInspection(profile: AriavaProfileDescriptor, identity: HostIdentity
     ownerIntegrity: true,
     permissionIntegrity: true,
     metadataIntegrity: true,
-    pendingRotation: false,
   };
 }
 

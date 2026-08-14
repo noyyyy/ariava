@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { base64UrlDecode, type CanonicalEvent, type CanonicalSessionState } from '@ariava/protocol';
 
 mock.module('../src/e2e/node-crypto', () => ({
+  ChaChaPolyAuthenticationError: class ChaChaPolyAuthenticationError extends Error {},
   chachaPolySeal: (_key: Uint8Array, plaintext: Uint8Array) => ({ nonce: new Uint8Array(12).fill(1), ciphertext: new Uint8Array([...plaintext, ...new Uint8Array(16)]) }),
   chachaPolyOpen: (_key: Uint8Array, _nonce: Uint8Array, ciphertext: Uint8Array) => ciphertext.slice(0, -16),
   generateX25519KeyMaterial: () => ({ privateKeyPkcs8: new Uint8Array(48).fill(2), publicKeyRaw: new Uint8Array(32).fill(3) }),
@@ -51,18 +52,20 @@ function needHumanEvent(): CanonicalEvent {
   };
 }
 
-function recipient(index: number) {
+const identity = { version: 1 as const, hostId: 'host-test', encryptionKeyId: 'ekey-test', publicKey: '',
+  privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' };
+function recipient(index: number, hostIdentity = identity) {
   return {
     linkId: `link-${index}`, linkGeneration: 1, watchDeviceId: `watch-${index}`, epoch: index, state: 'active' as const,
-    transcriptDigest: 'A'.repeat(43),
+    transcriptDigest: 'A'.repeat(43), hostIdentity,
+    hostBinding: { version: 1 as const, entityType: 'host' as const, entityId: hostIdentity.hostId, identityKeyId: 'key-host',
+      encryptionKeyId: hostIdentity.encryptionKeyId, publicKey: hostIdentity.publicKey, sequence: hostIdentity.sequence,
+      createdAt: hostIdentity.createdAt, bindingSignature: 'B'.repeat(86) },
     watchBinding: { version: 1 as const, entityType: 'watch' as const, entityId: `watch-${index}`,
       identityKeyId: `key-${index}`, encryptionKeyId: `ekey-watch-${index}`, publicKey: 'A'.repeat(43),
       sequence: 1, createdAt: '2026-08-01T00:00:00.000Z', bindingSignature: 'B'.repeat(86) },
   };
 }
-
-const identity = { version: 1, hostId: 'host-test', encryptionKeyId: 'ekey-test', publicKey: '',
-  privateKeyPkcs8: new Uint8Array(), sequence: 1, createdAt: '2026-08-01T00:00:00.000Z' };
 
 function openMockedContent(content: { ciphertext: string }): any {
   const ciphertext = base64UrlDecode(content.ciphertext, undefined, 'test ciphertext');
@@ -83,7 +86,7 @@ describe('EncryptedUploadOrchestrator canonical Event binding', () => {
       recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
       publishEncryptedEvent: async (event: any, session: any) => { uploads.push({ event, session }); },
     };
-    const flushed = await new EncryptedUploadOrchestrator(store, client as any, identity, { reconcileRecipients: () => [] } as any).flushPendingEvents();
+    const flushed = await new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any).flushPendingEvents();
     expect(flushed).toBe(1);
     expect(uploads[0].event).toMatchObject({ type: 'done', status: 'idle', content: { payloadKind: 'event-content-v2' } });
     expect(uploads[0].session).toMatchObject({ status: 'idle', updatedAt: terminal.updatedAt, lastEventId: 'event-test', content: { payloadKind: 'session-content-v2' } });
@@ -113,7 +116,7 @@ describe('EncryptedUploadOrchestrator canonical Event binding', () => {
       reconcileEncryptedEvent: async () => ({ committed: false }),
     };
     const keyring = { reconcileRecipients: () => [recipient(version)] };
-    expect(await new EncryptedUploadOrchestrator(store, client as any, identity, keyring as any).flushPendingEvents()).toBe(1);
+    expect(await new EncryptedUploadOrchestrator(store, client as any, keyring as any).flushPendingEvents()).toBe(1);
     const retried = uploads[1];
     expect(retried.event).toMatchObject({ type: 'need_human', status: 'need_human', recipientSetVersion: 2 });
     expect(retried.session).toMatchObject({ status: 'need_human', lastEventId: 'event-test', recipientSetVersion: 2 });
@@ -121,6 +124,28 @@ describe('EncryptedUploadOrchestrator canonical Event binding', () => {
       version: 2, needHuman: { reason: 'error', error: { providerCode: 'E_PROVIDER', retryExhausted: true } },
     });
     expect(retried.event.notificationPreviews[0]).toMatchObject({ eventType: 'need_human', content: { payloadKind: 'notification-preview-v2' } });
+  });
+
+  test('uses each mixed historical pin identity for Event, Session, and notification wraps', async () => {
+    const store = fixture();
+    const terminal = terminalSession();
+    store.replaceDriverSessions('pi', [terminal]);
+    store.queuePendingEvent(doneEvent(), terminal);
+    store.setRecipientSetVersion(1);
+    const historical = { ...identity, encryptionKeyId: 'ekey-historical', sequence: 1 };
+    const current = { ...identity, encryptionKeyId: 'ekey-current', sequence: 2 };
+    const recipients = [recipient(1, historical), recipient(2, current)];
+    let published: any;
+    const client = {
+      recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
+      publishEncryptedEvent: async (event: any, session: any) => { published = { event, session }; },
+    };
+    const keyring = { reconcileRecipients: () => recipients };
+    expect(await new EncryptedUploadOrchestrator(store, client as any, keyring as any).flushPendingEvents()).toBe(1);
+    expect(published.event.keyWraps.map((wrap: any) => wrap.senderEncryptionKeyId)).toEqual(['ekey-historical', 'ekey-current']);
+    expect(published.session.keyWraps.map((wrap: any) => wrap.senderEncryptionKeyId)).toEqual(['ekey-historical', 'ekey-current']);
+    expect(published.event.notificationPreviews.map((preview: any) => preview.keyWrap.senderEncryptionKeyId))
+      .toEqual(['ekey-historical', 'ekey-current']);
   });
 
   test('transient retry preserves one inflight v2 tuple rather than rebuilding classification', async () => {
@@ -131,7 +156,7 @@ describe('EncryptedUploadOrchestrator canonical Event binding', () => {
       recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
       publishEncryptedEvent: async (event: any, session: any) => { published.push({ event, session }); if (offline) throw new Error('offline'); },
     };
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, identity, { reconcileRecipients: () => [] } as any);
+    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
     expect(await orchestrator.flushPendingEvents()).toBe(0);
     const inflight = store.getInflightEventUpload('event-test');
     offline = false;
@@ -148,7 +173,7 @@ describe('EncryptedUploadOrchestrator canonical Event binding', () => {
       publishEncryptedSession: async () => { snapshotUploads += 1; },
       publishEncryptedEvent: async () => { eventUploads += 1; },
     };
-    expect(await new EncryptedUploadOrchestrator(store, client as any, identity, { reconcileRecipients: () => [] } as any).flushPendingEvents()).toBe(1);
+    expect(await new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any).flushPendingEvents()).toBe(1);
     expect({ recipientReads, snapshotUploads, eventUploads }).toEqual({ recipientReads: 1, snapshotUploads: 1, eventUploads: 1 });
   });
 });

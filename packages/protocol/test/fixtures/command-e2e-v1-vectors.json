@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "suite": "x25519-hkdf-sha256-chachapoly-v1",
+  "provenance": "Fixed public test-only X25519 inputs, DEKs, and nonces. Consumed, never regenerated, by product tests.",
+  "link": {
+    "linkId": "link_vector_01",
+    "hostId": "host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+    "watchDeviceId": "watch_Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw",
+    "linkGeneration": 7,
+    "epoch": 3
+  },
+  "keys": {
+    "hostPrivateKeyPkcs8": "MC4CAQAwBQYDK2VuBCIEIEi0REi8oJtImBOTJXWrozBXx6UYnuV9c6io8uP1czdQ",
+    "watchPrivateKeyPkcs8": "MC4CAQAwBQYDK2VuBCIEIOgzsgpcYDtLjJupEMmPswZfu92ZRznAW15CNyq6_W1o",
+    "hostPublicKey": "Gal7qMoataJtQyEIuNwHo5NLutXDKjY_63Tf7ovq7TM",
+    "watchPublicKey": "hSGEQYV0kVUu4p_cmCiI9X3i8Mmzy_N4D21zI6YX_CQ",
+    "watchToBridgeWrapKey": "L-Yt4xgNlxFcvHxj7hAFzrgodaFOlTjWJLq41bx3I54",
+    "bridgeToWatchWrapKey": "rnswkXRIUrdIZH7YvJHVHE0lklF1GZTDWhrEoZrl8hk"
+  },
+  "bindings": {
+    "host": {
+      "version": 1,
+      "entityType": "host",
+      "entityId": "host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "identityKeyId": "key_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "encryptionKeyId": "ekey_CYl2qZ_WVBpJ3yUjhyJV39dm_YVsJJTDGInbKOGGz5M",
+      "suite": "x25519-hkdf-sha256-chachapoly-v1",
+      "publicKey": "Gal7qMoataJtQyEIuNwHo5NLutXDKjY_63Tf7ovq7TM",
+      "sequence": 1,
+      "createdAt": "2026-07-20T00:00:00.000Z",
+      "canonicalBytes": "MjE6YXJpYXZhLWUyZS1iaW5kaW5nLXYxCjQ6aG9zdAo0ODpob3N0X0lmNHgzNkZVb21GaWFfaFVCR19TSnh0NzdVdHF2a1dxV0lkLTlILVhJYmsKNDc6a2V5X0lmNHgzNkZVb21GaWFfaFVCR19TSnh0NzdVdHF2a1dxV0lkLTlILVhJYmsKNDg6ZWtleV9DWWwycVpfV1ZCcEozeVVqaHlKVjM5ZG1fWVZzSkpUREdJbmJLT0dHejVNCjMyOngyNTUxOS1oa2RmLXNoYTI1Ni1jaGFjaGFwb2x5LXYxCjE6MQoyNDoyMDI2LTA3LTIwVDAwOjAwOjAwLjAwMFoKNDM6R2FsN3FNb2F0YUp0UXlFSXVOd0hvNU5MdXRYREtqWV82M1RmN292cTdUTQo",
+      "bindingSignature": "ouGzskX-WjG9bfnCv25b2_szR2LB3E7lO9HO9bXjcedlOSznoDFiLu3k6XzcATGt23vvyz2LeFLWNmISUsP9CA"
+    },
+    "watch": {
+      "version": 1,
+      "entityType": "watch",
+      "entityId": "watch_Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw",
+      "identityKeyId": "key_Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw",
+      "encryptionKeyId": "ekey_s1AePUnR2isyW7SU0ULj_DCqtX2TXrxTlqjjFjAexIE",
+      "suite": "x25519-hkdf-sha256-chachapoly-v1",
+      "publicKey": "hSGEQYV0kVUu4p_cmCiI9X3i8Mmzy_N4D21zI6YX_CQ",
+      "sequence": 1,
+      "createdAt": "2026-07-20T00:00:00.000Z",
+      "canonicalBytes": "MjE6YXJpYXZhLWUyZS1iaW5kaW5nLXYxCjU6d2F0Y2gKNDk6d2F0Y2hfVmtkYXAxUmpSMHdDaGQ5ZHZ5dkt0ejJtVVRXSU9lbTNkSUd5NnJFSGNJdwo0NzprZXlfVmtkYXAxUmpSMHdDaGQ5ZHZ5dkt0ejJtVVRXSU9lbTNkSUd5NnJFSGNJdwo0ODpla2V5X3MxQWVQVW5SMmlzeVc3U1UwVUxqX0RDcXRYMlRYcnhUbHFqakZqQWV4SUUKMzI6eDI1NTE5LWhrZGYtc2hhMjU2LWNoYWNoYXBvbHktdjEKMToxCjI0OjIwMjYtMDctMjBUMDA6MDA6MDAuMDAwWgo0MzpoU0dFUVlWMGtWVXU0cF9jbUNpSTlYM2k4TW16eV9ONEQyMXpJNllYX0NRCg",
+      "bindingSignature": "sIMPIm0vrLGS-xZP_GlGF56HZMvV0JnxuRd4JK7KXkUAs8JpiTW_c-3BJ-M3_5vy8asffG10cWeqi0NS_BT-Aw"
+    }
+  },
+  "interrupt": {
+    "plaintext": "eyJ2ZXJzaW9uIjoxLCJhY3Rpb24iOiJpbnRlcnJ1cHQifQ",
+    "contentAAD": "MzE6YXJpYXZhLWludGVycnVwdC1jb250ZW50LWFhZC12MQoxNTp3YXRjaC10by1icmlkZ2UKNDg6aG9zdF9JZjR4MzZGVW9tRmlhX2hVQkdfU0p4dDc3VXRxdmtXcVdJZC05SC1YSWJrCjQ5OndhdGNoX1ZrZGFwMVJqUjB3Q2hkOWR2eXZLdHoybVVUV0lPZW0zZElHeTZyRUhjSXcKMjU6c2Vzc2lvbl9jb21tYW5kX3ZlY3Rvcl8wMQoyNzpjb21tYW5kX2ludGVycnVwdF92ZWN0b3JfMDEKOTppbnRlcnJ1cHQKMjQ6MjAyNi0wOC0xMlQwMDowMDowMC4wMDBaCjI0OjIwMjYtMDgtMTJUMDA6MDU6MDAuMDAwWgoyMzpub25jZV9jb21tYW5kX3ZlY3Rvcl8wMQoyNzpjb250ZW50X2ludGVycnVwdF92ZWN0b3JfMDEKMjA6aW50ZXJydXB0LWNvbnRlbnQtdjEK",
+    "wrapAAD": "MTg6YXJpYXZhLXdyYXAtYWFkLXYxCjE1OndhdGNoLXRvLWJyaWRnZQoxNDpsaW5rX3ZlY3Rvcl8wMQoxOjcKMTozCjQ4Omhvc3RfSWY0eDM2RlVvbUZpYV9oVUJHX1NKeHQ3N1V0cXZrV3FXSWQtOUgtWEliawo0OTp3YXRjaF9Wa2RhcDFSalIwd0NoZDlkdnl2S3R6Mm1VVFdJT2VtM2RJR3k2ckVIY0l3CjQ4OmVrZXlfczFBZVBVblIyaXN5VzdTVTBVTGpfRENxdFgyVFhyeFRscWpqRmpBZXhJRQo0ODpla2V5X0NZbDJxWl9XVkJwSjN5VWpoeUpWMzlkbV9ZVnNKSlRER0luYktPR0d6NU0KMjc6Y29udGVudF9pbnRlcnJ1cHRfdmVjdG9yXzAxCjIwOmludGVycnVwdC1jb250ZW50LXYxCg",
+    "dek": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+    "envelopeBinding": "MzU6YXJpYXZhLWVuY3J5cHRlZC1jb21tYW5kLWJpbmRpbmctdjEKNDg6aG9zdF9JZjR4MzZGVW9tRmlhX2hVQkdfU0p4dDc3VXRxdmtXcVdJZC05SC1YSWJrCjQ5OndhdGNoX1ZrZGFwMVJqUjB3Q2hkOWR2eXZLdHoybVVUV0lPZW0zZElHeTZyRUhjSXcKMjU6c2Vzc2lvbl9jb21tYW5kX3ZlY3Rvcl8wMQoyNzpjb21tYW5kX2ludGVycnVwdF92ZWN0b3JfMDEKOTppbnRlcnJ1cHQKMDoKMjQ6MjAyNi0wOC0xMlQwMDowMDowMC4wMDBaCjI0OjIwMjYtMDgtMTJUMDA6MDU6MDAuMDAwWgoyMzpub25jZV9jb21tYW5kX3ZlY3Rvcl8wMQoxNDpsaW5rX3ZlY3Rvcl8wMQoxOjcKMTozCjE6MQozMjp4MjU1MTktaGtkZi1zaGEyNTYtY2hhY2hhcG9seS12MQoyNzpjb250ZW50X2ludGVycnVwdF92ZWN0b3JfMDEKMjA6aW50ZXJydXB0LWNvbnRlbnQtdjEKMTY6SVNJakpDVW1KeWdwS2lzcwo2Nzo3QnhYeVR1NVBvS0tUNnBpZFlyWVFKSWxJVmFfU1dhZFU5djhFUDRHb1l0Q0p2aG9RN3lWbmlNLWJpQl85dUZfc0xVCjE6MQozMjp4MjU1MTktaGtkZi1zaGEyNTYtY2hhY2hhcG9seS12MQoyNzpjb250ZW50X2ludGVycnVwdF92ZWN0b3JfMDEKMTQ6bGlua192ZWN0b3JfMDEKMTo3CjE6Mwo0ODpla2V5X3MxQWVQVW5SMmlzeVc3U1UwVUxqX0RDcXRYMlRYcnhUbHFqakZqQWV4SUUKNDg6ZWtleV9DWWwycVpfV1ZCcEozeVVqaHlKVjM5ZG1fWVZzSkpUREdJbmJLT0dHejVNCjE2OkxTNHZNREV5TXpRMU5qYzQKNjQ6SC1oNmJMbXRHTWkyUzdvR282ZGtiT3ZpRlQ5eElvRy1tSVZ3WTUzNjJtekNDOUplT0p3T05FRm8tZTE2cURKRwo",
+    "commandDigest": "uOKGPLz1HONDJa-EI2NOInwDoDnWKWNAW-MzCtYF3LE",
+    "envelope": {
+      "hostId": "host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "watchDeviceId": "watch_Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw",
+      "sessionId": "session_command_vector_01",
+      "commandId": "command_interrupt_vector_01",
+      "issuedAt": "2026-08-12T00:00:00.000Z",
+      "expiresAt": "2026-08-12T00:05:00.000Z",
+      "nonce": "nonce_command_vector_01",
+      "type": "interrupt",
+      "linkId": "link_vector_01",
+      "linkGeneration": 7,
+      "epoch": 3,
+      "payload": {
+        "content": {
+          "version": 1,
+          "suite": "x25519-hkdf-sha256-chachapoly-v1",
+          "contentId": "content_interrupt_vector_01",
+          "payloadKind": "interrupt-content-v1",
+          "nonce": "ISIjJCUmJygpKiss",
+          "ciphertext": "7BxXyTu5PoKKT6pidYrYQJIlIVa_SWadU9v8EP4GoYtCJvhoQ7yVniM-biB_9uF_sLU"
+        },
+        "keyWrap": {
+          "version": 1,
+          "suite": "x25519-hkdf-sha256-chachapoly-v1",
+          "contentId": "content_interrupt_vector_01",
+          "linkId": "link_vector_01",
+          "linkGeneration": 7,
+          "epoch": 3,
+          "senderEncryptionKeyId": "ekey_s1AePUnR2isyW7SU0ULj_DCqtX2TXrxTlqjjFjAexIE",
+          "recipientEncryptionKeyId": "ekey_CYl2qZ_WVBpJ3yUjhyJV39dm_YVsJJTDGInbKOGGz5M",
+          "nonce": "LS4vMDEyMzQ1Njc4",
+          "ciphertext": "H-h6bLmtGMi2S7oGo6dkbOviFT9xIoG-mIVwY5362mzCC9JeOJwONEFo-e16qDJG"
+        }
+      }
+    }
+  },
+  "receiptPlaintexts": [
+    {
+      "value": {
+        "version": 1,
+        "accepted": true,
+        "status": "executed"
+      },
+      "plaintext": "eyJ2ZXJzaW9uIjoxLCJhY2NlcHRlZCI6dHJ1ZSwic3RhdHVzIjoiZXhlY3V0ZWQifSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    },
+    {
+      "value": {
+        "version": 1,
+        "accepted": false,
+        "status": "expired"
+      },
+      "plaintext": "eyJ2ZXJzaW9uIjoxLCJhY2NlcHRlZCI6ZmFsc2UsInN0YXR1cyI6ImV4cGlyZWQifSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    },
+    {
+      "value": {
+        "version": 1,
+        "accepted": false,
+        "status": "rejected"
+      },
+      "plaintext": "eyJ2ZXJzaW9uIjoxLCJhY2NlcHRlZCI6ZmFsc2UsInN0YXR1cyI6InJlamVjdGVkIn0gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    },
+    {
+      "value": {
+        "version": 1,
+        "accepted": false,
+        "status": "failed"
+      },
+      "plaintext": "eyJ2ZXJzaW9uIjoxLCJhY2NlcHRlZCI6ZmFsc2UsInN0YXR1cyI6ImZhaWxlZCJ9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    }
+  ],
+  "receipt": {
+    "contentAAD": "Mzc6YXJpYXZhLWNvbW1hbmQtcmVjZWlwdC1jb250ZW50LWFhZC12MQoxNTpicmlkZ2UtdG8td2F0Y2gKNDg6aG9zdF9JZjR4MzZGVW9tRmlhX2hVQkdfU0p4dDc3VXRxdmtXcVdJZC05SC1YSWJrCjQ5OndhdGNoX1ZrZGFwMVJqUjB3Q2hkOWR2eXZLdHoybVVUV0lPZW0zZElHeTZyRUhjSXcKMjU6c2Vzc2lvbl9jb21tYW5kX3ZlY3Rvcl8wMQoyNzpjb21tYW5kX2ludGVycnVwdF92ZWN0b3JfMDEKOTppbnRlcnJ1cHQKNDM6dU9LR1BMejFIT05ESmEtRUkyTk9JbndEb0RuV0tXTkFXLU16Q3RZRjNMRQoyNDoyMDI2LTA4LTEyVDAwOjAwOjAxLjAwMFoKMjU6Y29udGVudF9yZWNlaXB0X3ZlY3Rvcl8wMQoyNjpjb21tYW5kLXJlY2VpcHQtY29udGVudC12MQo",
+    "wrapAAD": "MTg6YXJpYXZhLXdyYXAtYWFkLXYyCjE1OmJyaWRnZS10by13YXRjaAoxNDpsaW5rX3ZlY3Rvcl8wMQoxOjcKMTozCjQ4Omhvc3RfSWY0eDM2RlVvbUZpYV9oVUJHX1NKeHQ3N1V0cXZrV3FXSWQtOUgtWEliawo0OTp3YXRjaF9Wa2RhcDFSalIwd0NoZDlkdnl2S3R6Mm1VVFdJT2VtM2RJR3k2ckVIY0l3CjQ4OmVrZXlfQ1lsMnFaX1dWQnBKM3lVamh5SlYzOWRtX1lWc0pKVERHSW5iS09HR3o1TQo0ODpla2V5X3MxQWVQVW5SMmlzeVc3U1UwVUxqX0RDcXRYMlRYcnhUbHFqakZqQWV4SUUKMjU6Y29udGVudF9yZWNlaXB0X3ZlY3Rvcl8wMQoyNjpjb21tYW5kLXJlY2VpcHQtY29udGVudC12MQo",
+    "dek": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A",
+    "envelopeBinding": "MzM6YXJpYXZhLWNvbW1hbmQtcmVjZWlwdC1iaW5kaW5nLXYxCjE6MQo0ODpob3N0X0lmNHgzNkZVb21GaWFfaFVCR19TSnh0NzdVdHF2a1dxV0lkLTlILVhJYmsKNDk6d2F0Y2hfVmtkYXAxUmpSMHdDaGQ5ZHZ5dkt0ejJtVVRXSU9lbTNkSUd5NnJFSGNJdwoyNTpzZXNzaW9uX2NvbW1hbmRfdmVjdG9yXzAxCjI3OmNvbW1hbmRfaW50ZXJydXB0X3ZlY3Rvcl8wMQo5OmludGVycnVwdAo0Mzp1T0tHUEx6MUhPTkRKYS1FSTJOT0lud0RvRG5XS1dOQVctTXpDdFlGM0xFCjI0OjIwMjYtMDgtMTJUMDA6MDA6MDEuMDAwWgoxNDpsaW5rX3ZlY3Rvcl8wMQoxOjcKMTozCjE6MQozMjp4MjU1MTktaGtkZi1zaGEyNTYtY2hhY2hhcG9seS12MQoyNTpjb250ZW50X3JlY2VpcHRfdmVjdG9yXzAxCjI2OmNvbW1hbmQtcmVjZWlwdC1jb250ZW50LXYxCjE2OllXSmpaR1ZtWjJocGFtdHMKMTkyOnBISzFjSWl1bURwNGlSYTk3cmJ4VGpzc2hoUndCOHdGVlYwUjNrNWhSQVB0S05zc0hHeS1nTUF3YUhyT21qNW52YzRseVBMU1NRekRVWndMVjlyQTIzbGp5WjZsQXBpd3l3RmlaNkxReEt1SVVhV0xOdG5TNXl5ZlB2LUZpdDdKazB6dmhsbFA0UWJUS3F5Ulg2amstOUVBREtPX2NwRGVfdVctTmp0ZmpxUWt5MUpZQ0pGaEtzR0hPNVVLTjBwSQoxOjEKMzI6eDI1NTE5LWhrZGYtc2hhMjU2LWNoYWNoYXBvbHktdjEKMjU6Y29udGVudF9yZWNlaXB0X3ZlY3Rvcl8wMQoxNDpsaW5rX3ZlY3Rvcl8wMQoxOjcKMTozCjQ4OmVrZXlfQ1lsMnFaX1dWQnBKM3lVamh5SlYzOWRtX1lWc0pKVERHSW5iS09HR3o1TQo0ODpla2V5X3MxQWVQVW5SMmlzeVc3U1UwVUxqX0RDcXRYMlRYcnhUbHFqakZqQWV4SUUKMTY6Ylc1dmNIRnljM1IxZG5kNAo2NDpfZEN0NnMyeWpWNTZURjJRTDlFcUM5dW41N01WanAzYmFwM05TZUVHS053aXF6RVlKQzAzcnVseXZqMjZMS0gtCg",
+    "receiptDigest": "Tc1WkQe0gLJsYxW4kBOjt0CCHwXXtKzg6foHwrJdW-E",
+    "envelope": {
+      "version": 1,
+      "hostId": "host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "watchDeviceId": "watch_Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw",
+      "sessionId": "session_command_vector_01",
+      "commandId": "command_interrupt_vector_01",
+      "commandType": "interrupt",
+      "commandDigest": "uOKGPLz1HONDJa-EI2NOInwDoDnWKWNAW-MzCtYF3LE",
+      "completedAt": "2026-08-12T00:00:01.000Z",
+      "linkId": "link_vector_01",
+      "linkGeneration": 7,
+      "epoch": 3,
+      "content": {
+        "version": 1,
+        "suite": "x25519-hkdf-sha256-chachapoly-v1",
+        "contentId": "content_receipt_vector_01",
+        "payloadKind": "command-receipt-content-v1",
+        "nonce": "YWJjZGVmZ2hpamts",
+        "ciphertext": "pHK1cIiumDp4iRa97rbxTjsshhRwB8wFVV0R3k5hRAPtKNssHGy-gMAwaHrOmj5nvc4lyPLSSQzDUZwLV9rA23ljyZ6lApiwywFiZ6LQxKuIUaWLNtnS5yyfPv-Fit7Jk0zvhllP4QbTKqyRX6jk-9EADKO_cpDe_uW-NjtfjqQky1JYCJFhKsGHO5UKN0pI"
+      },
+      "keyWrap": {
+        "version": 1,
+        "suite": "x25519-hkdf-sha256-chachapoly-v1",
+        "contentId": "content_receipt_vector_01",
+        "linkId": "link_vector_01",
+        "linkGeneration": 7,
+        "epoch": 3,
+        "senderEncryptionKeyId": "ekey_CYl2qZ_WVBpJ3yUjhyJV39dm_YVsJJTDGInbKOGGz5M",
+        "recipientEncryptionKeyId": "ekey_s1AePUnR2isyW7SU0ULj_DCqtX2TXrxTlqjjFjAexIE",
+        "nonce": "bW5vcHFyc3R1dnd4",
+        "ciphertext": "_dCt6s2yjV56TF2QL9EqC9un57MVjp3bap3NSeEGKNwiqzEYJC03rulyvj26LKH-"
+      }
+    }
+  }
+}

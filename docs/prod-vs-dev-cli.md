@@ -33,8 +33,8 @@ Both descriptors are validated by `apps/bridge/src/cli/profile.ts`: fixed resour
 | `status` | Host/service/identity/pi status | Isolated dev profile status | shared |
 | `status pi` | Pi extension status | — (rejected) | shared |
 | `doctor` | Full install/service checks | Isolated dev source checks | shared |
-| `identity` | Inspect/rotate/reset Host identity | Same, dev identity | shared |
-| `host` | rotate-key / reset | Same, dev identity | shared |
+| `identity` | Inspect/reset Host identity | Same, dev identity | shared |
+| `host` | — (rejected) | — (rejected) | removed compatibility namespace |
 | `pair` | Pair a Watch with Safety Code | Same, dev Host | shared |
 | `watches` | List/remove Watch links | Same, dev Host | shared |
 | `service` | install/reinstall/status/start/stop/restart/uninstall | — (rejected) | lifecycle |
@@ -58,7 +58,8 @@ Unavailable commands fail with `ERR_COMMAND_UNAVAILABLE_FOR_PROFILE` before any 
 - **`config`** — identical subcommands and redaction. The mutation policy differs intentionally: the **default** profile allows setting `statePath`, `agentAdapterConfigPath`, `agentAdapterPort` (`DEFAULT_MUTABLE_RESOURCE_KEYS`); the **dev** profile rejects them (`ERR_IDENTITY_MANAGED_CONFIG`) because dev resources are fixed and fail closed on mismatch. `config show`, `get`, and `path` print structured output identically for both.
 - **`status`** — both emit the same concise aligned human card (`Ariava` header, aligned labels); `--json` emits the envelope with profile-specific data (dev adds `profile: 'dev'` and source evidence; prod adds `service`/`piExtension`/identity evidence). Envelope message is profile-aware: `Ariava dev host status.` / `Ariava host status.` (converged).
 - **`doctor`** — both print flat `key: value` check lines and exit `0`/`1`; the health formula is per-profile (prod checks service/metadata/pi install state; dev checks source Bridge/pi presence). The human formatter is one shared helper (converged).
-- **`identity` / `host`** — identical operations; messages and usage strings are profile-aware. `identity status` prints structured inspection JSON for both (inspection command, not a card). `host reset` requires `--confirm` for both and emits `ERR_CONFIRMATION_REQUIRED` (converged).
+- **`identity`** — exactly `status` and confirmed `reset`; messages and usage strings are profile-aware. `identity status` prints structured inspection JSON for both. `identity reset` without `--confirm` emits `ERR_CONFIRMATION_REQUIRED` before profile mutation. Confirmed reset removes the old signing/E2E domain, pins, journal/outbox, runtime state, and links, creates one canonical zero-link replacement, and requires Watch re-pairing. Ariava does not rotate identity signing keys in place. Replace the identity with `ariava identity reset --confirm`, then re-pair Watches.
+- **Canonical identity failure** — daemon, signer, Relay client, and onboarding readiness load only canonical identity evidence. Exact recognized non-canonical/pending evidence is accepted only by the confirmed reset coordinator; unknown or inconclusive evidence fails closed. Network, `401`, `5xx`, and ordinary configuration errors preserve identity and are not reset triggers.
 - **`pair` / `watches`** — identical, isolated to the selected profile.
 - **`--version`** — production reads the installed package version (semver enforced; throws on invalid); dev reads the source `package.json` with a `0.0.0-dev` fallback instead of throwing.
 
@@ -95,7 +96,7 @@ These are places where the two profiles were expected to behave identically but 
 | # | Area | Before | After |
 | --- | --- | --- | --- |
 | 1 | `status` human output (dev) | Raw `JSON.stringify` dump | Concise aligned card identical in style to production |
-| 2 | `host reset` without `--confirm` (dev) | Generic `ERR_CLI` | `ERR_CONFIRMATION_REQUIRED`, same machine contract as production |
+| 2 | `identity reset` without `--confirm` (dev) | Generic `ERR_CLI` | `ERR_CONFIRMATION_REQUIRED`, same machine contract as production |
 | 3 | `config agent-secret rotate` (dev) | Told the user to restart the Ariava **service** | Tells the user to restart the **source Bridge** |
 | 4 | `doctor` human formatter | Two near-duplicate formatters (`formatDoctor`, `formatDevDoctor`) | One shared `formatDoctorChecks` |
 | 5 | `status` envelope message | Generic `Ariava host status.` for both | Profile-aware: `Ariava dev host status.` / `Ariava host status.` |
@@ -111,5 +112,5 @@ These are places where the two profiles were expected to behave identically but 
 - `bun test ./apps/bridge/test/dev-profile-cli.test.ts` — dev surface, status card, doctor, identity/host, pair.
 - `bun test ./apps/bridge/test/public-cli.test.ts` — production status baseline, dev status envelope, config/service lifecycle.
 - `bun test ./apps/bridge/test/profile-domain-contract.test.ts` — both profiles: probes, config mutation policy, redaction, agent-secret messages.
-- `bun test ./apps/bridge/test/identity-cli.test.ts` — confirmation contract, identity safety.
+- `bun test ./apps/bridge/test/identity-cli.test.ts` — confirmation contract, canonical identity/reset safety.
 - `bun test ./apps/bridge/test/unified-cli-shell.test.ts` — routing/denial matrix, shared-command staging.

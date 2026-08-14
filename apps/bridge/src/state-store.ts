@@ -10,14 +10,25 @@ import {
   type SecureFileWriteHooks,
   type SecureFileRemoveHooks,
 } from './host-manager/secure-files';
-import type { CanonicalEvent, CanonicalSessionState, CommandResult, HostProjection, ReplaceE2ECurrentSessionsRequestV1 } from '@ariava/protocol';
-import { base64UrlDecode, e2eCurrentSessionsSemanticDigestV1 } from '@ariava/protocol';
+import type {
+  CanonicalEvent, CanonicalSessionState, CommandResult, EncryptedCommandEnvelopeV1, HostProjection,
+  ReplaceE2ECurrentSessionsRequestV1,
+} from '@ariava/protocol';
+import {
+  SIGNED_REQUEST_LIMITS,
+  base64UrlDecode, buildCommandReceiptEnvelopeBindingBytes, buildEncryptedCommandEnvelopeBindingBytes,
+  e2eCurrentSessionsSemanticDigestV1, isCanonicalTimestamp, validateCommandReceiptEnvelopeV1, validateCommandResult,
+  validateEncryptedCommandEnvelopeV1,
+} from '@ariava/protocol';
 import type {
   BridgeRuntimeHealth,
+  CommandReceiptOutboxInputV1,
   DriverRuntimeHealth,
   EventUploadCompletionV1,
   PendingSessionHandle,
   PersistedBridgeState,
+  PersistedCommandExecutionV4,
+  PersistedCommandPinReferenceV1,
   PersistedCurrentSessionsSnapshotState,
   PersistedProducerEventReservationV1,
   PersistedTerminalCancellationV1,
@@ -38,21 +49,24 @@ import {
   type RuntimeCoordinator,
 } from './runtime-lock';
 
-export const BRIDGE_RUNTIME_STATE_SCHEMA_VERSION = 3 as const;
+export const BRIDGE_RUNTIME_STATE_SCHEMA_VERSION = 4 as const;
+export const COMMAND_RECEIPT_RETENTION_DAYS = 30 as const;
+export const COMMAND_RECEIPT_RETENTION_MS = COMMAND_RECEIPT_RETENTION_DAYS * 24 * 60 * 60 * 1_000;
+const PRIOR_RUNTIME_STATE_SCHEMA_VERSION = 3 as const;
 const OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION = 2 as const;
 const LEGACY_RUNTIME_STATE_SCHEMA_VERSION = 1 as const;
 const RESET_INTENT_VERSION = 1 as const;
+const MIGRATION_INTENT_VERSION = 1 as const;
 const ABSENT_HASH = 'absent';
 const MAX_RECENT_EVENTS = 200;
-const MAX_COMMAND_RESULTS = 200;
 const EMPTY_SNAPSHOT: PersistedCurrentSessionsSnapshotState = {
   version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0,
 };
 
-function emptyState(runtimeResetEpoch = randomUUID()): PersistedBridgeState {
+function emptyState(runtimeResetEpoch: string = randomUUID()): PersistedBridgeState {
   return {
     schemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, runtimeResetEpoch, host: null, sessions: {}, sessionDrivers: {},
-    reconciledDrivers: {}, recentEvents: [], sessionRevisions: {}, pendingHandles: {}, commandResults: {}, seenCommands: {},
+    reconciledDrivers: {}, recentEvents: [], sessionRevisions: {}, pendingHandles: {}, commandExecutions: {},
     currentSessionsSnapshot: structuredClone(EMPTY_SNAPSHOT), runtimeHealth: { status: 'healthy', drivers: [] },
   };
 }
@@ -74,6 +88,35 @@ interface RuntimeResetIntentV1 {
   createdAt: string;
 }
 
+interface RuntimeSchemaFloorV1 {
+  version: 1;
+  hostId: string;
+  minSchemaVersion: 4;
+  statePath: string;
+  spoolPath: string;
+}
+
+interface RuntimeMigrationIntentV1 {
+  version: 1;
+  fromSchemaVersion: 3;
+  toSchemaVersion: 4;
+  hostId: string;
+  statePath: string;
+  spoolPath: string;
+  floorPath: string;
+  intentPath: string;
+  stateSourceHash: string;
+  spoolSourceHash: string;
+  floorSourceHash: string;
+  stateTargetHash: string;
+  spoolTargetHash: string;
+  floorTargetHash: string;
+  stateTarget: PersistedBridgeState;
+  spoolTarget: LocalSpoolFileV2;
+  floorTarget: RuntimeSchemaFloorV1;
+  createdAt: string;
+}
+
 type RuntimeResetPhase = 'before-intent' | 'after-intent' | 'after-spool' | 'after-state' | 'after-cleanup';
 type RuntimeRecoveryPhase = 'after-unreadable-recovery';
 export interface BridgeStateStoreOptions { deferRuntimePreflight?: boolean; runtimeCoordinator?: RuntimeCoordinator }
@@ -82,11 +125,16 @@ export interface RuntimeResetHooks {
   remove?: SecureFileRemoveHooks;
   recoveryStep?: (phase: RuntimeRecoveryPhase) => void;
 }
+export interface CommandExecutionPinResolver {
+  resolvePinReference(linkId: string, linkGeneration: number, epoch: number): PersistedCommandPinReferenceV1 | undefined;
+}
 
 export class BridgeStateStore {
+
   private storedState: PersistedBridgeState;
   private spool?: LocalEncryptedSpool;
   private runtimeReady: boolean;
+  private commandExecutionPinsReady: boolean;
   private readonly runtimeCoordinator: RuntimeCoordinator;
   private readonly releaseStateWriter: () => void;
   private readonly ownsRuntimeCoordinator: boolean;
@@ -112,6 +160,7 @@ export class BridgeStateStore {
       this.releaseStateWriter = releaseStateWriter;
       this.assertRuntimeAccess();
       this.runtimeReady = options.deferRuntimePreflight !== true;
+      this.commandExecutionPinsReady = options.deferRuntimePreflight !== true;
       this.storedState = this.runtimeReady ? this.loadCurrentOrFresh() : emptyState('preflight-pending');
     } catch (error) {
       releaseStateWriter?.();
@@ -164,8 +213,16 @@ export class BridgeStateStore {
     resetRemoveHooks?: SecureFileRemoveHooks,
   ): PersistedBridgeState {
     try {
+      const migrationIntentPath = runtimeMigrationIntentPathForState(this.filePath);
+      if (pathHasFilesystemEvidence(migrationIntentPath)) {
+        return this.resumeRuntimeMigration(hostId, resetWriteHooks, resetRemoveHooks);
+      }
+      const floorPath = runtimeSchemaFloorPathForState(this.filePath);
+      const floorBytes = readOptionalSecureBytes(floorPath);
+      const floor = floorBytes ? parseRuntimeSchemaFloor(parseRawJson(floorBytes, 'Bridge runtime schema floor'), this.filePath, hostId) : undefined;
       const intentPath = runtimeResetIntentPathForState(this.filePath);
       if (pathHasFilesystemEvidence(intentPath)) {
+        if (floor) throw new Error('Bridge runtime reset intent exists after the schema floor was established');
         const resumed = this.resumeRuntimeReset(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
         if (resumed.schemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION) {
           return parseCurrentState(resumed, hostId);
@@ -177,20 +234,37 @@ export class BridgeStateStore {
       const spoolBytes = readOptionalSecureBytes(spoolPath);
       const stateRecord = parseRawJson(stateBytes, 'Bridge runtime state');
       const spoolRecord = parseRawJson(spoolBytes, 'Bridge runtime spool');
+      if (floor) {
+        if (!stateRecord || !spoolRecord || !isCurrentStateRecord(stateRecord)) {
+          throw new Error('Bridge runtime artifacts violate the established schema floor');
+        }
+        const state = parseCurrentState(stateRecord, hostId);
+        const spool = parseCurrentSpoolRecord(spoolRecord, hostId, state.runtimeResetEpoch);
+        assertCurrentRuntimeRelationships(state, spool, hostId);
+        return state;
+      }
       if (stateRecord && isCurrentStateRecord(stateRecord)) {
         const state = parseCurrentState(stateRecord, hostId);
         if (!spoolRecord) throw new Error('current Bridge runtime spool is missing');
         const spool = parseCurrentSpoolRecord(spoolRecord, hostId, state.runtimeResetEpoch);
         assertCurrentRuntimeRelationships(state, spool, hostId);
+        writeSecureJson(floorPath, runtimeSchemaFloor(this.filePath, hostId), undefined, resetWriteHooks);
         return state;
+      }
+      if (stateRecord && spoolRecord && isPriorStateRecordV3(stateRecord, hostId)
+        && isSpoolRecordForSchema(spoolRecord, PRIOR_RUNTIME_STATE_SCHEMA_VERSION, hostId, stateRecord.runtimeResetEpoch as string, 'current')) {
+        return this.beginRuntimeMigration(
+          hostId, stateRecord, spoolRecord, stateBytes!, spoolBytes!, resetWriteHooks, resetRemoveHooks,
+        );
       }
       if (!stateRecord && !spoolRecord) {
         return this.initializeFreshRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
       }
       if (isRecognizedObsoleteRuntime(stateRecord, spoolRecord, hostId)) {
-        return this.beginRuntimeReset(hostId, keyStore, stateBytes, spoolBytes,
-          OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION,
-          resetStep, resetWriteHooks, resetRemoveHooks) as PersistedBridgeState;
+        this.beginRuntimeReset(hostId, keyStore, stateBytes, spoolBytes,
+          OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, PRIOR_RUNTIME_STATE_SCHEMA_VERSION,
+          resetStep, resetWriteHooks, resetRemoveHooks);
+        return this.preflightRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
       }
       if (!isRecognizedLegacyRuntime(stateRecord, spoolRecord, hostId)) {
         throw new Error('Bridge runtime schema is unknown, malformed, or internally inconsistent');
@@ -208,9 +282,10 @@ export class BridgeStateStore {
     resetWriteHooks?: SecureFileWriteHooks,
     resetRemoveHooks?: SecureFileRemoveHooks,
   ): PersistedBridgeState {
-    return this.beginRuntimeReset(hostId, keyStore, undefined, undefined,
-      OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION,
-      resetStep, resetWriteHooks, resetRemoveHooks) as PersistedBridgeState;
+    this.beginRuntimeReset(hostId, keyStore, undefined, undefined,
+      OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, PRIOR_RUNTIME_STATE_SCHEMA_VERSION,
+      resetStep, resetWriteHooks, resetRemoveHooks);
+    return this.preflightRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
   }
 
   private beginRuntimeReset(
@@ -300,6 +375,59 @@ export class BridgeStateStore {
     removeSecureFile(runtimeResetIntentPathForState(this.filePath), undefined, resetRemoveHooks);
     resetStep?.('after-cleanup');
     return stateTarget;
+  }
+
+  private beginRuntimeMigration(
+    hostId: string, stateSource: Record<string, unknown>, spoolSource: Record<string, unknown>,
+    stateSourceBytes: Buffer, spoolSourceBytes: Buffer,
+    writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
+  ): PersistedBridgeState {
+    const stateTarget = migrateStateV3ToV4(stateSource, hostId);
+    const spoolTarget = migrateSpoolV3ToV4(spoolSource, hostId, stateTarget.runtimeResetEpoch);
+    const floorTarget = runtimeSchemaFloor(this.filePath, hostId);
+    const intent: RuntimeMigrationIntentV1 = {
+      version: MIGRATION_INTENT_VERSION, fromSchemaVersion: 3, toSchemaVersion: 4, hostId,
+      statePath: resolve(this.filePath), spoolPath: resolve(spoolPathForState(this.filePath)),
+      floorPath: resolve(runtimeSchemaFloorPathForState(this.filePath)),
+      intentPath: resolve(runtimeMigrationIntentPathForState(this.filePath)),
+      stateSourceHash: hashBytes(stateSourceBytes), spoolSourceHash: hashBytes(spoolSourceBytes), floorSourceHash: ABSENT_HASH,
+      stateTargetHash: hashBytes(serializeSecureJson(stateTarget)), spoolTargetHash: hashBytes(serializeSecureJson(spoolTarget)),
+      floorTargetHash: hashBytes(serializeSecureJson(floorTarget)), stateTarget, spoolTarget, floorTarget,
+      createdAt: new Date().toISOString(),
+    };
+    writeSecureJsonExclusive(intent.intentPath, intent, undefined, writeHooks);
+    return this.finishRuntimeMigration(intent, writeHooks, removeHooks);
+  }
+
+  private resumeRuntimeMigration(
+    hostId: string, writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
+  ): PersistedBridgeState {
+    const intent = parseMigrationIntent(readSecureJson<unknown>(runtimeMigrationIntentPathForState(this.filePath)), this.filePath);
+    if (intent.hostId !== hostId) throw new Error('Bridge runtime migration intent Host mismatch');
+    return this.finishRuntimeMigration(intent, writeHooks, removeHooks);
+  }
+
+  private finishRuntimeMigration(
+    intent: RuntimeMigrationIntentV1, writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
+  ): PersistedBridgeState {
+    assertMigrationIntentTargets(intent);
+    const stateBytes = readOptionalSecureBytes(this.filePath);
+    const spoolBytes = readOptionalSecureBytes(spoolPathForState(this.filePath));
+    const floorBytes = readOptionalSecureBytes(runtimeSchemaFloorPathForState(this.filePath));
+    assertMigrationMemberHash('state', stateBytes, intent.stateSourceHash, intent.stateTargetHash);
+    assertMigrationMemberHash('spool', spoolBytes, intent.spoolSourceHash, intent.spoolTargetHash);
+    assertMigrationMemberHash('schema floor', floorBytes, intent.floorSourceHash, intent.floorTargetHash);
+    if (hashOptional(spoolBytes) !== intent.spoolTargetHash) {
+      writeSecureJson(spoolPathForState(this.filePath), intent.spoolTarget, undefined, writeHooks);
+    }
+    if (hashOptional(stateBytes) !== intent.stateTargetHash) {
+      writeSecureJson(this.filePath, intent.stateTarget, undefined, writeHooks);
+    }
+    if (hashOptional(floorBytes) !== intent.floorTargetHash) {
+      writeSecureJson(runtimeSchemaFloorPathForState(this.filePath), intent.floorTarget, undefined, writeHooks);
+    }
+    removeSecureFile(runtimeMigrationIntentPathForState(this.filePath), undefined, removeHooks);
+    return parseCurrentState(intent.stateTarget, intent.hostId);
   }
 
   private assertRuntimeAccess(): void {
@@ -547,7 +675,6 @@ export class BridgeStateStore {
   }
   private finishTerminalCancellation(cancellation: PersistedTerminalCancellationV1): void {
     if (!this.spool) return;
-    this.assertTerminalCancellationSource(cancellation);
     const itemId = terminalCancellationItemId(cancellation.eventId);
     const sourceExists = this.spool.get(cancellation.eventId) !== undefined;
     const intentExists = this.spool.get(itemId) !== undefined;
@@ -580,6 +707,7 @@ export class BridgeStateStore {
           throw new TypeError('terminal cancellation recovery journal conflicts with state');
         }
       }
+      this.assertTerminalCancellationSource(cancellation);
       this.finishTerminalCancellation(cancellation);
       if (this.state.terminalCancellations?.[cancellation.eventId]) {
         throw new Error('terminal cancellation recovery requires retry');
@@ -914,24 +1042,208 @@ export class BridgeStateStore {
     delete nextState.pendingHandles[key];
     this.commit(nextState);
   }
-  getCommandResult(commandId: string): CommandResult | undefined { return this.state.commandResults[commandId]; }
-  hasSeenCommand(commandId: string): boolean { return commandId in this.state.seenCommands; }
-  rememberCommandResult(result: CommandResult, expected: { commandId: string; hostId: string; sessionId: string }): void {
-    if (result.commandId !== expected.commandId || result.hostId !== expected.hostId || result.sessionId !== expected.sessionId) {
-      throw new TypeError('command result does not match its trusted command binding');
-    }
-    const nextState = structuredClone(this.state);
-    nextState.commandResults[result.commandId] = structuredClone(result);
-    nextState.seenCommands[result.commandId] = result.updatedAt;
-    const retainedIds = new Set(Object.keys(nextState.commandResults).slice(-MAX_COMMAND_RESULTS));
-    nextState.commandResults = Object.fromEntries(
-      Object.entries(nextState.commandResults).filter(([commandId]) => retainedIds.has(commandId)),
-    );
-    nextState.seenCommands = Object.fromEntries(
-      Object.entries(nextState.seenCommands).filter(([commandId]) => retainedIds.has(commandId)),
-    );
-    this.commit(nextState);
+  getCommandExecution(commandId: string): PersistedCommandExecutionV4 | undefined {
+    const execution = this.state.commandExecutions[commandId];
+    return execution ? structuredClone(execution) : undefined;
   }
+  listCommandExecutions(): PersistedCommandExecutionV4[] {
+    return Object.values(this.state.commandExecutions).map((execution) => structuredClone(execution));
+  }
+  commandExecutionPinRetentionReferences(): import('./e2e/link-keyring').PinRetentionReferences {
+    const references: import('./e2e/link-keyring').PinRetentionReferences = {};
+    for (const execution of Object.values(this.state.commandExecutions)) {
+      const key = `${execution.pinReference.linkId}:${execution.pinReference.linkGeneration}:${execution.pinReference.epoch}`;
+      const category = commandExecutionRetentionCategory(execution);
+      const retainThrough = commandExecutionRetainedThrough(execution);
+      const values = references[category] ?? {};
+      values[key] = laterCanonicalTimestamp(values[key], retainThrough);
+      references[category] = values;
+    }
+    return references;
+  }
+  durableContentPinRetentionReferences(retainThrough: string): import('./e2e/link-keyring').PinRetentionReferences {
+    if (!isCanonicalTimestamp(retainThrough)) throw new TypeError('content retention cutoff is invalid');
+    const contentRetainedThrough: Record<string, string> = {};
+    const uploads = [
+      ...this.peekPendingUploads(),
+      ...this.state.recentEvents.flatMap((event) => [this.getInflightEventUpload(event.eventId)]),
+      ...this.listInflightSessionIds().map((sessionId) => this.getInflightSessionUpload(sessionId)),
+    ];
+    for (const upload of uploads) collectEncryptedUploadPinReferences(upload, contentRetainedThrough, retainThrough);
+    return Object.keys(contentRetainedThrough).length === 0 ? {} : { contentRetainedThrough };
+  }
+  pruneEligibleCommandExecutions(now: string): PersistedCommandExecutionV4[] {
+    if (!isCanonicalTimestamp(now)) throw new TypeError('command execution prune clock is invalid');
+    const eligible = Object.entries(this.state.commandExecutions)
+      .filter(([, execution]) => commandExecutionRetainedThrough(execution) < now);
+    if (eligible.length === 0) return [];
+    const nextState = structuredClone(this.state);
+    for (const [commandId] of eligible) delete nextState.commandExecutions[commandId];
+    this.commit(nextState);
+    return eligible.map(([, execution]) => structuredClone(execution));
+  }
+  validateCommandExecutionPins(
+    resolver: CommandExecutionPinResolver,
+    options: { allowUnavailableForTerminal?: boolean } = {},
+  ): void {
+    for (const execution of Object.values(this.state.commandExecutions)) {
+      const expected = execution.pinReference;
+      const actual = resolver.resolvePinReference(expected.linkId, expected.linkGeneration, expected.epoch);
+      if (!actual && options.allowUnavailableForTerminal
+        && (execution.state === 'terminal_receipt_blocked' || execution.state === 'terminal')) continue;
+      if (!actual || JSON.stringify(actual) !== JSON.stringify(expected)) {
+        throw new Error('Bridge runtime command execution pin reference is unavailable or inconsistent');
+      }
+    }
+    this.commandExecutionPinsReady = true;
+  }
+  claimCommandExecution(input: {
+    originalEncryptedCommand: EncryptedCommandEnvelopeV1; commandDigest: string;
+    pinReference: PersistedCommandPinReferenceV1; claimedAt: string;
+  }): { status: 'claimed' | 'duplicate'; execution: PersistedCommandExecutionV4 } | { status: 'conflict' } {
+    this.assertCommandExecutionPinsReady();
+    const candidate: PersistedCommandExecutionV4 = {
+      version: 1, originalEncryptedCommand: structuredClone(input.originalEncryptedCommand),
+      commandDigest: input.commandDigest, pinReference: structuredClone(input.pinReference),
+      watchDeviceId: input.originalEncryptedCommand.watchDeviceId, nonce: input.originalEncryptedCommand.nonce,
+      expiresAt: input.originalEncryptedCommand.expiresAt, state: 'claimed', claimedAt: input.claimedAt,
+    };
+    assertCommandExecution(candidate);
+    const existing = this.state.commandExecutions[input.originalEncryptedCommand.commandId];
+    if (existing) return sameCommandClaim(existing, candidate)
+      ? { status: 'duplicate', execution: structuredClone(existing) } : { status: 'conflict' };
+    if (Object.values(this.state.commandExecutions).some((execution) =>
+      execution.watchDeviceId === candidate.watchDeviceId && execution.nonce === candidate.nonce)) return { status: 'conflict' };
+    const nextState = structuredClone(this.state);
+    nextState.commandExecutions[input.originalEncryptedCommand.commandId] = candidate;
+    this.commit(nextState);
+    return { status: 'claimed', execution: structuredClone(candidate) };
+  }
+  markCommandDispatchStarted(commandId: string, dispatchStartedAt: string): PersistedCommandExecutionV4 {
+    const current = this.requireCommandExecution(commandId);
+    if (current.state !== 'claimed') throw new TypeError('command execution cannot start dispatch from its current state');
+    return this.replaceCommandExecution(commandId, { ...current, state: 'dispatch_started', dispatchStartedAt });
+  }
+  recoverOrphanedCommandExecutions(): number {
+    this.assertCommandExecutionPinsReady();
+    const orphanIds = Object.entries(this.state.commandExecutions)
+      .filter(([, execution]) => execution.state === 'claimed' || execution.state === 'dispatch_started')
+      .map(([commandId]) => commandId);
+    if (orphanIds.length === 0) return 0;
+    const nextState = structuredClone(this.state);
+    for (const commandId of orphanIds) nextState.commandExecutions[commandId] = {
+      ...nextState.commandExecutions[commandId]!, state: 'outcome_unknown',
+    };
+    this.commit(nextState);
+    return orphanIds.length;
+  }
+  markCommandOutcomeUnknown(commandId: string): PersistedCommandExecutionV4 {
+    const current = this.requireCommandExecution(commandId);
+    if (current.state !== 'claimed' && current.state !== 'dispatch_started') {
+      throw new TypeError('command execution cannot become outcome-unknown from its current state');
+    }
+    return this.replaceCommandExecution(commandId, { ...current, state: 'outcome_unknown' });
+  }
+  persistTerminalReceiptBlocked(commandId: string, terminalResult: CommandResult): PersistedCommandExecutionV4 {
+    const current = this.requireCommandExecution(commandId);
+    if (current.state !== 'claimed' && current.state !== 'dispatch_started') {
+      throw new TypeError('command execution cannot persist a terminal result from its current state');
+    }
+    return this.replaceCommandExecution(commandId, {
+      ...current, state: 'terminal_receipt_blocked', terminalResult: structuredClone(terminalResult),
+    });
+  }
+  persistTerminalCommandReceipt(
+    commandId: string, terminalResult: CommandResult, outbox: CommandReceiptOutboxInputV1,
+  ): PersistedCommandExecutionV4 {
+    const current = this.requireCommandExecution(commandId);
+    if (current.state !== 'claimed' && current.state !== 'dispatch_started' && current.state !== 'terminal_receipt_blocked') {
+      throw new TypeError('command execution cannot become terminal from its current state');
+    }
+    if (current.state === 'terminal_receipt_blocked' && JSON.stringify(current.terminalResult) !== JSON.stringify(terminalResult)) {
+      throw new TypeError('terminal result is immutable');
+    }
+    assertReceiptOutboxForExecution(current, terminalResult, outbox);
+    return this.replaceCommandExecution(commandId, {
+      ...current, state: 'terminal', terminalResult: structuredClone(terminalResult),
+      receiptOutbox: { version: 1, state: 'pending', canonicalBody: outbox.canonicalBody, receiptDigest: outbox.receiptDigest },
+    });
+  }
+  markCommandReceiptOutbox(commandId: string, state: 'acknowledged' | 'undeliverable'): PersistedCommandExecutionV4 {
+    const current = this.requireCommandExecution(commandId);
+    if (current.state !== 'terminal' || !current.receiptOutbox || current.receiptOutbox.state !== 'pending') {
+      throw new TypeError('command receipt outbox cannot transition from its current state');
+    }
+    return this.replaceCommandExecution(commandId, { ...current, receiptOutbox: { ...current.receiptOutbox, state } });
+  }
+  private requireCommandExecution(commandId: string): PersistedCommandExecutionV4 {
+    this.assertCommandExecutionPinsReady();
+    const execution = this.state.commandExecutions[commandId];
+    if (!execution) throw new TypeError('command execution is not claimed');
+    return structuredClone(execution);
+  }
+  private replaceCommandExecution(commandId: string, execution: PersistedCommandExecutionV4): PersistedCommandExecutionV4 {
+    assertCommandExecution(execution);
+    if (execution.originalEncryptedCommand.commandId !== commandId) throw new TypeError('command execution ID binding is invalid');
+    const nextState = structuredClone(this.state);
+    nextState.commandExecutions[commandId] = execution;
+    this.commit(nextState);
+    return structuredClone(execution);
+  }
+  private assertCommandExecutionPinsReady(): void {
+    if (!this.commandExecutionPinsReady) {
+      throw new Error('Bridge runtime command execution pins are unavailable before startup validation');
+    }
+  }
+}
+
+function commandExecutionRetainedThrough(execution: PersistedCommandExecutionV4): string {
+  if (execution.state === 'claimed' || execution.state === 'dispatch_started' || execution.state === 'outcome_unknown') {
+    return addMilliseconds(execution.expiresAt, SIGNED_REQUEST_LIMITS.clockSkewMs, 'command execution expiry');
+  }
+  if (!execution.terminalResult) throw new TypeError('terminal command execution retention is noncanonical');
+  return addMilliseconds(execution.terminalResult.updatedAt, COMMAND_RECEIPT_RETENTION_MS, 'command receipt retention');
+}
+
+function addMilliseconds(timestamp: string, durationMs: number, label: string): string {
+  if (!isCanonicalTimestamp(timestamp)) throw new TypeError(`${label} timestamp is invalid`);
+  const value = Date.parse(timestamp) + durationMs;
+  if (!Number.isFinite(value)) throw new TypeError(`${label} timestamp is invalid`);
+  return new Date(value).toISOString();
+}
+
+function laterCanonicalTimestamp(left: string | undefined, right: string): string {
+  return left && left > right ? left : right;
+}
+
+function collectEncryptedUploadPinReferences(
+  value: unknown, references: Record<string, string>, retainThrough: string,
+ ): void {
+  if (!isRecord(value)) return;
+  for (const nested of Object.values(value)) {
+    if (Array.isArray(nested)) {
+      for (const item of nested) collectEncryptedUploadPinReferences(item, references, retainThrough);
+      continue;
+    }
+    if (!isRecord(nested)) continue;
+    if (isNonEmptyString(nested.linkId) && isPositiveSafeInteger(nested.linkGeneration) && isPositiveSafeInteger(nested.epoch)) {
+      const key = `${nested.linkId}:${nested.linkGeneration}:${nested.epoch}`;
+      references[key] = laterCanonicalTimestamp(references[key], retainThrough);
+    }
+    collectEncryptedUploadPinReferences(nested, references, retainThrough);
+  }
+}
+
+function commandExecutionRetentionCategory(
+  execution: PersistedCommandExecutionV4,
+): keyof import('./e2e/link-keyring').PinRetentionReferences {
+  if (execution.state === 'claimed' || execution.state === 'dispatch_started' || execution.state === 'outcome_unknown') {
+    return 'executionRetainedThrough';
+  }
+  if (execution.state === 'terminal_receipt_blocked') return 'terminalReceiptRetainedThrough';
+  if (execution.receiptOutbox?.state === 'pending') return 'pendingOutboxRetainedThrough';
+  if (execution.receiptOutbox?.state === 'undeliverable') return 'undeliverableOutboxRetainedThrough';
+  return 'terminalReceiptRetainedThrough';
 }
 
 function retainRecentEvents(
@@ -958,6 +1270,43 @@ function sanitizePersistedHost(host: HostProjection | null): HostProjection | nu
   delete value.claimCode; delete value.claimCodeExpiresAt; delete value.ownerUserId;
   return value;
 }
+function sameCommandClaim(left: PersistedCommandExecutionV4, right: PersistedCommandExecutionV4): boolean {
+  return left.commandDigest === right.commandDigest
+    && JSON.stringify(left.originalEncryptedCommand) === JSON.stringify(right.originalEncryptedCommand)
+    && JSON.stringify(left.pinReference) === JSON.stringify(right.pinReference);
+}
+
+function assertReceiptOutboxForExecution(
+  execution: PersistedCommandExecutionV4, terminalResult: CommandResult, outbox: CommandReceiptOutboxInputV1,
+ ): void {
+  if (!validateCommandResult(terminalResult) || !validateCommandReceiptEnvelopeV1(outbox.receipt)
+    || JSON.stringify(outbox.receipt) !== outbox.canonicalBody
+    || hashBytes(buildCommandReceiptEnvelopeBindingBytes(outbox.receipt)) !== outbox.receiptDigest) {
+    throw new TypeError('command receipt outbox input is invalid');
+  }
+  const receipt = outbox.receipt;
+  const command = execution.originalEncryptedCommand;
+  if (terminalResult.commandId !== command.commandId || terminalResult.hostId !== command.hostId
+    || terminalResult.sessionId !== command.sessionId || receipt.hostId !== command.hostId
+    || receipt.watchDeviceId !== command.watchDeviceId || receipt.sessionId !== command.sessionId
+    || receipt.commandId !== command.commandId || receipt.commandType !== command.type
+    || receipt.commandDigest !== execution.commandDigest || receipt.completedAt !== terminalResult.updatedAt
+    || receipt.linkId !== execution.pinReference.linkId
+    || receipt.linkGeneration !== execution.pinReference.linkGeneration || receipt.epoch !== execution.pinReference.epoch
+    || receipt.keyWrap.senderEncryptionKeyId !== execution.pinReference.hostEncryptionKeyId
+    || receipt.keyWrap.recipientEncryptionKeyId !== execution.pinReference.watchEncryptionKeyId) {
+    throw new TypeError('command receipt does not match its execution');
+  }
+}
+
+function assertPersistedReceiptMatchesExecution(execution: PersistedCommandExecutionV4): void {
+  const outbox = execution.receiptOutbox!;
+  const receipt = JSON.parse(outbox.canonicalBody);
+  assertReceiptOutboxForExecution(execution, execution.terminalResult!, {
+    canonicalBody: outbox.canonicalBody, receiptDigest: outbox.receiptDigest, receipt,
+  });
+}
+
 function sameEventCompletion(left: EventUploadCompletionV1, right: EventUploadCompletionV1): boolean {
   return left.version === right.version && left.eventId === right.eventId && left.sessionId === right.sessionId
     && left.revision === right.revision && left.eventContentId === right.eventContentId
@@ -966,6 +1315,12 @@ function sameEventCompletion(left: EventUploadCompletionV1, right: EventUploadCo
 
 export function runtimeResetIntentPathForState(statePath: string): string {
   return `${statePath}.runtime-reset.json`;
+}
+export function runtimeMigrationIntentPathForState(statePath: string): string {
+  return `${statePath}.runtime-migration.json`;
+}
+export function runtimeSchemaFloorPathForState(statePath: string): string {
+  return `${statePath}.schema-floor.json`;
 }
 
 function readOptionalSecureBytes(path: string): Buffer | undefined {
@@ -985,6 +1340,10 @@ function parseRawJson(bytes: Buffer | undefined, label: string): Record<string, 
 }
 
 const CURRENT_STATE_REQUIRED_KEYS = [
+  'schemaVersion', 'runtimeResetEpoch', 'host', 'sessions', 'sessionDrivers', 'reconciledDrivers', 'recentEvents',
+  'sessionRevisions', 'pendingHandles', 'commandExecutions', 'currentSessionsSnapshot',
+] as const;
+const PRIOR_V3_STATE_REQUIRED_KEYS = [
   'schemaVersion', 'runtimeResetEpoch', 'host', 'sessions', 'sessionDrivers', 'reconciledDrivers', 'recentEvents',
   'sessionRevisions', 'pendingHandles', 'commandResults', 'seenCommands', 'currentSessionsSnapshot',
 ] as const;
@@ -1027,7 +1386,7 @@ function isCurrentStateRecord(value: Record<string, unknown>): boolean {
     || !isStringMap(value.sessionDrivers) || !isTrueMap(value.reconciledDrivers)
     || !Array.isArray(value.recentEvents) || !value.recentEvents.every(isCurrentEvent)
     || !isNonNegativeIntegerMap(value.sessionRevisions) || !isValueMap(value.pendingHandles, isCurrentPendingHandle)
-    || !isValueMap(value.commandResults, isCurrentCommandResult) || !isStringMap(value.seenCommands)
+    || !isValueMap(value.commandExecutions, isCurrentCommandExecution)
     || !isCurrentSnapshot(value.currentSessionsSnapshot)) return false;
   if (value.recipientSetVersion !== undefined && !isPositiveSafeInteger(value.recipientSetVersion)) return false;
   return (value.eventUploadCompletions === undefined || isValueMap(value.eventUploadCompletions, isCurrentEventCompletion))
@@ -1039,8 +1398,92 @@ function isCurrentStateRecord(value: Record<string, unknown>): boolean {
 function parseCurrentState(value: unknown, hostId?: string): PersistedBridgeState {
   if (!isRecord(value) || !isCurrentStateRecord(value)) throw new Error('Bridge runtime state schema is invalid');
   const state = structuredClone(value) as unknown as PersistedBridgeState;
-  if (hostId !== undefined) assertCurrentStateRelationships(state, hostId);
+  const relationshipHostId = hostId ?? inferCurrentStateHostId(state);
+  assertCurrentStateRelationships(state, relationshipHostId);
   return state;
+}
+
+function inferCurrentStateHostId(state: PersistedBridgeState): string {
+  const hostIds = new Set<string>();
+  if (state.host) hostIds.add(state.host.hostId);
+  for (const session of Object.values(state.sessions)) hostIds.add(session.hostId);
+  for (const event of state.recentEvents) hostIds.add(event.hostId);
+  for (const handle of Object.values(state.pendingHandles)) hostIds.add(handle.hostId);
+  for (const execution of Object.values(state.commandExecutions)) hostIds.add(execution.originalEncryptedCommand.hostId);
+  if (hostIds.size > 1) throw new Error('Bridge runtime Host relationships are inconsistent');
+  return hostIds.values().next().value ?? '';
+}
+
+function isPriorStateRecordV3(value: Record<string, unknown>, hostId: string): boolean {
+  if (!hasExactOptionalKeys(value, PRIOR_V3_STATE_REQUIRED_KEYS, CURRENT_STATE_OPTIONAL_KEYS)
+    || value.schemaVersion !== PRIOR_RUNTIME_STATE_SCHEMA_VERSION || !isRuntimeEpoch(value.runtimeResetEpoch)
+    || !(value.host === null || isCurrentHost(value.host)) || !isValueMap(value.sessions, isCurrentSession)
+    || !isStringMap(value.sessionDrivers) || !isTrueMap(value.reconciledDrivers)
+    || !Array.isArray(value.recentEvents) || !value.recentEvents.every(isCurrentEvent)
+    || !isNonNegativeIntegerMap(value.sessionRevisions) || !isValueMap(value.pendingHandles, isCurrentPendingHandle)
+    || !isValueMap(value.commandResults, isPriorCommandResult) || !isStringMap(value.seenCommands)
+    || !isCurrentSnapshot(value.currentSessionsSnapshot)) return false;
+  if (value.recipientSetVersion !== undefined && !isPositiveSafeInteger(value.recipientSetVersion)) return false;
+  if ((value.eventUploadCompletions !== undefined && !isValueMap(value.eventUploadCompletions, isCurrentEventCompletion))
+    || (value.producerEventReservations !== undefined && !isValueMap(value.producerEventReservations, isCurrentProducerReservation))
+    || (value.terminalCancellations !== undefined && !isValueMap(value.terminalCancellations, isCurrentTerminalCancellation))
+    || (value.runtimeHealth !== undefined && !isCurrentRuntimeHealth(value.runtimeHealth))) return false;
+  try { assertPriorStateV3Relationships(value, hostId); return true; } catch { return false; }
+}
+function assertPriorStateV3Relationships(state: Record<string, unknown>, hostId: string): void {
+  const projection = state as unknown as { host: HostProjection | null; sessions: Record<string, CanonicalSessionState>;
+    sessionDrivers: Record<string, string>; recentEvents: CanonicalEvent[]; sessionRevisions: Record<string, number>;
+    pendingHandles: Record<string, PendingSessionHandle>; commandResults: Record<string, Record<string, unknown>>;
+    seenCommands: Record<string, string>; currentSessionsSnapshot: PersistedCurrentSessionsSnapshotState;
+    recipientSetVersion?: number; eventUploadCompletions?: Record<string, PersistedBridgeState['eventUploadCompletions'] extends infer T ? never : never>; };
+  if (projection.host && projection.host.hostId !== hostId) throw new Error('prior Host projection belongs to another Host');
+  const events = new Map<string, CanonicalEvent>();
+  for (const [sessionId, session] of Object.entries(projection.sessions)) {
+    if (sessionId !== session.sessionId || session.hostId !== hostId) throw new Error('prior Session binding is invalid');
+  }
+  for (const [sessionId, driver] of Object.entries(projection.sessionDrivers)) {
+    if (!projection.sessions[sessionId] || projection.sessions[sessionId]!.provider !== driver) throw new Error('prior driver binding is invalid');
+  }
+  for (const event of projection.recentEvents) {
+    if (event.hostId !== hostId || events.has(event.eventId)) throw new Error('prior Event binding is invalid');
+    const session = projection.sessions[event.sessionId];
+    if (session && session.provider !== event.provider) throw new Error('prior Event Session binding is invalid');
+    events.set(event.eventId, event);
+  }
+  for (const revision of Object.values(projection.sessionRevisions)) if (revision < 1) throw new Error('prior revision is invalid');
+  for (const [key, handle] of Object.entries(projection.pendingHandles)) {
+    const event = events.get(handle.handledThroughEventId);
+    if (key !== sessionHandleKey(hostId, handle.sessionId) || handle.hostId !== hostId || !event
+      || event.sessionId !== handle.sessionId
+      || (handle.handledThroughEventCreatedAt !== undefined && handle.handledThroughEventCreatedAt !== event.createdAt)) {
+      throw new Error('prior handle binding is invalid');
+    }
+  }
+  for (const [commandId, result] of Object.entries(projection.commandResults)) {
+    if (commandId !== result.commandId || result.hostId !== hostId || projection.seenCommands[commandId] !== result.updatedAt) {
+      throw new Error('prior command result binding is invalid');
+    }
+  }
+  if (Object.keys(projection.seenCommands).some((commandId) => !projection.commandResults[commandId])) {
+    throw new Error('prior seen-command binding is invalid');
+  }
+  const compatible = { ...state, schemaVersion: 4, commandExecutions: {} } as Record<string, unknown>;
+  delete compatible.commandResults; delete compatible.seenCommands;
+  assertCurrentStateRelationships(compatible as unknown as PersistedBridgeState, hostId);
+}
+
+
+function migrateStateV3ToV4(value: Record<string, unknown>, hostId: string): PersistedBridgeState {
+  if (!isPriorStateRecordV3(value, hostId)) throw new Error('Bridge runtime schema v3 is invalid');
+  const { commandResults: _commandResults, seenCommands: _seenCommands, schemaVersion: _schemaVersion, ...metadata } = value;
+  return parseCurrentState({ ...structuredClone(metadata), schemaVersion: 4, commandExecutions: {} }, hostId);
+}
+
+function migrateSpoolV3ToV4(value: Record<string, unknown>, hostId: string, epoch: string): LocalSpoolFileV2 {
+  if (!isSpoolRecordForSchema(value, PRIOR_RUNTIME_STATE_SCHEMA_VERSION, hostId, epoch, 'current')) {
+    throw new Error('Bridge runtime spool schema v3 is invalid');
+  }
+  return { ...(structuredClone(value) as unknown as LocalSpoolFileV2), runtimeStateSchemaVersion: 4 };
 }
 
 function isRecognizedPriorStateRecord(value: Record<string, unknown> | undefined, hostId: string): boolean {
@@ -1062,7 +1505,7 @@ function isRecognizedPriorStateRecord(value: Record<string, unknown> | undefined
   if (value.terminalCancellations !== undefined && !isValueMap(value.terminalCancellations, isCurrentTerminalCancellation)) return false;
   if (value.pendingHandles !== undefined && !isValueMap(value.pendingHandles, isCurrentPendingHandle)) return false;
   if (value.pendingReads !== undefined && !isValueMap(value.pendingReads, isRecognizedPriorRead)) return false;
-  if (value.commandResults !== undefined && !isValueMap(value.commandResults, isCurrentCommandResult)) return false;
+  if (value.commandResults !== undefined && !isValueMap(value.commandResults, isPriorCommandResult)) return false;
   if (value.seenCommands !== undefined && !isStringMap(value.seenCommands)) return false;
   if (value.currentSessionsSnapshot !== undefined && !isRecognizedPriorSnapshot(value.currentSessionsSnapshot, hostId)) return false;
   return hasRecognizedPriorStateRelationships(value, hostId);
@@ -1087,23 +1530,20 @@ function isRecognizedObsoleteRuntime(
 }
 
 function isObsoleteStateRecord(value: Record<string, unknown>, hostId: string): boolean {
-  if (!hasExactOptionalKeys(value, CURRENT_STATE_REQUIRED_KEYS, CURRENT_STATE_OPTIONAL_KEYS)
+  if (!hasExactOptionalKeys(value, PRIOR_V3_STATE_REQUIRED_KEYS, CURRENT_STATE_OPTIONAL_KEYS)
     || value.schemaVersion !== OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION || !isRuntimeEpoch(value.runtimeResetEpoch)
     || !(value.host === null || isCurrentHost(value.host)) || !isValueMap(value.sessions, isCurrentSession)
     || !isStringMap(value.sessionDrivers) || !isTrueMap(value.reconciledDrivers)
     || !Array.isArray(value.recentEvents) || !value.recentEvents.every(isObsoleteEvent)
     || !isNonNegativeIntegerMap(value.sessionRevisions) || !isValueMap(value.pendingHandles, isCurrentPendingHandle)
-    || !isValueMap(value.commandResults, isCurrentCommandResult) || !isStringMap(value.seenCommands)
+    || !isValueMap(value.commandResults, isPriorCommandResult) || !isStringMap(value.seenCommands)
     || !isCurrentSnapshot(value.currentSessionsSnapshot)) return false;
   if (value.recipientSetVersion !== undefined && !isPositiveSafeInteger(value.recipientSetVersion)) return false;
   if ((value.eventUploadCompletions !== undefined && !isValueMap(value.eventUploadCompletions, isCurrentEventCompletion))
     || (value.producerEventReservations !== undefined && !isValueMap(value.producerEventReservations, isCurrentProducerReservation))
     || (value.terminalCancellations !== undefined && !isValueMap(value.terminalCancellations, isCurrentTerminalCancellation))
     || (value.runtimeHealth !== undefined && !isCurrentRuntimeHealth(value.runtimeHealth))) return false;
-  try {
-    assertCurrentStateRelationships(value as unknown as PersistedBridgeState, hostId);
-    return true;
-  } catch { return false; }
+  try { assertPriorStateV3Relationships(value, hostId); return true; } catch { return false; }
 }
 
 function parseCurrentSpoolRecord(value: Record<string, unknown>, hostId: string, epoch: string): LocalSpoolFileV2 {
@@ -1114,7 +1554,7 @@ function parseCurrentSpoolRecord(value: Record<string, unknown>, hostId: string,
 }
 
 function isSpoolRecordForSchema(
-  value: Record<string, unknown>, schemaVersion: 2 | 3, hostId: string, epoch: string, kind: 'current' | 'standalone-v2',
+  value: Record<string, unknown>, schemaVersion: 2 | 3 | 4, hostId: string, epoch: string, kind: 'current' | 'standalone-v2',
 ): boolean {
   return hasExactKeys(value, ['version', 'runtimeStateSchemaVersion', 'runtimeResetEpoch', 'hostId', 'keyId', 'items'])
     && value.version === 2 && value.runtimeStateSchemaVersion === schemaVersion
@@ -1165,11 +1605,16 @@ function parseResetIntent(value: unknown): RuntimeResetIntentV1 {
 
 function isValidResetTransition(from: unknown, to: unknown): boolean {
   return (from === LEGACY_RUNTIME_STATE_SCHEMA_VERSION && to === OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION)
-    || (from === OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION && to === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION);
+    || (from === OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION && to === PRIOR_RUNTIME_STATE_SCHEMA_VERSION);
 }
 
 function emptyStateForSchema(schemaVersion: 2 | 3, epoch: string): Record<string, unknown> {
-  return { ...emptyState(epoch), schemaVersion };
+  if (schemaVersion === PRIOR_RUNTIME_STATE_SCHEMA_VERSION) {
+    const { commandExecutions: _commandExecutions, ...state } = emptyState(epoch);
+    return { ...state, schemaVersion, commandResults: {}, seenCommands: {} };
+  }
+  const { commandExecutions: _commandExecutions, ...state } = emptyState(epoch);
+  return { ...state, schemaVersion, commandResults: {}, seenCommands: {} };
 }
 
 function spoolFileForSchema(schemaVersion: 2 | 3, hostId: string, epoch: string, keyId: string): LocalSpoolFileV2 {
@@ -1186,15 +1631,15 @@ function assertResetIntentPaths(intent: RuntimeResetIntentV1, statePath: string)
 
 function assertRuntimeResetTargets(
   intent: RuntimeResetIntentV1, stateTarget: Record<string, unknown>, spoolTarget: LocalSpoolFileV2,
-): void {
+ ): void {
   if (hashBytes(serializeSecureJson(stateTarget)) !== intent.stateTargetHash
     || hashBytes(serializeSecureJson(spoolTarget)) !== intent.spoolTargetHash) {
     throw new Error('Bridge runtime reset intent target hash is invalid');
   }
-  if (intent.toSchemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION) {
-    const state = parseCurrentState(stateTarget, intent.hostId);
-    const spool = parseCurrentSpoolRecord(spoolTarget as unknown as Record<string, unknown>, intent.hostId, intent.epoch);
-    assertCurrentRuntimeRelationships(state, spool, intent.hostId);
+  if (intent.toSchemaVersion === PRIOR_RUNTIME_STATE_SCHEMA_VERSION) {
+    if (!isPriorStateRecordV3(stateTarget, intent.hostId) || !isSpoolRecordForSchema(
+      spoolTarget as unknown as Record<string, unknown>, PRIOR_RUNTIME_STATE_SCHEMA_VERSION, intent.hostId, intent.epoch, 'current',
+    )) throw new Error('Bridge runtime reset intent prior target is invalid');
   } else if (!isObsoleteStateRecord(stateTarget, intent.hostId) || !isSpoolRecordForSchema(
     spoolTarget as unknown as Record<string, unknown>, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, intent.hostId, intent.epoch, 'current',
   )) {
@@ -1209,8 +1654,8 @@ function assertResetStateMember(
   assertResetMemberHash('state', actual, intent.stateSourceHash, intent.stateTargetHash);
   if (actual === intent.stateTargetHash) {
     const parsed = parseRawJson(bytes, 'Bridge runtime reset state target');
-    const valid = intent.toSchemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION
-      ? !!parsed && isCurrentStateRecord(parsed)
+    const valid = intent.toSchemaVersion === PRIOR_RUNTIME_STATE_SCHEMA_VERSION
+      ? !!parsed && isPriorStateRecordV3(parsed, hostId)
       : !!parsed && isObsoleteStateRecord(parsed, hostId);
     if (!valid || JSON.stringify(parsed) !== JSON.stringify(target)) {
       throw new Error('Bridge runtime reset state target is invalid');
@@ -1242,6 +1687,75 @@ function assertResetSpoolMember(
       : !!spool && isSpoolRecordForSchema(spool, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, hostId,
         (spool.runtimeResetEpoch as string), 'current');
     if (!valid) throw new Error('Bridge runtime reset spool source schema is invalid');
+  }
+}
+
+function runtimeSchemaFloor(statePath: string, hostId: string): RuntimeSchemaFloorV1 {
+  const resolvedStatePath = resolve(statePath);
+  return {
+    version: 1, hostId, minSchemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION,
+    statePath: resolvedStatePath, spoolPath: resolve(spoolPathForState(resolvedStatePath)),
+  };
+}
+
+function parseRuntimeSchemaFloor(
+  value: Record<string, unknown> | undefined, statePath: string, hostId: string,
+ ): RuntimeSchemaFloorV1 {
+  if (!value || !hasExactKeys(value, ['version', 'hostId', 'minSchemaVersion', 'statePath', 'spoolPath'])
+    || value.version !== 1 || value.hostId !== hostId
+    || value.minSchemaVersion !== BRIDGE_RUNTIME_STATE_SCHEMA_VERSION) {
+    throw new Error('Bridge runtime schema floor is invalid');
+  }
+  const expected = runtimeSchemaFloor(statePath, hostId);
+  if (value.statePath !== expected.statePath || value.spoolPath !== expected.spoolPath) {
+    throw new Error('Bridge runtime schema floor path binding is invalid');
+  }
+  return value as unknown as RuntimeSchemaFloorV1;
+}
+
+function parseMigrationIntent(value: unknown, statePath: string): RuntimeMigrationIntentV1 {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    'version', 'fromSchemaVersion', 'toSchemaVersion', 'hostId', 'statePath', 'spoolPath', 'floorPath', 'intentPath',
+    'stateSourceHash', 'spoolSourceHash', 'floorSourceHash', 'stateTargetHash', 'spoolTargetHash', 'floorTargetHash',
+    'stateTarget', 'spoolTarget', 'floorTarget', 'createdAt',
+  ]) || value.version !== MIGRATION_INTENT_VERSION || value.fromSchemaVersion !== PRIOR_RUNTIME_STATE_SCHEMA_VERSION
+    || value.toSchemaVersion !== BRIDGE_RUNTIME_STATE_SCHEMA_VERSION || !isNonEmptyString(value.hostId)
+    || !isAbsoluteResolvedPath(value.statePath) || !isAbsoluteResolvedPath(value.spoolPath)
+    || !isAbsoluteResolvedPath(value.floorPath) || !isAbsoluteResolvedPath(value.intentPath)
+    || !isRuntimeHash(value.stateSourceHash) || !isRuntimeHash(value.spoolSourceHash) || !isRuntimeHash(value.floorSourceHash)
+    || !isRuntimeHash(value.stateTargetHash) || !isRuntimeHash(value.spoolTargetHash) || !isRuntimeHash(value.floorTargetHash)
+    || !isNonEmptyString(value.createdAt) || !isCanonicalTimestamp(value.createdAt)) {
+    throw new Error('Bridge runtime migration intent is invalid');
+  }
+  const intent = value as unknown as RuntimeMigrationIntentV1;
+  const expectedStatePath = resolve(statePath);
+  if (intent.statePath !== expectedStatePath || intent.spoolPath !== resolve(spoolPathForState(expectedStatePath))
+    || intent.floorPath !== resolve(runtimeSchemaFloorPathForState(expectedStatePath))
+    || intent.intentPath !== resolve(runtimeMigrationIntentPathForState(expectedStatePath))) {
+    throw new Error('Bridge runtime migration intent path binding is invalid');
+  }
+  assertMigrationIntentTargets(intent);
+  return intent;
+}
+
+function assertMigrationIntentTargets(intent: RuntimeMigrationIntentV1): void {
+  const state = parseCurrentState(intent.stateTarget, intent.hostId);
+  const spool = parseCurrentSpoolRecord(
+    intent.spoolTarget as unknown as Record<string, unknown>, intent.hostId, state.runtimeResetEpoch,
+  );
+  const floor = parseRuntimeSchemaFloor(intent.floorTarget as unknown as Record<string, unknown>, intent.statePath, intent.hostId);
+  assertCurrentRuntimeRelationships(state, spool, intent.hostId);
+  if (hashBytes(serializeSecureJson(intent.stateTarget)) !== intent.stateTargetHash
+    || hashBytes(serializeSecureJson(intent.spoolTarget)) !== intent.spoolTargetHash
+    || hashBytes(serializeSecureJson(floor)) !== intent.floorTargetHash || intent.floorSourceHash !== ABSENT_HASH) {
+    throw new Error('Bridge runtime migration intent target hash is invalid');
+  }
+}
+
+function assertMigrationMemberHash(name: string, bytes: Buffer | undefined, source: string, target: string): void {
+  const actual = hashOptional(bytes);
+  if (actual !== source && actual !== target) {
+    throw new Error(`Bridge runtime migration ${name} changed outside the migration journal`);
   }
 }
 
@@ -1349,13 +1863,93 @@ function isCurrentPendingHandle(value: unknown): boolean {
     && (value.action === 'pi_input' || value.action === 'bridge_recovery')
     && (value.handledThroughEventCreatedAt === undefined || isNonEmptyString(value.handledThroughEventCreatedAt));
 }
-function isCurrentCommandResult(value: unknown): boolean {
-  return isRecord(value) && hasExactOptionalKeys(value,
+function isPriorCommandResult(value: unknown): boolean {
+  if (!isRecord(value) || !hasExactOptionalKeys(value,
     ['commandId', 'hostId', 'sessionId', 'accepted', 'status', 'message', 'updatedAt'], ['correlationId'])
-    && ['commandId', 'hostId', 'sessionId', 'message', 'updatedAt'].every((key) => isNonEmptyString(value[key]))
-    && typeof value.accepted === 'boolean'
-    && ['queued', 'delivered', 'executed', 'expired', 'rejected', 'failed'].includes(value.status as string)
-    && (value.correlationId === undefined || isNonEmptyString(value.correlationId));
+    || !['commandId', 'hostId', 'sessionId', 'message', 'updatedAt'].every((key) => isNonEmptyString(value[key]))
+    || typeof value.accepted !== 'boolean'
+    || !['queued', 'delivered', 'executed', 'expired', 'rejected', 'failed'].includes(value.status as string)
+    || (value.correlationId !== undefined && !isNonEmptyString(value.correlationId))) return false;
+  return true;
+}
+
+function isCurrentCommandExecution(value: unknown): boolean {
+  try { assertCommandExecution(value); return true; } catch { return false; }
+}
+
+function assertCommandExecution(value: unknown): asserts value is PersistedCommandExecutionV4 {
+  if (!isRecord(value) || !hasExactOptionalKeys(value, [
+    'version', 'originalEncryptedCommand', 'commandDigest', 'pinReference', 'watchDeviceId', 'nonce', 'expiresAt',
+    'state', 'claimedAt',
+  ], ['dispatchStartedAt', 'terminalResult', 'receiptOutbox']) || value.version !== 1
+    || !validateEncryptedCommandEnvelopeV1(value.originalEncryptedCommand)
+    || !isVerifier(value.commandDigest) || !isPersistedCommandPinReference(value.pinReference)
+    || value.watchDeviceId !== value.originalEncryptedCommand.watchDeviceId
+    || value.nonce !== value.originalEncryptedCommand.nonce || value.expiresAt !== value.originalEncryptedCommand.expiresAt
+    || !isCanonicalTimestamp(value.claimedAt)
+    || !['claimed', 'dispatch_started', 'outcome_unknown', 'terminal_receipt_blocked', 'terminal'].includes(value.state as string)) {
+    throw new TypeError('command execution is invalid');
+  }
+  const execution = value as unknown as PersistedCommandExecutionV4;
+  const recomputedDigest = hashBytes(buildEncryptedCommandEnvelopeBindingBytes(execution.originalEncryptedCommand));
+  if (execution.commandDigest !== recomputedDigest
+    || execution.pinReference.linkId !== execution.originalEncryptedCommand.linkId
+    || execution.pinReference.linkGeneration !== execution.originalEncryptedCommand.linkGeneration
+    || execution.pinReference.epoch !== execution.originalEncryptedCommand.epoch
+    || execution.pinReference.hostEncryptionKeyId !== execution.originalEncryptedCommand.payload.keyWrap.recipientEncryptionKeyId
+    || execution.pinReference.watchEncryptionKeyId !== execution.originalEncryptedCommand.payload.keyWrap.senderEncryptionKeyId) {
+    throw new TypeError('command execution binding is invalid');
+  }
+  if (execution.dispatchStartedAt !== undefined && !isCanonicalTimestamp(execution.dispatchStartedAt)) {
+    throw new TypeError('command dispatch timestamp is invalid');
+  }
+  if (execution.terminalResult !== undefined && (!validateCommandResult(execution.terminalResult)
+    || execution.terminalResult.commandId !== execution.originalEncryptedCommand.commandId
+    || execution.terminalResult.hostId !== execution.originalEncryptedCommand.hostId
+    || execution.terminalResult.sessionId !== execution.originalEncryptedCommand.sessionId)) {
+    throw new TypeError('command terminal result binding is invalid');
+  }
+  if (execution.receiptOutbox !== undefined && !isPersistedReceiptOutbox(execution.receiptOutbox)) {
+    throw new TypeError('command receipt outbox is invalid');
+  }
+  switch (execution.state) {
+    case 'claimed':
+      if (execution.dispatchStartedAt || execution.terminalResult || execution.receiptOutbox) throw new TypeError('claimed command shape is invalid');
+      break;
+    case 'dispatch_started':
+      if (!execution.dispatchStartedAt || execution.terminalResult || execution.receiptOutbox) throw new TypeError('dispatch-started command shape is invalid');
+      break;
+    case 'outcome_unknown':
+      if (execution.terminalResult || execution.receiptOutbox) throw new TypeError('outcome-unknown command shape is invalid');
+      break;
+    case 'terminal_receipt_blocked':
+      if (!execution.terminalResult || execution.receiptOutbox) throw new TypeError('receipt-blocked command shape is invalid');
+      break;
+    case 'terminal':
+      if (!execution.terminalResult || !execution.receiptOutbox) throw new TypeError('terminal command shape is invalid');
+      assertPersistedReceiptMatchesExecution(execution);
+      break;
+  }
+}
+
+function isPersistedCommandPinReference(value: unknown): value is PersistedCommandPinReferenceV1 {
+  return isRecord(value) && hasExactKeys(value, [
+    'version', 'linkId', 'linkGeneration', 'epoch', 'transcriptDigest', 'hostEncryptionKeyId', 'watchEncryptionKeyId',
+  ]) && value.version === 1 && isNonEmptyString(value.linkId) && isPositiveSafeInteger(value.linkGeneration)
+    && isPositiveSafeInteger(value.epoch) && isVerifier(value.transcriptDigest)
+    && typeof value.hostEncryptionKeyId === 'string' && /^ekey_[A-Za-z0-9_-]{43}$/u.test(value.hostEncryptionKeyId)
+    && typeof value.watchEncryptionKeyId === 'string' && /^ekey_[A-Za-z0-9_-]{43}$/u.test(value.watchEncryptionKeyId);
+}
+
+function isPersistedReceiptOutbox(value: unknown): boolean {
+  if (!isRecord(value) || !hasExactKeys(value, ['version', 'state', 'canonicalBody', 'receiptDigest'])
+    || value.version !== 1 || !['pending', 'acknowledged', 'undeliverable'].includes(value.state as string)
+    || !isNonEmptyString(value.canonicalBody) || !isVerifier(value.receiptDigest)) return false;
+  try {
+    const receipt = JSON.parse(value.canonicalBody);
+    return validateCommandReceiptEnvelopeV1(receipt) && JSON.stringify(receipt) === value.canonicalBody
+      && hashBytes(buildCommandReceiptEnvelopeBindingBytes(receipt)) === value.receiptDigest;
+  } catch { return false; }
 }
 function isCurrentEventCompletion(value: unknown): boolean {
   return isRecord(value) && hasExactOptionalKeys(value,
@@ -1418,12 +2012,16 @@ function isCanonicalHealthTimestamp(value: unknown): value is string {
 
 function assertCurrentStateRelationships(state: PersistedBridgeState, hostId: string): void {
   if (state.host && state.host.hostId !== hostId) throw new Error('Bridge runtime Host projection belongs to another Host');
+  const sessions = new Set(Object.keys(state.sessions));
   const events = new Map<string, CanonicalEvent>();
   for (const [sessionId, session] of Object.entries(state.sessions)) {
     if (session.sessionId !== sessionId || session.hostId !== hostId) throw new Error('Bridge runtime Session binding is invalid');
   }
-  for (const sessionId of Object.keys(state.sessionDrivers)) {
-    if (!state.sessions[sessionId]) throw new Error('Bridge runtime Session driver binding is invalid');
+  for (const [sessionId, driver] of Object.entries(state.sessionDrivers)) {
+    const session = state.sessions[sessionId];
+    if (!session || session.sessionId !== sessionId || session.provider !== driver) {
+      throw new Error('Bridge runtime Session driver binding is invalid');
+    }
   }
   for (const event of state.recentEvents) {
     if (event.hostId !== hostId || events.has(event.eventId)) throw new Error('Bridge runtime Event binding is invalid');
@@ -1442,17 +2040,14 @@ function assertCurrentStateRelationships(state: PersistedBridgeState, hostId: st
       throw new Error('Bridge runtime handle binding is invalid');
     }
   }
-  for (const [commandId, result] of Object.entries(state.commandResults)) {
-    const session = state.sessions[result.sessionId];
-    const lastEvent = session?.lastEventId ? events.get(session.lastEventId) : undefined;
-    if (commandId !== result.commandId || result.hostId !== hostId
-      || (session && lastEvent && lastEvent.sessionId !== result.sessionId)
-      || state.seenCommands[commandId] !== result.updatedAt) {
-      throw new Error('Bridge runtime command result binding is invalid');
-    }
-  }
-  if (Object.keys(state.seenCommands).some((commandId) => !state.commandResults[commandId])) {
-    throw new Error('Bridge runtime seen-command binding is invalid');
+  const nonceBindings = new Set<string>();
+  for (const [commandId, execution] of Object.entries(state.commandExecutions)) {
+    assertCommandExecution(execution);
+    if (commandId !== execution.originalEncryptedCommand.commandId
+      || execution.originalEncryptedCommand.hostId !== hostId) throw new Error('Bridge runtime command execution binding is invalid');
+    const nonceBinding = `${execution.watchDeviceId}\n${execution.nonce}`;
+    if (nonceBindings.has(nonceBinding)) throw new Error('Bridge runtime command nonce binding is duplicated');
+    nonceBindings.add(nonceBinding);
   }
   for (const [eventId, completion] of Object.entries(state.eventUploadCompletions ?? {})) {
     const currentRevision = state.sessionRevisions[completion.sessionId] ?? 0;
@@ -1476,7 +2071,9 @@ function assertCurrentStateRelationships(state: PersistedBridgeState, hostId: st
   }
   for (const [eventId, cancellation] of Object.entries(state.terminalCancellations ?? {})) {
     const event = events.get(eventId);
-    if (eventId !== cancellation.eventId || (event && event.sessionId !== cancellation.sessionId)) {
+    if (eventId !== cancellation.eventId
+      || (!cancellation.removeSession && !sessions.has(cancellation.sessionId))
+      || (event && event.sessionId !== cancellation.sessionId)) {
       throw new Error('Bridge runtime terminal cancellation binding is invalid');
     }
   }
@@ -1503,8 +2100,6 @@ function assertCurrentRuntimeRelationships(state: PersistedBridgeState, spool: L
   for (const item of spool.items) {
     if (ids.has(item.spoolItemId)) throw new Error('Bridge runtime spool item ID is duplicated');
     ids.add(item.spoolItemId);
-  }
-  for (const item of spool.items) {
     const eventKind = item.payloadKind !== 'session-source-v2' && item.payloadKind !== 'session-upload-v2';
     if (eventKind && !item.eventId) throw new Error('Bridge runtime spool Event binding is invalid');
     if (item.payloadKind === 'event-source-v2') {
@@ -1540,7 +2135,16 @@ function assertCurrentRuntimeRelationships(state: PersistedBridgeState, spool: L
     }
     if (item.payloadKind === 'terminal-cancellation-v2') {
       const cancellation = state.terminalCancellations?.[item.eventId!];
+      const source = spool.items.find((candidate) => candidate.spoolItemId === item.eventId);
+      const reservation = Object.values(state.producerEventReservations ?? {})
+        .find((candidate) => candidate.eventId === item.eventId);
+      const recoverableIntentOnly = !cancellation
+        && reservation?.sessionId === item.sessionId
+        && source?.payloadKind === 'event-reservation-v2'
+        && source.eventId === item.eventId
+        && source.sessionId === item.sessionId;
       if (item.spoolItemId !== terminalCancellationItemId(item.eventId!)
+        || (!cancellation && !recoverableIntentOnly)
         || (cancellation && cancellation.sessionId !== item.sessionId)) {
         throw new Error('Bridge runtime terminal cancellation spool binding is invalid');
       }

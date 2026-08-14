@@ -23,7 +23,7 @@ async function fixture(handler: (request: Request) => Response | Promise<Respons
   const config = loadBridgeConfig(); Object.assign(config, { runtimePlatform: 'linux', hostPlatform: 'linux', hostId: identity.hostId,
     identity: publicIdentityMetadata(identity), relayBaseUrl: `http://127.0.0.1:${server.port}`, configPath: join(root, 'config.json'),
     statePath: join(root, 'state.json'), identityPath, agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') } });
-  const driver = { name: 'test', listSessions: async () => sessions.map((session) => ({ ...session, hostId: identity.hostId })), executeCommand: async () => { throw new Error('unused'); } };
+  const driver = { name: 'pi', listSessions: async () => sessions.map((session) => ({ ...session, hostId: identity.hostId })), executeCommand: async () => { throw new Error('unused'); } };
   const daemon = new BridgeDaemon(config, [driver], identityStore);
   return { daemon, config, identity, driver };
 }
@@ -35,7 +35,7 @@ function relay(hostId: string, lifecycle: (body: any) => Response) {
   return async (request: Request) => {
     const path = new URL(request.url).pathname;
     if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
-    if (path === '/v2/bridge/e2e/recipients') return Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] });
+    if (path === '/v2/bridge/e2e/recipients') return Response.json({ hostId, recipientSetVersion: 1, recipients: [] });
     if (path === '/v2/bridge/e2e/sessions/current') return lifecycle(await request.json());
     if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] });
     return Response.json({ ok: true });
@@ -64,7 +64,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     online = true;
     fx.daemon.stop();
     const restartedIdentityStore = new LinuxJsonHostIdentityStore(fx.config.identityPath);
-    const restarted = new BridgeDaemon(fx.config, [{ name: 'test', listSessions: async () => [], executeCommand: async () => { throw new Error('unused'); } }], restartedIdentityStore);
+    const restarted = new BridgeDaemon(fx.config, [{ name: 'pi', listSessions: async () => [], executeCommand: async () => { throw new Error('unused'); } }], restartedIdentityStore);
     expect((await restarted.syncOnce()).offline).toBe(false);
     expect(bodies.map((body) => body.revision)).toEqual([1, 2]);
     expect(bodies[1]).toMatchObject({ hostId, recipientSetVersion: 1, sessions: [] });
@@ -78,7 +78,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
       if (path === '/v2/bridge/e2e/recipients') {
         recipientReads += 1;
         return recipientReady
-          ? Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] })
+          ? Response.json({ hostId, recipientSetVersion: 1, recipients: [] })
           : Response.json({ error: 'e2e_recipient_not_ready' }, { status: 409 });
       }
       if (path === '/v2/bridge/e2e/sessions/current') {
@@ -95,7 +95,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     expect(waitingState).toEqual({ version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0 });
     expect(manifests).toEqual([]);
     expect((fx.daemon as any).reconciliationTimer).toBeUndefined();
-    expect(recipientReads).toBe(1);
+    expect(recipientReads).toBe(3);
 
     recipientReady = true;
     expect((await fx.daemon.syncOnce()).offline).toBe(false);
@@ -121,7 +121,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     const fx = await fixture(async (request) => {
       const path = new URL(request.url).pathname; paths.push(path);
       if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
-      if (path === '/v2/bridge/e2e/recipients') return Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] });
+      if (path === '/v2/bridge/e2e/recipients') return Response.json({ hostId, recipientSetVersion: 1, recipients: [] });
       if (path === '/v2/bridge/e2e/sessions') { const body: any = await request.json(); uploads.push({ sessionId: body.session.sessionId, revision: body.session.revision }); if (failSecond && body.session.sessionId === 'session-b') return new Response('failed', { status: 503 }); return Response.json({ ok: true }); }
       if (path === '/v2/bridge/e2e/sessions/current') { manifest = await request.json(); return Response.json({ ok: true, hostId, revision: manifest.revision, activeSessionCount: manifest.sessions.length }); }
       if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] });
@@ -144,7 +144,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     const fx = await fixture(async (request) => {
       const path = new URL(request.url).pathname;
       if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
-      if (path === '/v2/bridge/e2e/recipients') return Response.json({ version: 1, hostId, recipientSetVersion: version, recipients: [] });
+      if (path === '/v2/bridge/e2e/recipients') return Response.json({ hostId, recipientSetVersion: version, recipients: [] });
       if (path === '/v2/bridge/e2e/sessions') { const body: any = await request.json(); const item = body.session; uploads.push({ sessionId: item.sessionId, revision: item.revision, recipientSetVersion: item.recipientSetVersion });
         if (!churned && item.sessionId === 'session-b') { churned = true; version = 2; return Response.json({ ok: false, code: 'e2e_recipient_set_changed' }, { status: 409 }); } return Response.json({ ok: true }); }
       if (path === '/v2/bridge/e2e/sessions/reconcile') return Response.json({ committed: false });
@@ -162,14 +162,14 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     const fx = await fixture(async (request) => {
       const path = new URL(request.url).pathname;
       if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
-      if (path === '/v2/bridge/e2e/recipients') { recipientReads += 1; return Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] }); }
+      if (path === '/v2/bridge/e2e/recipients') { recipientReads += 1; return Response.json({ hostId, recipientSetVersion: 1, recipients: [] }); }
       if (path === '/v2/bridge/e2e/sessions') { uploads += 1; return Response.json({ ok: false, code: 'e2e_recipient_set_changed' }, { status: 409 }); }
       if (path === '/v2/bridge/e2e/sessions/reconcile') { reconciles += 1; return Response.json({ committed: false }); }
       if (path === '/v2/bridge/e2e/sessions/current') { manifests += 1; return Response.json({ ok: true }); }
       if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] }); return Response.json({ ok: true });
     }, [activeSession('session-a')]); hostId = fx.identity.hostId;
     expect((await fx.daemon.syncOnce()).offline).toBe(true);
-    expect({ recipientReads, uploads, reconciles, manifests }).toEqual({ recipientReads: 2, uploads: 1, reconciles: 1, manifests: 0 });
+    expect({ recipientReads, uploads, reconciles, manifests }).toEqual({ recipientReads: 3, uploads: 1, reconciles: 1, manifests: 0 });
   });
 
   test('invalid finalized references rebuild all active Sessions under a higher Host revision', async () => {
@@ -177,7 +177,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     const fx = await fixture(async (request) => {
       const path = new URL(request.url).pathname;
       if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
-      if (path === '/v2/bridge/e2e/recipients') return Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] });
+      if (path === '/v2/bridge/e2e/recipients') return Response.json({ hostId, recipientSetVersion: 1, recipients: [] });
       if (path === '/v2/bridge/e2e/sessions') { uploads.push((await request.json() as any).session); return Response.json({ ok: true }); }
       if (path === '/v2/bridge/e2e/sessions/current') { const body: any = await request.json(); manifests.push(body); if (manifests.length === 1) return Response.json({ ok: false, code: 'e2e_session_reference_invalid', hostId }, { status: 409 }); return Response.json({ ok: true, hostId, revision: body.revision, activeSessionCount: 1 }); }
       if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] }); return Response.json({ ok: true });
@@ -193,7 +193,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     const fx = await fixture(async (request) => {
       const path = new URL(request.url).pathname;
       if (path === '/v2/bridge/enroll') return Response.json({ host: { hostId, hostName: 'Host', platform: 'linux', bridgeVersion: '1', registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), bridgeStatus: 'online' } });
-      if (path === '/v2/bridge/e2e/recipients') return Response.json({ version: 1, hostId, recipientSetVersion: 1, recipients: [] });
+      if (path === '/v2/bridge/e2e/recipients') return Response.json({ hostId, recipientSetVersion: 1, recipients: [] });
       if (path === '/v2/bridge/e2e/sessions') { const body: any = await request.json(); uploads.push({ sessionId: body.session.sessionId, revision: body.session.revision }); if (failSecond && body.session.sessionId === 'session-b') return new Response('offline', { status: 503 }); return Response.json({ ok: true }); }
       if (path === '/v2/bridge/e2e/sessions/current') { manifest = await request.json(); return Response.json({ ok: true, hostId, revision: manifest.revision, activeSessionCount: manifest.sessions.length }); }
       if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] }); return Response.json({ ok: true });
@@ -203,7 +203,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     failSecond = false; uploads.length = 0;
     fx.daemon.stop();
     const restartedIdentityStore = new LinuxJsonHostIdentityStore(fx.config.identityPath);
-    const restartedDriver = { name: 'test', listSessions: async () => [activeSession('session-a'), activeSession('session-b')].map((session) => ({ ...session, hostId })), executeCommand: async () => { throw new Error('unused'); } };
+    const restartedDriver = { name: 'pi', listSessions: async () => [activeSession('session-a'), activeSession('session-b')].map((session) => ({ ...session, hostId })), executeCommand: async () => { throw new Error('unused'); } };
     const restarted = new BridgeDaemon(fx.config, [restartedDriver], restartedIdentityStore);
     await (restarted as any).validateStartup();
     expect((restarted as any).stateStore.listInflightSessionIds()).toEqual(['session-b']);

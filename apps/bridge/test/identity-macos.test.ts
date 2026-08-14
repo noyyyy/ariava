@@ -2,8 +2,6 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { generateHostRotationIdentity } from '../src/identity/host-identity';
-import { resetHostIdentity } from '../src/identity/manager';
 import { createRuntimeHostIdentityStore } from '../src/identity/runtime-store';
 import {
   MACOS_IDENTITY_KEYCHAIN_SERVICE,
@@ -34,7 +32,7 @@ describe('MacOSKeychainHostIdentityStore', () => {
       status: 'ready', storageType: 'macos-keychain', hostId: identity.hostId, keyId: identity.keyId,
       algorithm: 'Ed25519', publicKeyFingerprint: identity.publicKeyFingerprint,
       storageReference: { type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: identity.hostId },
-      ownerIntegrity: true, permissionIntegrity: true, metadataIntegrity: true, pendingRotation: false,
+      ownerIntegrity: true, permissionIntegrity: true, metadataIntegrity: true,
     });
   });
 
@@ -43,32 +41,6 @@ describe('MacOSKeychainHostIdentityStore', () => {
     const store = new MacOSKeychainHostIdentityStore(metadataPath(), runner);
     const identity = await store.createFirstRun();
     expect((await store.load())?.keyId).toBe(identity.keyId);
-  });
-
-  test('keeps pending key in approved hostId.pending item until promote', async () => {
-    const runner = new FakeKeychain();
-    const store = new MacOSKeychainHostIdentityStore(metadataPath(), runner);
-    const current = await store.createFirstRun();
-    const pending = await generateHostRotationIdentity(current.hostId, {
-      type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: `${current.hostId}.pending`,
-    });
-    await store.stageRotation({ operationId: 'rotation-1', issuedAt: new Date().toISOString(), identity: pending.identity });
-    expect(runner.items.has(current.hostId)).toBe(true);
-    expect(runner.items.has(`${current.hostId}.pending`)).toBe(true);
-    expect((await store.load())?.keyId).toBe(current.keyId);
-    expect(await store.inspect()).toMatchObject({
-      status: 'rotation-pending', pendingRotation: true, pendingOperationId: 'rotation-1',
-      storageReference: { type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: current.hostId },
-    });
-    expect((await store.promoteRotation('rotation-1')).keyId).toBe(pending.identity.keyId);
-    expect(runner.items.has(`${current.hostId}.pending`)).toBe(false);
-
-    const secondPending = await generateHostRotationIdentity(current.hostId, {
-      type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: `${current.hostId}.pending`,
-    });
-    await store.stageRotation({ operationId: 'rotation-2', issuedAt: new Date().toISOString(), identity: secondPending.identity });
-    await store.abortRotation('rotation-2');
-    expect(runner.items.has(`${current.hostId}.pending`)).toBe(false);
   });
 
   test('isolates default and dev evidence and key accounts in the same service', async () => {
@@ -93,13 +65,8 @@ describe('MacOSKeychainHostIdentityStore', () => {
 
     const defaultEvidence = runner.items.get(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default);
     const defaultKey = runner.items.get(defaultIdentity.hostId);
-    const pending = await generateHostRotationIdentity(devIdentity.hostId, {
-      type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: `${devIdentity.hostId}.pending`,
-    });
-    await devStore.stageRotation({ operationId: 'dev-rotation', issuedAt: new Date().toISOString(), identity: pending.identity });
-    expect(runner.items.has(`${devIdentity.hostId}.pending`)).toBe(true);
-    await devStore.abortRotation('dev-rotation');
-    expect(runner.items.has(`${devIdentity.hostId}.pending`)).toBe(false);
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    inspectResetOnlyLegacyIdentityEvidence(devStore);
     await devStore.resetAfterExplicitConfirmation();
 
     expect(runner.items.get(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default)).toEqual(defaultEvidence);
@@ -141,34 +108,20 @@ describe('MacOSKeychainHostIdentityStore', () => {
     const crossedDevPath = metadataPath();
     const defaultStore = new MacOSKeychainHostIdentityStore(defaultPath, runner);
     const defaultIdentity = await defaultStore.createFirstRun();
-    const pending = await generateHostRotationIdentity(defaultIdentity.hostId, {
-      type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: `${defaultIdentity.hostId}.pending`,
-    });
-    await defaultStore.stageRotation({ operationId: 'default-pending', issuedAt: new Date().toISOString(), identity: pending.identity });
     copyFileSync(defaultPath, crossedDevPath);
 
     const defaultMetadata = readFileSync(defaultPath);
     const crossedMetadata = readFileSync(crossedDevPath);
     const defaultEvidence = runner.items.get(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default);
     const defaultCurrent = runner.items.get(defaultIdentity.hostId);
-    const defaultPending = runner.items.get(`${defaultIdentity.hostId}.pending`);
     const crossedDevStore = new MacOSKeychainHostIdentityStore(crossedDevPath, runner, {}, 'dev');
-    const crossedNext = await generateHostRotationIdentity(defaultIdentity.hostId, {
-      type: 'macos-keychain', service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: `${defaultIdentity.hostId}.pending`,
-    });
 
     await expect(crossedDevStore.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
-    await expect(crossedDevStore.loadPending()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
-    await expect(crossedDevStore.stageRotation({ operationId: 'crossed', issuedAt: new Date().toISOString(), identity: crossedNext.identity }))
-      .rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
-    await expect(crossedDevStore.abortRotation('default-pending')).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
-    await expect(crossedDevStore.promoteRotation('default-pending')).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
     await expect(crossedDevStore.resetAfterExplicitConfirmation()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
 
     expect(runner.items.has(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev)).toBe(false);
     expect(runner.items.get(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default)).toEqual(defaultEvidence);
     expect(runner.items.get(defaultIdentity.hostId)).toEqual(defaultCurrent);
-    expect(runner.items.get(`${defaultIdentity.hostId}.pending`)).toEqual(defaultPending);
     expect(readFileSync(defaultPath)).toEqual(defaultMetadata);
     expect(readFileSync(crossedDevPath)).toEqual(crossedMetadata);
   });
@@ -190,22 +143,127 @@ describe('MacOSKeychainHostIdentityStore', () => {
     expect(runner.items.has(MACOS_IDENTITY_EVIDENCE_ACCOUNTS.dev)).toBe(false);
   });
 
-  test('explicit reset repairs corrupt metadata without deleting untrusted Keychain accounts', async () => {
+  test('malformed metadata blocks reset-only replacement and preserves exact accounts', async () => {
     const runner = new FakeKeychain();
     const path = metadataPath();
     const store = new MacOSKeychainHostIdentityStore(path, runner);
     const previous = await store.createFirstRun();
     const previousKey = runner.snapshot(previous.hostId);
-    writeFileSync(path, '{bad json');
-
-    const result = await resetHostIdentity(store, 'https://relay.test');
-
-    expect(result.revokedOldIdentity).toBe(false);
-    expect(result.warning).toContain('ERR_IDENTITY_INVALID');
-    expect(result.identity.hostId).not.toBe(previous.hostId);
+    const bytes = '{bad json';
+    writeFileSync(path, bytes);
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(() => inspectResetOnlyLegacyIdentityEvidence(store)).toThrow();
+    await expect(store.resetAfterExplicitConfirmation('reset_malformed')).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    expect(readFileSync(path, 'utf8')).toBe(bytes);
     expect(runner.snapshot(previous.hostId)).toEqual(previousKey);
-    expect((await store.load())?.hostId).toBe(result.identity.hostId);
-    expect(await store.inspect()).toMatchObject({ status: 'ready', hostId: result.identity.hostId });
+  });
+
+  test('recognized pending metadata is reset-only and deletes only exact referenced accounts', async () => {
+    const runner = new FakeKeychain();
+    const path = metadataPath();
+    const store = new MacOSKeychainHostIdentityStore(path, runner);
+    const previous = await store.createFirstRun();
+    const metadata = JSON.parse(readFileSync(path, 'utf8'));
+    const pendingAccount = `${previous.hostId}.pending`;
+    runner.items.set(pendingAccount, runner.snapshot(previous.hostId));
+    const unrelated = `host_${'Z'.repeat(43)}`;
+    runner.items.set(unrelated, new Uint8Array([1, 2, 3]));
+    metadata.pending = {
+      operationId: 'op_pending', issuedAt: new Date().toISOString(),
+      identity: { ...metadata.current, privateKeyStorage: { ...metadata.current.privateKeyStorage, account: pendingAccount } },
+    };
+    writeFileSync(path, JSON.stringify(metadata), { mode: 0o600 });
+    await expect(store.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_INVALID' });
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(inspectResetOnlyLegacyIdentityEvidence(store)).toMatchObject({
+      classification: 'old-identity-unreadable', oldHostId: previous.hostId, oldKeyId: previous.keyId,
+    });
+    const replacement = await store.resetAfterExplicitConfirmation('reset_pending');
+    store.completeExplicitReset('reset_pending');
+    expect(replacement.hostId).not.toBe(previous.hostId);
+    expect(runner.items.has(previous.hostId)).toBe(false);
+    expect(runner.items.has(pendingAccount)).toBe(false);
+    expect(runner.items.get(unrelated)).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  test.each([
+    ['foreign current account', (metadata: any) => { metadata.current.privateKeyStorage.account = `host_${'F'.repeat(43)}`; }],
+    ['coordinated foreign Host/account tuple', (metadata: any) => {
+      metadata.current.hostId = `host_${'F'.repeat(43)}`;
+      metadata.current.privateKeyStorage.account = metadata.current.hostId;
+    }],
+    ['reserved evidence current account', (metadata: any) => { metadata.current.privateKeyStorage.account = MACOS_IDENTITY_EVIDENCE_ACCOUNTS.default; }],
+    ['unknown pending account', (metadata: any) => {
+      metadata.pending = { operationId: 'op_pending', issuedAt: new Date().toISOString(), identity: {
+        ...metadata.current, privateKeyStorage: { ...metadata.current.privateKeyStorage, account: `host_${'P'.repeat(43)}.pending` },
+      } };
+    }],
+  ])('reset-only decoder rejects %s without deleting any account', async (_label, mutate) => {
+    const runner = new FakeKeychain();
+    const path = metadataPath();
+    const store = new MacOSKeychainHostIdentityStore(path, runner);
+    const previous = await store.createFirstRun();
+    const metadata = JSON.parse(readFileSync(path, 'utf8'));
+    mutate(metadata);
+    writeFileSync(path, JSON.stringify(metadata), { mode: 0o600 });
+    const before = new Map([...runner.items].map(([account, bytes]) => [account, new Uint8Array(bytes)]));
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(() => inspectResetOnlyLegacyIdentityEvidence(store)).toThrow();
+    await expect(store.resetAfterExplicitConfirmation('reset_rejected')).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    expect(runner.items).toEqual(before);
+    expect(runner.items.has(previous.hostId)).toBe(true);
+  });
+
+  test('exact creation sentinel must match current metadata tuple before cleanup', async () => {
+    const runner = new FakeKeychain();
+    const path = metadataPath();
+    const store = new MacOSKeychainHostIdentityStore(path, runner);
+    const previous = await store.createFirstRun();
+    writeFileSync(`${path}.creating`, JSON.stringify({
+      schema: 'ariava-macos-identity-creation-v1', phase: 'creating',
+      hostId: previous.hostId, keyId: `key_${'M'.repeat(43)}`,
+    }), { mode: 0o600 });
+    const before = new Map([...runner.items].map(([account, bytes]) => [account, new Uint8Array(bytes)]));
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(() => inspectResetOnlyLegacyIdentityEvidence(store)).toThrow();
+    await expect(store.resetAfterExplicitConfirmation('reset_mismatch')).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    expect(runner.items).toEqual(before);
+  });
+
+  test('metadata-absent creation evidence requires matching Host and key suffixes', async () => {
+    const runner = new FakeKeychain();
+    const path = metadataPath();
+    const store = new MacOSKeychainHostIdentityStore(path, runner);
+    const previous = await store.createFirstRun();
+    rmSync(path);
+    writeFileSync(`${path}.creating`, JSON.stringify({
+      schema: 'ariava-macos-identity-creation-v1', phase: 'creating',
+      hostId: previous.hostId, keyId: `key_${'M'.repeat(43)}`,
+    }), { mode: 0o600 });
+    const before = new Map([...runner.items].map(([account, bytes]) => [account, new Uint8Array(bytes)]));
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(() => inspectResetOnlyLegacyIdentityEvidence(store)).toThrow(expect.objectContaining({
+      code: 'ERR_IDENTITY_RESET_REQUIRED',
+    }));
+    await expect(store.resetAfterExplicitConfirmation('reset_mismatched_creation')).rejects.toMatchObject({
+      code: 'ERR_IDENTITY_RESET_REQUIRED',
+    });
+    expect(runner.items).toEqual(before);
+  });
+
+  test('unknown creation sentinel schema blocks cleanup without deleting accounts', async () => {
+    const runner = new FakeKeychain();
+    const path = metadataPath();
+    const store = new MacOSKeychainHostIdentityStore(path, runner);
+    const previous = await store.createFirstRun();
+    writeFileSync(`${path}.creating`, JSON.stringify({
+      schema: 'ariava-macos-identity-creation-v2', phase: 'creating', hostId: previous.hostId, keyId: previous.keyId,
+    }), { mode: 0o600 });
+    const before = new Map([...runner.items].map(([account, bytes]) => [account, new Uint8Array(bytes)]));
+    const { inspectResetOnlyLegacyIdentityEvidence } = await import('../src/cli/operations/identity-reset-legacy-evidence');
+    expect(() => inspectResetOnlyLegacyIdentityEvidence(store)).toThrow();
+    await expect(store.resetAfterExplicitConfirmation('reset_unknown_sentinel')).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
+    expect(runner.items).toEqual(before);
   });
 
   test('requires an absolute secure metadata path before any Keychain write', async () => {
@@ -222,18 +280,6 @@ describe('MacOSKeychainHostIdentityStore', () => {
     rmSync(path);
     await expect(store.load()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
     await expect(store.createFirstRun()).rejects.toMatchObject({ code: 'ERR_IDENTITY_RESET_REQUIRED' });
-  });
-
-  test('same operationId with a different key is rejected', async () => {
-    const runner = new FakeKeychain();
-    const store = new MacOSKeychainHostIdentityStore(metadataPath(), runner);
-    const current = await store.createFirstRun();
-    const storage = { type: 'macos-keychain' as const, service: MACOS_IDENTITY_KEYCHAIN_SERVICE, account: `${current.hostId}.pending` };
-    const first = await generateHostRotationIdentity(current.hostId, storage);
-    const second = await generateHostRotationIdentity(current.hostId, storage);
-    const issuedAt = new Date().toISOString();
-    await store.stageRotation({ operationId: 'same-op', issuedAt, identity: first.identity });
-    await expect(store.stageRotation({ operationId: 'same-op', issuedAt, identity: second.identity })).rejects.toMatchObject({ code: 'ERR_IDENTITY_INVALID' });
   });
 
   test('reports locked Keychain as recoverable instead of invalid identity evidence', async () => {

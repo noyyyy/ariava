@@ -18,6 +18,8 @@ import type { AriavaProfileId, ProfileResourceSet } from '../profile';
 export const HOST_DOMAIN_RESET_JOURNAL_VERSION = 1 as const;
 
 export const HOST_DOMAIN_RESET_PHASES = [
+  'quarantine-pending',
+  'quarantined',
   'prepared',
   'revoke-pending',
   'old-identity-revoked',
@@ -36,6 +38,15 @@ export type HostDomainResetRevokeState = 'not-attempted' | 'pending' | 'complete
 export type HostDomainResetRevokeOutcome = 'revoked' | 'identity-already-revoked' | 'old-identity-unreadable' | null;
 export type HostDomainResetServiceBackend = 'launchd' | 'systemd-user' | 'none';
 
+export interface HostDomainResetSigningCleanupV1 {
+  kind: 'linux-json' | 'macos-keychain';
+  resourceDigest: string;
+  profile: AriavaProfileId;
+  previousAccount: string | null;
+  previousPendingAccount: string | null;
+  interruptedCreationAccount: string | null;
+}
+
 export interface HostDomainResetJournalV1 {
   version: 1;
   operationId: string;
@@ -46,6 +57,7 @@ export interface HostDomainResetJournalV1 {
   newHostId: string | null;
   newKeyId: string | null;
   oldEncryptionKeyId: string | null;
+  signingCleanup: HostDomainResetSigningCleanupV1 | null;
   signingReplacementAttemptedAt: string | null;
   encryptionIdentityReplacedAt: string | null;
   runtimeArtifactsClearedAt: string | null;
@@ -77,13 +89,21 @@ export interface HostDomainResetJournalWriteOptions {
 
 const JOURNAL_KEYS = [
   'version', 'operationId', 'profile', 'phase', 'oldHostId', 'oldKeyId', 'newHostId', 'newKeyId',
-  'oldEncryptionKeyId', 'signingReplacementAttemptedAt', 'encryptionIdentityReplacedAt',
+  'oldEncryptionKeyId', 'signingCleanup', 'signingReplacementAttemptedAt', 'encryptionIdentityReplacedAt',
   'runtimeArtifactsClearedAt', 'configSavedAt', 'enrolledAt', 'serviceMetadataSynchronizedAt',
   'resourceDigest', 'createdAt', 'updatedAt', 'revoke', 'service',
+] as const;
+const SIGNING_CLEANUP_KEYS = [
+  'kind', 'resourceDigest', 'profile', 'previousAccount', 'previousPendingAccount', 'interruptedCreationAccount',
 ] as const;
 const REVOKE_KEYS = ['state', 'outcome'] as const;
 const SERVICE_KEYS = ['managed', 'installed', 'enabled', 'wasRunning', 'backend'] as const;
 const PHASE_INDEX = new Map(HOST_DOMAIN_RESET_PHASES.map((phase, index) => [phase, index]));
+
+export function identityResourceDigest(path: string): string {
+  return createHash('sha256').update(path).digest('hex');
+}
+
 
 export function hostDomainResourceDigest(resources: ProfileResourceSet): string {
   const paths = hostDomainResourcePaths(resources);
@@ -213,6 +233,7 @@ function parseHostDomainResetJournal(value: unknown, resources: ProfileResourceS
     || !isNullablePublicId(value.newHostId, 'host_')
     || !isNullablePublicId(value.newKeyId, 'key_')
     || !isNullableEncryptionKeyId(value.oldEncryptionKeyId)
+    || !isSigningCleanup(value.signingCleanup, resources)
     || !isDigest(value.resourceDigest)
     || value.resourceDigest !== hostDomainResourceDigest(resources)
     || !isCanonicalTimestamp(value.createdAt)
@@ -238,9 +259,15 @@ function parseHostDomainResetJournal(value: unknown, resources: ProfileResourceS
 
 function assertStableBinding(current: HostDomainResetJournalV1, candidate: HostDomainResetJournalV1): void {
   for (const key of [
-    'version', 'operationId', 'profile', 'resourceDigest', 'createdAt', 'oldHostId', 'oldKeyId', 'oldEncryptionKeyId',
+    'version', 'operationId', 'profile', 'resourceDigest', 'createdAt',
   ] as const) {
     if (candidate[key] !== current[key]) throw new TypeError(`Host-domain reset journal ${key} cannot change`);
+  }
+  const bindingPrepared = current.phase === 'quarantined' && candidate.phase === 'prepared';
+  for (const key of ['oldHostId', 'oldKeyId', 'oldEncryptionKeyId', 'signingCleanup'] as const) {
+    if (!bindingPrepared && JSON.stringify(candidate[key]) !== JSON.stringify(current[key])) {
+      throw new TypeError(`Host-domain reset journal ${key} cannot change`);
+    }
   }
   if (current.newHostId !== null && candidate.newHostId !== current.newHostId) {
     throw new TypeError('Host-domain reset journal newHostId cannot change');
@@ -281,6 +308,28 @@ function hostDomainResourcePaths(resources: ProfileResourceSet): Record<string, 
     hostDomainResetJournalPath: resources.hostDomainResetJournalPath,
   };
 }
+
+function isSigningCleanup(value: unknown, resources: ProfileResourceSet): value is HostDomainResetSigningCleanupV1 | null {
+  if (value === null) return true;
+  if (!isRecord(value) || !hasExactKeys(value, SIGNING_CLEANUP_KEYS)
+    || !['linux-json', 'macos-keychain'].includes(String(value.kind))
+    || value.resourceDigest !== identityResourceDigest(resources.identityMetadataPath)
+    || value.profile !== resources.identityProfile) return false;
+  if (value.kind === 'linux-json') {
+    return value.previousAccount === null && value.previousPendingAccount === null
+      && value.interruptedCreationAccount === null;
+  }
+  const previous = typeof value.previousAccount === 'string' && /^host_[A-Za-z0-9_-]{43}$/u.test(value.previousAccount)
+    ? value.previousAccount : null;
+  if (value.previousAccount !== null && previous === null) return false;
+  if (value.previousPendingAccount !== null && value.previousPendingAccount !== `${previous}.pending`) return false;
+  if (value.interruptedCreationAccount !== null
+    && (typeof value.interruptedCreationAccount !== 'string'
+      || !/^host_[A-Za-z0-9_-]{43}$/u.test(value.interruptedCreationAccount)
+      || (previous !== null && value.interruptedCreationAccount !== previous))) return false;
+  return true;
+}
+
 
 function isRevoke(value: unknown): boolean {
   if (!isRecord(value) || !hasExactKeys(value, REVOKE_KEYS)) return false;
@@ -358,15 +407,25 @@ function hasValidPhaseInvariants(journal: HostDomainResetJournalV1): boolean {
   const oldKnown = journal.oldHostId !== null;
   if (oldKnown && journal.newHostId === journal.oldHostId) return false;
   if ((journal.phase === 'revoke-pending' || journal.phase === 'old-identity-revoked') && !oldKnown) return false;
+  const revokeSkipped = journal.revoke.state === 'skipped' && journal.revoke.outcome === 'old-identity-unreadable';
 
-  const expectedRevokeState: HostDomainResetRevokeState = !oldKnown
-    ? 'skipped'
-    : journal.phase === 'prepared'
-      ? 'not-attempted'
-      : journal.phase === 'revoke-pending'
-        ? 'pending'
-        : 'complete';
+  const preInspection = journal.phase === 'quarantine-pending' || journal.phase === 'quarantined';
+  const expectedRevokeState: HostDomainResetRevokeState = preInspection
+    ? 'not-attempted'
+    : revokeSkipped
+      ? 'skipped'
+      : !oldKnown
+        ? 'skipped'
+        : journal.phase === 'prepared'
+          ? 'not-attempted'
+          : journal.phase === 'revoke-pending'
+            ? 'pending'
+            : 'complete';
   if (journal.revoke.state !== expectedRevokeState) return false;
+  if (preInspection) {
+    if (oldKnown || journal.oldEncryptionKeyId !== null || journal.revoke.outcome !== null || journal.signingCleanup !== null) return false;
+  } else if (!oldKnown && !revokeSkipped) return false;
+  if (revokeSkipped && journal.signingCleanup === null) return false;
 
   if (!exactEvidence('signing-replacement-pending', journal.signingReplacementAttemptedAt !== null)) return false;
   if (!exactEvidence('signing-identity-replaced', journal.newHostId !== null && journal.newKeyId !== null)) return false;
@@ -387,8 +446,8 @@ export function assertHostDomainResetRuntimeStartAllowed(resources: ProfileResou
   const journal = loadHostDomainResetJournal(resources);
   if (!journal || journal.phase === 'service-restore-pending') return;
   const remediation = resources.identityProfile === 'dev'
-    ? 'bun run dev:cli -- host reset --confirm'
-    : 'ariava host reset --confirm';
+    ? 'bun run dev:cli -- identity reset --confirm'
+    : 'ariava identity reset --confirm';
   const error = new Error(`Host-domain reset recovery required at phase ${journal.phase}; run \`${remediation}\``);
   Object.assign(error, {
     code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',

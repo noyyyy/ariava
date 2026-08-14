@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { logExtensionError, resolveExtensionLogPath } from '../src/logger';
+import { logExtensionEvent, resolveExtensionLogPath } from '../src/logger';
 
 const originalLogPath = process.env.ARIAVA_PI_LOG_PATH;
 const temporaryDirectories: string[] = [];
@@ -19,7 +19,7 @@ afterEach(() => {
 });
 
 describe('pi extension logging', () => {
-  test('explicit log path takes precedence over the process environment', async () => {
+  test('explicit log path takes precedence and writes only fixed fields', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'pi-logger-'));
     temporaryDirectories.push(directory);
     const explicitPath = join(directory, 'explicit.log');
@@ -27,11 +27,48 @@ describe('pi extension logging', () => {
     process.env.ARIAVA_PI_LOG_PATH = environmentPath;
 
     expect(resolveExtensionLogPath(explicitPath)).toBe(explicitPath);
-    logExtensionError('explicit path', new Error('expected'), explicitPath);
+    logExtensionEvent('command_result_submit_failed', { commandId: 'opaque-command-1' }, explicitPath);
     await waitForFile(explicitPath);
 
-    expect(readFileSync(explicitPath, 'utf8')).toContain('explicit path');
+    const entry = JSON.parse(readFileSync(explicitPath, 'utf8')) as Record<string, unknown>;
+    expect(entry).toEqual({
+      event: 'command_result_submit_failed',
+      commandId: 'opaque-command-1',
+    });
+    expect(Object.keys(entry).sort()).toEqual(['commandId', 'event']);
     expect(existsSync(environmentPath)).toBe(false);
+  });
+
+  test('capture excludes plaintext, exception text, ciphertext, key wrap, and private material', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pi-logger-'));
+    temporaryDirectories.push(directory);
+    const environmentPath = join(directory, 'environment.log');
+    process.env.ARIAVA_PI_LOG_PATH = environmentPath;
+    const forbidden = [
+      'continue with secret instructions',
+      'private driver failure',
+      'ciphertext_private_marker',
+      'keywrap_private_marker',
+      'private_key_private_marker',
+    ];
+
+    logExtensionEvent('command_dispatch_failed', {
+      commandId: 'opaque-command-2',
+      commandPlaintext: forbidden[0],
+      error: forbidden[1],
+      ciphertext: forbidden[2],
+      keyWrap: forbidden[3],
+      privateKey: forbidden[4],
+    } as never);
+    await waitForFile(environmentPath);
+
+    const capture = readFileSync(environmentPath, 'utf8');
+    expect(JSON.parse(capture)).toEqual({
+      event: 'command_dispatch_failed',
+      commandId: 'opaque-command-2',
+    });
+    for (const value of forbidden) expect(capture).not.toContain(value);
+    expect(capture).not.toMatch(/error|message|reason|detail|stack|ciphertext|keywrap|private[_-]?key/iu);
   });
 
   test('uses ARIAVA_PI_LOG_PATH when no explicit path is supplied', async () => {
@@ -41,10 +78,12 @@ describe('pi extension logging', () => {
     process.env.ARIAVA_PI_LOG_PATH = environmentPath;
 
     expect(resolveExtensionLogPath()).toBe(environmentPath);
-    logExtensionError('environment path', new Error('expected'));
+    logExtensionEvent('command_poll_failed');
     await waitForFile(environmentPath);
 
-    expect(readFileSync(environmentPath, 'utf8')).toContain('environment path');
+    expect(JSON.parse(readFileSync(environmentPath, 'utf8'))).toEqual({
+      event: 'command_poll_failed',
+    });
   });
 
   test('keeps the production default when the environment value is absent or empty', () => {

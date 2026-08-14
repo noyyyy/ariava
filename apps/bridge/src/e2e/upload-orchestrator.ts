@@ -1,5 +1,4 @@
 import type { E2ERecipientSnapshotV1, EncryptedEventUploadV2, EncryptedSessionSnapshotUploadV2 } from '@ariava/protocol';
-import type { HostEncryptionIdentity } from '../identity';
 import type { RelayClient } from '../relay-client';
 import { RelayClientError } from '../relay-client';
 import type { BridgeStateStore } from '../state-store';
@@ -24,7 +23,7 @@ type EncryptedEventAndSession = { event: EncryptedEventUploadV2; session: Encryp
 
 export class EncryptedUploadOrchestrator {
   constructor(private readonly stateStore: BridgeStateStore, private readonly client: RelayClient,
-    private readonly encryptionIdentity: HostEncryptionIdentity, private readonly keyring: LocalLinkKeyring,
+    private readonly keyring: LocalLinkKeyring,
     private readonly hooks?: EncryptedUploadHooks) {}
 
   async publishAuthoritativeSnapshots(snapshot: E2ERecipientSnapshotV1, recipients: ActiveRecipientMaterial[], sessionIds: readonly string[]): Promise<{ recipientSetVersion: number; revisions: Map<string, number> } | undefined> {
@@ -41,7 +40,7 @@ export class EncryptedUploadOrchestrator {
         let upload = this.stateStore.getInflightSessionUpload(sessionId) as EncryptedSessionSnapshotUploadV2 | undefined;
         if (!upload || upload.recipientSetVersion !== passVersion) {
           const next = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: upload?.revision ?? this.stateStore.nextSessionRevision(sessionId),
-            recipientSetVersion: passVersion, recipients, hostIdentity: this.encryptionIdentity });
+            recipientSetVersion: passVersion, recipients });
           if (upload) this.stateStore.replaceInflightSessionUpload(sessionId, next); else this.stateStore.persistInflightSessionUpload(sessionId, next);
           upload = next;
         }
@@ -60,7 +59,7 @@ export class EncryptedUploadOrchestrator {
                 this.stateStore.removeInflightSessionUpload(sessionId);
               } else {
                 const replacement = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: upload.revision,
-                  recipientSetVersion: refreshed.recipientSetVersion, recipients: refreshedRecipients, hostIdentity: this.encryptionIdentity });
+                  recipientSetVersion: refreshed.recipientSetVersion, recipients: refreshedRecipients });
                 this.stateStore.replaceInflightSessionUpload(sessionId, replacement);
               }
               snapshot = refreshed; recipients = refreshedRecipients; restart = true; break;
@@ -185,9 +184,8 @@ export class EncryptedUploadOrchestrator {
     recipientSetVersion: number,
     recipients: ActiveRecipientMaterial[],
   ): EncryptedEventAndSession {
-    const upload = encryptEventUpload({ ...eventEncryptionInput(event, session), revision, recipientSetVersion, recipients,
-      hostIdentity: this.encryptionIdentity });
-    attachNotificationPreviews(upload, event, session, recipients, this.encryptionIdentity);
+    const upload = encryptEventUpload({ ...eventEncryptionInput(event, session), revision, recipientSetVersion, recipients });
+    attachNotificationPreviews(upload, event, session, recipients);
     return upload;
   }
 
@@ -202,7 +200,7 @@ export class EncryptedUploadOrchestrator {
     for (const session of this.stateStore.listSessions()) {
       if (!this.stateStore.getInflightSessionUpload(session.sessionId)) {
         const upload = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: this.stateStore.nextSessionRevision(session.sessionId),
-          recipientSetVersion: snapshot.recipientSetVersion, recipients, hostIdentity: this.encryptionIdentity });
+          recipientSetVersion: snapshot.recipientSetVersion, recipients });
         this.stateStore.persistInflightSessionUpload(session.sessionId, upload); pendingIds.add(session.sessionId);
       }
     }
@@ -235,11 +233,11 @@ export class EncryptedUploadOrchestrator {
             this.stateStore.removeInflightSessionUpload(sessionId);
             if (currentSnapshot.recipientSetVersion === upload.recipientSetVersion) return false;
             upload = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: this.stateStore.nextSessionRevision(sessionId),
-              recipientSetVersion: currentSnapshot.recipientSetVersion, recipients: currentRecipients, hostIdentity: this.encryptionIdentity });
+              recipientSetVersion: currentSnapshot.recipientSetVersion, recipients: currentRecipients });
             this.stateStore.persistInflightSessionUpload(sessionId, upload);
           } else {
             const replacement = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: upload.revision,
-              recipientSetVersion: currentSnapshot.recipientSetVersion, recipients: currentRecipients, hostIdentity: this.encryptionIdentity });
+              recipientSetVersion: currentSnapshot.recipientSetVersion, recipients: currentRecipients });
             this.stateStore.replaceInflightSessionUpload(sessionId, replacement); upload = replacement;
           }
         }
@@ -286,7 +284,6 @@ function attachNotificationPreviews(
   event: import('@ariava/protocol').CanonicalEvent,
   session: import('@ariava/protocol').CanonicalSessionState,
   recipients: ActiveRecipientMaterial[],
-  hostIdentity: HostEncryptionIdentity,
   ): void {
   try {
     const plaintext = buildNotificationPreview(event, session);
@@ -298,7 +295,6 @@ function attachNotificationPreviews(
       event: upload.event,
       plaintext,
       recipients,
-      hostIdentity,
     });
   } catch {
     upload.event.notificationPreviews = [];

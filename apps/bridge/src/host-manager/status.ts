@@ -49,7 +49,7 @@ export interface HostManagerStatus {
   environmentOverrides: string[];
   bridgeSourceKind?: AriavaInstallMetadata['bridgeSource'] extends infer T ? (T extends { kind: infer K } ? K : never) : never;
   identity: {
-    status: 'not-initialized' | 'configured' | 'ready' | 'rotation-pending' | 'invalid';
+    status: 'not-initialized' | 'configured' | 'ready' | 'invalid';
     storageType?: 'linux-json' | 'macos-keychain';
     storageReference?: import('../identity/types').HostPrivateKeyStorage;
     path?: string;
@@ -60,8 +60,6 @@ export interface HostManagerStatus {
     ownerIntegrity?: boolean;
     permissionIntegrity?: boolean;
     metadataIntegrity?: boolean;
-    pendingRotation?: boolean;
-    pendingOperationId?: string;
   };
 }
 
@@ -120,8 +118,7 @@ export function buildHostManagerStatus(args: {
       ownerIntegrity: false,
       permissionIntegrity: false,
       metadataIntegrity: false,
-      pendingRotation: false,
-    } : { status: 'not-initialized', pendingRotation: false }),
+    } : { status: 'not-initialized' }),
   };
 }
 

@@ -48,6 +48,16 @@ ARIAVA_RUN_REAL_MACOS_KEYCHAIN_LAUNCHD_TEST=1 ./scripts/test-macos-keychain-laun
 
 These commands can touch a real user Keychain/launchd domain or manage a disposable Linux VM. They are not ordinary CI and do not alter the npm publication trigger or artifact boundary.
 
+## Identity and command hardening break
+
+This release is a coordinated full-client break. It removes the Public TypeScript `RotationPayload`, `KeyRotationRequest`, and `KeyRotationResponse` contracts; removes the executable `host rotate-key`/`host` CLI namespace; removes free-text `CommandResult.message` and all Relay plaintext terminal-result storage/routes; requires encrypted `interrupt` as well as encrypted `reply`; and changes Pi/Bridge terminal exchange to message-free exact fields. Relay command submission now returns only `{ commandId, receivedAt }` and is not execution evidence. Terminal proof is a fixed-length encrypted Host receipt verified and archived by the Watch.
+
+Ariava does not rotate identity signing keys in place. Replace the identity with `ariava identity reset --confirm`, then re-pair Watches. Both default and dev profiles expose only `ariava identity status` and `ariava identity reset --confirm` for identity actions. Reset removes the old signing/E2E domain, pins, command journal/outbox, runtime state, and links and creates a canonical zero-link replacement.
+
+Do not publish this as a compatible Bridge-only or Pi-only update. The matching Public `ariava` and `@ariava/pi-extension` packages must be reviewed and published together from the same tag, and operators must require the matching Relay migration/Worker and Watch release under the private cutover runbook. Old Bridge, Pi, Relay, and Watch combinations are intentionally rejected; there is no plaintext fallback, version negotiation, or legacy interrupt `{}`.
+
+The Public npm tag remains independent of Relay deployment, Watch distribution, private gitlink integration, and any private product tag. Follow the private `docs/operations/identity-command-e2e-hardening-cutover.md` for the authorized command freeze, quiescence, migration `0022`, Watch threshold, verification, and forward-only recovery sequence.
+
 ## Normal Trusted Publishing release
 
 1. Start from a synchronized `main` branch. Commit unrelated feature or test changes separately, then change every common release version through the existing bump tool:

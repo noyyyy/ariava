@@ -69,9 +69,10 @@ export function createDefaultHostDomainResetLifecycle(
     },
     stopAndConfirm(snapshot) {
       if (!snapshot.installed || !record || !manager) return;
-      if (snapshot.wasRunning) manager.stop(record);
       const status = manager.status(record, runtimePath(), binPath());
-      if (status.processRunning) throw new AriavaCliError('ERR_SERVICE_COMMAND', 'Ariava service did not stop before Host reset.');
+      if (status.processRunning) manager.stop(record);
+      const stopped = manager.status(record, runtimePath(), binPath());
+      if (stopped.processRunning) throw new AriavaCliError('ERR_SERVICE_COMMAND', 'Ariava service did not stop before Host reset.');
     },
     synchronizeMetadata(snapshot, identityReference) {
       if (!snapshot.installed || !record || !manager) return;

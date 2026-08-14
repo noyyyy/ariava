@@ -3,10 +3,10 @@ import {
   isBridgeStatus,
   isCanonicalTimestamp,
   isHostPlatform,
-  isLinkRevokeReason,
   normalizePairingCode,
   validateEncryptionKeyBindingV1,
   type BridgePairWatchResponse,
+  type EncryptionKeyBindingV1,
   type E2EPendingLinkProjectionV1,
   type HostPlatform,
 } from '@ariava/protocol';
@@ -56,7 +56,11 @@ export interface PairProfileDependencies {
   ): Promise<void>;
   createRelay(relayBaseUrl: string, identity: HostIdentity): PairProfileRelay;
   pairWatch(relay: PairProfileRelay, pairingCode: string): Promise<BridgePairWatchResponse>;
-  createKeyring(resources: ResolvedProfileResources, identity: HostEncryptionIdentity): LocalLinkKeyring;
+  createKeyring(
+    resources: ResolvedProfileResources,
+    identities: ReturnType<AriavaProfileCliContext['encryptionIdentity']['create']>,
+    migrationContext: { currentHostIdentity: HostIdentity; signedCurrentHostBinding: EncryptionKeyBindingV1 },
+  ): LocalLinkKeyring;
   createHostBinding: typeof createHostEncryptionBinding;
   activate(input: HostSafetyCodeActivationInput): Promise<HostSafetyCodeActivationOutcome>;
 }
@@ -68,7 +72,7 @@ export function createDefaultPairProfileDependencies(bridgeVersion: string): Pai
     enroll: enrollCurrentIdentity,
     createRelay: (relayBaseUrl, identity) => new RelayClient({ baseUrl: relayBaseUrl, signer: identity.signer }),
     pairWatch: (relay, pairingCode) => (relay as RelayClient).pairWatch(pairingCode),
-    createKeyring: (resources, identity) => new LocalLinkKeyring(resources.linkKeyringPath, identity),
+    createKeyring: (resources, identities, migrationContext) => new LocalLinkKeyring(resources.linkKeyringPath, identities, migrationContext),
     createHostBinding: createHostEncryptionBinding,
     activate: runHostSafetyCodeActivation,
   };
@@ -91,9 +95,8 @@ export async function pairProfile(
         : 'Host identity is not initialized; run `ariava init`.';
       throw new HostIdentityError('ERR_IDENTITY_NOT_INITIALIZED', message);
     }
-    const encryptionIdentity = context.encryptionIdentity
-      .create(resources, context.platform)
-      .loadOrCreate(identity.hostId);
+    const encryptionStore = context.encryptionIdentity.create(resources, context.platform);
+    const encryptionIdentity = encryptionStore.loadOrCreate(identity.hostId);
     await dependencies.enroll(
       resolved.relayBaseUrl,
       identity,
@@ -113,8 +116,11 @@ export async function pairProfile(
       input.write?.(line);
     };
     input.presentAccepted?.(pairing);
-    const keyring = dependencies.createKeyring(resources, encryptionIdentity);
     const hostBinding = await dependencies.createHostBinding(identity, encryptionIdentity);
+    const keyring = dependencies.createKeyring(resources, encryptionStore, {
+      currentHostIdentity: identity,
+      signedCurrentHostBinding: hostBinding,
+    });
     const safetyCodeActivation = await dependencies.activate({
       projection: pairing.e2e,
       alreadyPaired: pairing.alreadyPaired,
@@ -166,14 +172,17 @@ function assertPairingResponse(pairing: BridgePairWatchResponse, identity: HostI
 
 function isHostProjection(value: unknown): value is BridgePairWatchResponse['host'] {
   if (!isRecord(value)) return false;
-  return isEntityId(value.hostId, 'host')
+  return hasExactKeys(value, [
+    'hostId', 'hostName', 'platform', 'bridgeVersion', 'registeredAt', 'lastSeenAt', 'bridgeStatus', 'status',
+  ])
+    && isEntityId(value.hostId, 'host')
     && isNonEmptyString(value.hostName)
     && isHostPlatform(value.platform)
     && isNonEmptyString(value.bridgeVersion)
     && isCanonicalTimestamp(value.registeredAt)
     && isCanonicalTimestamp(value.lastSeenAt)
     && isBridgeStatus(value.bridgeStatus)
-    && (value.status === undefined || value.status === 'active' || value.status === 'revoked');
+    && value.status === 'active';
 }
 
 function isWatchProjection(value: unknown): value is BridgePairWatchResponse['watchDevice'] {
@@ -187,13 +196,13 @@ function isWatchProjection(value: unknown): value is BridgePairWatchResponse['wa
 }
 
 function isHostWatchLink(value: unknown): value is BridgePairWatchResponse['link'] {
-  if (!isRecord(value)) return false;
+  if (!isRecord(value) || !hasExactKeys(value, [
+    'hostId', 'watchDeviceId', 'pairedAt', 'generation', 'updatedAt',
+  ])) return false;
   return isEntityId(value.hostId, 'host')
     && isEntityId(value.watchDeviceId, 'watch')
     && isCanonicalTimestamp(value.pairedAt)
     && isPositiveInteger(value.generation)
-    && (value.revokedAt === undefined || isCanonicalTimestamp(value.revokedAt))
-    && (value.revokedBy === undefined || isLinkRevokeReason(value.revokedBy))
     && isCanonicalTimestamp(value.updatedAt);
 }
 
@@ -242,4 +251,9 @@ function isEncoded(value: unknown, bytes: number): value is string {
   } catch {
     return false;
   }
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
 }

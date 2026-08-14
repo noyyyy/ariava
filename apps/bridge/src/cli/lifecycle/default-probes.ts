@@ -137,8 +137,8 @@ export function probeDefaultDoctorChecks(
   };
   Object.assign(checks, {
     identityReady: shared.identity.status === 'ready',
-    identityWarning: shared.identity.status === 'rotation-pending'
-      ? 'Host key rotation is pending; recover it before normal operation.'
+    identityWarning: shared.identity.status === 'invalid'
+      ? 'Host identity signing state requires reset; run `ariava identity reset --confirm` and re-pair Watches.'
       : undefined,
   });
   return checks;

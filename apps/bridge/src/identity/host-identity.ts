@@ -12,7 +12,7 @@ import {
   deriveEntityIdentity,
 } from '@ariava/protocol';
 import { HostIdentityError } from './errors';
-import { NodeHostRequestSigner, rebindHostRequestSigner } from './request-signer';
+import { NodeHostRequestSigner } from './request-signer';
 import {
   HOST_IDENTITY_ALGORITHM,
   type HostIdentity,
@@ -36,14 +36,6 @@ export async function generateHostIdentity(
   return importHostIdentityPrivateKey(privateKey.export({ type: 'pkcs8', format: 'der' }), storage, createdAt);
 }
 
-export async function generateHostRotationIdentity(
-  hostId: string,
-  storage: HostPrivateKeyStorage,
-  createdAt = new Date().toISOString(),
-): Promise<GeneratedHostKeyMaterial> {
-  const generated = await generateHostIdentity(storage, createdAt);
-  return rebindGeneratedIdentity(generated, { ...generated.identity, hostId });
-}
 
 export async function importHostIdentityPrivateKey(
   pkcs8: Uint8Array,
@@ -57,15 +49,9 @@ export async function importHostIdentityPrivateKey(
     const rawPublicKey = extractRawPublicKey(createPublicKey(privateKey));
     const derived = await deriveEntityIdentity('host', rawPublicKey);
     const publicKey = base64UrlEncode(rawPublicKey);
-    const canonicalHostId = derived.entityId;
-    const expectedHostId = expected?.hostId;
-    const rotationKey = expectedHostId !== undefined && expectedHostId !== canonicalHostId;
-    if (rotationKey && (expected?.keyId === undefined || expected.keyId !== derived.keyId)) {
-      throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Rotated Host identity key ID does not match the private key');
-    }
     const metadata: HostIdentityMetadata = {
       identityVersion: 2,
-      hostId: rotationKey ? expectedHostId : canonicalHostId,
+      hostId: derived.entityId,
       keyId: derived.keyId,
       algorithm: HOST_IDENTITY_ALGORITHM,
       publicKey,
@@ -95,35 +81,18 @@ export function getHostIdentityPrivateKey(identity: HostIdentity): Uint8Array {
   return new Uint8Array(privateKey);
 }
 
-export function rebindHostIdentity(identity: HostIdentity, metadata: HostIdentityMetadata): HostIdentity {
+export function rebindHostIdentityStorage(identity: HostIdentity, storage: HostPrivateKeyStorage): HostIdentity {
   const privateKey = PRIVATE_KEY_MATERIAL.get(identity);
   if (!privateKey) throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Host identity is not backed by local key material');
+  const metadata = { ...identity, privateKeyStorage: storage };
   const rebound: HostIdentity = {
     ...metadata,
-    signer: rebindHostRequestSigner(identity.signer, metadata.hostId, metadata.keyId),
+    signer: new NodeHostRequestSigner(identity.hostId, identity.keyId, createPrivateKey({ key: Buffer.from(privateKey), format: 'der', type: 'pkcs8' })),
   };
   PRIVATE_KEY_MATERIAL.set(rebound, new Uint8Array(privateKey));
   return rebound;
 }
 
-function rebindGeneratedIdentity(
-  generated: GeneratedHostKeyMaterial,
-  metadata: HostIdentityMetadata,
-): GeneratedHostKeyMaterial {
-  return {
-    identity: rebindHostIdentity(generated.identity, {
-      identityVersion: metadata.identityVersion,
-      hostId: metadata.hostId,
-      keyId: metadata.keyId,
-      algorithm: metadata.algorithm,
-      publicKey: metadata.publicKey,
-      publicKeyFingerprint: metadata.publicKeyFingerprint,
-      createdAt: metadata.createdAt,
-      privateKeyStorage: metadata.privateKeyStorage,
-    }),
-    privateKeyPkcs8: generated.privateKeyPkcs8,
-  };
-}
 
 export function decodePkcs8(value: string): Uint8Array {
   try {

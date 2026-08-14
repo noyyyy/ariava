@@ -229,6 +229,8 @@ describe('default Host-domain reset service lifecycle', () => {
     expect(runner.calls).toEqual([
       { command: '/usr/bin/node', args: ['--version'] },
       { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },
+      { command: '/usr/bin/node', args: ['--version'] },
+      { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },
       { command: 'launchctl', args: ['bootout', 'gui/501/io.test.ariava'] },
       { command: '/usr/bin/node', args: ['--version'] },
       { command: 'launchctl', args: ['print', 'gui/501/io.test.ariava'] },

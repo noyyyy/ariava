@@ -11,7 +11,8 @@ import type {
   HostEnrollmentRequest,
   HostProjection,
 } from '@ariava/protocol';
-import { AGENT_ADAPTER_PROTOCOL_VERSION, canonicalE2ECurrentSessionsDigestV1 } from '@ariava/protocol';
+import { AGENT_ADAPTER_PROTOCOL_VERSION, canonicalE2ECurrentSessionsDigestV1, validateCommandResult,
+  type CommandResult, type E2ERecipientSnapshotV1 } from '@ariava/protocol';
 import { isoNow } from '@ariava/shared-utils';
 import { AgentAdapterClient } from './agent-adapter/client';
 import { writeAgentAdapterConfig } from './agent-adapter/config';
@@ -22,20 +23,26 @@ import { PaiDriver } from './drivers/pi';
 import { probeHostPlatform } from './host-platform';
 import { loadUserConfig, resolveAriavaConfig, resolvePersistedAriavaConfig } from './host-manager/config';
 import { ensureAriavaSecureDirectories, pathHasFilesystemEvidence, readSecureJson, redactSensitive } from './host-manager/secure-files';
-import { createHostEncryptionBinding, createRuntimeHostEncryptionIdentityStore, HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostEncryptionIdentity, type HostIdentity, type HostIdentityStore } from './identity';
+import { createHostEncryptionBinding, createRuntimeHostEncryptionIdentityStore, HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostEncryptionIdentity, type HostEncryptionIdentityStore, type HostIdentity, type HostIdentityStore } from './identity';
 import { RelayClient, RelayClientError } from './relay-client';
 import { BridgeStateStore } from './state-store';
 import { assertProductionNodeRuntime } from './runtime/node-runtime';
 import { assertNodeCryptoSelfTest } from './e2e/node-crypto-self-test';
 import type { AgentDriver, BridgeConfig, BridgeSyncResult } from './types';
+import { LocalLinkKeyring, type PinRetentionReferences } from './e2e/link-keyring';
 import { prepareCommandForExecution } from './e2e/command-execution';
-import { LocalLinkKeyring } from './e2e/link-keyring';
 import { EncryptedUploadOrchestrator } from './e2e/upload-orchestrator';
 import { acquireRuntimeCoordinator, type RuntimeCoordinator } from './runtime-lock';
 import { createDefaultProfile } from './cli/profiles/default';
 import { createDevProfile } from './cli/profiles/dev';
 import { assertHostDomainResetRuntimeStartAllowed } from './cli/operations/host-domain-reset-journal';
 import { resolveAriavaDevProfilePaths } from './host-manager/dev-profile';
+import {
+  drainPendingCommandReceipts,
+  persistTerminalCommandResult,
+  recoverBlockedCommandReceipts,
+  type CommandReceiptConstructionDependencies,
+} from './e2e/command-receipt-recovery';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const BRIDGE_VERSION = readPackageVersion();
@@ -177,8 +184,10 @@ export class BridgeDaemon {
   private readonly adapterServer: AgentAdapterServer;
   private readonly drivers: AgentDriver[];
   private readonly router: CommandRouter;
+  private encryptionStore?: HostEncryptionIdentityStore;
   private encryptionIdentity?: HostEncryptionIdentity;
   private keyring?: LocalLinkKeyring;
+  private keyringMigrationContext?: ConstructorParameters<typeof LocalLinkKeyring>[2];
   private filesystemVerified = false;
   private startupValidated = false;
   private syncFlight?: Promise<BridgeSyncResult>;
@@ -192,6 +201,11 @@ export class BridgeDaemon {
   private readonly runtimeHealthLogger = new RuntimeHealthLogger();
   private pollWaitTimer?: unknown;
   private pollWaitResolve?: () => void;
+  private commandReceiptConstruction: CommandReceiptConstructionDependencies = {};
+  private receiptDrainFlight?: Promise<number>;
+  private commandNow: () => Date = () => new Date(Date.now());
+  private commandFlightActive = false;
+  private runtimeDisposed = false;
   constructor(
     private readonly config: BridgeConfig,
     drivers?: AgentDriver[],
@@ -200,12 +214,7 @@ export class BridgeDaemon {
     private readonly reconciliationScheduler: ReconciliationScheduler = DEFAULT_RECONCILIATION_SCHEDULER,
     private readonly pollWaitScheduler: PollWaitScheduler = DEFAULT_POLL_WAIT_SCHEDULER,
   ) {
-    const journalPath = resolve(dirname(config.configPath), 'host-domain-reset.json');
-    if (pathHasFilesystemEvidence(journalPath)) {
-      const profile = configPathMatchesProfile(config.configPath, 'dev') ? createDevProfile() : createDefaultProfile();
-      const resources = profile.resolveResources(resolvePersistedAriavaConfig(config.configPath));
-      assertHostDomainResetRuntimeStartAllowed(resources);
-    }
+    this.assertHostDomainResetStartAllowed();
     this.runtimeCoordinator = acquireRuntimeCoordinator(config.statePath);
     let stateStore: BridgeStateStore | undefined;
     try {
@@ -274,13 +283,27 @@ export class BridgeDaemon {
       if (recovery.droppedUnreadableItems > 0) {
         process.stderr.write(`Ariava dropped ${recovery.droppedUnreadableItems} unreadable encrypted spool item(s).\n`);
       }
-      const encryptionStore = createRuntimeHostEncryptionIdentityStore(this.config.identityPath, this.config.runtimePlatform ?? process.platform);
-      this.encryptionIdentity = encryptionStore.loadOrCreate(identity.hostId);
-      this.keyring = new LocalLinkKeyring(`${this.config.identityPath}.e2e-keyring.json`, this.encryptionIdentity);
+      this.encryptionStore = createRuntimeHostEncryptionIdentityStore(this.config.identityPath, this.config.runtimePlatform ?? process.platform);
+      this.encryptionIdentity = this.encryptionStore.loadOrCreate(identity.hostId);
+      const hostBinding = await createHostEncryptionBinding(identity, this.encryptionIdentity);
+      this.keyringMigrationContext = { currentHostIdentity: identity, signedCurrentHostBinding: hostBinding };
+      this.keyring = new LocalLinkKeyring(
+        `${this.config.identityPath}.e2e-keyring.json`, this.encryptionStore, this.keyringMigrationContext,
+      );
+      this.stateStore.validateCommandExecutionPins(this.keyring, { allowUnavailableForTerminal: true });
       this.relayClient = new RelayClient(
         { baseUrl: this.config.relayBaseUrl, signer: identity.signer },
         () => this.relayAbortController.signal,
       );
+      try {
+        await this.refreshCommandAuthority();
+        this.stateStore.recoverOrphanedCommandExecutions();
+        await recoverBlockedCommandReceipts(this.stateStore, this.keyring, this.commandReceiptConstruction);
+        await drainPendingCommandReceipts(this.stateStore, this.keyring, this.client());
+        this.pruneCommandRuntime();
+      } catch {
+        // Command recovery stays frozen until an authoritative snapshot succeeds.
+      }
       this.startupValidated = true;
     } catch (error) {
       this.disposeRuntimeCoordinator();
@@ -327,7 +350,23 @@ export class BridgeDaemon {
 
   stop(): void {
     this.stopped = true;
-    this.adapterRegistry.dispose();
+    if (this.runtimeDisposed) return;
+    let commandRecoveryComplete = !this.startupValidated;
+    if (this.startupValidated) {
+      try {
+        const hasActiveCommands = this.stateStore.listCommandExecutions().some(
+          (execution) => execution.state === 'claimed' || execution.state === 'dispatch_started',
+        );
+        commandRecoveryComplete = !hasActiveCommands;
+        if (hasActiveCommands) {
+          this.stateStore.recoverOrphanedCommandExecutions();
+          commandRecoveryComplete = true;
+        }
+      } catch {
+        commandRecoveryComplete = false;
+      }
+    }
+    try { this.adapterRegistry.dispose(); } catch {}
     if (this.reconciliationTimer !== undefined) {
       this.reconciliationScheduler.cancel(this.reconciliationTimer);
       this.reconciliationTimer = undefined;
@@ -338,12 +377,22 @@ export class BridgeDaemon {
     }
     this.cancelPollWait();
     this.relayAbortController.abort();
-    this.adapterServer.stop(true);
-    this.disposeRuntimeCoordinator();
+    try { this.adapterServer.stop(true); } catch {}
+    if (commandRecoveryComplete) this.disposeRuntimeCoordinator();
   }
   private disposeRuntimeCoordinator(): void {
+    if (this.runtimeDisposed) return;
     this.stateStore.dispose();
     this.runtimeCoordinator.dispose();
+    this.runtimeDisposed = true;
+  }
+
+  private markCommandOutcomeUnknownIfActive(commandId: string): void {
+    const execution = this.stateStore.getCommandExecution(commandId);
+    if (!execution || execution.state === 'outcome_unknown' || this.stopped) return;
+    if (execution.state === 'claimed' || execution.state === 'dispatch_started') {
+      this.stateStore.markCommandOutcomeUnknown(commandId);
+    }
   }
   get adapterUrl(): string { return this.adapterServer.url; }
   get driverNames(): string[] { return this.drivers.map((driver) => driver.name); }
@@ -359,7 +408,21 @@ export class BridgeDaemon {
     return flight;
   }
 
+  private assertHostDomainResetStartAllowed(): void {
+    const journalPath = resolve(dirname(this.config.configPath), 'host-domain-reset.json');
+    if (!pathHasFilesystemEvidence(journalPath)) return;
+    const profile = configPathMatchesProfile(this.config.configPath, 'dev') ? createDevProfile() : createDefaultProfile();
+    const resources = profile.resolveResources(resolvePersistedAriavaConfig(this.config.configPath));
+    assertHostDomainResetRuntimeStartAllowed(resources);
+  }
+
   private async performSyncOnce(): Promise<BridgeSyncResult> {
+    try {
+      this.assertHostDomainResetStartAllowed();
+    } catch (error) {
+      this.stop();
+      throw error;
+    }
     await this.validateStartup();
     this.reconciliationRequested = false;
     let offline = false;
@@ -368,6 +431,7 @@ export class BridgeDaemon {
     } catch {
       offline = true;
     }
+    if (!offline) await this.reconcileRecipientsAndDrainReceipts();
 
     const newEvents: CanonicalEvent[] = [];
     let authoritativeSetComplete = true;
@@ -443,7 +507,11 @@ export class BridgeDaemon {
   }
 
   private async recoverCurrentSessionsSnapshotPipeline(activeSessions: CanonicalSessionState[]): Promise<void> {
-    if (this.encryptionIdentity) this.keyring = new LocalLinkKeyring(`${this.config.identityPath}.e2e-keyring.json`, this.encryptionIdentity);
+    if (this.encryptionStore) {
+      this.keyring = new LocalLinkKeyring(
+        `${this.config.identityPath}.e2e-keyring.json`, this.encryptionStore, this.keyringMigrationContext,
+      );
+    }
     this.stateStore.clearInflightSessionUploads(activeSessions.map((session) => session.sessionId));
   }
 
@@ -639,7 +707,7 @@ export class BridgeDaemon {
   }
 
   private uploadOrchestrator(): EncryptedUploadOrchestrator {
-    return new EncryptedUploadOrchestrator(this.stateStore, this.client(), this.encryptionIdentity!, this.keyring!, {
+    return new EncryptedUploadOrchestrator(this.stateStore, this.client(), this.keyring!, {
       eventFailure: (failure) => this.encryptedEventFailureLogger.record(failure),
     });
   }
@@ -662,32 +730,118 @@ export class BridgeDaemon {
   }
 
 
-  private async pullAndHandleCommands() {
-    const response = await this.client().pullCommands(this.config.hostId);
-    const handled = [];
-    for (const command of response.commands) {
-      const prepared = await prepareCommandForExecution(command, this.keyring);
-      if (!prepared.ok) {
-        const result = {
-          commandId: command.commandId,
-          hostId: command.hostId,
-          sessionId: command.sessionId,
-          accepted: false,
-          status: 'failed' as const,
-          message: 'Encrypted reply execution is unavailable until the local E2E keyring is configured.',
-          correlationId: prepared.code,
-          updatedAt: isoNow(),
-        };
-        this.stateStore.rememberCommandResult(result, command);
-        handled.push(result);
-        await this.client().submitCommandResult(result);
+  private reconcileRecipientsAndDrainReceipts(): Promise<number> {
+    if (this.receiptDrainFlight) return this.receiptDrainFlight;
+    const flight = this.performReconciledReceiptDrain();
+    this.receiptDrainFlight = flight;
+    void flight.finally(() => {
+      if (this.receiptDrainFlight === flight) this.receiptDrainFlight = undefined;
+    }).catch(() => {});
+    return flight;
+  }
+
+  private async performReconciledReceiptDrain(): Promise<number> {
+    if (!this.keyring || !this.stateStore.listCommandExecutions().some((execution) =>
+      execution.state === 'terminal' && execution.receiptOutbox?.state === 'pending')) return 0;
+    try {
+      await this.refreshCommandAuthority();
+    } catch {
+      return 0;
+    }
+    return drainPendingCommandReceipts(this.stateStore, this.keyring, this.client());
+  }
+
+  private async pullAndHandleCommands(): Promise<CommandResult[]> {
+    if (this.commandFlightActive) return [];
+    this.commandFlightActive = true;
+    try {
+    if (!this.keyring) throw new Error('E2E command keyring is unavailable');
+    try {
+      await this.refreshCommandAuthority();
+    } catch {
+      return [];
+    }
+    await recoverBlockedCommandReceipts(this.stateStore, this.keyring, this.commandReceiptConstruction);
+    await drainPendingCommandReceipts(this.stateStore, this.keyring, this.client());
+    this.pruneCommandRuntime();
+    const commands = await this.client().pullCommands(this.config.hostId);
+    const handled: CommandResult[] = [];
+    for (const encrypted of commands) {
+      const preparation = await prepareCommandForExecution(encrypted, this.keyring, this.commandNow);
+      if (!preparation.ok) continue;
+      const { prepared } = preparation;
+      const claim = this.stateStore.claimCommandExecution({
+        originalEncryptedCommand: prepared.originalEncryptedCommand, commandDigest: prepared.commandDigest,
+        pinReference: prepared.pinReference, claimedAt: this.commandNow().toISOString(),
+      });
+      if (claim.status === 'conflict') throw new Error('Relay command replay nonce or body conflict');
+      if (claim.status === 'duplicate') continue;
+      let dispatchStarted = false;
+      let terminalResult: CommandResult | undefined;
+      try {
+        const outcome = await this.router.handle(prepared.loopbackCommand, { beforeDispatch: () => {
+          this.stateStore.markCommandDispatchStarted(encrypted.commandId, this.commandNow().toISOString());
+          dispatchStarted = true;
+        } });
+        if (!validateCommandResult(outcome.result)) {
+          if (dispatchStarted) this.markCommandOutcomeUnknownIfActive(encrypted.commandId);
+          continue;
+        }
+        terminalResult = outcome.result;
+      } catch {
+        this.markCommandOutcomeUnknownIfActive(encrypted.commandId);
         continue;
       }
-      const outcome = await this.router.handle(prepared.command);
-      handled.push(outcome.result);
-      await this.client().submitCommandResult(outcome.result);
+      if (this.stopped) continue;
+      try {
+        await this.refreshCommandAuthority();
+      } catch {
+        this.stateStore.persistTerminalReceiptBlocked(encrypted.commandId, terminalResult);
+        handled.push(terminalResult);
+        continue;
+      }
+      await persistTerminalCommandResult(
+        this.stateStore, this.keyring, encrypted.commandId, terminalResult, this.commandReceiptConstruction,
+      );
+      await drainPendingCommandReceipts(this.stateStore, this.keyring, this.client());
+      this.pruneCommandRuntime();
+      handled.push(terminalResult);
     }
     return handled;
+    } finally {
+      this.commandFlightActive = false;
+    }
+  }
+
+  private async refreshCommandAuthority(): Promise<E2ERecipientSnapshotV1> {
+    if (!this.keyring) throw new Error('E2E command keyring is unavailable');
+    const snapshot = await this.client().recipientSnapshot();
+    const acceptedVersion = this.stateStore.getRecipientSetVersion();
+    if (acceptedVersion !== undefined && snapshot.recipientSetVersion < acceptedVersion) {
+      throw new TypeError('recipient snapshot rollback rejected');
+    }
+    if (acceptedVersion === snapshot.recipientSetVersion) {
+      const active = this.keyring.listActive().map((pin) =>
+        `${pin.linkId}:${pin.linkGeneration}:${pin.epoch}:${pin.watchDeviceId}:${pin.watchBinding.encryptionKeyId}`).sort();
+      const received = snapshot.recipients.map((recipient) =>
+        `${recipient.linkId}:${recipient.linkGeneration}:${recipient.epoch}:${recipient.watchDeviceId}:${recipient.watchBinding.encryptionKeyId}`).sort();
+      if (JSON.stringify(active) !== JSON.stringify(received)) {
+        throw new TypeError('recipient snapshot version conflict rejected');
+      }
+    }
+    this.keyring.reconcileRecipients(snapshot);
+    this.stateStore.setRecipientSetVersion(snapshot.recipientSetVersion);
+    return snapshot;
+  }
+
+  private pruneCommandRuntime(now = this.commandNow().toISOString()): void {
+    if (!this.keyring) return;
+    this.stateStore.pruneEligibleCommandExecutions(now);
+    const references = mergePinRetentionReferences(
+      this.stateStore.durableContentPinRetentionReferences(now),
+      this.stateStore.commandExecutionPinRetentionReferences(),
+    );
+    this.keyring.pruneRetiring(references, now);
   }
 
 
@@ -705,6 +859,24 @@ export class BridgeDaemon {
         .map(([, value]) => value as string),
     ].filter((value): value is string => Boolean(value))));
   }
+}
+
+
+function mergePinRetentionReferences(...inputs: PinRetentionReferences[]): PinRetentionReferences {
+  const merged: PinRetentionReferences = {};
+  for (const input of inputs) {
+    for (const [category, values] of Object.entries(input) as Array<
+      [keyof PinRetentionReferences, Record<string, string> | undefined]
+    >) {
+      if (!values) continue;
+      const target = merged[category] ?? {};
+      for (const [key, timestamp] of Object.entries(values)) {
+        if (!target[key] || target[key]! < timestamp) target[key] = timestamp;
+      }
+      merged[category] = target;
+    }
+  }
+  return merged;
 }
 
 

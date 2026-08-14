@@ -2,11 +2,7 @@ import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { initializeProfile } from '../src/cli/operations/initialize';
-import {
-  inspectProfileIdentity,
-  resetProfileIdentity,
-  rotateProfileIdentity,
-} from '../src/cli/operations/identity';
+import { inspectProfileIdentity, resetProfileIdentity } from '../src/cli/operations/identity';
 import { pairProfile, type PairProfileDependencies } from '../src/cli/operations/pair';
 import { watchesProfile, type WatchesProfileDependencies } from '../src/cli/operations/watches';
 import { runConfigCommand } from '../src/cli/commands/config';
@@ -486,47 +482,7 @@ describe('profile-aware initialization and identity inspection', () => {
   });
 });
 
-describe('profile-aware identity rotation and reset', () => {
-  test.each(['default', 'dev'] as const)('%s rotation uses selected Relay, signer, metadata, and evidence namespace', async (profileId) => {
-    const harness = createHarness();
-    const unselected = profileId === 'default' ? 'dev' : 'default';
-    await initializeProfile(harness.contexts[profileId]);
-    resetLog(harness);
-    const sentinelBefore = harness.sentinelBytes(unselected);
-    let observedRelay: string | undefined;
-    let observedEntityId: string | undefined;
-
-    const result = await rotateProfileIdentity(harness.contexts[profileId], {
-      rotate: async (store, relayBaseUrl) => {
-        observedRelay = relayBaseUrl;
-        const identity = await store.load();
-        observedEntityId = identity?.signer.entityId;
-        const pending = await store.loadPending();
-        await store.stageRotation(pending ?? {
-          operationId: `op_${profileId}`,
-          issuedAt: '2026-08-05T00:00:00.000Z',
-          identity: identity!,
-        });
-        await store.promoteRotation(`op_${profileId}`);
-        return {
-          operationId: `op_${profileId}`,
-          entityId: identity!.hostId,
-          oldKeyId: identity!.keyId,
-          newKeyId: identity!.keyId,
-          status: 'completed',
-          completedAt: '2026-08-05T00:00:00.000Z',
-        };
-      },
-    });
-
-    expect(observedRelay).toBe(profileId === 'default' ? 'https://ariava-relay.noyx.io' : 'http://127.0.0.1:8790');
-    expect(observedEntityId).toBe(result.entityId);
-    expect(harness.config(profileId).identity).toMatchObject({ hostId: result.entityId, keyId: result.newKeyId });
-    expect(harness.events.some((event) => event.profile === profileId && event.action === 'keychainWrites')).toBe(true);
-    expect(harness.sentinelBytes(unselected)).toEqual(sentinelBefore);
-    expectZeroAccess(harness, unselected);
-  });
-
+describe('profile-aware identity reset', () => {
   test.each(['default', 'dev'] as const)('%s confirmed reset replaces and enrolls only selected profile resources', async (profileId) => {
     const harness = createHarness();
     const unselected = profileId === 'default' ? 'dev' : 'default';
@@ -650,7 +606,7 @@ describe('profile-aware identity rotation and reset', () => {
 });
 
 describe('profile-aware watches operations', () => {
-  test.each(['default', 'dev'] as const)('%s list/remove use only selected Host, Watch link, and signer', async (profileId) => {
+  test.each(['default', 'dev'] as const)('%s list/remove use only selected Host, Watch link, signer, and keyring', async (profileId) => {
     const harness = createHarness();
     const unselected = profileId === 'default' ? 'dev' : 'default';
     await initializeProfile(harness.contexts[profileId]);
@@ -668,18 +624,95 @@ describe('profile-aware watches operations', () => {
     );
 
     const suffix = profileId === 'default' ? 'D' : 'V';
-    expect(listed).toEqual({ action: 'list', watches: [{ watchDeviceId }] });
+    expect(listed).toEqual({ action: 'list', watches: [{ watchDeviceId, pairedAt: '2026-07-15T00:00:00.000Z', lastSeenAt: '2026-07-15T00:00:00.000Z', linkGeneration: 7 }] });
     expect(removed).toEqual({ action: 'remove', watchDeviceId });
     expect(accesses).toEqual([
       `enroll:${profileId}:host_${suffix.repeat(43)}`,
       `list:${profileId}:host_${suffix.repeat(43)}`,
       `enroll:${profileId}:host_${suffix.repeat(43)}`,
-      `remove:${profileId}:host_${suffix.repeat(43)}:${watchDeviceId}`,
+      `list:${profileId}:host_${suffix.repeat(43)}`,
+      `keyring:${profileId}:${harness.profiles[profileId].resources.linkKeyringPath}`,
+      `remove:${profileId}:host_${suffix.repeat(43)}:${watchDeviceId}:7`,
+      `revoke:${profileId}:${watchDeviceId}:7`,
     ]);
     expect(harness.counters[profileId].relaySigners).toBe(2);
-    expect(harness.counters[profileId].relayRequests).toBe(4);
+    expect(harness.counters[profileId].relayRequests).toBe(5);
     expect(harness.sentinelBytes(unselected)).toEqual(sentinelBefore);
     expectZeroAccess(harness, unselected);
+  });
+
+  test('remove sends the generation captured by its authoritative list without later inference', async () => {
+    const harness = createHarness();
+    await initializeProfile(harness.contexts.default);
+    resetLog(harness);
+    const accesses: string[] = [];
+    const dependencies = watchesDependencies(harness, 'default', accesses);
+    const originalCreateRelay = dependencies.createRelay;
+    dependencies.createRelay = (relayBaseUrl, identity) => {
+      const relay = originalCreateRelay(relayBaseUrl, identity);
+      return {
+        ...relay,
+        async listWatches() {
+          const listed = await relay.listWatches();
+          return { watches: listed.watches.map((watch) => ({ ...watch, linkGeneration: 41 })) };
+        },
+        async removeWatch(watchDeviceId, linkGeneration) {
+          expect(linkGeneration).toBe(41);
+          return relay.removeWatch(watchDeviceId, linkGeneration);
+        },
+      };
+    };
+    await watchesProfile(harness.contexts.default, {
+      action: 'remove', watchDeviceId: `watch_${'D'.repeat(43)}`,
+    }, dependencies);
+    expect(accesses.some((entry) => entry.endsWith(':41'))).toBe(true);
+  });
+
+  test.each([
+    ['Relay error', async () => { throw new Error('unlink outcome uncertain'); }],
+    ['malformed success', async () => ({ ok: true, extra: true }) as never],
+  ] as const)('%s prepares the selected keyring but never reports local revocation', async (_name, removeWatch) => {
+    const harness = createHarness();
+    await initializeProfile(harness.contexts.default);
+    resetLog(harness);
+    const accesses: string[] = [];
+    const dependencies = watchesDependencies(harness, 'default', accesses);
+    const originalCreateRelay = dependencies.createRelay;
+    dependencies.createRelay = (relayBaseUrl, identity) => ({
+      ...originalCreateRelay(relayBaseUrl, identity),
+      removeWatch,
+    });
+    const watchDeviceId = `watch_${'D'.repeat(43)}`;
+
+    await expect(watchesProfile(
+      harness.contexts.default, { action: 'remove', watchDeviceId }, dependencies,
+    )).rejects.toThrow();
+
+    expect(accesses.some((entry) => entry.startsWith('keyring:'))).toBe(true);
+    expect(accesses.some((entry) => entry.startsWith('revoke:'))).toBe(false);
+    expectZeroAccess(harness, 'dev');
+  });
+
+  test('local revoke failure rejects after exact Relay success instead of claiming unlink completion', async () => {
+    const harness = createHarness();
+    await initializeProfile(harness.contexts.default);
+    resetLog(harness);
+    const accesses: string[] = [];
+    const dependencies = watchesDependencies(harness, 'default', accesses);
+    dependencies.createKeyring = () => {
+      accesses.push('keyring:default:injected');
+      return {
+        revokeWatchGeneration() { accesses.push('revoke.failed'); throw new Error('durable local revoke failed'); },
+      };
+    };
+
+    await expect(watchesProfile(harness.contexts.default, {
+      action: 'remove', watchDeviceId: `watch_${'D'.repeat(43)}`,
+    }, dependencies)).rejects.toThrow('durable local revoke failed');
+    expect(accesses.at(-3)).toStartWith('keyring:default:');
+    expect(accesses.at(-2)).toStartWith('remove:default:');
+    expect(accesses.at(-1)).toBe('revoke.failed');
+    expectZeroAccess(harness, 'dev');
   });
 });
 
@@ -719,8 +752,8 @@ describe('profile-aware pairing security transaction', () => {
       'relay.create',
       'pairWatch:PEYX7K',
       'accepted.present',
-      'keyring.create',
       'hostBinding.create',
+      'keyring.create',
       'safetyCode.activate',
     ]);
     expect(keyringPaths).toEqual([harness.profiles[profileId].resources.linkKeyringPath]);
@@ -837,9 +870,17 @@ function watchesDependencies(
   accesses: string[],
 ): WatchesProfileDependencies {
   const context = harness.contexts[profileId];
+  const selectedEncryptionStores: unknown[] = [];
+  const originalEncryptionCreate = context.encryptionIdentity.create;
+  context.encryptionIdentity.create = (resources, platform) => {
+    const store = originalEncryptionCreate(resources, platform);
+    selectedEncryptionStores.push(store);
+    return store;
+  };
+  const hostBinding = {} as EncryptionKeyBindingV1;
   return {
     bridgeVersion: '1.2.3-test',
-    async createHostBinding() { return {} as never; },
+    async createHostBinding() { return hostBinding; },
     createRelay(_relayBaseUrl, identity) {
       context.access?.('relaySigners');
       const signer = identity.signer.entityId;
@@ -852,12 +893,29 @@ function watchesDependencies(
         async listWatches() {
           accesses.push(`list:${profileId}:${signer}`);
           context.access?.('relayRequests');
-          return { watches: [{ watchDeviceId: `watch_${(profileId === 'default' ? 'D' : 'V').repeat(43)}` }] as never[] };
+          return { watches: [{
+            watchDeviceId: `watch_${(profileId === 'default' ? 'D' : 'V').repeat(43)}`,
+            pairedAt: '2026-07-15T00:00:00.000Z',
+            lastSeenAt: '2026-07-15T00:00:00.000Z',
+            linkGeneration: 7,
+          }] };
         },
-        async removeWatch(watchDeviceId) {
-          accesses.push(`remove:${profileId}:${signer}:${watchDeviceId}`);
+        async removeWatch(watchDeviceId, linkGeneration) {
+          accesses.push(`remove:${profileId}:${signer}:${watchDeviceId}:${linkGeneration}`);
           context.access?.('relayRequests');
           return { ok: true as const };
+        },
+      };
+    },
+    createKeyring(resources, identities, migrationContext) {
+      accesses.push(`keyring:${profileId}:${resources.linkKeyringPath}`);
+      expect(resources.linkKeyringPath).toBe(harness.profiles[profileId].resources.linkKeyringPath);
+      expect(identities).toBe(selectedEncryptionStores.at(-1));
+      expect(migrationContext.currentHostIdentity.signer.entityId).toBe(`host_${(profileId === 'default' ? 'D' : 'V').repeat(43)}`);
+      expect(migrationContext.signedCurrentHostBinding).toBe(hostBinding);
+      return {
+        revokeWatchGeneration(watchDeviceId: string, linkGeneration: number) {
+          accesses.push(`revoke:${profileId}:${watchDeviceId}:${linkGeneration}`);
         },
       };
     },
@@ -881,8 +939,10 @@ function pairDependencies(
     store.load = async () => { callOrder.push('identity.load'); return originalLoad(); };
     return store;
   };
+  let selectedEncryptionStore: unknown;
   context.encryptionIdentity.create = (resources, platform) => {
     const store = originalEncryptionCreate(resources, platform);
+    selectedEncryptionStore = store;
     const originalLoadOrCreate = store.loadOrCreate.bind(store);
     store.loadOrCreate = (hostId) => {
       callOrder.push('encryption.loadOrCreate');
@@ -890,6 +950,7 @@ function pairDependencies(
     };
     return store;
   };
+  const hostBinding = {} as never;
   return {
     bridgeVersion: '1.2.3-test',
     normalizePairingCode(value) { callOrder.push('normalize'); return normalizePairingCode(value); },
@@ -909,13 +970,16 @@ function pairDependencies(
       context.access?.('relayRequests');
       return pairResponse(profileId);
     },
-    createKeyring(resources) {
+    createKeyring(resources, identities, migrationContext) {
       callOrder.push('keyring.create');
       keyringPaths.push(resources.linkKeyringPath);
+      expect(migrationContext.signedCurrentHostBinding).toBe(hostBinding);
+      expect(migrationContext.currentHostIdentity.signer.entityId).toBe(`host_${(profileId === 'default' ? 'D' : 'V').repeat(43)}`);
+      expect(identities).toBe(selectedEncryptionStore);
       context.access?.('filesystemReads', resources.linkKeyringPath);
       return {} as never;
     },
-    async createHostBinding() { callOrder.push('hostBinding.create'); return {} as never; },
+    async createHostBinding() { callOrder.push('hostBinding.create'); return hostBinding; },
     async activate() { callOrder.push('safetyCode.activate'); return outcome; },
   };
 }
@@ -938,6 +1002,7 @@ function pairResponse(profileId: 'default' | 'dev', includeE2E = false): BridgeP
       registeredAt: now,
       lastSeenAt: now,
       bridgeStatus: 'online',
+      status: 'active',
     },
     watchDevice: {
       watchDeviceId: `watch_${'W'.repeat(43)}`,
@@ -1004,6 +1069,8 @@ function malformedPairingCases(): MalformedPairingCase[] {
     set('non-canonical Host registration timestamp', 'host.registeredAt', '2026-08-05'),
     set('non-canonical Host last-seen timestamp', 'host.lastSeenAt', 'yesterday'),
     set('invalid Bridge status', 'host.bridgeStatus', 'ready'),
+    remove('omitted active Host status', 'host.status'),
+    set('revoked Host status', 'host.status', 'revoked'),
     {
       name: 'invalid Watch ID with matching link ID',
       mutate(response) {
@@ -1027,6 +1094,19 @@ function malformedPairingCases(): MalformedPairingCase[] {
     set('zero link generation', 'link.generation', 0),
     set('fractional link generation', 'link.generation', 1.5),
     set('non-canonical link update timestamp', 'link.updatedAt', 'today'),
+    set('revoked link timestamp', 'link.revokedAt', '2026-08-05T00:00:01.000Z'),
+    set('revoked link actor', 'link.revokedBy', 'host'),
+    {
+      name: 'revoked link timestamp and actor',
+      mutate(response) {
+        const clone = structuredClone(response);
+        clone.link.revokedAt = '2026-08-05T00:00:01.000Z';
+        clone.link.revokedBy = 'host';
+        return clone;
+      },
+    },
+    set('revoked link state', 'link.state', 'revoked'),
+    set('revoked link status', 'link.status', 'revoked'),
     set('non-object E2E projection', 'e2e', []),
     set('empty E2E link ID', 'e2e.linkId', ''),
     set('mismatched E2E Host ID', 'e2e.hostId', otherHostId),

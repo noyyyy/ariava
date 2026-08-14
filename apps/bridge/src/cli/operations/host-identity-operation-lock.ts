@@ -32,7 +32,7 @@ function hostIdentityTransitionLockedError(): AriavaCliError {
     'Another Host identity transition is already in progress for this profile.',
     {
       retryable: true,
-      remediation: { message: 'Wait for the active Host reset or key rotation to finish, then retry.' },
+      remediation: { message: 'Wait for the active Host identity reset to finish, then retry.' },
     },
   );
 }

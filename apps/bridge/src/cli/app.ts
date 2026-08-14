@@ -4,6 +4,12 @@ import { commandLabel, commandSummary, findCatalogEntry, formatHelp } from './ca
 import { commandUnavailableFailure, normalizeCliFailure } from './failure';
 import { renderCliFailure, renderCliSuccess } from './output';
 
+const REMOVED_SIGNING_ROTATION_COMMANDS = new Set([
+  'host\u0000rotate-key',
+  'identity\u0000rotate-key',
+  'identity\u0000rotate-signing-key',
+]);
+
 const SEMVER_IDENTIFIER = '(?:0|[1-9]\\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)';
 const SEMVER_BUILD_IDENTIFIER = '[0-9A-Za-z-]+';
 const SEMVER_PATTERN = new RegExp(
@@ -44,6 +50,9 @@ export async function runAriavaCli(argv: string[], context: AriavaCliApplication
       return 0;
     }
 
+    const removedRotationFailure = removedSigningRotationFailure(parsed.args, context.profileId);
+    if (removedRotationFailure) throw removedRotationFailure;
+
     const entry = findCatalogEntry(command);
     if (!entry) throw new Error(`Unknown command: ${command}`);
     const availability = entry.availability[context.profileId];
@@ -65,6 +74,21 @@ export async function runAriavaCli(argv: string[], context: AriavaCliApplication
     renderCliFailure(context.output, parsed.json, normalizeCliFailure(error));
     return 1;
   }
+}
+
+function removedSigningRotationFailure(
+  args: readonly string[],
+  profile: AriavaProfileId,
+): Error | undefined {
+  if (args.length !== 2 || !REMOVED_SIGNING_ROTATION_COMMANDS.has(`${args[0]}\u0000${args[1]}`)) {
+    return undefined;
+  }
+  const resetCommand = profile === 'dev'
+    ? 'dev-profile-cli identity reset --confirm'
+    : 'ariava identity reset --confirm';
+  return new Error(
+    `Signing keys cannot be rotated in place. Use \`${resetCommand}\` to replace the identity and re-pair Watches.`,
+  );
 }
 
 export function parseGlobalArguments(argv: readonly string[]): { args: string[]; json: boolean } {

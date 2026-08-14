@@ -2,11 +2,14 @@
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
+
 const args = process.argv.slice(2);
 let kind = 'root';
+let protocolDeclarationsOnly = false;
 let inputPath;
 for (let index = 0; index < args.length; index += 1) {
-  if (args[index] === '--kind' && ['root', 'pi'].includes(args[index + 1])) {
+  if (args[index] === '--protocol-declarations-only') protocolDeclarationsOnly = true;
+  else if (args[index] === '--kind' && ['root', 'pi'].includes(args[index + 1])) {
     kind = args[index + 1];
     index += 1;
   } else if (!inputPath) inputPath = args[index];
@@ -40,21 +43,56 @@ function readTarEntry(tarball, entry) {
   return result.stdout;
 }
 
+
+function assertPackedProtocolDeclarations(tarball) {
+  const commands = readTarEntry(tarball, 'packages/protocol/dist/commands.d.ts');
+  const identity = readTarEntry(tarball, 'packages/protocol/dist/identity.d.ts');
+  const index = readTarEntry(tarball, 'packages/protocol/dist/index.d.ts');
+  const declarations = `${commands}\n${identity}\n${index}`;
+  for (const removed of ['RotationPayload', 'KeyRotationRequest', 'KeyRotationResponse']) {
+    if (declarations.includes(removed)) fail(`packed protocol declarations contain removed ${removed}`);
+  }
+  const resultUnion = /export type CommandResult = CommandResultBase & \(\{\s*accepted: true;\s*status: 'executed';\s*\} \| \{\s*accepted: false;\s*status: 'expired' \| 'rejected' \| 'failed';\s*\}\);/u;
+  if (!resultUnion.test(commands)) fail('packed CommandResult declaration is not the legal accepted/status discriminated union');
+  const ack = commands.match(/export interface CommandSubmissionAckV1 \{([^}]*)\}/u)?.[1] ?? '';
+  if (!/^\s*commandId: string;\s*receivedAt: string;\s*$/u.test(ack)) {
+    fail('packed CommandSubmissionAckV1 declaration is not exact');
+  }
+  const resultBase = commands.match(/interface CommandResultBase\s*\{([^}]*)\}/u)?.[1] ?? '';
+  if (!/^\s*commandId: string;\s*hostId: string;\s*sessionId: string;\s*updatedAt: string;\s*$/u.test(resultBase)) {
+    fail('packed CommandResultBase declaration is not exact');
+  }
+}
+
+
 const runtimeFixturePaths = {
+  command: 'packages/protocol/dist/fixtures/command-e2e-v1-vectors.json',
   vectors: 'packages/protocol/dist/fixtures/e2e-v2-vectors.json',
   preview: 'packages/protocol/dist/fixtures/notification-preview-v2-vector.json',
   parity: 'packages/protocol/dist/fixtures/need-human-error-validation-v2.json',
 };
 
 function assertRuntimeFixtureContents(tarball) {
+  let command;
   let vectors;
   let preview;
   let parity;
   try {
+    command = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.command));
     vectors = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.vectors));
     preview = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.preview));
     parity = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.parity));
-  } catch { fail('runtime v2 and parity fixtures must be valid JSON'); }
+  } catch { fail('command E2E v1, runtime v2, and parity fixtures must be valid JSON'); }
+  if (command.version !== 1 || command.suite !== 'x25519-hkdf-sha256-chachapoly-v1'
+    || command.interrupt?.envelope?.type !== 'interrupt'
+    || command.interrupt?.envelope?.payload?.content?.payloadKind !== 'interrupt-content-v1'
+    || !String(command.interrupt?.commandDigest ?? '').trim()
+    || command.receipt?.envelope?.content?.payloadKind !== 'command-receipt-content-v1'
+    || !String(command.receipt?.receiptDigest ?? '').trim()
+    || !Array.isArray(command.receiptPlaintexts) || command.receiptPlaintexts.length !== 4
+    || command.receiptPlaintexts.some((entry) => !String(entry?.plaintext ?? '').trim())) {
+    fail('command E2E v1 interoperability fixture is invalid');
+  }
   if (vectors.version !== 2 || vectors.event?.contentId === undefined || vectors.session?.contentId === undefined
     || !String(vectors.event?.contentAAD ?? '').trim() || !String(vectors.session?.contentAAD ?? '').trim()) {
     fail('runtime v2 interoperability fixture is invalid');
@@ -82,6 +120,13 @@ if (inputPath.endsWith('.tgz')) {
 }
 const files = new Set(filePaths);
 
+if (protocolDeclarationsOnly) {
+  if (!inputPath.endsWith('.tgz')) fail('protocol declaration assertion requires a packed tarball');
+  assertPackedProtocolDeclarations(inputPath);
+  console.log('npm packed protocol declaration assertion passed');
+  process.exit(0);
+}
+
 const forbiddenPatterns = [
   /(^|\/)(?:docs|screenshots|scripts|node_modules)(\/|$)/u,
   /(^|\/)(?:notify\.js|ariava\.png)$/u,
@@ -100,6 +145,7 @@ const forbiddenPatterns = [
   /macos-helper/iu,
   /runtime-image/iu,
   /\.(?:png|jpe?g|gif|webp|heic|svg)$/iu,
+  /packages\/protocol\/dist\/fixtures\/(?:e2e-v1-vectors|notification-preview-v1-vector)\.json$/u,
 ];
 
 if (kind === 'pi') {
@@ -146,6 +192,10 @@ const required = [
   'apps/bridge/dist/e2e/node-crypto-self-test.js',
   'packages/protocol/dist/index.js',
   'packages/protocol/dist/index.d.ts',
+  'packages/protocol/dist/commands.js',
+  'packages/protocol/dist/commands.d.ts',
+  'packages/protocol/dist/identity.js',
+  'packages/protocol/dist/identity.d.ts',
   'packages/protocol/dist/events.js',
   'packages/protocol/dist/events.d.ts',
   'packages/protocol/dist/encryption.js',
@@ -178,6 +228,7 @@ if (inputPath.endsWith('.tgz')) {
   assertPublishedVersion(manifest.version);
   if (manifest.name !== 'ariava') fail(`root package name must be ariava, got: ${JSON.stringify(manifest.name ?? null)}`);
   assertRuntimeFixtureContents(inputPath);
+  assertPackedProtocolDeclarations(inputPath);
 } else {
   assertPublishedVersion(packVersion, 'pack metadata version');
 }

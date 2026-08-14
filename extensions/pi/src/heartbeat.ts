@@ -1,7 +1,7 @@
 import type { AgentAdapter } from './adapter-interface';
 import type { SessionStatus } from '@ariava/protocol';
 import type { PiSessionInfo } from './session';
-import { logExtensionErrorThrottled } from './logger';
+import { logExtensionEventThrottled } from './logger';
 
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
 
@@ -20,8 +20,8 @@ export function startHeartbeat(ctx: HeartbeatContext, intervalMs = DEFAULT_HEART
   activeTimer = setInterval(async () => {
     try {
       await ctx.client.heartbeat(ctx.sessionId, ctx.status, ctx.latestActivityText, ctx.getSession?.() ?? undefined);
-    } catch (error) {
-      logExtensionErrorThrottled('heartbeat', error);
+    } catch {
+      logExtensionEventThrottled('heartbeat_failed');
     }
   }, intervalMs);
 }

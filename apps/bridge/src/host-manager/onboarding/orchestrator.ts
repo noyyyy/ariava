@@ -300,10 +300,9 @@ function preflightDetail(detection: OnboardingDetection): Record<string, unknown
 function throwIdentityNotReady(readiness: Extract<OnboardingHostStateDecision, { kind: 'reject' }>): never {
   throw onboardingError('ERR_IDENTITY_INVALID', readiness.reason, 'host-init', false, {
     identityStatus: readiness.identityStatus,
-    pendingRotation: readiness.pendingRotation,
     remediation: {
       message: readiness.reason,
-      command: 'ariava host reset --confirm',
+      command: 'ariava identity reset --confirm',
     },
   });
 }

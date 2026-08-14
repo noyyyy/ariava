@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   AGENT_ADAPTER_PROTOCOL_HEADER,
   AGENT_ADAPTER_PROTOCOL_VERSION,
+  E2E_SUITE_V1,
+  type EncryptionKeyBindingV1,
   type HostEnrollmentResponse,
   type SignedRequestHeaders,
 } from '@ariava/protocol';
@@ -84,7 +86,12 @@ const identity: HostIdentity = {
 const inspection: HostIdentityInspection = {
   status: 'ready', storageType: 'linux-json', storageReference: storage, path: storage.path,
   hostId: identity.hostId, keyId: identity.keyId, algorithm: 'Ed25519', publicKeyFingerprint: identity.publicKeyFingerprint,
-  ownerIntegrity: true, permissionIntegrity: true, metadataIntegrity: true, pendingRotation: false,
+  ownerIntegrity: true, permissionIntegrity: true, metadataIntegrity: true,
+};
+const encryptionBinding: EncryptionKeyBindingV1 = {
+  version: 1, entityType: 'host', entityId: identity.hostId, identityKeyId: identity.keyId,
+  encryptionKeyId: 'ekey-test', suite: E2E_SUITE_V1, publicKey: 'public-encryption-key',
+  sequence: 1, createdAt: identity.createdAt, bindingSignature: 'binding-signature',
 };
 const config: ResolvedAriavaConfig = {
   relayBaseUrl: 'https://relay.example', hostName: 'Test Host', agentAdapterPort: 7272,
@@ -114,7 +121,7 @@ function fixture(overrides: Partial<StrictReadinessInput> = {}, depOverrides: Pa
     target: 'adapter-installed', cliVersion: '1.2.3',
     stableCli: { executablePath: '/prefix/bin/ariava', packageRoot: '/prefix/lib/node_modules/ariava', packageVersion: '1.2.3', npmPrefix: '/prefix', npmBinPath: '/prefix/bin' },
     installMetadata: { installer: { manager: 'npm', ariavaBinRealPath: '/prefix/bin/ariava', recordedAt: '2026-07-20T00:00:00.000Z' } },
-    config, identityInspection: inspection, identity,
+    config, identityInspection: inspection, identity, encryptionBinding,
     serviceRecord: { backend: 'systemd-user', installedAt: '2026-07-20T00:00:00.000Z', runtimePath: '/usr/bin/node', ariavaBinPath: '/prefix/bin/ariava', configPath: config.configPath, identityReference: storage, definitionPath: '/home/test/.config/systemd/user/ariava.service', serviceId: 'ariava.service' },
     expectedRuntimePath: '/usr/bin/node', expectedAriavaBinPath: '/prefix/bin/ariava',
     hostMetadata: { hostName: 'Test Host', platform: 'linux', bridgeVersion: '1.2.3' }, piStatus,
@@ -252,7 +259,7 @@ describe('strict onboarding readiness', () => {
     const cases: Array<[string, Partial<StrictReadinessInput>, RegExp]> = [
       ['stable-cli', { stableCli: { ...healthy.input.stableCli, packageVersion: 'old' } }, /Stable Ariava CLI/i],
       ['persisted-config', { config: { ...config, environmentOverrides: ['ARIAVA_RELAY_BASE_URL'] } }, /Persisted Host configuration/i],
-      ['identity', { identityInspection: { ...inspection, pendingRotation: true, status: 'rotation-pending' } }, /Host identity is not ready/i],
+      ['identity', { identityInspection: { ...inspection, status: 'invalid' } }, /Host identity is not ready/i],
       ['service-references', { serviceRecord: { ...healthy.input.serviceRecord!, configPath: '/wrong' } }, /service metadata/i],
     ];
     for (const [id, override, messagePattern] of cases) {
@@ -336,7 +343,12 @@ describe('strict onboarding readiness', () => {
       },
       createRelayClient: (options) => {
         capturedNonce = options.nonce?.();
-        return { enrollHost: async () => enrollment() };
+        return {
+          enrollHost: async (request) => {
+            expect(request.encryptionBinding).toEqual(encryptionBinding);
+            return enrollment();
+          },
+        };
       },
     };
     await expect(checkRelay(input, depsWithoutNonce)).resolves.toBeUndefined();
@@ -438,7 +450,7 @@ describe('strict onboarding readiness', () => {
     }> = [
       { id: 'stable-cli', code: 'ERR_STABLE_CLI_PATH', actionId: 'retry-onboarding', command: 'npx --yes ariava@latest setup' },
       { id: 'persisted-config', code: 'ERR_RELAY_CONFIG_REQUIRED', actionId: 'retry-onboarding', command: 'ariava doctor' },
-      { id: 'identity', code: 'ERR_IDENTITY_INVALID', actionId: 'resolve-failure', command: 'ariava host reset --confirm' },
+      { id: 'identity', code: 'ERR_IDENTITY_INVALID', actionId: 'resolve-failure', command: 'ariava identity reset --confirm' },
       { id: 'service-support', code: 'ERR_UNSUPPORTED_PLATFORM', actionId: 'retry-onboarding', command: 'ariava setup --resume' },
       { id: 'service-installed', code: 'ERR_SERVICE_NOT_INSTALLED', actionId: 'retry-onboarding', command: 'ariava service reinstall' },
       { id: 'service-enabled', code: 'ERR_ONBOARDING_NOT_READY', actionId: 'retry-onboarding', command: 'ariava setup --resume' },
@@ -471,7 +483,6 @@ describe('strict onboarding readiness', () => {
     const multipleFailures = fixture({
       target: 'host-ready',
       stableCli: { ...healthy.input.stableCli, packageVersion: 'old' },
-      identityInspection: { ...healthy.input.identityInspection, pendingRotation: true },
     });
     const failed = await checkStrictOnboardingReadiness(multipleFailures.input, multipleFailures.deps);
     expect(failed.nextActions).toEqual([{
@@ -523,7 +534,6 @@ describe('strict onboarding readiness', () => {
       ['owner integrity', { ...input.identityInspection, ownerIntegrity: false }],
       ['permission integrity', { ...input.identityInspection, permissionIntegrity: false }],
       ['metadata integrity', { ...input.identityInspection, metadataIntegrity: false }],
-      ['pending rotation', { ...input.identityInspection, pendingRotation: true }],
       ['Host ID binding', { ...input.identityInspection, hostId: 'other-host' }],
       ['key ID binding', { ...input.identityInspection, keyId: 'other-key' }],
     ];
@@ -679,15 +689,15 @@ describe('strict onboarding readiness', () => {
       data: {
         step: 'strict-readiness',
         retryable: false,
-        remediation: { message: 'invalid identity', command: 'ariava host reset --confirm' },
+        remediation: { message: 'invalid identity', command: 'ariava identity reset --confirm' },
       },
     });
 
     const commandCases: Array<[string | undefined, string]> = [
       ['ERR_IDENTITY_KEYCHAIN_LOCKED', 'security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"'],
-      ['ERR_IDENTITY_MISSING', 'ariava host reset --confirm'],
-      ['ERR_IDENTITY_PERMISSIONS', 'ariava host reset --confirm'],
-      ['ERR_IDENTITY_RESET_REQUIRED', 'ariava host reset --confirm'],
+      ['ERR_IDENTITY_MISSING', 'ariava identity reset --confirm'],
+      ['ERR_IDENTITY_PERMISSIONS', 'ariava identity reset --confirm'],
+      ['ERR_IDENTITY_RESET_REQUIRED', 'ariava identity reset --confirm'],
       ['ERR_SERVICE_NOT_INSTALLED', 'ariava service reinstall'],
       ['ERR_SERVICE_METADATA', 'ariava service reinstall'],
       ['ERR_AGENT_ADAPTER_DISCOVERY', 'ariava service restart'],

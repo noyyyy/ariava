@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { E2E_SUITE_V1, base64UrlEncode } from '../../../packages/protocol/dist/index.js';
+import {
+  E2E_SUITE_V1, base64UrlEncode, buildEncryptionBindingBytes, buildLinkTranscriptBytes, contentSha256,
+} from '../../../packages/protocol/dist/index.js';
 import { BridgeDaemon } from '../dist/daemon.js';
 import { EncryptedUploadOrchestrator } from '../dist/e2e/upload-orchestrator.js';
 import { generateHostEncryptionIdentity } from '../dist/identity/host-encryption-key.js';
@@ -38,16 +40,27 @@ async function fixture(handler, sessions = []) {
   const root = mkdtempSync(join(tmpdir(), 'ariava-daemon-e2e-')); dirs.push(root); chmodSync(root, 0o700);
   const identityPath = join(root, 'identity.json'); const hostId = `host_${'H'.repeat(43)}`;
   const runtimeEncryptionIdentity = generateHostEncryptionIdentity(hostId);
-  const watchId = `watch_${'W'.repeat(43)}`; const watch = generateHostEncryptionIdentity(watchId);
-  const binding = { version: 1, entityType: 'watch', entityId: watchId, identityKeyId: `key_${'A'.repeat(43)}`,
+  const watchId = `watch_${'W'.repeat(43)}`; const watch = generateHostEncryptionIdentity(hostId, 2);
+  const hostBinding = { version: 1, entityType: 'host', entityId: hostId, identityKeyId: `key_${'H'.repeat(43)}`,
+    encryptionKeyId: runtimeEncryptionIdentity.encryptionKeyId, suite: E2E_SUITE_V1, publicKey: runtimeEncryptionIdentity.publicKey,
+    sequence: runtimeEncryptionIdentity.sequence, createdAt: runtimeEncryptionIdentity.createdAt,
+    bindingSignature: base64UrlEncode(new Uint8Array(64)) };
+  const watchBinding = { version: 1, entityType: 'watch', entityId: watchId, identityKeyId: `key_${'W'.repeat(43)}`,
     encryptionKeyId: watch.encryptionKeyId, suite: E2E_SUITE_V1, publicKey: watch.publicKey, sequence: 1,
     createdAt: '2026-07-20T00:00:00.000Z', bindingSignature: base64UrlEncode(new Uint8Array(64)) };
-  const linkId = 'link-1'; const keyring = new LocalLinkKeyring(`${identityPath}.e2e-keyring.json`, runtimeEncryptionIdentity);
-  keyring.persistActive({ version: 1, status: 'active', linkId, hostId, watchDeviceId: watchId,
-    linkGeneration: 1, epoch: 1, transcriptDigest: base64UrlEncode(new Uint8Array(32)), watchBinding: binding,
-    watchBindingDigest: base64UrlEncode(new Uint8Array(32)), peerProofDigest: base64UrlEncode(new Uint8Array(32)), activatedAt: '2026-07-20T00:00:00.000Z' });
+  const bindingDigest = async (value) => { const { bindingSignature: _, ...unsigned } = value;
+    return contentSha256(buildEncryptionBindingBytes(unsigned)); };
+  const hostBindingDigest = await bindingDigest(hostBinding); const watchBindingDigest = await bindingDigest(watchBinding);
+  const linkId = 'link-1'; const linkGeneration = 1; const epoch = 1;
+  const transcriptDigest = await contentSha256(buildLinkTranscriptBytes({
+    linkId, hostId, watchDeviceId: watchId, linkGeneration, epoch, hostBindingDigest, watchBindingDigest,
+  }));
+  const keyring = new LocalLinkKeyring(`${identityPath}.e2e-keyring.json`, runtimeEncryptionIdentity);
+  keyring.persistActive({ version: 2, status: 'active', linkId, hostId, watchDeviceId: watchId,
+    linkGeneration, epoch, transcriptDigest, hostBinding, hostBindingDigest, watchBinding, watchBindingDigest,
+    peerProofDigest: base64UrlEncode(new Uint8Array(32)), activatedAt: '2026-07-20T00:00:00.000Z' });
   const snapshots = (version) => ({ version: 1, hostId, recipientSetVersion: version, recipients: [{
-    linkId, linkGeneration: 1, watchDeviceId: watchId, epoch: 1, state: 'active', watchBinding: binding }] });
+    linkId, linkGeneration, watchDeviceId: watchId, epoch, state: 'active', watchBinding }] });
   const config = { hostId, relayBaseUrl: 'http://relay.invalid', statePath: join(root, 'state.json'), identityPath };
   const state = new BridgeStateStore(config.statePath);
   state.initializeEncryptedSpool(config.hostId, config.identityPath, 'linux');
@@ -66,7 +79,7 @@ async function fixture(handler, sessions = []) {
     reconcileEncryptedSession: (session) => invoke('/v2/bridge/e2e/sessions/reconcile', { session }).then((value) => value.committed),
   };
   const recipients = keyring.reconcileRecipients(snapshots(1));
-  const orchestrator = (stateStore = state, hooks) => new EncryptedUploadOrchestrator(stateStore, client, runtimeEncryptionIdentity, keyring, hooks);
+  const orchestrator = (stateStore = state, hooks) => new EncryptedUploadOrchestrator(stateStore, client, keyring, hooks);
   return { root, config, state, calls, snapshots, recipients, client, keyring, runtimeEncryptionIdentity, orchestrator, restore: () => {} };
 }
 
@@ -371,7 +384,7 @@ test('all-session recipient refresh replaces stale inflight on two consecutive r
   try {
     const state = f.state;
     state.initializeEncryptedSpool(f.config.hostId, f.config.identityPath, 'linux');
-    state.replaceDriverSessions('test', [
+    state.replaceDriverSessions('pi', [
       { ...s1, hostId: f.config.hostId }, { ...s2, hostId: f.config.hostId },
     ]);
     const ok = await f.orchestrator(state).publishRecipientChangeSnapshots(f.snapshots(1), f.recipients);
@@ -379,7 +392,7 @@ test('all-session recipient refresh replaces stale inflight on two consecutive r
     assert.deepEqual([...attempts.keys()].sort(), ['s1', 's2']);
     assert.equal(attempts.get('s1'), 3); assert.equal(attempts.get('s2'), 3);
     state.dispose();
-    const restarted = new BridgeStateStore(f.config.statePath);
+    const restarted = new BridgeStateStore(f.config.statePath, undefined, { deferRuntimePreflight: true });
     restarted.initializeEncryptedSpool(f.config.hostId, f.config.identityPath, 'linux');
     assert.equal(restarted.currentSessionRevision('s1'), 1); assert.equal(restarted.currentSessionRevision('s2'), 1);
     assert.deepEqual(restarted.listInflightSessionIds(), []);
