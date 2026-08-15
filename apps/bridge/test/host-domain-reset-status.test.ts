@@ -7,11 +7,12 @@ import { runDoctorCommand } from '../src/cli/commands/doctor';
 import { createProfileCliContext } from '../src/cli/context';
 import { createDefaultProfile } from '../src/cli/profiles/default';
 import { createDevProfile } from '../src/cli/profiles/dev';
-import { HOST_DOMAIN_RESET_PHASES } from '../src/cli/operations/host-domain-reset-journal';
 import {
-  buildJournal,
-  writeJournalFixture,
-} from './helpers/host-domain-reset-journal-fixture';
+  HOST_DOMAIN_RESET_JOURNAL_VERSION,
+  HOST_DOMAIN_RESET_PHASES,
+  hostDomainResourceDigest,
+} from '../src/cli/operations/host-domain-reset-journal';
+import { writeJournalFixture } from './fixtures/host-domain-reset-journal-fixtures';
 
 const roots: string[] = [];
 const originalHome = process.env.HOME;
@@ -23,6 +24,15 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+function phaseTimestamp(
+  phase: typeof HOST_DOMAIN_RESET_PHASES[number], required: typeof HOST_DOMAIN_RESET_PHASES[number],
+): string | null {
+  return HOST_DOMAIN_RESET_PHASES.indexOf(phase) >= HOST_DOMAIN_RESET_PHASES.indexOf(required)
+    ? '2026-08-11T00:00:00.000Z'
+    : null;
+}
+
+
 function dependencies(profileId: 'default' | 'dev', phase: typeof HOST_DOMAIN_RESET_PHASES[number]) {
   const home = mkdtempSync(join(tmpdir(), `ariava-${profileId}-reset-status-`));
   roots.push(home);
@@ -30,10 +40,29 @@ function dependencies(profileId: 'default' | 'dev', phase: typeof HOST_DOMAIN_RE
   process.env.XDG_CONFIG_HOME = join(home, 'xdg');
   const profile = profileId === 'default' ? createDefaultProfile() : createDevProfile();
   mkdirSync(profile.resources.root, { recursive: true, mode: 0o700 });
-  const servicePatch = profileId === 'default'
-    ? { service: { managed: true, installed: false, enabled: false, wasRunning: false, backend: 'systemd-user' } }
-    : {};
-  writeJournalFixture(profile.resources, buildJournal(profile.resources, phase, servicePatch));
+  writeJournalFixture(profile.resources, {
+    version: HOST_DOMAIN_RESET_JOURNAL_VERSION, operationId: 'reset_0123456789abcdef', profile: profileId, phase,
+    oldHostId: ['quarantine-pending', 'quarantined'].includes(phase) ? null : `host_${'A'.repeat(43)}`,
+    oldKeyId: ['quarantine-pending', 'quarantined'].includes(phase) ? null : `key_${'B'.repeat(43)}`,
+    newHostId: HOST_DOMAIN_RESET_PHASES.indexOf(phase) >= HOST_DOMAIN_RESET_PHASES.indexOf('signing-identity-replaced') ? `host_${'C'.repeat(43)}` : null,
+    newKeyId: HOST_DOMAIN_RESET_PHASES.indexOf(phase) >= HOST_DOMAIN_RESET_PHASES.indexOf('signing-identity-replaced') ? `key_${'D'.repeat(43)}` : null,
+    oldEncryptionKeyId: null,
+    signingCleanup: null,
+    signingReplacementAttemptedAt: phaseTimestamp(phase, 'signing-replacement-pending'),
+    encryptionIdentityReplacedAt: phaseTimestamp(phase, 'encryption-identity-replaced'),
+    runtimeArtifactsClearedAt: phaseTimestamp(phase, 'runtime-artifacts-cleared'),
+    configSavedAt: phaseTimestamp(phase, 'config-saved'),
+    enrolledAt: phaseTimestamp(phase, 'enrolled'),
+    serviceMetadataSynchronizedAt: phaseTimestamp(phase, 'service-metadata-synchronized'),
+    resourceDigest: hostDomainResourceDigest(profile.resources), createdAt: '2026-08-11T00:00:00.000Z', updatedAt: '2026-08-11T00:00:00.000Z',
+    revoke: phase === 'quarantine-pending' || phase === 'quarantined' || phase === 'prepared'
+      ? { state: 'not-attempted', outcome: null }
+      : phase === 'revoke-pending' ? { state: 'pending', outcome: null }
+        : { state: 'complete', outcome: 'revoked' },
+    service: profileId === 'default'
+      ? { managed: true, installed: false, enabled: false, wasRunning: false, backend: 'systemd-user' }
+      : { managed: false, installed: false, enabled: false, wasRunning: false, backend: 'none' },
+  });
   const context = createProfileCliContext({
     profile, platform: 'linux', hostName: () => 'Host', generateSecret: () => 'secret',
     config: { load: () => ({}), save: () => {} },

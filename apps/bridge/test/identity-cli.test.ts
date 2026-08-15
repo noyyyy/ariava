@@ -21,6 +21,7 @@ import commandFixture from '../../../packages/protocol/test/fixtures/command-e2e
 import type { ServiceManager } from '../src/host-manager';
 import { createDefaultProfile } from '../src/cli/profiles/default';
 import { FakeKeychain } from './fixtures/fake-keychain';
+import type { ProcessAwareLockDependencies } from '../src/host-manager/process-aware-lock';
 import { withHostIdentityOperationLock } from '../src/cli/operations/host-identity-operation-lock';
 
 const roots: string[] = [];
@@ -374,7 +375,14 @@ describe('identity-safe public CLI', () => {
     const deps = cliDeps(profile.resources.root, identityPath, () => config, (next) => { config = next; }, output, errors);
     deps.createProfile = () => profile;
     deps.createHostIdentityStore = (path: string) => new MacOSKeychainHostIdentityStore(path, keychain);
-    deps.hostIdentityOperationLock = { run: withHostIdentityOperationLock };
+    const lockDependencies: Partial<ProcessAwareLockDependencies> = {
+      platform: 'linux', uid: process.getuid!(), pid: process.pid, now: () => new Date(),
+      ownerToken: () => 'c'.repeat(48), currentProcessStart: () => 'identity-cli-test-start',
+      inspector: { inspect: () => ({ status: 'alive', processStart: 'identity-cli-test-start' }) },
+    };
+    deps.hostIdentityOperationLock = {
+      run: (resources, operation) => withHostIdentityOperationLock(resources, operation, lockDependencies),
+    };
     expect(await runPublicCli(['identity', 'reset', '--confirm', '--json'], deps)).toBe(1);
     expect(JSON.parse(errors[0]!)).toMatchObject({
       code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',

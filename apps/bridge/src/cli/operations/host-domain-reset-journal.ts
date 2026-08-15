@@ -1,18 +1,19 @@
-/**
- * Compatibility module for the Host-domain reset journal.
- *
- * Authoritative public surface (spec §9): constants, journal types, digests,
- * the controlled store operations, and the opaque operation-lease / machine
- * transition / restore-confirmation types. Low-level decoder internals, raw
- * encoder/bytes, lock snapshots, and unsafe write/remove are NOT exposed here;
- * the unrestricted raw write/remove API and the `operationLockHeld` bypass no
- * longer exist in production.
- */
+import {
+  loadHostDomainResetJournal,
+} from './host-domain-reset-journal-store';
+import type { ProfileResourceSet } from '../profile';
+
+// ---------------------------------------------------------------------------
+// Host-domain reset journal compatibility module (journal-boundary spec §9)
+//
+// This module exports EXACTLY the authoritative compatibility surface. Low-level
+// schema/codec internals, raw journal writes/unlinks, and lock snapshots are
+// NOT public here. Consumers must go through the high-level store operations.
+// ---------------------------------------------------------------------------
+
 export {
   HOST_DOMAIN_RESET_JOURNAL_VERSION,
   HOST_DOMAIN_RESET_PHASES,
-  identityResourceDigest,
-  hostDomainResourceDigest,
 } from './host-domain-reset-journal-schema';
 export type {
   HostDomainResetPhase,
@@ -23,15 +24,32 @@ export type {
   HostDomainResetJournalV1,
 } from './host-domain-reset-journal-schema';
 export {
-  advanceHostDomainResetJournal,
-  assertHostDomainResetRuntimeStartAllowed,
-  createHostDomainResetJournal,
+  identityResourceDigest,
+  hostDomainResourceDigest,
+} from './host-domain-reset-journal-policy';
+export type { HostDomainResetTransition } from './host-domain-reset-journal-policy';
+export {
   loadHostDomainResetJournal,
+  advanceHostDomainResetJournal,
+  createHostDomainResetJournal,
   removeAfterServiceRestoreConfirmed,
 } from './host-domain-reset-journal-store';
 export type { RestoreConfirmation } from './host-domain-reset-journal-store';
-export type {
-  HostDomainResetJournalTransition,
-  HostResetJournalViolation,
-} from './host-domain-reset-journal-policy';
 export type { HostIdentityOperationLease } from './host-identity-operation-lock';
+
+export function assertHostDomainResetRuntimeStartAllowed(resources: ProfileResourceSet): void {
+  const journal = loadHostDomainResetJournal(resources);
+  if (!journal) return;
+  const remediation = resources.identityProfile === 'dev'
+    ? 'bun run dev:cli -- identity reset --confirm'
+    : 'ariava identity reset --confirm';
+  const error = new Error(`Host-domain reset recovery required at phase ${journal.phase}; run \`${remediation}\``);
+  Object.assign(error, {
+    code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',
+    phase: journal.phase,
+    operationId: journal.operationId,
+    retryable: true,
+    remediation,
+  });
+  throw error;
+}

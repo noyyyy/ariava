@@ -169,44 +169,107 @@
   },
   {
     "repository": "public",
-    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
-    "testName": "schema codec module imports only its pure leaves",
+    "path": "apps/bridge/test/host-domain-reset-machine.policy.test.ts",
+    "testName": "machine imports only the pure schema and policy modules",
     "ruleId": "STRUCT001",
     "propositionClass": "structural"
   },
   {
     "repository": "public",
-    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
-    "testName": "policy module imports no store or effect modules",
+    "path": "apps/bridge/test/host-domain-reset-machine.policy.test.ts",
+    "testName": "machine does not reach the store, executor, recovery, or artifact modules",
     "ruleId": "STRUCT001",
     "propositionClass": "structural"
   },
   {
     "repository": "public",
-    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
-    "testName": "store module imports no coordinator or executor modules",
+    "path": "apps/bridge/test/host-domain-reset-machine.policy.test.ts",
+    "testName": "machine performs no filesystem or process I/O",
     "ruleId": "STRUCT001",
     "propositionClass": "structural"
   },
   {
     "repository": "public",
-    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
-    "testName": "compatibility barrel exposes exactly the frozen §9 surface",
+    "path": "apps/bridge/test/host-domain-reset-machine.policy.test.ts",
+    "testName": "schema module does not import the store module",
     "ruleId": "STRUCT001",
     "propositionClass": "structural"
   },
   {
     "repository": "public",
-    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
-    "testName": "daemon, profile probe, and status reach journal API only through the barrel",
+    "path": "apps/bridge/test/host-domain-reset-machine.policy.test.ts",
+    "testName": "policy module does not import the store module",
     "ruleId": "STRUCT001",
     "propositionClass": "structural"
   },
   {
     "repository": "public",
-    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
-    "testName": "production never imports the test-tree journal fixture helper",
+    "path": "apps/bridge/test/host-domain-reset-machine.policy.test.ts",
+    "testName": "machine does not transitively import host-manager, state-store, or relay modules",
     "ruleId": "STRUCT001",
     "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-executor.policy.test.ts",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural",
+    "testName": "executor does not import the journal store, coordinator, context, or recovery modules"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-executor.policy.test.ts",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural",
+    "testName": "executor performs no direct filesystem, secure-files, or state-store I/O"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-executor.policy.test.ts",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural",
+    "testName": "executor imports only sanctioned effect and pure-policy modules"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-executor.policy.test.ts",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural",
+    "testName": "executor does not transitively import the journal store or context"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-recovery.policy.test.ts",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural",
+    "testName": "recovery does not import cli/context, the coordinator, or the machine"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-recovery.policy.test.ts",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural",
+    "testName": "recovery imports only the public store surface, never raw store internals"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-recovery.policy.test.ts",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural",
+    "testName": "recovery never acquires or fabricates the Host identity operation lease"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-recovery.policy.test.ts",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural",
+    "testName": "recovery performs no raw journal unlink or arbitrary-path write"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-recovery.policy.test.ts",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural",
+    "testName": "recovery never reads or writes the journal advancement lock or the raw journal path"
   }
 ]

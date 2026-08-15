@@ -15,11 +15,13 @@ import type { AriavaUserConfig } from '../src/host-manager/config';
 import { SecureFileError } from '../src/host-manager/secure-files';
 import { AriavaCliError } from '../src/host-manager/service/errors';
 import { acquireOnboardingLock } from '../src/host-manager/onboarding/lock';
+import type { ProcessAwareLockDependencies } from '../src/host-manager/process-aware-lock';
+import type { ProfileResourceSet } from '../src/cli/profile';
 import {
   hostIdentityOperationLockPath,
   withHostIdentityOperationLock,
+  type HostIdentityOperationLease,
 } from '../src/cli/operations/host-identity-operation-lock';
-import type { HostIdentityOperationLease } from '../src/cli/operations/host-identity-operation-lock';
 import { RESET_ONLY_IDENTITY_EVIDENCE_SOURCE } from '../src/identity/reset-only-evidence-source';
 import { HostIdentityError } from '../src/identity/errors';
 import { enrollCurrentIdentity } from '../src/identity/manager';
@@ -36,8 +38,22 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+function testLockDependencies(): Partial<ProcessAwareLockDependencies> {
+  return {
+    platform: 'linux',
+    uid: process.getuid?.(),
+    pid: process.pid,
+    now: () => new Date(),
+    ownerToken: () => 'b'.repeat(48),
+    currentProcessStart: () => 'coordinator-test-process-start',
+    inspector: { inspect: () => ({ status: 'alive', processStart: 'coordinator-test-process-start' }) },
+  };
+}
+
 const deterministicHostIdentityOperationLock = {
-  run: withHostIdentityOperationLock,
+  run<T>(resources: ProfileResourceSet, operation: (lease: HostIdentityOperationLease) => Promise<T>): Promise<T> {
+    return withHostIdentityOperationLock(resources, operation, testLockDependencies());
+  },
 };
 
 function fixture(useProductionLock = false) {
@@ -118,9 +134,9 @@ function crashOnceAfterEffect(effect: Parameters<NonNullable<HostDomainResetHook
     const value = fixture();
     const resetLocks: string[] = [];
     value.context.hostIdentityOperationLock = {
-      async run(resources, operation) {
+      run(resources, operation) {
         resetLocks.push(resources.hostDomainResetJournalPath);
-        return withHostIdentityOperationLock(resources, operation);
+        return deterministicHostIdentityOperationLock.run(resources, operation);
       },
     };
     await initializeProfile(value.context);
@@ -214,7 +230,7 @@ describe('Host-domain reset coordinator recovery', () => {
 
     const result = await resetHostDomain(context, dependencies);
     expect(result.service.processRunning).toBe(true);
-    expect(calls).toEqual(['stop', 'stop', 'sync', 'restore']);
+    expect(calls).toEqual(['stop', 'stop', 'sync', 'stop', 'restore']);
     expect(existsSync(profile.resources.hostDomainResetJournalPath)).toBe(false);
   });
   test('service-restore-pending retry restarts a previously running stopped service', async () => {
@@ -296,7 +312,7 @@ describe('Host-domain reset coordinator recovery', () => {
       replace: async (store, operationId: string) => store.resetAfterExplicitConfirmation(operationId), enroll: async () => {},
     });
     expect(result.service).toEqual({ managed: true, ...service, backend: 'systemd-user', processRunning: service.wasRunning, status: service.wasRunning ? 'running' : 'stopped' });
-    expect(calls).toEqual(['stop', 'sync', 'restore']);
+    expect(calls).toEqual(['stop', 'sync', 'stop', 'restore']);
     expect(existsSync(profile.resources.hostDomainResetJournalPath)).toBe(false);
   });
 
@@ -330,7 +346,7 @@ describe('Host-domain reset coordinator recovery', () => {
 
 
 
-  test('service-restore-pending recovery uses the idempotent restore path without stop or sync', async () => {
+  test('service-restore-pending recovery re-stops before the idempotent restore path without metadata sync', async () => {
     const value = fixture();
     await initializeProfile(value.context);
     const calls: string[] = [];
@@ -759,7 +775,7 @@ describe('Host-domain reset coordinator recovery', () => {
     await expect(resetHostDomain(context, dependencies)).rejects.toMatchObject({
       code: 'ERR_HOST_RESET_RECOVERY_REQUIRED', data: { phase: 'service-restore-pending', retryable: true },
     });
-    expect(calls).toEqual(['stop', 'sync', 'restore']);
+    expect(calls).toEqual(['stop', 'sync', 'stop', 'restore']);
     const journal = loadHostDomainResetJournal(profile.resources)!;
     const validState = readFileSync(profile.resources.statePath, 'utf8');
     const validSpool = readFileSync(profile.resources.encryptedSpoolPath, 'utf8');

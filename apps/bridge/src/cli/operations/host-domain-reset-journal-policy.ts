@@ -1,304 +1,400 @@
-import type { ProfileResourceSet } from '../profile';
-import {
-  encodeHostDomainResetJournal,
-  hostDomainResourceDigest,
-  parseHostDomainResetJournal,
-  phaseOrder,
-  type HostDomainResetJournalV1,
-  type HostDomainResetPhase,
-  type HostDomainResetSigningCleanupV1,
+import type {
+  HostDomainResetJournalV1,
+  HostDomainResetPhase,
+  HostDomainResetSigningCleanupV1,
 } from './host-domain-reset-journal-schema';
+export {
+  HOST_DOMAIN_RESET_BINDING_INPUTS,
+  hostDomainResourceDigest,
+  identityResourceDigest,
+} from './host-domain-reset-journal-binding';
+export type { HostDomainResetBindingInput } from './host-domain-reset-journal-binding';
 
 /**
- * Exact machine-authorized transition union. The production coordinator may
- * not construct arbitrary `Partial<Journal>` patches; every write-side
- * advancement must submit one of these discriminated transitions.
+ * Pure Host-domain reset journal transition policy.
+ *
+ * This module owns phase/order/transition validation and never performs
+ * filesystem effects, I/O, locking, or journal removal. The pure resource
+ * binding seam is owned by `host-domain-reset-journal-binding.ts`; policy may
+ * re-export it for compatibility but schema never depends on policy.
+ *
+ * The policy validates the exact transition union instead of arbitrary
+ * `Partial<Journal>` patches: allowed edges are exactly the adjacent phase
+ * edges below, the only skip is `prepared -> signing-replacement-pending`
+ * authorized exclusively by already-journaled recognized-unreadable evidence,
+ * and same-phase transitions accept only byte-identical replay.
  */
-export type HostDomainResetJournalTransition =
-  | { kind: 'advance'; phase: 'quarantined'; at: string }                                  // quarantine-pending -> quarantined
-  | { kind: 'bind-prepared'; at: string; oldHostId: string | null; oldKeyId: string | null;
-      oldEncryptionKeyId: string | null; signingCleanup: HostDomainResetSigningCleanupV1 | null;
-      revoke: { state: 'not-attempted'; outcome: null } | { state: 'skipped'; outcome: 'old-identity-unreadable' } }
-  | { kind: 'start-revoke'; at: string }                                                   // prepared -> revoke-pending
-  | { kind: 'complete-revoke'; at: string; outcome: 'revoked' | 'identity-already-revoked' } // revoke-pending -> old-identity-revoked
-  | { kind: 'begin-signing-replacement'; at: string }                                      // old-identity-revoked -> signing-replacement-pending
-                                                                                            //   or prepared -> signing-replacement-pending (only with recognized unreadable evidence)
-  | { kind: 'complete-signing-replacement'; at: string; newHostId: string; newKeyId: string } // -> signing-identity-replaced
-  | { kind: 'complete-encryption-replacement'; at: string }                                // -> encryption-identity-replaced
-  | { kind: 'complete-artifact-cleanup'; at: string }                                      // -> runtime-artifacts-cleared
-  | { kind: 'complete-config-save'; at: string }                                           // -> config-saved
-  | { kind: 'complete-enrollment'; at: string }                                            // -> enrolled
-  | { kind: 'complete-metadata-sync'; at: string }                                         // -> service-metadata-synchronized
-  | { kind: 'complete-restore-intent'; at: string }                                        // -> service-restore-pending
-  | { kind: 'replay' };                                                                    // same-phase byte-identical
+
+// ---------------------------------------------------------------------------
+// Frozen v1 phase order and exact transition union
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Frozen v1 phase order and exact transition union
+// ---------------------------------------------------------------------------
+
+/** Canonical frozen v1 phase order (journal-boundary spec §3.1). */
+export const HOST_DOMAIN_RESET_PHASE_ORDER: readonly HostDomainResetPhase[] = [
+  'quarantine-pending',
+  'quarantined',
+  'prepared',
+  'revoke-pending',
+  'old-identity-revoked',
+  'signing-replacement-pending',
+  'signing-identity-replaced',
+  'encryption-identity-replaced',
+  'runtime-artifacts-cleared',
+  'config-saved',
+  'enrolled',
+  'service-metadata-synchronized',
+  'service-restore-pending',
+];
+
+type JournalField = keyof HostDomainResetJournalV1;
+
+/** Journal fields (excluding phase/updatedAt) that the transition policy checks. */
+const TRANSITION_FIELDS: readonly JournalField[] = [
+  'service',
+  'revoke',
+  'oldHostId',
+  'oldKeyId',
+  'newHostId',
+  'newKeyId',
+  'oldEncryptionKeyId',
+  'signingCleanup',
+  'signingReplacementAttemptedAt',
+  'encryptionIdentityReplacedAt',
+  'runtimeArtifactsClearedAt',
+  'configSavedAt',
+  'enrolledAt',
+  'serviceMetadataSynchronizedAt',
+];
+
+/** Fields bound immutably for the whole journal lifetime. */
+const IMMUTABLE_FIELDS: readonly JournalField[] = [
+  'version',
+  'operationId',
+  'profile',
+  'resourceDigest',
+  'createdAt',
+  'service',
+];
 
 export type HostResetJournalViolation =
-  | { kind: 'unknown-transition' }
-  | { kind: 'phase-rollback' }
-  | { kind: 'phase-skip' }
-  | { kind: 'forbidden-skip' }
-  | { kind: 'same-phase-mutation' }
-  | { kind: 'timestamp-rollback' }
-  | { kind: 'immutable-binding-change'; field: string }
-  | { kind: 'premature-binding' }
-  | { kind: 'non-null-overwrite'; field: string }
-  | { kind: 'digest-mismatch' }
-  | { kind: 'service-snapshot-change' }
-  | { kind: 'invalid-candidate'; detail?: string };
-
-export type JournalTransitionResult =
-  | { ok: true; journal: HostDomainResetJournalV1 }
-  | { ok: false; reason: HostResetJournalViolation };
-
-type NonReplayTransition = Exclude<HostDomainResetJournalTransition, { kind: 'replay' }>;
-type TransitionKind = NonReplayTransition['kind'];
-
-const TRANSITION_TARGET: Record<TransitionKind, HostDomainResetPhase> = {
-  advance: 'quarantined',
-  'bind-prepared': 'prepared',
-  'start-revoke': 'revoke-pending',
-  'complete-revoke': 'old-identity-revoked',
-  'begin-signing-replacement': 'signing-replacement-pending',
-  'complete-signing-replacement': 'signing-identity-replaced',
-  'complete-encryption-replacement': 'encryption-identity-replaced',
-  'complete-artifact-cleanup': 'runtime-artifacts-cleared',
-  'complete-config-save': 'config-saved',
-  'complete-enrollment': 'enrolled',
-  'complete-metadata-sync': 'service-metadata-synchronized',
-  'complete-restore-intent': 'service-restore-pending',
-};
-
-const TRANSITION_SOURCES: Record<TransitionKind, readonly HostDomainResetPhase[]> = {
-  advance: ['quarantine-pending'],
-  'bind-prepared': ['quarantined'],
-  'start-revoke': ['prepared'],
-  'complete-revoke': ['revoke-pending'],
-  'begin-signing-replacement': ['prepared', 'old-identity-revoked'],
-  'complete-signing-replacement': ['signing-replacement-pending'],
-  'complete-encryption-replacement': ['signing-identity-replaced'],
-  'complete-artifact-cleanup': ['encryption-identity-replaced'],
-  'complete-config-save': ['runtime-artifacts-cleared'],
-  'complete-enrollment': ['config-saved'],
-  'complete-metadata-sync': ['enrolled'],
-  'complete-restore-intent': ['service-metadata-synchronized'],
-};
-
-const TRANSITION_MUTATIONS: Record<TransitionKind, readonly string[]> = {
-  advance: ['phase', 'updatedAt'],
-  'bind-prepared': ['phase', 'updatedAt', 'oldHostId', 'oldKeyId', 'oldEncryptionKeyId', 'signingCleanup', 'revoke'],
-  'start-revoke': ['phase', 'updatedAt', 'revoke'],
-  'complete-revoke': ['phase', 'updatedAt', 'revoke'],
-  'begin-signing-replacement': ['phase', 'updatedAt', 'signingReplacementAttemptedAt'],
-  'complete-signing-replacement': ['phase', 'updatedAt', 'newHostId', 'newKeyId'],
-  'complete-encryption-replacement': ['phase', 'updatedAt', 'encryptionIdentityReplacedAt'],
-  'complete-artifact-cleanup': ['phase', 'updatedAt', 'runtimeArtifactsClearedAt'],
-  'complete-config-save': ['phase', 'updatedAt', 'configSavedAt'],
-  'complete-enrollment': ['phase', 'updatedAt', 'enrolledAt'],
-  'complete-metadata-sync': ['phase', 'updatedAt', 'serviceMetadataSynchronizedAt'],
-  'complete-restore-intent': ['phase', 'updatedAt'],
-};
-
-const IMMUTABLE_FIELDS = [
-  'version', 'operationId', 'profile', 'resourceDigest', 'createdAt',
-] as const;
-const OLD_BINDING_FIELDS = [
-  'oldHostId', 'oldKeyId', 'oldEncryptionKeyId', 'signingCleanup', 'revoke',
-] as const;
-const NULL_ONLY_FIELDS = [
-  'oldHostId', 'oldKeyId', 'oldEncryptionKeyId', 'signingCleanup',
-  'newHostId', 'newKeyId', 'signingReplacementAttemptedAt', 'encryptionIdentityReplacedAt',
-  'runtimeArtifactsClearedAt', 'configSavedAt', 'enrolledAt', 'serviceMetadataSynchronizedAt',
-] as const;
+  | { kind: 'same-phase-modification'; field: JournalField }
+  | { kind: 'phase-rollback'; from: HostDomainResetPhase; to: HostDomainResetPhase }
+  | { kind: 'non-adjacent-transition'; from: HostDomainResetPhase; to: HostDomainResetPhase }
+  | { kind: 'unreadable-skip-without-evidence'; from: HostDomainResetPhase; to: HostDomainResetPhase }
+  | { kind: 'revoke-precondition-mismatch'; from: HostDomainResetPhase; to: HostDomainResetPhase }
+  | { kind: 'immutable-field-changed'; field: JournalField }
+  | { kind: 'field-change-not-allowed'; field: JournalField; from: HostDomainResetPhase; to: HostDomainResetPhase }
+  | { kind: 'one-way-fill-violation'; field: JournalField }
+  | { kind: 'timestamp-rollback' };
 
 /**
- * Apply one machine-authorized transition to the stored current journal.
- * Returns the candidate on success or a classified violation. The candidate
- * must pass the exact decoder after applying (digest, phase evidence, and
- * timestamp invariants are re-validated by the schema).
+ * Exact discriminated transition union accepted by the secure store.
+ *
+ * Every variant names its phase and the fields that may be written on that
+ * exact edge; nothing else may change. `signing-replacement-pending` covers
+ * both the `old-identity-revoked` adjacent edge and the unique recognized-
+ * unreadable `prepared` skip, which the policy distinguishes by the current
+ * journal's revoke evidence.
  */
-export function applyHostDomainResetJournalTransition(
+export type HostDomainResetTransition =
+  | { phase: 'quarantined' }
+  | {
+    phase: 'prepared';
+    oldHostId: string | null;
+    oldKeyId: string | null;
+    oldEncryptionKeyId: string | null;
+    signingCleanup: HostDomainResetSigningCleanupV1 | null;
+    revoke: HostDomainResetJournalV1['revoke'];
+  }
+  | { phase: 'revoke-pending'; revoke: { state: 'pending'; outcome: null } }
+  | { phase: 'old-identity-revoked'; revoke: { state: 'complete'; outcome: 'revoked' | 'identity-already-revoked' } }
+  | { phase: 'signing-replacement-pending'; signingReplacementAttemptedAt: string }
+  | { phase: 'signing-identity-replaced'; newHostId: string; newKeyId: string }
+  | { phase: 'encryption-identity-replaced'; encryptionIdentityReplacedAt: string }
+  | { phase: 'runtime-artifacts-cleared'; runtimeArtifactsClearedAt: string }
+  | { phase: 'config-saved'; configSavedAt: string }
+  | { phase: 'enrolled'; enrolledAt: string }
+  | { phase: 'service-metadata-synchronized'; serviceMetadataSynchronizedAt: string }
+  | { phase: 'service-restore-pending' };
+
+/**
+ * Applies an exact transition to the current journal, stamping `updatedAt`.
+ * Pure: never performs I/O, locking, or validation (the store validates the
+ * resulting candidate through `validateHostDomainResetTransition`).
+ */
+export function applyHostDomainResetTransition(
   current: HostDomainResetJournalV1,
-  transition: HostDomainResetJournalTransition,
-  resources: ProfileResourceSet,
-): JournalTransitionResult {
-  if (transition.kind === 'replay') return { ok: true, journal: current };
-
-  const target = TRANSITION_TARGET[transition.kind];
-  if (Date.parse(transition.at) < Date.parse(current.updatedAt)) {
-    return { ok: false, reason: { kind: 'timestamp-rollback' } };
-  }
-  const candidate = buildCandidate(current, transition);
-  if (target === current.phase) {
-    return encodeHostDomainResetJournal(candidate) === encodeHostDomainResetJournal(current)
-      ? { ok: true, journal: candidate }
-      : { ok: false, reason: { kind: 'same-phase-mutation' } };
-  }
-
-  const sources = TRANSITION_SOURCES[transition.kind];
-  if (!sources.includes(current.phase)) {
-    if (phaseOrder(current.phase) > phaseOrder(target)) {
-      return { ok: false, reason: { kind: 'phase-rollback' } };
-    }
-    return transition.kind === 'begin-signing-replacement' && current.phase === 'prepared'
-      ? { ok: false, reason: { kind: 'forbidden-skip' } }
-      : { ok: false, reason: { kind: 'phase-skip' } };
-  }
-  if (transition.kind === 'begin-signing-replacement' && current.phase === 'prepared') {
-    const revokeSkipped = current.revoke.state === 'skipped' && current.revoke.outcome === 'old-identity-unreadable';
-    if (!revokeSkipped || current.signingCleanup === null) {
-      return { ok: false, reason: { kind: 'forbidden-skip' } };
-    }
-  }
-
-  const overwritten = nullOnlyOverwritten(current, transition);
-  if (overwritten !== null) {
-    return { ok: false, reason: { kind: 'non-null-overwrite', field: overwritten } };
-  }
-  const scope = mutatedOutOfScope(current, candidate, transition);
-  if (scope !== null) {
-    if (scope === 'service') return { ok: false, reason: { kind: 'service-snapshot-change' } };
-    if ((OLD_BINDING_FIELDS as readonly string[]).includes(scope)) {
-      return { ok: false, reason: { kind: 'premature-binding' } };
-    }
-    return { ok: false, reason: { kind: 'immutable-binding-change', field: scope } };
-  }
-  if (candidate.resourceDigest !== hostDomainResourceDigest(resources)) {
-    return { ok: false, reason: { kind: 'digest-mismatch' } };
-  }
-
-  let journal: HostDomainResetJournalV1;
-  try {
-    journal = parseHostDomainResetJournal(candidate, resources);
-  } catch {
-    return { ok: false, reason: { kind: 'invalid-candidate' } };
-  }
-  return { ok: true, journal };
-}
-
-/**
- * Create-time guard: the initial journal must be an exact schema-valid
- * `quarantine-pending` journal with empty identity evidence, empty effect
- * timestamps, `revoke = not-attempted/null`, and `updatedAt === createdAt`.
- */
-export function validateInitialJournal(
-  initial: HostDomainResetJournalV1,
-  resources: ProfileResourceSet,
-): JournalTransitionResult {
-  let parsed: HostDomainResetJournalV1;
-  try {
-    parsed = parseHostDomainResetJournal(initial, resources);
-  } catch {
-    return { ok: false, reason: { kind: 'invalid-candidate' } };
-  }
-  if (parsed.phase !== 'quarantine-pending') {
-    return { ok: false, reason: { kind: 'invalid-candidate', detail: 'initial journal must be quarantine-pending' } };
-  }
-  if (parsed.oldHostId !== null || parsed.oldKeyId !== null || parsed.newHostId !== null
-    || parsed.newKeyId !== null || parsed.oldEncryptionKeyId !== null || parsed.signingCleanup !== null) {
-    return { ok: false, reason: { kind: 'invalid-candidate', detail: 'initial journal must not bind identity evidence' } };
-  }
-  if (parsed.signingReplacementAttemptedAt !== null || parsed.encryptionIdentityReplacedAt !== null
-    || parsed.runtimeArtifactsClearedAt !== null || parsed.configSavedAt !== null || parsed.enrolledAt !== null
-    || parsed.serviceMetadataSynchronizedAt !== null) {
-    return { ok: false, reason: { kind: 'invalid-candidate', detail: 'initial journal must not carry effect timestamps' } };
-  }
-  if (parsed.revoke.state !== 'not-attempted' || parsed.revoke.outcome !== null) {
-    return { ok: false, reason: { kind: 'invalid-candidate', detail: 'initial journal revoke must be not-attempted/null' } };
-  }
-  if (parsed.updatedAt !== parsed.createdAt) {
-    return { ok: false, reason: { kind: 'invalid-candidate', detail: 'initial journal updatedAt must equal createdAt' } };
-  }
-  return { ok: true, journal: parsed };
-}
-
-function buildCandidate(current: HostDomainResetJournalV1, transition: NonReplayTransition): HostDomainResetJournalV1 {
-  const at = transition.at;
-  const base = { ...current, updatedAt: at };
-  switch (transition.kind) {
-    case 'advance':
-      return { ...base, phase: 'quarantined' };
-    case 'bind-prepared':
+  transition: HostDomainResetTransition,
+  updatedAt: string,
+): HostDomainResetJournalV1 {
+  switch (transition.phase) {
+    case 'quarantined':
+      return { ...current, phase: 'quarantined', updatedAt };
+    case 'prepared':
       return {
-        ...base,
+        ...current,
         phase: 'prepared',
         oldHostId: transition.oldHostId,
         oldKeyId: transition.oldKeyId,
         oldEncryptionKeyId: transition.oldEncryptionKeyId,
         signingCleanup: transition.signingCleanup,
         revoke: transition.revoke,
+        updatedAt,
       };
-    case 'start-revoke':
-      return { ...base, phase: 'revoke-pending', revoke: { state: 'pending', outcome: null } };
-    case 'complete-revoke':
-      return { ...base, phase: 'old-identity-revoked', revoke: { state: 'complete', outcome: transition.outcome } };
-    case 'begin-signing-replacement':
-      return { ...base, phase: 'signing-replacement-pending', signingReplacementAttemptedAt: at };
-    case 'complete-signing-replacement':
-      return { ...base, phase: 'signing-identity-replaced', newHostId: transition.newHostId, newKeyId: transition.newKeyId };
-    case 'complete-encryption-replacement':
-      return { ...base, phase: 'encryption-identity-replaced', encryptionIdentityReplacedAt: at };
-    case 'complete-artifact-cleanup':
-      return { ...base, phase: 'runtime-artifacts-cleared', runtimeArtifactsClearedAt: at };
-    case 'complete-config-save':
-      return { ...base, phase: 'config-saved', configSavedAt: at };
-    case 'complete-enrollment':
-      return { ...base, phase: 'enrolled', enrolledAt: at };
-    case 'complete-metadata-sync':
-      return { ...base, phase: 'service-metadata-synchronized', serviceMetadataSynchronizedAt: at };
-    case 'complete-restore-intent':
-      return { ...base, phase: 'service-restore-pending' };
+    case 'revoke-pending':
+      return { ...current, phase: 'revoke-pending', revoke: transition.revoke, updatedAt };
+    case 'old-identity-revoked':
+      return { ...current, phase: 'old-identity-revoked', revoke: transition.revoke, updatedAt };
+    case 'signing-replacement-pending':
+      return { ...current, phase: 'signing-replacement-pending', signingReplacementAttemptedAt: transition.signingReplacementAttemptedAt, updatedAt };
+    case 'signing-identity-replaced':
+      return { ...current, phase: 'signing-identity-replaced', newHostId: transition.newHostId, newKeyId: transition.newKeyId, updatedAt };
+    case 'encryption-identity-replaced':
+      return { ...current, phase: 'encryption-identity-replaced', encryptionIdentityReplacedAt: transition.encryptionIdentityReplacedAt, updatedAt };
+    case 'runtime-artifacts-cleared':
+      return { ...current, phase: 'runtime-artifacts-cleared', runtimeArtifactsClearedAt: transition.runtimeArtifactsClearedAt, updatedAt };
+    case 'config-saved':
+      return { ...current, phase: 'config-saved', configSavedAt: transition.configSavedAt, updatedAt };
+    case 'enrolled':
+      return { ...current, phase: 'enrolled', enrolledAt: transition.enrolledAt, updatedAt };
+    case 'service-metadata-synchronized':
+      return { ...current, phase: 'service-metadata-synchronized', serviceMetadataSynchronizedAt: transition.serviceMetadataSynchronizedAt, updatedAt };
+    case 'service-restore-pending':
+      return { ...current, phase: 'service-restore-pending', updatedAt };
   }
 }
 
-function nullOnlyOverwritten(current: HostDomainResetJournalV1, transition: NonReplayTransition): string | null {
-  switch (transition.kind) {
-    case 'bind-prepared':
-      for (const field of ['oldHostId', 'oldKeyId', 'oldEncryptionKeyId', 'signingCleanup'] as const) {
-        if (current[field] !== null) return field;
+export type JournalTransitionResult =
+  | { ok: true; journal: HostDomainResetJournalV1 }
+  | { ok: false; reason: HostResetJournalViolation };
+
+interface TransitionEdge {
+  from: HostDomainResetPhase;
+  to: HostDomainResetPhase;
+  /** Fields that may differ between current and candidate on this edge. */
+  writable: ReadonlySet<JournalField>;
+  /** Subset of `writable` that may only change one-way null -> value. */
+  fillOnly: ReadonlySet<JournalField>;
+  /** Optional precondition on the current journal for this edge. */
+  require?: (current: HostDomainResetJournalV1) => boolean;
+  /** Violation emitted when `require` fails. */
+  requireViolation: HostResetJournalViolation;
+}
+
+const NO_FIELDS: ReadonlySet<JournalField> = new Set();
+
+function fillOnly(...fields: JournalField[]): ReadonlySet<JournalField> {
+  return new Set(fields);
+}
+
+function writableWith(...fields: JournalField[]): ReadonlySet<JournalField> {
+  return new Set(fields);
+}
+
+const TRANSITION_EDGES: readonly TransitionEdge[] = [
+  {
+    from: 'quarantine-pending',
+    to: 'quarantined',
+    writable: NO_FIELDS,
+    fillOnly: NO_FIELDS,
+    requireViolation: { kind: 'non-adjacent-transition', from: 'quarantine-pending', to: 'quarantined' },
+  },
+  {
+    from: 'quarantined',
+    to: 'prepared',
+    writable: writableWith('oldHostId', 'oldKeyId', 'oldEncryptionKeyId', 'signingCleanup', 'revoke'),
+    fillOnly: fillOnly('oldHostId', 'oldKeyId', 'oldEncryptionKeyId', 'signingCleanup'),
+    requireViolation: { kind: 'non-adjacent-transition', from: 'quarantined', to: 'prepared' },
+  },
+  {
+    from: 'prepared',
+    to: 'revoke-pending',
+    writable: writableWith('revoke'),
+    fillOnly: NO_FIELDS,
+    require: (current) => current.revoke.state === 'not-attempted' && current.revoke.outcome === null,
+    requireViolation: { kind: 'revoke-precondition-mismatch', from: 'prepared', to: 'revoke-pending' },
+  },
+  {
+    from: 'prepared',
+    to: 'signing-replacement-pending',
+    writable: writableWith('signingReplacementAttemptedAt'),
+    fillOnly: fillOnly('signingReplacementAttemptedAt'),
+    require: (current) => current.revoke.state === 'skipped' && current.revoke.outcome === 'old-identity-unreadable',
+    requireViolation: { kind: 'unreadable-skip-without-evidence', from: 'prepared', to: 'signing-replacement-pending' },
+  },
+  {
+    from: 'revoke-pending',
+    to: 'old-identity-revoked',
+    writable: writableWith('revoke'),
+    fillOnly: NO_FIELDS,
+    require: (current) => current.revoke.state === 'pending',
+    requireViolation: { kind: 'revoke-precondition-mismatch', from: 'revoke-pending', to: 'old-identity-revoked' },
+  },
+  {
+    from: 'old-identity-revoked',
+    to: 'signing-replacement-pending',
+    writable: writableWith('signingReplacementAttemptedAt'),
+    fillOnly: fillOnly('signingReplacementAttemptedAt'),
+    requireViolation: { kind: 'non-adjacent-transition', from: 'old-identity-revoked', to: 'signing-replacement-pending' },
+  },
+  {
+    from: 'signing-replacement-pending',
+    to: 'signing-identity-replaced',
+    writable: writableWith('newHostId', 'newKeyId'),
+    fillOnly: fillOnly('newHostId', 'newKeyId'),
+    requireViolation: { kind: 'non-adjacent-transition', from: 'signing-replacement-pending', to: 'signing-identity-replaced' },
+  },
+  {
+    from: 'signing-identity-replaced',
+    to: 'encryption-identity-replaced',
+    writable: writableWith('encryptionIdentityReplacedAt'),
+    fillOnly: fillOnly('encryptionIdentityReplacedAt'),
+    requireViolation: { kind: 'non-adjacent-transition', from: 'signing-identity-replaced', to: 'encryption-identity-replaced' },
+  },
+  {
+    from: 'encryption-identity-replaced',
+    to: 'runtime-artifacts-cleared',
+    writable: writableWith('runtimeArtifactsClearedAt'),
+    fillOnly: fillOnly('runtimeArtifactsClearedAt'),
+    requireViolation: { kind: 'non-adjacent-transition', from: 'encryption-identity-replaced', to: 'runtime-artifacts-cleared' },
+  },
+  {
+    from: 'runtime-artifacts-cleared',
+    to: 'config-saved',
+    writable: writableWith('configSavedAt'),
+    fillOnly: fillOnly('configSavedAt'),
+    requireViolation: { kind: 'non-adjacent-transition', from: 'runtime-artifacts-cleared', to: 'config-saved' },
+  },
+  {
+    from: 'config-saved',
+    to: 'enrolled',
+    writable: writableWith('enrolledAt'),
+    fillOnly: fillOnly('enrolledAt'),
+    requireViolation: { kind: 'non-adjacent-transition', from: 'config-saved', to: 'enrolled' },
+  },
+  {
+    from: 'enrolled',
+    to: 'service-metadata-synchronized',
+    writable: writableWith('serviceMetadataSynchronizedAt'),
+    fillOnly: fillOnly('serviceMetadataSynchronizedAt'),
+    requireViolation: { kind: 'non-adjacent-transition', from: 'enrolled', to: 'service-metadata-synchronized' },
+  },
+  {
+    from: 'service-metadata-synchronized',
+    to: 'service-restore-pending',
+    writable: NO_FIELDS,
+    fillOnly: NO_FIELDS,
+    requireViolation: { kind: 'non-adjacent-transition', from: 'service-metadata-synchronized', to: 'service-restore-pending' },
+  },
+];
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function phaseIndex(phase: HostDomainResetPhase): number {
+  const index = HOST_DOMAIN_RESET_PHASE_ORDER.indexOf(phase);
+  if (index < 0) throw new TypeError(`Host-domain reset journal phase ${phase} is not a known v1 phase`);
+  return index;
+}
+
+function findEdge(from: HostDomainResetPhase, to: HostDomainResetPhase): TransitionEdge | undefined {
+  return TRANSITION_EDGES.find((edge) => edge.from === from && edge.to === to);
+}
+
+function firstDifferingField(current: HostDomainResetJournalV1, candidate: HostDomainResetJournalV1): JournalField | undefined {
+  for (const field of TRANSITION_FIELDS) {
+    if (!sameValue(current[field], candidate[field])) return field;
+  }
+  return undefined;
+}
+
+/**
+ * Validates that `candidate` is reached from `current` by exactly one legal
+ * transition. Both journals must already be exact-decoded/schema-valid.
+ *
+ * - same phase: accepts only byte-identical replay;
+ * - different phase: must be an adjacent edge (or the unique recognized-
+ *   unreadable skip) with only the edge's writable fields differing;
+ * - `quarantined -> prepared` is the only edge that binds old identity/E2E/
+ *   cleanup/revoke decision;
+ * - new IDs and the six effect timestamps fill only one-way null -> value on
+ *   their exact edge and are never overwritten;
+ * - operation/profile/resource/service/createdAt never change and `updatedAt`
+ *   never rolls back.
+ */
+export function validateHostDomainResetTransition(
+  current: HostDomainResetJournalV1,
+  candidate: HostDomainResetJournalV1,
+): JournalTransitionResult {
+  if (candidate.phase === current.phase) {
+    if (sameValue(current, candidate)) return { ok: true, journal: candidate };
+    const field = firstDifferingField(current, candidate) ?? 'updatedAt';
+    return { ok: false, reason: { kind: 'same-phase-modification', field } };
+  }
+
+  if (phaseIndex(candidate.phase) < phaseIndex(current.phase)) {
+    return { ok: false, reason: { kind: 'phase-rollback', from: current.phase, to: candidate.phase } };
+  }
+
+  const edge = findEdge(current.phase, candidate.phase);
+  if (!edge) {
+    return { ok: false, reason: { kind: 'non-adjacent-transition', from: current.phase, to: candidate.phase } };
+  }
+
+  if (edge.require && !edge.require(current)) {
+    return { ok: false, reason: edge.requireViolation };
+  }
+
+  if (Date.parse(candidate.updatedAt) < Date.parse(current.updatedAt)) {
+    return { ok: false, reason: { kind: 'timestamp-rollback' } };
+  }
+
+  for (const field of IMMUTABLE_FIELDS) {
+    if (!sameValue(current[field], candidate[field])) {
+      return { ok: false, reason: { kind: 'immutable-field-changed', field } };
+    }
+  }
+
+  for (const field of TRANSITION_FIELDS) {
+    if (IMMUTABLE_FIELDS.includes(field)) continue;
+    if (!sameValue(current[field], candidate[field])) {
+      if (!edge.writable.has(field)) {
+        return { ok: false, reason: { kind: 'field-change-not-allowed', field, from: current.phase, to: candidate.phase } };
       }
-      return null;
-    case 'complete-signing-replacement':
-      if (current.newHostId !== null) return 'newHostId';
-      if (current.newKeyId !== null) return 'newKeyId';
-      return null;
-    case 'begin-signing-replacement':
-      return current.signingReplacementAttemptedAt !== null ? 'signingReplacementAttemptedAt' : null;
-    case 'complete-encryption-replacement':
-      return current.encryptionIdentityReplacedAt !== null ? 'encryptionIdentityReplacedAt' : null;
-    case 'complete-artifact-cleanup':
-      return current.runtimeArtifactsClearedAt !== null ? 'runtimeArtifactsClearedAt' : null;
-    case 'complete-config-save':
-      return current.configSavedAt !== null ? 'configSavedAt' : null;
-    case 'complete-enrollment':
-      return current.enrolledAt !== null ? 'enrolledAt' : null;
-    case 'complete-metadata-sync':
-      return current.serviceMetadataSynchronizedAt !== null ? 'serviceMetadataSynchronizedAt' : null;
-    default:
-      return null;
+      if (edge.fillOnly.has(field) && current[field] !== null) {
+        return { ok: false, reason: { kind: 'one-way-fill-violation', field } };
+      }
+    }
   }
+
+  return { ok: true, journal: candidate };
 }
 
-function mutatedOutOfScope(
-  current: HostDomainResetJournalV1,
-  candidate: HostDomainResetJournalV1,
-  transition: NonReplayTransition,
-): string | null {
-  const allowed = new Set(TRANSITION_MUTATIONS[transition.kind]);
-  for (const key of [...IMMUTABLE_FIELDS, ...OLD_BINDING_FIELDS, 'service', 'newHostId', 'newKeyId',
-    'signingReplacementAttemptedAt', 'encryptionIdentityReplacedAt', 'runtimeArtifactsClearedAt',
-    'configSavedAt', 'enrolledAt', 'serviceMetadataSynchronizedAt'] as const) {
-    if (allowed.has(key)) continue;
-    if (fieldChanged(key, current, candidate)) return key;
+/** Human-readable message for a transition violation (used by the store). */
+export function hostResetJournalViolationMessage(reason: HostResetJournalViolation): string {
+  switch (reason.kind) {
+    case 'same-phase-modification':
+      return `Host-domain reset journal ${reason.field} cannot change without a phase transition`;
+    case 'phase-rollback':
+      return `Host-domain reset journal phase rollback is not allowed (from ${reason.from} to ${reason.to})`;
+    case 'non-adjacent-transition':
+      return `Host-domain reset journal non-adjacent phase transition is not allowed (from ${reason.from} to ${reason.to})`;
+    case 'unreadable-skip-without-evidence':
+      return `Host-domain reset journal unreadable skip requires journaled skipped/old-identity-unreadable revoke evidence (from ${reason.from} to ${reason.to})`;
+    case 'revoke-precondition-mismatch':
+      return `Host-domain reset journal revoke transition is not allowed (from ${reason.from} to ${reason.to})`;
+    case 'immutable-field-changed':
+      return `Host-domain reset journal ${reason.field} cannot change`;
+    case 'field-change-not-allowed':
+      return `Host-domain reset journal ${reason.field} cannot change on transition (from ${reason.from} to ${reason.to})`;
+    case 'one-way-fill-violation':
+      return `Host-domain reset journal ${reason.field} can only be filled once`;
+    case 'timestamp-rollback':
+      return 'Host-domain reset journal timestamp rollback is not allowed';
   }
-  return null;
-}
-
-function fieldChanged(
-  key: string,
-  current: HostDomainResetJournalV1,
-  candidate: HostDomainResetJournalV1,
-): boolean {
-  const currentValue = (current as unknown as Record<string, unknown>)[key];
-  const candidateValue = (candidate as unknown as Record<string, unknown>)[key];
-  return JSON.stringify(currentValue) !== JSON.stringify(candidateValue);
 }

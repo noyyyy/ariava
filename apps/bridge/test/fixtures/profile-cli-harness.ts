@@ -1,3 +1,5 @@
+import type { ProcessAwareLockDependencies } from '../../src/host-manager/process-aware-lock';
+import { withHostIdentityOperationLock } from '../../src/cli/operations/host-identity-operation-lock';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
@@ -15,7 +17,6 @@ import type {
   HostIdentityStore,
 } from '../../src/identity';
 import type { AriavaProfileDescriptor, AriavaProfileId } from '../../src/cli/profile';
-import { withHostIdentityOperationLock } from '../../src/cli/operations/host-identity-operation-lock';
 
 export const PROFILE_ACCESS_KINDS = [
   'filesystemReads',
@@ -68,7 +69,6 @@ export function createProfileCliHarness(): ProfileCliHarness {
     default: fakeIdentity('default'),
     dev: fakeIdentity('dev'),
   };
-  const hostIdentityOperationTails = new Map<string, Promise<void>>();
 
   for (const profile of Object.values(profiles)) {
     mkdirSync(profile.resources.root, { recursive: true, mode: 0o700 });
@@ -112,21 +112,9 @@ export function createProfileCliHarness(): ProfileCliHarness {
         },
       },
       hostIdentityOperationLock: {
-        async run(resources, operation) {
-          const lockPath = resources.hostDomainResetJournalPath;
-          const previous = hostIdentityOperationTails.get(lockPath) ?? Promise.resolve();
-          let release!: () => void;
-          const barrier = new Promise<void>((resolve) => { release = resolve; });
-          const tail = previous.then(() => barrier);
-          hostIdentityOperationTails.set(lockPath, tail);
-          await previous;
-          events.push({ profile: profile.id, initiatedBy: profile.id, action: 'hostIdentityOperationLock.run', path: lockPath });
-          try {
-            return await withHostIdentityOperationLock(resources, operation);
-          } finally {
-            release();
-            if (hostIdentityOperationTails.get(lockPath) === tail) hostIdentityOperationTails.delete(lockPath);
-          }
+        run(resources, operation) {
+          events.push({ profile: profile.id, initiatedBy: profile.id, action: 'hostIdentityOperationLock.run', path: resources.hostDomainResetJournalPath });
+          return withHostIdentityOperationLock(resources, operation, testLockDependencies());
         },
       },
       identity: {
@@ -140,8 +128,10 @@ export function createProfileCliHarness(): ProfileCliHarness {
       },
       encryptionIdentity: {
         create(resources) {
+          // Mirrors the real stores: replaceForReset persists, so a subsequent load() returns the replacement.
+          let replaced: HostEncryptionIdentity | null = null;
           return {
-            load: () => null,
+            load: () => replaced,
             loadOrCreate: () => {
               counters[profile.id].filesystemReads += 1;
               counters[profile.id].filesystemWrites += 1;
@@ -151,7 +141,8 @@ export function createProfileCliHarness(): ProfileCliHarness {
             replaceForReset: () => {
               counters[profile.id].filesystemWrites += 1;
               events.push({ profile: profile.id, initiatedBy: profile.id, action: 'encryption.replace', path: resources.encryptionIdentityPath });
-              return fakeEncryptionIdentity(profile.id, identities[profile.id].hostId);
+              replaced = fakeEncryptionIdentity(profile.id, identities[profile.id].hostId);
+              return replaced;
             },
           };
         },
@@ -281,6 +272,18 @@ function sentinelPath(profile: AriavaProfileDescriptor): string {
 
 function emptyCounters(): ProfileAccessCounters {
   return Object.fromEntries(PROFILE_ACCESS_KINDS.map((kind) => [kind, 0])) as ProfileAccessCounters;
+}
+
+function testLockDependencies(): Partial<ProcessAwareLockDependencies> {
+  return {
+    platform: 'linux',
+    uid: process.getuid?.(),
+    pid: process.pid,
+    now: () => new Date(),
+    ownerToken: () => 'a'.repeat(48),
+    currentProcessStart: () => 'profile-harness-process-start',
+    inspector: { inspect: () => ({ status: 'alive', processStart: 'profile-harness-process-start' }) },
+  };
 }
 
 function withProfileEnvironment<T>(home: string, run: () => T): T {

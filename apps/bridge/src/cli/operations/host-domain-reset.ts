@@ -1,33 +1,39 @@
 import { randomUUID } from 'node:crypto';
 import type { HostPlatform } from '@ariava/protocol';
 import { probeHostPlatform } from '../../host-platform';
-import {
-  publicIdentityMetadata,
-  type HostEncryptionIdentity,
-  type HostIdentity,
+import type {
+  HostEncryptionIdentity,
+  HostEncryptionIdentityStore,
+  HostIdentity,
+  HostIdentityStore,
 } from '../../identity';
-import { HostIdentityError } from '../../identity/errors';
-import { RESET_ONLY_IDENTITY_EVIDENCE_SOURCE } from '../../identity/reset-only-evidence-source';
-import { inspectResetOnlyLegacyIdentityEvidence } from './identity-reset-legacy-evidence';
-import { buildProfileInitializedConfig } from './initialize';
-import { clearHostDomainArtifacts } from './host-domain-artifacts';
-import { pathHasFilesystemEvidence } from '../../host-manager/secure-files';
+import type { HostReplacementSpoolKeyStore } from '../../e2e/local-spool';
+import type { RuntimeCoordinator } from '../../runtime-lock';
 import { AriavaCliError } from '../../host-manager/service/errors';
-import { assertCurrentRuntimeArtifacts } from '../../state-store';
+import { buildProfileInitializedConfig } from './initialize';
 import {
   HOST_DOMAIN_RESET_JOURNAL_VERSION,
   advanceHostDomainResetJournal,
   createHostDomainResetJournal,
   hostDomainResourceDigest,
-  identityResourceDigest,
   loadHostDomainResetJournal,
-  removeAfterServiceRestoreConfirmed,
-  type HostDomainResetJournalTransition,
   type HostDomainResetJournalV1,
   type HostDomainResetServiceBackend,
+  type HostDomainResetTransition,
 } from './host-domain-reset-journal';
-import { restoreHostDomainServiceAndConfirm } from './host-domain-reset-journal-store';
+import { nextHostResetAction } from './host-domain-reset-machine';
+import {
+  activeRuntimeError,
+  executeHostResetAction,
+  type HostResetExecutorDependencies,
+  type HostResetRuntimePort,
+} from './host-domain-reset-executor';
+import {
+  prepareRecovery,
+  recoverServiceRestorePending,
+} from './host-domain-reset-recovery';
 import type { HostIdentityOperationLease } from './host-identity-operation-lock';
+import type { ProfileResourceSet } from '../profile';
 import type { AriavaProfileCliContext } from '../context';
 
 export interface HostDomainResetPrimitive {
@@ -62,19 +68,31 @@ export async function resetHostDomain(
   context.validation.descriptor();
   const loaded = await import('../context').then(({ loadResolvedProfileConfig }) => loadResolvedProfileConfig(context));
   let recoveryJournal: HostDomainResetJournalV1 | null = null;
-  return context.hostIdentityOperationLock.run(loaded.resources, async (lease) => {
+  return context.hostIdentityOperationLock.run(loaded.resources, async (operationLease) => {
     try {
-      return await resetHostDomainUnlocked(context, dependencies, lease, (journal) => { recoveryJournal = journal; });
+      return await resetHostDomainUnlocked(context, dependencies, operationLease, (journal) => { recoveryJournal = journal; });
     } catch (error) {
       throw normalizeResetRecoveryError(context, recoveryJournal, error);
     }
   });
 }
 
+/**
+ * Thin coordinator (primary spec §6–§8, §11 step 8).
+ *
+ * The coordinator owns ONLY: descriptor validation, profile resource
+ * resolution, the Host identity operation lease (obtained by the public
+ * entry), the fresh-reset bootstrap (§7.1), the machine-driven loop
+ * (nextHostResetAction -> exact executor -> secure store advance), and the
+ * restore routing seam into the recovery module. It never parses raw JSON,
+ * compares phases itself, computes resource digests itself, or owns effect
+ * stores beyond constructing the narrow dependency bundle the executors
+ * consume. The journal is the only durable phase/transition authority.
+ */
 async function resetHostDomainUnlocked(
   context: AriavaProfileCliContext,
   dependencies: HostDomainResetPrimitive,
-  lease: HostIdentityOperationLease,
+  operationLease: HostIdentityOperationLease,
   recordRecoveryJournal: (journal: HostDomainResetJournalV1) => void,
 ): Promise<HostDomainResetResult> {
   context.validation.descriptor();
@@ -82,230 +100,149 @@ async function resetHostDomainUnlocked(
   const baseConfig = buildProfileInitializedConfig(context, loaded.fileConfig);
   const resolved = { ...loaded.resolved, ...baseConfig };
   const resources = context.validation.resolved(resolved);
+
   let journal = loadHostDomainResetJournal(resources);
   if (journal) recordRecoveryJournal(journal);
-  let coordinator: ReturnType<AriavaProfileCliContext['runtimeCoordinator']['acquire']> | undefined;
 
-  const now = (): string => new Date().toISOString();
-  const advance = (transition: HostDomainResetJournalTransition) => {
-    journal = advanceHostDomainResetJournal(resources, journal!, transition, lease);
+  // Runtime exclusivity port: acquired at quarantine (fresh bootstrap or the
+  // stop-quarantine executor on resume), disposed in the coordinator's finally,
+  // and released by the recovery module before restore. Never a removal proof.
+  let heldCoordinator: RuntimeCoordinator | undefined;
+  const runtime: HostResetRuntimePort = {
+    acquire: () => context.runtimeCoordinator.acquire(resources),
+    get held() { return heldCoordinator; },
+    set held(value) { heldCoordinator = value; },
+    release() {
+      heldCoordinator?.dispose();
+      heldCoordinator = undefined;
+    },
+  };
+
+  // Stores are created lazily on first executor access: no identity/E2E/
+  // spool-key store exists before the quarantine advance (nothing
+  // identity/Relay/destructive happens before `quarantined`).
+  let identityStore: HostIdentityStore | undefined;
+  let encryptionStore: HostEncryptionIdentityStore | undefined;
+  let spoolKeyStore: HostReplacementSpoolKeyStore | undefined;
+
+  const executorDeps: HostResetExecutorDependencies = {
+    profileId: context.profile.id,
+    resources,
+    get identityStore() { return identityStore ??= context.identity.create(resources, context.platform); },
+    get encryptionStore() { return encryptionStore ??= context.encryptionIdentity.create(resources, context.platform); },
+    get spoolKeyStore() { return spoolKeyStore ??= context.hostReplacementSpoolKey.create(resources, context.platform); },
+    lifecycle: context.hostDomainResetLifecycle,
+    runtime,
+    config: context.config,
+    baseConfig,
+    relayBaseUrl: resolved.relayBaseUrl,
+    hostName: resolved.hostName,
+    platform: probeHostPlatform(context.platform),
+    bridgeVersion: dependencies.bridgeVersion,
+    revoke: (identity) => dependencies.revoke(identity, resolved.relayBaseUrl),
+    replace: dependencies.replace,
+    enroll: (identity, metadata, encryptionIdentity) =>
+      dependencies.enroll(resolved.relayBaseUrl, identity, metadata, encryptionIdentity),
+    access: context.access,
+    hooks: dependencies.hooks
+      ? { afterEffect: dependencies.hooks.afterEffect }
+      : undefined,
+  };
+
+  const advance = (transition: HostDomainResetTransition): HostDomainResetJournalV1 => {
+    journal = advanceHostDomainResetJournal(resources, journal!, transition, operationLease);
     recordRecoveryJournal(journal);
     dependencies.hooks?.afterPhase?.(journal.phase);
     return journal;
   };
 
-  let service: HostDomainResetJournalV1['service'];
-  if (!journal) {
-    service = context.hostDomainResetLifecycle.prepare(resources);
-  } else {
-    assertServiceSnapshot(context, resources, journal);
-    service = journal.service;
-  }
-
-  if (!journal) {
-    const timestamp = new Date().toISOString();
-    journal = {
-      version: HOST_DOMAIN_RESET_JOURNAL_VERSION,
-      operationId: `reset_${randomUUID().replaceAll('-', '')}`,
-      profile: context.profile.id,
-      phase: 'quarantine-pending',
-      oldHostId: null,
-      oldKeyId: null,
-      newHostId: null,
-      newKeyId: null,
-      oldEncryptionKeyId: null,
-      signingCleanup: null,
-      signingReplacementAttemptedAt: null,
-      encryptionIdentityReplacedAt: null,
-      runtimeArtifactsClearedAt: null,
-      configSavedAt: null,
-      enrolledAt: null,
-      serviceMetadataSynchronizedAt: null,
-      resourceDigest: hostDomainResourceDigest(resources),
-      createdAt: timestamp,
-      updatedAt: timestamp,
-      revoke: { state: 'not-attempted', outcome: null },
-      service,
-    };
-    createHostDomainResetJournal(resources, journal, lease);
-    recordRecoveryJournal(journal);
-  }
-
-  context.hostDomainResetLifecycle.stopAndConfirm(service);
-  if (journal.phase === 'quarantine-pending') dependencies.hooks?.afterPhase?.(journal.phase);
-  try {
-    coordinator = context.runtimeCoordinator.acquire(resources);
-  } catch (error) {
-    throw activeRuntimeError(context, error);
-  }
-  let replacement: HostIdentity;
-  try {
-    if (journal.phase === 'quarantine-pending') advance({ kind: 'advance', phase: 'quarantined', at: now() });
-    const store = context.identity.create(resources, context.platform);
-    if (journal.phase === 'quarantined') {
-      journal = await prepareIdentityInspectionJournal(
-        context, resources, store, journal, lease, dependencies, recordRecoveryJournal,
-      );
+  const acquireRuntimeOwnership = (): void => {
+    try {
+      runtime.held = runtime.acquire();
+    } catch (error) {
+      throw activeRuntimeError(context.profile.id, error);
     }
+  };
 
-    if (journal.phase === 'service-restore-pending') {
-      const recoveredReplacement = await requireReplacement(store, journal);
-      const encryptionIdentity = context.encryptionIdentity.create(resources, context.platform).load();
-      if (!encryptionIdentity || encryptionIdentity.hostId !== recoveredReplacement.hostId) {
-        throw recoveryRequired('Replacement Host encryption identity evidence is invalid');
-      }
-      const currentConfig = context.config.load(context.profile.resources.configPath);
-      if (JSON.stringify(currentConfig.identity) !== JSON.stringify(publicIdentityMetadata(recoveredReplacement))) {
-        throw recoveryRequired('Replacement Host config identity evidence is invalid');
-      }
-      if (pathHasFilesystemEvidence(resources.linkKeyringPath) || pathHasFilesystemEvidence(resources.runtimeResetIntentPath)) {
-        throw recoveryRequired('Old or incomplete Host-bound runtime artifacts were reintroduced during reset recovery');
-      }
-      const stateExists = pathHasFilesystemEvidence(resources.statePath);
-      const spoolExists = pathHasFilesystemEvidence(resources.encryptedSpoolPath);
-      if (stateExists !== spoolExists) throw recoveryRequired('Replacement Host runtime artifact pair is incomplete');
-      if (stateExists) {
-        try { assertCurrentRuntimeArtifacts(resources.statePath, recoveredReplacement.hostId); }
-        catch (error) { throw recoveryRequired('Replacement Host runtime artifact evidence is invalid', error); }
-      } else {
-        context.hostReplacementSpoolKey.create(resources, context.platform).assertAbsentForHostReplacement();
-      }
-      coordinator.dispose();
-      coordinator = undefined;
-      const identityReference = publicIdentityMetadata(recoveredReplacement).privateKeyStorage;
-      const { processRunning, confirmation } = restoreHostDomainServiceAndConfirm(
+  try {
+    if (!journal) {
+      // §7.1 fresh bootstrap: prepare -> create quarantine-pending journal
+      // (durable snapshot + digest binding) -> stopAndConfirm -> acquire runtime
+      // exclusivity -> machine-issued transition to quarantined. Nothing
+      // identity/Relay/destructive happens before `quarantined`.
+      const service = context.hostDomainResetLifecycle.prepare(resources);
+      journal = createHostDomainResetJournal(
         resources,
-        journal,
-        lease,
-        identityReference,
-        (snapshot, reference) => context.hostDomainResetLifecycle.restoreAndConfirm(snapshot, reference),
+        buildInitialJournal(context, resources, service),
+        operationLease,
       );
-      removeAfterServiceRestoreConfirmed(resources, journal, lease, confirmation);
-      return resetResult(journal, recoveredReplacement, processRunning);
-    }
-    const oldIdentity = await loadExpectedOldIdentity(store, journal);
-    if (journal.phase === 'prepared') {
-      if (oldIdentity) advance({ kind: 'start-revoke', at: now() });
-      else advance({ kind: 'begin-signing-replacement', at: now() });
-    }
-    if (journal.phase === 'revoke-pending') {
-      if (!oldIdentity) throw recoveryRequired('Old Host identity is unavailable while Relay revoke is pending');
-      const outcome = await dependencies.revoke(oldIdentity, resolved.relayBaseUrl);
-      advance({ kind: 'complete-revoke', at: now(), outcome });
-    }
-    if (journal.phase === 'old-identity-revoked') {
-      advance({ kind: 'begin-signing-replacement', at: now() });
-    }
-
-    replacement = await adoptOrReplaceSigningIdentity(store, journal, dependencies);
-    if (journal.oldHostId && store.deleteAfterHostReplacement && !store.completeExplicitReset) {
-      store.deleteAfterHostReplacement(journal.oldHostId);
-    }
-    if (journal.phase === 'signing-replacement-pending') {
-      dependencies.hooks?.afterEffect?.('signing-replaced');
-      advance({
-        kind: 'complete-signing-replacement',
-        at: now(),
-        newHostId: replacement.hostId,
-        newKeyId: replacement.keyId,
-      });
-    }
-    replacement = await requireReplacement(store, journal);
-    store.completeExplicitReset?.(journal.operationId);
-
-    const encryptionStore = context.encryptionIdentity.create(resources, context.platform);
-    let encryptionIdentity = encryptionStore.recoverReset?.(replacement.hostId, journal.operationId) ?? encryptionStore.load();
-    if (encryptionIdentity && encryptionIdentity.hostId !== replacement.hostId) {
-      if (!phaseBefore(journal.phase, 'encryption-identity-replaced')) {
-        throw recoveryRequired('Replacement Host encryption identity evidence is invalid');
+      recordRecoveryJournal(journal);
+      context.hostDomainResetLifecycle.stopAndConfirm(service);
+      dependencies.hooks?.afterPhase?.(journal.phase);
+      acquireRuntimeOwnership();
+      advance({ phase: 'quarantined' });
+    } else {
+      // Every resumed invocation (any phase) rehydrates the FRESH lifecycle
+      // adapter and compares only managed/installed/enabled/backend before any
+      // action selection or effect.
+      prepareRecovery(executorDeps, journal);
+      // Mid-flight resumes (prepared .. service-metadata-synchronized)
+      // re-quarantine exactly like the monolithic entry: stopAndConfirm the
+      // immutable snapshot, then re-acquire runtime exclusivity so the
+      // artifact-clear executor finds ownership held. quarantine-pending is
+      // handled by the stop-quarantine executor; service-restore-pending by
+      // the recovery module.
+      if (journal.phase !== 'quarantine-pending' && journal.phase !== 'service-restore-pending') {
+        context.hostDomainResetLifecycle.stopAndConfirm(journal.service);
+        acquireRuntimeOwnership();
       }
-      encryptionIdentity = null;
     }
-    if (!encryptionIdentity) {
-      if (!phaseBefore(journal.phase, 'encryption-identity-replaced')) {
-        throw recoveryRequired('Replacement Host encryption identity evidence is missing');
+
+    while (true) {
+      const action = nextHostResetAction(journal);
+      if (action.type === 'restore-service-and-remove-journal') {
+        return await recoverServiceRestorePending(executorDeps, journal, operationLease);
       }
-      encryptionIdentity = encryptionStore.recoverReset?.(replacement.hostId, journal.operationId)
-        ?? encryptionStore.replaceForReset(replacement.hostId, journal.operationId);
+      const result = await executeHostResetAction(action, journal, executorDeps);
+      if (result.kind === 'restore') {
+        return await recoverServiceRestorePending(executorDeps, journal, operationLease);
+      }
+      advance(result.transition);
     }
-    if (journal.oldEncryptionKeyId && encryptionStore.deleteAfterHostReplacement && !encryptionStore.completeReset) {
-      encryptionStore.deleteAfterHostReplacement(journal.oldEncryptionKeyId);
-    }
-    dependencies.hooks?.afterEffect?.('encryption-replaced');
-    if (phaseBefore(journal.phase, 'encryption-identity-replaced')) {
-      advance({ kind: 'complete-encryption-replacement', at: now() });
-    }
-    encryptionStore.completeReset?.(journal.operationId);
-
-    const expectedOldSpoolHostId = journal.revoke.outcome === 'old-identity-unreadable'
-      ? undefined
-      : journal.oldHostId ?? undefined;
-    clearHostDomainArtifacts(
-      resources, coordinator!, context.hostReplacementSpoolKey.create(resources, context.platform), expectedOldSpoolHostId,
-    );
-    dependencies.hooks?.afterEffect?.('artifacts-cleared');
-    if (phaseBefore(journal.phase, 'runtime-artifacts-cleared')) {
-      advance({ kind: 'complete-artifact-cleanup', at: now() });
-    }
-
-    const expectedConfig = { ...baseConfig, identity: publicIdentityMetadata(replacement) };
-    const currentConfig = context.config.load(context.profile.resources.configPath);
-    if (JSON.stringify(currentConfig.identity) !== JSON.stringify(expectedConfig.identity)) {
-      context.access?.('filesystemWrites', context.profile.resources.configPath);
-      context.config.save(expectedConfig, context.profile.resources.configPath);
-    }
-    dependencies.hooks?.afterEffect?.('config-saved');
-    if (phaseBefore(journal.phase, 'config-saved')) {
-      advance({ kind: 'complete-config-save', at: now() });
-    }
-
-    await dependencies.enroll(resolved.relayBaseUrl, replacement, {
-      hostName: resolved.hostName,
-      platform: probeHostPlatform(context.platform),
-      bridgeVersion: dependencies.bridgeVersion,
-    }, encryptionIdentity);
-    dependencies.hooks?.afterEffect?.('enrolled');
-    if (phaseBefore(journal.phase, 'enrolled')) {
-      advance({ kind: 'complete-enrollment', at: now() });
-    }
-
-    context.hostDomainResetLifecycle.synchronizeMetadata(
-      journal.service, publicIdentityMetadata(replacement).privateKeyStorage,
-    );
-    dependencies.hooks?.afterEffect?.('service-metadata-synchronized');
-    if (phaseBefore(journal.phase, 'service-metadata-synchronized')) {
-      advance({ kind: 'complete-metadata-sync', at: now() });
-    }
-    if (phaseBefore(journal.phase, 'service-restore-pending')) advance({ kind: 'complete-restore-intent', at: now() });
   } finally {
-    coordinator?.dispose();
+    runtime.release();
   }
-
-  const identityReference = publicIdentityMetadata(replacement!).privateKeyStorage;
-  const { processRunning, confirmation } = restoreHostDomainServiceAndConfirm(
-    resources,
-    journal,
-    lease,
-    identityReference,
-    (snapshot, reference) => context.hostDomainResetLifecycle.restoreAndConfirm(snapshot, reference),
-  );
-  dependencies.hooks?.afterEffect?.('service-restored');
-  removeAfterServiceRestoreConfirmed(resources, journal, lease, confirmation);
-  return resetResult(journal, replacement!, processRunning);
 }
 
-function activeRuntimeError(context: AriavaProfileCliContext, _error: unknown): AriavaCliError {
-  return new AriavaCliError(
-    'ERR_HOST_RESET_RUNTIME_ACTIVE',
-    `${context.profile.id === 'dev' ? 'Stop the foreground dev Bridge and retry. ' : ''}Host reset runtime is active`,
-    { retryable: true, remediation: { message: 'Stop the active Bridge runtime, then retry Host reset.' } },
-  );
-}
-
-function recoveryRequired(message: string, _cause?: unknown): AriavaCliError {
-  return new AriavaCliError('ERR_HOST_RESET_RECOVERY_REQUIRED', message, {
-    retryable: true, remediation: { message: 'Retry the same Host reset command to resume recovery.' },
-  });
+function buildInitialJournal(
+  context: AriavaProfileCliContext,
+  resources: ProfileResourceSet,
+  service: HostDomainResetJournalV1['service'],
+): HostDomainResetJournalV1 {
+  const timestamp = new Date().toISOString();
+  return {
+    version: HOST_DOMAIN_RESET_JOURNAL_VERSION,
+    operationId: `reset_${randomUUID().replaceAll('-', '')}`,
+    profile: context.profile.id,
+    phase: 'quarantine-pending',
+    oldHostId: null,
+    oldKeyId: null,
+    newHostId: null,
+    newKeyId: null,
+    oldEncryptionKeyId: null,
+    signingCleanup: null,
+    signingReplacementAttemptedAt: null,
+    encryptionIdentityReplacedAt: null,
+    runtimeArtifactsClearedAt: null,
+    configSavedAt: null,
+    enrolledAt: null,
+    serviceMetadataSynchronizedAt: null,
+    resourceDigest: hostDomainResourceDigest(resources),
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    revoke: { state: 'not-attempted', outcome: null },
+    service,
+  };
 }
 
 function normalizeResetRecoveryError(
@@ -325,193 +262,6 @@ function normalizeResetRecoveryError(
   );
   Object.defineProperty(normalized, 'cause', { value: error, enumerable: false });
   return normalized;
-}
-
-async function loadExpectedOldIdentity(
-  store: ReturnType<AriavaProfileCliContext['identity']['create']>,
-  journal: HostDomainResetJournalV1,
-): Promise<HostIdentity | null> {
-  if (!journal.oldHostId || journal.revoke.outcome === 'old-identity-unreadable') return null;
-  const current = await store.load();
-  if (!current || current.hostId !== journal.oldHostId || current.keyId !== journal.oldKeyId) {
-    if (journal.phase === 'prepared' || journal.phase === 'revoke-pending') {
-      throw recoveryRequired('Old Host signing identity evidence changed before Relay revoke completed');
-    }
-  }
-  return current;
-}
-
-async function adoptOrReplaceSigningIdentity(
-  store: ReturnType<AriavaProfileCliContext['identity']['create']>,
-  journal: HostDomainResetJournalV1,
-  dependencies: HostDomainResetPrimitive,
-): Promise<HostIdentity> {
-  let provenCandidate: HostIdentity | null | undefined;
-  try {
-    provenCandidate = await store.recoverExplicitReset?.(journal.operationId);
-  } catch (error) {
-    if (!isDefiniteResetRequiredIdentityError(error)) throw error;
-    provenCandidate = null;
-  }
-  let current: HostIdentity | null;
-  try {
-    current = await store.load();
-  } catch (error) {
-    if (!isDefiniteResetRequiredIdentityError(error)) throw error;
-    if (provenCandidate) return provenCandidate;
-    prepareExactSigningCleanup(store, journal);
-    return dependencies.replace(store, journal.operationId);
-  }
-  if (journal.newHostId !== null) {
-    if (current?.hostId !== journal.newHostId || current.keyId !== journal.newKeyId) {
-      throw recoveryRequired('Replacement Host signing identity evidence is invalid');
-    }
-    return current;
-  }
-  if (current && current.hostId !== journal.oldHostId) {
-    if (!provenCandidate || current.hostId !== provenCandidate.hostId || current.keyId !== provenCandidate.keyId) {
-      return dependencies.replace(store, journal.operationId);
-    }
-    return provenCandidate;
-  }
-  if (journal.phase !== 'signing-replacement-pending') {
-    throw recoveryRequired('Replacement Host signing identity evidence is missing');
-  }
-  prepareExactSigningCleanup(store, journal);
-  return provenCandidate ?? dependencies.replace(store, journal.operationId);
-}
-
-async function requireReplacement(
-  store: ReturnType<AriavaProfileCliContext['identity']['create']>,
-  journal: HostDomainResetJournalV1,
-): Promise<HostIdentity> {
-  if (!journal.newHostId || !journal.newKeyId) throw recoveryRequired('Replacement Host identity is not journaled');
-  const current = await store.load();
-  if (!current || current.hostId !== journal.newHostId || current.keyId !== journal.newKeyId) {
-    throw recoveryRequired('Replacement Host signing identity evidence is invalid');
-  }
-  return current;
-}
-
-async function prepareIdentityInspectionJournal(
-  context: AriavaProfileCliContext,
-  resources: Parameters<typeof hostDomainResourceDigest>[0],
-  store: ReturnType<AriavaProfileCliContext['identity']['create']>,
-  journal: HostDomainResetJournalV1,
-  lease: HostIdentityOperationLease,
-  dependencies: HostDomainResetPrimitive,
-  recordRecoveryJournal: (journal: HostDomainResetJournalV1) => void,
-): Promise<HostDomainResetJournalV1> {
-  if (journal.phase !== 'quarantined') return journal;
-  let oldIdentity: HostIdentity | null = null;
-  let legacyEvidence: ReturnType<typeof inspectResetOnlyLegacyIdentityEvidence> | undefined;
-  try {
-    oldIdentity = await store.load();
-  } catch (error) {
-    if (!isDefiniteResetRequiredIdentityError(error)) throw error;
-    legacyEvidence = inspectResetOnlyLegacyIdentityEvidence(store);
-    if (legacyEvidence.classification !== 'old-identity-unreadable') throw error;
-  }
-  if (oldIdentity && RESET_ONLY_IDENTITY_EVIDENCE_SOURCE in store) {
-    const decoded = inspectResetOnlyLegacyIdentityEvidence(store);
-    if (decoded.source.kind === 'macos-keychain') legacyEvidence = decoded;
-  }
-  const oldEncryptionIdentity = context.encryptionIdentity.create(resources, context.platform).load();
-  const prepared = advanceHostDomainResetJournal(resources, journal, {
-    kind: 'bind-prepared',
-    at: new Date().toISOString(),
-    oldHostId: oldIdentity?.hostId ?? legacyEvidence?.oldHostId ?? null,
-    oldKeyId: oldIdentity?.keyId ?? legacyEvidence?.oldKeyId ?? null,
-    oldEncryptionKeyId: oldEncryptionIdentity?.encryptionKeyId ?? null,
-    signingCleanup: legacyEvidence ? {
-      kind: legacyEvidence.source.kind,
-      resourceDigest: identityResourceDigest(legacyEvidence.source.resourcePath),
-      profile: context.profile.id,
-      previousAccount: legacyEvidence.cleanup?.previousAccount ?? null,
-      previousPendingAccount: legacyEvidence.cleanup?.previousPendingAccount ?? null,
-      interruptedCreationAccount: legacyEvidence.cleanup?.interruptedCreationAccount ?? null,
-    } : null,
-    revoke: oldIdentity ? { state: 'not-attempted', outcome: null } : { state: 'skipped', outcome: 'old-identity-unreadable' },
-  }, lease);
-  recordRecoveryJournal(prepared);
-  dependencies.hooks?.afterPhase?.(prepared.phase);
-  return prepared;
-}
-
-function prepareExactSigningCleanup(
-  store: ReturnType<AriavaProfileCliContext['identity']['create']>,
-  journal: HostDomainResetJournalV1,
-): void {
-  if (journal.phase !== 'signing-replacement-pending') return;
-  if (!journal.signingCleanup) return;
-  const evidence = inspectResetOnlyLegacyIdentityEvidence(store);
-  const expected = journal.signingCleanup;
-  if (!expected || evidence.classification !== 'old-identity-unreadable'
-    || evidence.oldHostId !== journal.oldHostId || evidence.oldKeyId !== journal.oldKeyId
-    || evidence.source.kind !== expected.kind
-    || identityResourceDigest(evidence.source.resourcePath) !== expected.resourceDigest
-    || ('profile' in evidence.source && evidence.source.profile !== expected.profile)
-    || JSON.stringify(evidence.cleanup ?? {
-      previousAccount: null, previousPendingAccount: null, interruptedCreationAccount: null,
-    }) !== JSON.stringify({
-      previousAccount: expected.previousAccount,
-      previousPendingAccount: expected.previousPendingAccount,
-      interruptedCreationAccount: expected.interruptedCreationAccount,
-    })) {
-    throw recoveryRequired('Old Host signing identity cleanup evidence changed before replacement');
-  }
-}
-
-function isDefiniteResetRequiredIdentityError(error: unknown): boolean {
-  return error instanceof HostIdentityError && [
-    'ERR_IDENTITY_INVALID',
-    'ERR_IDENTITY_MISSING',
-    'ERR_IDENTITY_RESET_REQUIRED',
-  ].includes(error.code);
-}
-
-
-function assertServiceSnapshot(
-  context: AriavaProfileCliContext,
-  resources: unknown,
-  journal: HostDomainResetJournalV1,
-): void {
-  const current = context.hostDomainResetLifecycle.prepare(resources);
-  if (current.managed !== journal.service.managed
-    || current.installed !== journal.service.installed
-    || current.enabled !== journal.service.enabled
-    || current.backend !== journal.service.backend) {
-    throw recoveryRequired('Host reset service state changed during recovery');
-  }
-}
-
-function resetResult(
-  journal: HostDomainResetJournalV1, replacement: HostIdentity, processRunning: boolean,
-): HostDomainResetResult {
-  return {
-    hostId: replacement.hostId,
-    keyId: replacement.keyId,
-    revokedOldIdentity: journal.revoke.outcome === 'revoked' || journal.revoke.outcome === 'identity-already-revoked',
-    links: [],
-    watchPairingRequired: true,
-    ...(journal.revoke.outcome === 'old-identity-unreadable'
-      ? { warning: 'Old Host identity could not be loaded or revoked: ERR_IDENTITY_INVALID' }
-      : {}),
-    service: {
-      ...journal.service, processRunning,
-      status: journal.service.managed ? (processRunning ? 'running' : 'stopped') : 'unmanaged',
-    },
-  };
-}
-
-function phaseBefore(left: HostDomainResetJournalV1['phase'], right: HostDomainResetJournalV1['phase']): boolean {
-  const phases: HostDomainResetJournalV1['phase'][] = [
-    'quarantine-pending', 'quarantined', 'prepared', 'revoke-pending', 'old-identity-revoked',
-    'signing-replacement-pending', 'signing-identity-replaced', 'encryption-identity-replaced',
-    'runtime-artifacts-cleared', 'config-saved', 'enrolled', 'service-metadata-synchronized',
-    'service-restore-pending',
-  ];
-  return phases.indexOf(left) < phases.indexOf(right);
 }
 
 export interface HostDomainResetLifecycleAdapter {

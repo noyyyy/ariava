@@ -1,32 +1,76 @@
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
+import { readSecureJson } from '../../host-manager/secure-files';
 import { AriavaCliError } from '../../host-manager/service/errors';
 import {
   acquireProcessAwareLock,
+  type OwnedProcessAwareLock,
   type ProcessAwareLockDependencies,
 } from '../../host-manager/process-aware-lock';
-import { readSecureJson } from '../../host-manager/secure-files';
 import type { ProfileResourceSet } from '../profile';
-
-/**
- * Opaque ownership proof for the Host identity operation lock. Only
- * `withHostIdentityOperationLock` constructs leases; callers receive one in
- * the callback and can only ask `assertOwned()`. The lease stays live from
- * before the journal is loaded/created until guarded removal completes, and
- * it cannot be forged with a boolean flag or an empty `assertOwned()`.
- */
-export interface HostIdentityOperationLease {
-  assertOwned(): void;
-}
-
-interface HostIdentityOperationLeasePayload {
-  canonicalLockPath: string;
-  assertOwned(): void;
-}
-
-const LEASE_PAYLOADS = new WeakMap<object, HostIdentityOperationLeasePayload>();
 
 export function hostIdentityOperationLockPath(resources: ProfileResourceSet): string {
   return `${resources.hostDomainResetJournalPath}.operation.lock`;
+}
+
+const HOST_IDENTITY_OPERATION_LEASE_TYPE: unique symbol = Symbol('HostIdentityOperationLease');
+
+export interface HostIdentityOperationLease {
+  readonly [HOST_IDENTITY_OPERATION_LEASE_TYPE]: true;
+  assertOwned(): void;
+}
+
+interface IssuedLease {
+  canonicalLockPath: string;
+  resourceDigest: string;
+  owned: OwnedProcessAwareLock;
+  uid: number | undefined;
+  active: boolean;
+}
+
+const ISSUED_LEASES = new WeakMap<object, IssuedLease>();
+
+function createHostIdentityOperationLease(
+  resources: ProfileResourceSet,
+  owned: OwnedProcessAwareLock,
+  uid: number | undefined,
+): HostIdentityOperationLease {
+  const lease: HostIdentityOperationLease = Object.freeze({
+    [HOST_IDENTITY_OPERATION_LEASE_TYPE]: true,
+    assertOwned() {
+      assertHostIdentityOperationLeaseOwned(lease, resources);
+    },
+  });
+  ISSUED_LEASES.set(lease, {
+    canonicalLockPath: canonicalOperationLockPath(resources),
+    resourceDigest: profileResourceFingerprint(resources),
+    owned,
+    uid,
+    active: true,
+  });
+  return lease;
+}
+
+export function assertHostIdentityOperationLeaseOwned(
+  lease: HostIdentityOperationLease,
+  resources: ProfileResourceSet,
+): void {
+  if ((typeof lease !== 'object' && typeof lease !== 'function') || lease === null) {
+    throw hostIdentityLeaseLostError();
+  }
+  const issued = ISSUED_LEASES.get(lease);
+  if (!issued?.active
+    || issued.canonicalLockPath !== canonicalOperationLockPath(resources)
+    || issued.resourceDigest !== profileResourceFingerprint(resources)) {
+    throw hostIdentityLeaseLostError();
+  }
+  let current: { ownerToken?: unknown };
+  try {
+    current = readSecureJson<{ ownerToken?: unknown }>(issued.owned.path, issued.uid);
+  } catch {
+    throw hostIdentityLeaseLostError();
+  }
+  if (current.ownerToken !== issued.owned.record.ownerToken) throw hostIdentityLeaseLostError();
 }
 
 export async function withHostIdentityOperationLock<T>(
@@ -34,53 +78,41 @@ export async function withHostIdentityOperationLock<T>(
   run: (lease: HostIdentityOperationLease) => Promise<T>,
   dependencies: Partial<ProcessAwareLockDependencies> = {},
 ): Promise<T> {
-  const canonicalLockPath = canonicalHostIdentityOperationLockPath(resources);
   const lock = acquireProcessAwareLock(
-    canonicalLockPath,
+    hostIdentityOperationLockPath(resources),
     hostIdentityTransitionLockedError,
     dependencies,
   );
-  const lease: HostIdentityOperationLease = {
-    assertOwned() {
-      assertHostIdentityOperationLeaseOwned(lease, canonicalLockPath);
-    },
-  };
-  LEASE_PAYLOADS.set(lease, {
-    canonicalLockPath,
-    assertOwned() {
-      const current = readSecureJson<{ ownerToken?: unknown }>(lock.path, dependencies.uid);
-      if (current.ownerToken !== lock.record.ownerToken) {
-        throw new TypeError('Host identity operation lock changed or is unsafe');
-      }
-    },
-  });
+  const lease = createHostIdentityOperationLease(
+    resources,
+    lock,
+    dependencies.uid ?? process.getuid?.(),
+  );
   try {
     return await run(lease);
   } finally {
+    const issued = ISSUED_LEASES.get(lease);
+    if (issued) issued.active = false;
     lock.release();
   }
 }
 
-export function assertHostIdentityOperationLeaseOwned(
-  lease: HostIdentityOperationLease,
-  expectedResourcesOrCanonicalLockPath: ProfileResourceSet | string,
-): void {
-  if ((typeof lease !== 'object' && typeof lease !== 'function') || lease === null) {
-    throw invalidHostIdentityOperationLease();
-  }
-  const payload = LEASE_PAYLOADS.get(lease);
-  if (!payload) throw invalidHostIdentityOperationLease();
-  const expectedCanonicalLockPath = typeof expectedResourcesOrCanonicalLockPath === 'string'
-    ? resolve(expectedResourcesOrCanonicalLockPath)
-    : canonicalHostIdentityOperationLockPath(expectedResourcesOrCanonicalLockPath);
-  if (payload.canonicalLockPath !== expectedCanonicalLockPath) {
-    throw invalidHostIdentityOperationLease();
-  }
-  payload.assertOwned();
+function profileResourceFingerprint(resources: ProfileResourceSet): string {
+  const canonicalEntries = Object.entries(resources)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return createHash('sha256').update(JSON.stringify(canonicalEntries)).digest('hex');
 }
 
-function canonicalHostIdentityOperationLockPath(resources: ProfileResourceSet): string {
+function canonicalOperationLockPath(resources: ProfileResourceSet): string {
   return resolve(hostIdentityOperationLockPath(resources));
+}
+
+function hostIdentityLeaseLostError(): AriavaCliError {
+  return new AriavaCliError(
+    'ERR_HOST_RESET_LEASE_LOST',
+    'Host identity operation lease is no longer held.',
+    { retryable: true, remediation: { message: 'Retry the Host reset command to resume recovery.' } },
+  );
 }
 
 function hostIdentityTransitionLockedError(): AriavaCliError {
@@ -92,8 +124,4 @@ function hostIdentityTransitionLockedError(): AriavaCliError {
       remediation: { message: 'Wait for the active Host identity reset to finish, then retry.' },
     },
   );
-}
-
-function invalidHostIdentityOperationLease(): TypeError {
-  return new TypeError('Host identity operation lease is invalid or unsafe');
 }

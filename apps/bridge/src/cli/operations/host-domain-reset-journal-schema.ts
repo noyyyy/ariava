@@ -1,6 +1,14 @@
-import { createHash } from 'node:crypto';
-import type { AriavaProfileId, ProfileResourceSet } from '../profile';
+import {
+  hostDomainResourceDigest,
+  identityResourceDigest,
+  type HostDomainResetProfileId,
+  type HostDomainResetResourceSet,
+} from './host-domain-reset-journal-binding';
 
+export {
+  hostDomainResourceDigest,
+  identityResourceDigest,
+} from './host-domain-reset-journal-binding';
 export const HOST_DOMAIN_RESET_JOURNAL_VERSION = 1 as const;
 
 export const HOST_DOMAIN_RESET_PHASES = [
@@ -27,7 +35,7 @@ export type HostDomainResetServiceBackend = 'launchd' | 'systemd-user' | 'none';
 export interface HostDomainResetSigningCleanupV1 {
   kind: 'linux-json' | 'macos-keychain';
   resourceDigest: string;
-  profile: AriavaProfileId;
+  profile: HostDomainResetProfileId;
   previousAccount: string | null;
   previousPendingAccount: string | null;
   interruptedCreationAccount: string | null;
@@ -36,7 +44,7 @@ export interface HostDomainResetSigningCleanupV1 {
 export interface HostDomainResetJournalV1 {
   version: 1;
   operationId: string;
-  profile: AriavaProfileId;
+  profile: HostDomainResetProfileId;
   phase: HostDomainResetPhase;
   oldHostId: string | null;
   oldKeyId: string | null;
@@ -77,57 +85,10 @@ const SIGNING_CLEANUP_KEYS = [
 ] as const;
 const REVOKE_KEYS = ['state', 'outcome'] as const;
 const SERVICE_KEYS = ['managed', 'installed', 'enabled', 'wasRunning', 'backend'] as const;
-const PHASE_INDEX = new Map(HOST_DOMAIN_RESET_PHASES.map((phase, index) => [phase, index]));
+export const PHASE_INDEX = new Map(HOST_DOMAIN_RESET_PHASES.map((phase, index) => [phase, index]));
 
-export function identityResourceDigest(path: string): string {
-  return createHash('sha256').update(path).digest('hex');
-}
 
-export function hostDomainResourceDigest(resources: ProfileResourceSet): string {
-  const paths = hostDomainResourcePaths(resources);
-  const canonical = JSON.stringify(Object.fromEntries(Object.entries(paths).sort(([left], [right]) => left.localeCompare(right))));
-  return createHash('sha256').update(canonical).digest('hex');
-}
-
-export function hostDomainResourcePaths(resources: ProfileResourceSet): Record<string, string> {
-  return {
-    root: resources.root,
-    configPath: resources.configPath,
-    identityMetadataPath: resources.identityMetadataPath,
-    encryptionIdentityPath: resources.encryptionIdentityPath,
-    linkKeyringPath: resources.linkKeyringPath,
-    statePath: resources.statePath,
-    agentAdapterConfigPath: resources.agentAdapterConfigPath,
-    piExtensionLogPath: resources.piExtensionLogPath,
-    installMetadataPath: resources.installMetadataPath,
-    encryptedSpoolPath: resources.encryptedSpoolPath,
-    runtimeResetIntentPath: resources.runtimeResetIntentPath,
-    runtimeLockPath: resources.runtimeLockPath,
-    runtimeTakeoverMutexPath: resources.runtimeTakeoverMutexPath,
-    macosSpoolEvidencePath: resources.macosSpoolEvidencePath,
-    linuxSpoolKeyPath: resources.linuxSpoolKeyPath,
-    hostDomainResetJournalPath: resources.hostDomainResetJournalPath,
-  };
-}
-
-/**
- * Position of a phase in the frozen v1 order. Used by the policy module to
- * classify rollback/skip/adjacency. Phases are validated before this is
- * reached, so an unknown phase here is a programming error.
- */
-export function phaseOrder(phase: HostDomainResetPhase): number {
-  const index = PHASE_INDEX.get(phase);
-  if (index === undefined) throw invalidJournal();
-  return index;
-}
-
-/**
- * Exact decoder. Unknown/missing/malformed fields fail closed, the resource
- * digest and profile must match the resolved resources, the dev profile must
- * carry an unmanaged service snapshot, and every phase must satisfy its
- * required/forbidden evidence invariants. No filesystem effects.
- */
-export function parseHostDomainResetJournal(value: unknown, resources: ProfileResourceSet): HostDomainResetJournalV1 {
+export function parseHostDomainResetJournal(value: unknown, resources: HostDomainResetResourceSet): HostDomainResetJournalV1 {
   if (!isRecord(value) || !hasExactKeys(value, JOURNAL_KEYS)) throw invalidJournal();
   if (value.version !== HOST_DOMAIN_RESET_JOURNAL_VERSION
     || !isOperationId(value.operationId)
@@ -162,65 +123,15 @@ export function parseHostDomainResetJournal(value: unknown, resources: ProfileRe
   return structuredClone(value) as unknown as HostDomainResetJournalV1;
 }
 
-/**
- * Canonical deterministic encoding: top-level and nested keys in exact
- * interface order, matching the bytes a freshly constructed coordinator
- * journal produces, so persisted v1 bytes stay byte-identical for the same
- * logical journal.
- */
-export function encodeHostDomainResetJournal(journal: HostDomainResetJournalV1): string {
-  return JSON.stringify(canonicalJournalRecord(journal));
+export function encodeHostDomainResetJournal(
+  journal: HostDomainResetJournalV1,
+  resources: HostDomainResetResourceSet,
+): string {
+  const validated = parseHostDomainResetJournal(journal, resources);
+  return `${JSON.stringify(validated, null, 2)}\n`;
 }
 
-export function canonicalJournalDigest(journal: HostDomainResetJournalV1): string {
-  return createHash('sha256').update(encodeHostDomainResetJournal(journal)).digest('hex');
-}
-
-function canonicalJournalRecord(journal: HostDomainResetJournalV1): Record<string, unknown> {
-  return {
-    version: journal.version,
-    operationId: journal.operationId,
-    profile: journal.profile,
-    phase: journal.phase,
-    oldHostId: journal.oldHostId,
-    oldKeyId: journal.oldKeyId,
-    newHostId: journal.newHostId,
-    newKeyId: journal.newKeyId,
-    oldEncryptionKeyId: journal.oldEncryptionKeyId,
-    signingCleanup: journal.signingCleanup === null
-      ? null
-      : {
-        kind: journal.signingCleanup.kind,
-        resourceDigest: journal.signingCleanup.resourceDigest,
-        profile: journal.signingCleanup.profile,
-        previousAccount: journal.signingCleanup.previousAccount,
-        previousPendingAccount: journal.signingCleanup.previousPendingAccount,
-        interruptedCreationAccount: journal.signingCleanup.interruptedCreationAccount,
-      },
-    signingReplacementAttemptedAt: journal.signingReplacementAttemptedAt,
-    encryptionIdentityReplacedAt: journal.encryptionIdentityReplacedAt,
-    runtimeArtifactsClearedAt: journal.runtimeArtifactsClearedAt,
-    configSavedAt: journal.configSavedAt,
-    enrolledAt: journal.enrolledAt,
-    serviceMetadataSynchronizedAt: journal.serviceMetadataSynchronizedAt,
-    resourceDigest: journal.resourceDigest,
-    createdAt: journal.createdAt,
-    updatedAt: journal.updatedAt,
-    revoke: {
-      state: journal.revoke.state,
-      outcome: journal.revoke.outcome,
-    },
-    service: {
-      managed: journal.service.managed,
-      installed: journal.service.installed,
-      enabled: journal.service.enabled,
-      wasRunning: journal.service.wasRunning,
-      backend: journal.service.backend,
-    },
-  };
-}
-
-function isSigningCleanup(value: unknown, resources: ProfileResourceSet): value is HostDomainResetSigningCleanupV1 | null {
+function isSigningCleanup(value: unknown, resources: HostDomainResetResourceSet): value is HostDomainResetSigningCleanupV1 | null {
   if (value === null) return true;
   if (!isRecord(value) || !hasExactKeys(value, SIGNING_CLEANUP_KEYS)
     || !['linux-json', 'macos-keychain'].includes(String(value.kind))

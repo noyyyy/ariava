@@ -1,3 +1,4 @@
+import type { HostIdentity } from '../../identity';
 import { AriavaCliError } from '../../host-manager/service/errors';
 import {
   acquireProcessAwareLock,
@@ -12,30 +13,28 @@ import {
   type SecureFileRemoveHooks,
   type SecureFileWriteHooks,
 } from '../../host-manager/secure-files';
-import type { HostPrivateKeyStorage } from '../../identity/types';
 import type { ProfileResourceSet } from '../profile';
 import {
-  assertHostIdentityOperationLeaseOwned,
-  type HostIdentityOperationLease,
-} from './host-identity-operation-lock';
-import {
-  canonicalJournalDigest,
   encodeHostDomainResetJournal,
   parseHostDomainResetJournal,
   type HostDomainResetJournalV1,
 } from './host-domain-reset-journal-schema';
 import {
-  applyHostDomainResetJournalTransition,
-  validateInitialJournal,
-  type HostDomainResetJournalTransition,
-  type HostResetJournalViolation,
+  applyHostDomainResetTransition,
+  hostResetJournalViolationMessage,
+  validateHostDomainResetTransition,
+  type HostDomainResetTransition,
 } from './host-domain-reset-journal-policy';
+import {
+  assertHostIdentityOperationLeaseOwned,
+  type HostIdentityOperationLease,
+} from './host-identity-operation-lock';
 
 export interface HostDomainResetJournalStoreOptions {
   uid?: number;
-  writeHooks?: SecureFileWriteHooks;
-  removeHooks?: SecureFileRemoveHooks;
+  hooks?: SecureFileWriteHooks;
   lockDependencies?: Partial<ProcessAwareLockDependencies>;
+  now?: () => Date;
 }
 
 export function loadHostDomainResetJournal(
@@ -53,163 +52,70 @@ export function loadHostDomainResetJournal(
   return parseHostDomainResetJournal(value, resources);
 }
 
-/**
- * Exclusive create of a `quarantine-pending` journal. Always acquires the
- * process-aware advancement lock, requires the journal to be absent, and
- * verifies the caller's Host identity operation lease before and after the
- * atomic exclusive write.
- */
 export function createHostDomainResetJournal(
   resources: ProfileResourceSet,
   initial: HostDomainResetJournalV1,
   operationLease: HostIdentityOperationLease,
   options: HostDomainResetJournalStoreOptions = {},
 ): HostDomainResetJournalV1 {
-  const lock = acquireJournalAdvancementLock(resources, options.uid, options.lockDependencies);
-  try {
-    const existing = loadHostDomainResetJournal(resources, options.uid);
-    if (existing !== null) throw new TypeError('Host-domain reset journal already exists');
-    const validated = validateInitialJournal(initial, resources);
-    if (!validated.ok) throw transitionViolationError(validated.reason);
-    assertHostIdentityOperationLeaseOwned(operationLease, resources);
-    writeSecureJsonExclusive(resources.hostDomainResetJournalPath, validated.journal, options.uid, {
-      ...options.writeHooks,
-      beforePromotion() {
-        options.writeHooks?.beforePromotion?.();
-        assertHostIdentityOperationLeaseOwned(operationLease, resources);
-        lock.assertOwned();
-      },
-    });
-    assertHostIdentityOperationLeaseOwned(operationLease, resources);
-    return validated.journal;
-  } finally {
-    lock.release();
+  if (initial.phase !== 'quarantine-pending') {
+    throw new TypeError('Host-domain reset journal must be created in quarantine-pending');
   }
+  const validated = parseHostDomainResetJournal(initial, resources);
+  assertHostIdentityOperationLeaseOwned(operationLease, resources);
+  writeSecureJsonExclusive(resources.hostDomainResetJournalPath, validated, options.uid, {
+    ...options.hooks,
+    beforePromotion() {
+      options.hooks?.beforePromotion?.();
+      assertHostIdentityOperationLeaseOwned(operationLease, resources);
+    },
+  });
+  assertHostIdentityOperationLeaseOwned(operationLease, resources);
+  return validated;
 }
 
-/**
- * Advance through exactly one machine-authorized transition. Always acquires
- * the process-aware advancement lock, requires the stored journal to exactly
- * match the caller's snapshot, and verifies the caller's Host identity
- * operation lease before the atomic write and again at promotion time.
- */
 export function advanceHostDomainResetJournal(
   resources: ProfileResourceSet,
   current: HostDomainResetJournalV1,
-  transition: HostDomainResetJournalTransition,
+  transition: HostDomainResetTransition,
   operationLease: HostIdentityOperationLease,
   options: HostDomainResetJournalStoreOptions = {},
 ): HostDomainResetJournalV1 {
   const lock = acquireJournalAdvancementLock(resources, options.uid, options.lockDependencies);
   try {
     const stored = loadHostDomainResetJournal(resources, options.uid);
-    if (!stored || encodeHostDomainResetJournal(stored) !== encodeHostDomainResetJournal(current)) {
+    if (!stored || JSON.stringify(stored) !== JSON.stringify(current)) {
       throw new TypeError('Host-domain reset journal changed before advancement');
     }
-    const result = applyHostDomainResetJournalTransition(stored, transition, resources);
-    if (!result.ok) throw transitionViolationError(result.reason);
+    const updatedAt = (options.now ?? (() => new Date()))().toISOString();
+    const candidate = parseHostDomainResetJournal(
+      applyHostDomainResetTransition(stored, transition, updatedAt),
+      resources,
+    );
+    const validation = validateHostDomainResetTransition(stored, candidate);
+    if (!validation.ok) throw new TypeError(hostResetJournalViolationMessage(validation.reason));
     assertHostIdentityOperationLeaseOwned(operationLease, resources);
-    writeSecureJson(resources.hostDomainResetJournalPath, result.journal, options.uid, {
-      ...options.writeHooks,
+    writeSecureJson(resources.hostDomainResetJournalPath, validation.journal, options.uid, {
+      ...options.hooks,
       beforePromotion() {
-        options.writeHooks?.beforePromotion?.();
-        assertHostIdentityOperationLeaseOwned(operationLease, resources);
+        options.hooks?.beforePromotion?.();
         lock.assertOwned();
+        assertHostIdentityOperationLeaseOwned(operationLease, resources);
       },
     });
-    return result.journal;
+    return validation.journal;
   } finally {
     lock.release();
   }
-}
-
-export function restoreHostDomainServiceAndConfirm(
-  resources: ProfileResourceSet,
-  current: HostDomainResetJournalV1,
-  operationLease: HostIdentityOperationLease,
-  identityReference: HostPrivateKeyStorage,
-  restoreAndConfirm: (
-    snapshot: HostDomainResetJournalV1['service'],
-    identityReference: HostPrivateKeyStorage,
-  ) => boolean,
-  options: Pick<HostDomainResetJournalStoreOptions, 'uid'> = {},
-): { processRunning: boolean; confirmation: RestoreConfirmation } {
-  assertHostIdentityOperationLeaseOwned(operationLease, resources);
-  if (current.phase !== 'service-restore-pending') {
-    throw new TypeError('Host-domain reset service restoration requires service-restore-pending');
-  }
-  const stored = loadHostDomainResetJournal(resources, options.uid);
-  if (!stored || encodeHostDomainResetJournal(stored) !== encodeHostDomainResetJournal(current)) {
-    throw new TypeError('Host-domain reset journal changed before service restoration');
-  }
-  assertReplacementIdentityReference(resources, current, identityReference);
-  const processRunning = restoreAndConfirm(current.service, identityReference);
-  if (typeof processRunning !== 'boolean') throw invalidConfirmation();
-  assertHostIdentityOperationLeaseOwned(operationLease, resources);
-  const confirmation = Object.freeze({}) as RestoreConfirmation;
-  CONFIRMATION_PAYLOADS.set(confirmation, {
-    operationId: current.operationId,
-    journalDigest: canonicalJournalDigest(current),
-    service: structuredClone(current.service),
-    identityReference: structuredClone(identityReference),
-    restoreReturn: processRunning,
-  });
-  return { processRunning, confirmation };
-}
-
-/**
- * Guarded removal requires the exact in-process confirmation produced by
- * `restoreHostDomainServiceAndConfirm` and an authentic live operation lease.
- */
-export function removeAfterServiceRestoreConfirmed(
-  resources: ProfileResourceSet,
-  current: HostDomainResetJournalV1,
-  operationLease: HostIdentityOperationLease,
-  confirmation: RestoreConfirmation,
-  options: HostDomainResetJournalStoreOptions = {},
-): void {
-  assertHostIdentityOperationLeaseOwned(operationLease, resources);
-  if (current.phase !== 'service-restore-pending') {
-    throw new TypeError('Host-domain reset journal removal requires service-restore-pending');
-  }
-  verifyRestoreConfirmation(confirmation, resources, current);
-  const stored = loadHostDomainResetJournal(resources, options.uid);
-  if (!stored || encodeHostDomainResetJournal(stored) !== encodeHostDomainResetJournal(current)) {
-    throw new TypeError('Host-domain reset journal changed before removal');
-  }
-  consumeRestoreConfirmation(confirmation, resources, current);
-  assertHostIdentityOperationLeaseOwned(operationLease, resources);
-  removeSecureFileIfPresent(resources.hostDomainResetJournalPath, options.uid, {
-    ...options.removeHooks,
-    beforeUnlink(path) {
-      options.removeHooks?.beforeUnlink?.(path);
-      assertHostIdentityOperationLeaseOwned(operationLease, resources);
-    },
-  });
-}
-
-export function assertHostDomainResetRuntimeStartAllowed(resources: ProfileResourceSet): void {
-  const journal = loadHostDomainResetJournal(resources);
-  if (!journal || journal.phase === 'service-restore-pending') return;
-  const remediation = resources.identityProfile === 'dev'
-    ? 'bun run dev:cli -- identity reset --confirm'
-    : 'ariava identity reset --confirm';
-  const error = new Error(`Host-domain reset recovery required at phase ${journal.phase}; run \`${remediation}\``);
-  Object.assign(error, {
-    code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',
-    phase: journal.phase,
-    operationId: journal.operationId,
-    retryable: true,
-    remediation,
-  });
-  throw error;
 }
 
 interface RestoreConfirmationPayload {
   operationId: string;
   journalDigest: string;
   service: HostDomainResetJournalV1['service'];
-  identityReference: HostPrivateKeyStorage;
+  replacementHostId: string;
+  replacementKeyId: string;
+  identityReference: HostIdentity['privateKeyStorage'];
   restoreReturn: boolean;
 }
 
@@ -219,47 +125,157 @@ export interface RestoreConfirmation {
   readonly [RESTORE_CONFIRMATION_TYPE]: true;
 }
 
-const CONFIRMATION_PAYLOADS = new WeakMap<RestoreConfirmation, RestoreConfirmationPayload>();
+const CONFIRMATIONS = new WeakMap<object, RestoreConfirmationPayload>();
 
-function verifyRestoreConfirmation(
-  confirmation: RestoreConfirmation,
+/**
+ * Recovery-only restore seam. The caller must already have completed fresh
+ * rehydration, re-quarantine, replacement-domain validation, and runtime
+ * ownership release. This operation independently binds the replacement
+ * identity/reference, invokes restore, and only then issues an in-process
+ * single-use confirmation.
+ */
+export function restoreHostDomainServiceAndConfirm(
   resources: ProfileResourceSet,
   current: HostDomainResetJournalV1,
-): RestoreConfirmationPayload {
-  if ((typeof confirmation !== 'object' && typeof confirmation !== 'function') || confirmation === null) {
-    throw invalidConfirmation();
+  operationLease: HostIdentityOperationLease,
+  replacement: HostIdentity,
+  restoreAndConfirm: (
+    snapshot: HostDomainResetJournalV1['service'],
+    identityReference: HostIdentity['privateKeyStorage'],
+  ) => boolean,
+  options: Pick<HostDomainResetJournalStoreOptions, 'uid'> = {},
+): { processRunning: boolean; confirmation: RestoreConfirmation } {
+  assertHostIdentityOperationLeaseOwned(operationLease, resources);
+  if (current.phase !== 'service-restore-pending') {
+    throw new TypeError('Host-domain reset service restoration requires service-restore-pending');
   }
-  const payload = CONFIRMATION_PAYLOADS.get(confirmation);
-  if (payload === undefined) throw invalidConfirmation();
-  if (payload.operationId !== current.operationId) throw invalidConfirmation();
-  if (payload.journalDigest !== canonicalJournalDigest(current)) throw invalidConfirmation();
-  if (JSON.stringify(payload.service) !== JSON.stringify(current.service)) throw invalidConfirmation();
-  assertReplacementIdentityReference(resources, current, payload.identityReference);
-  if (typeof payload.restoreReturn !== 'boolean') throw invalidConfirmation();
-  return payload;
+  const stored = loadHostDomainResetJournal(resources, options.uid);
+  if (!stored || JSON.stringify(stored) !== JSON.stringify(current)) {
+    throw new AriavaCliError(
+      'ERR_HOST_RESET_REMOVE_STALE_JOURNAL',
+      'Host-domain reset journal changed before service restoration.',
+      { retryable: true, remediation: { message: 'Re-run the Host reset recovery sequence from the current journal.' } },
+    );
+  }
+  assertReplacementIdentity(resources, current, replacement);
+  const identityReference = structuredClone(replacement.privateKeyStorage);
+  const processRunning = restoreAndConfirm(current.service, identityReference);
+  if (typeof processRunning !== 'boolean') throw invalidConfirmation();
+  assertHostIdentityOperationLeaseOwned(operationLease, resources);
+  const confirmation = Object.freeze({}) as RestoreConfirmation;
+  CONFIRMATIONS.set(confirmation, {
+    operationId: current.operationId,
+    journalDigest: encodeHostDomainResetJournal(current, resources),
+    service: structuredClone(current.service),
+    replacementHostId: replacement.hostId,
+    replacementKeyId: replacement.keyId,
+    identityReference,
+    restoreReturn: processRunning,
+  });
+  return { processRunning, confirmation };
+}
+
+export function removeAfterServiceRestoreConfirmed(
+  resources: ProfileResourceSet,
+  current: HostDomainResetJournalV1,
+  operationLease: HostIdentityOperationLease,
+  confirmation: RestoreConfirmation,
+  options: { uid?: number; hooks?: SecureFileRemoveHooks } = {},
+): void {
+  assertHostIdentityOperationLeaseOwned(operationLease, resources);
+  if (current.phase !== 'service-restore-pending') {
+    throw new AriavaCliError(
+      'ERR_HOST_RESET_REMOVE_WRONG_PHASE',
+      `Host-domain reset journal is at phase ${current.phase}; guarded removal requires service-restore-pending.`,
+      { retryable: false },
+    );
+  }
+  const stored = loadHostDomainResetJournal(resources, options.uid);
+  if (!stored || JSON.stringify(stored) !== JSON.stringify(current)) {
+    throw new AriavaCliError(
+      'ERR_HOST_RESET_REMOVE_STALE_JOURNAL',
+      'Host-domain reset journal changed before guarded removal.',
+      { retryable: true, remediation: { message: 'Re-run the Host reset recovery sequence from the current journal.' } },
+    );
+  }
+  consumeRestoreConfirmation(confirmation, stored, resources);
+  assertHostIdentityOperationLeaseOwned(operationLease, resources);
+  removeSecureFileIfPresent(resources.hostDomainResetJournalPath, options.uid, {
+    ...options.hooks,
+    beforeUnlink(path) {
+      options.hooks?.beforeUnlink?.(path);
+      assertHostIdentityOperationLeaseOwned(operationLease, resources);
+    },
+  });
 }
 
 function consumeRestoreConfirmation(
   confirmation: RestoreConfirmation,
+  stored: HostDomainResetJournalV1,
   resources: ProfileResourceSet,
-  current: HostDomainResetJournalV1,
 ): RestoreConfirmationPayload {
-  const payload = verifyRestoreConfirmation(confirmation, resources, current);
-  CONFIRMATION_PAYLOADS.delete(confirmation);
+  if ((typeof confirmation !== 'object' && typeof confirmation !== 'function') || confirmation === null) {
+    throw forgedConfirmation();
+  }
+  const payload = CONFIRMATIONS.get(confirmation);
+  if (!payload) throw forgedConfirmation();
+  if (payload.operationId !== stored.operationId) throw removalBindingError('ERR_HOST_RESET_REMOVE_WRONG_OPERATION');
+  if (payload.journalDigest !== encodeHostDomainResetJournal(stored, resources)) {
+    throw removalBindingError('ERR_HOST_RESET_REMOVE_STALE_JOURNAL');
+  }
+  if (JSON.stringify(payload.service) !== JSON.stringify(stored.service)) {
+    throw removalBindingError('ERR_HOST_RESET_REMOVE_WRONG_SERVICE');
+  }
+  if (payload.replacementHostId !== stored.newHostId || payload.replacementKeyId !== stored.newKeyId
+    || !isExactIdentityReference(resources, stored.newHostId, payload.identityReference)
+    || typeof payload.restoreReturn !== 'boolean') {
+    throw removalBindingError('ERR_HOST_RESET_REMOVE_WRONG_IDENTITY');
+  }
+  CONFIRMATIONS.delete(confirmation);
   return payload;
 }
 
-function assertReplacementIdentityReference(
+function assertReplacementIdentity(
   resources: ProfileResourceSet,
-  current: HostDomainResetJournalV1,
-  identityReference: HostPrivateKeyStorage,
+  journal: HostDomainResetJournalV1,
+  replacement: HostIdentity,
 ): void {
-  const valid = identityReference.type === 'linux-json'
-    ? identityReference.path === resources.identityMetadataPath
-    : identityReference.service === 'io.noyx.ariava.host-identity'
-      && current.newHostId !== null
-      && identityReference.account === current.newHostId;
-  if (!valid) throw invalidConfirmation();
+  if (replacement.hostId !== journal.newHostId || replacement.keyId !== journal.newKeyId
+    || !isExactIdentityReference(resources, replacement.hostId, replacement.privateKeyStorage)) {
+    throw removalBindingError('ERR_HOST_RESET_REMOVE_WRONG_IDENTITY');
+  }
+}
+
+function isExactIdentityReference(
+  resources: ProfileResourceSet,
+  hostId: string | null,
+  reference: HostIdentity['privateKeyStorage'],
+): boolean {
+  if (reference.type === 'linux-json') return reference.path === resources.identityMetadataPath;
+  return hostId !== null
+    && reference.service === 'io.noyx.ariava.host-identity'
+    && reference.account === hostId;
+}
+
+function forgedConfirmation(): AriavaCliError {
+  return new AriavaCliError(
+    'ERR_HOST_RESET_CONFIRMATION_FORGED',
+    'Host restore confirmation is forged, reused, or unrecognized.',
+    { retryable: false, remediation: { message: 'Re-run the Host reset recovery to obtain a fresh confirmation.' } },
+  );
+}
+
+function removalBindingError(code:
+  | 'ERR_HOST_RESET_REMOVE_WRONG_OPERATION'
+  | 'ERR_HOST_RESET_REMOVE_STALE_JOURNAL'
+  | 'ERR_HOST_RESET_REMOVE_WRONG_SERVICE'
+  | 'ERR_HOST_RESET_REMOVE_WRONG_IDENTITY'
+): AriavaCliError {
+  return new AriavaCliError(code, 'Host restore confirmation does not match the current reset journal.', { retryable: false });
+}
+
+function invalidConfirmation(): TypeError {
+  return new TypeError('Host-domain reset journal restore confirmation is invalid');
 }
 
 interface JournalAdvancementLock {
@@ -294,12 +310,4 @@ function journalAdvancementLockedError(): AriavaCliError {
     retryable: true,
     remediation: { message: 'Wait for the other onboarding process to finish, then retry.' },
   });
-}
-
-function transitionViolationError(reason: HostResetJournalViolation): TypeError {
-  return new TypeError(`Host-domain reset journal transition is invalid: ${reason.kind}`);
-}
-
-function invalidConfirmation(): TypeError {
-  return new TypeError('Host-domain reset journal restore confirmation is invalid');
 }

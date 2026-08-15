@@ -493,10 +493,8 @@ describe('profile-aware identity reset', () => {
 
     const result = await resetProfileIdentity(harness.contexts[profileId], {
       bridgeVersion: '1.2.3-test',
-      reset: async (store, relayBaseUrl) => ({
-        identity: await store.resetAfterExplicitConfirmation(),
-        revokedOldIdentity: relayBaseUrl.startsWith('http'),
-      }),
+      revoke: async (_identity, relayBaseUrl) => (relayBaseUrl.startsWith('http') ? 'revoked' : 'identity-already-revoked'),
+      replace: (store, operationId) => store.resetAfterExplicitConfirmation(operationId),
       enroll: async (relayBaseUrl, identity, metadata, encryptionIdentity) => {
         enrollment = {
           relayBaseUrl,
@@ -577,13 +575,11 @@ describe('profile-aware identity reset', () => {
 
     await expect(resetProfileIdentity(context, {
       bridgeVersion: '1.2.3-test',
-      reset: async (store) => {
+      revoke: async () => {
         resetCalls += 1;
-        return {
-          identity: await store.resetAfterExplicitConfirmation(),
-          revokedOldIdentity: true,
-        };
+        return 'revoked';
       },
+      replace: (store, operationId) => store.resetAfterExplicitConfirmation(operationId),
       enroll: async () => {
         enrollmentCalls += 1;
         context.access?.('relayRequests');
