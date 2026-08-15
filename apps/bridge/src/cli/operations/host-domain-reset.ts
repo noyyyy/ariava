@@ -17,14 +17,17 @@ import { assertCurrentRuntimeArtifacts } from '../../state-store';
 import {
   HOST_DOMAIN_RESET_JOURNAL_VERSION,
   advanceHostDomainResetJournal,
+  createHostDomainResetJournal,
   hostDomainResourceDigest,
   identityResourceDigest,
   loadHostDomainResetJournal,
-  removeHostDomainResetJournal,
-  writeHostDomainResetJournal,
+  removeAfterServiceRestoreConfirmed,
+  type HostDomainResetJournalTransition,
   type HostDomainResetJournalV1,
   type HostDomainResetServiceBackend,
 } from './host-domain-reset-journal';
+import { restoreHostDomainServiceAndConfirm } from './host-domain-reset-journal-store';
+import type { HostIdentityOperationLease } from './host-identity-operation-lock';
 import type { AriavaProfileCliContext } from '../context';
 
 export interface HostDomainResetPrimitive {
@@ -59,9 +62,9 @@ export async function resetHostDomain(
   context.validation.descriptor();
   const loaded = await import('../context').then(({ loadResolvedProfileConfig }) => loadResolvedProfileConfig(context));
   let recoveryJournal: HostDomainResetJournalV1 | null = null;
-  return context.hostIdentityOperationLock.run(loaded.resources, async () => {
+  return context.hostIdentityOperationLock.run(loaded.resources, async (lease) => {
     try {
-      return await resetHostDomainUnlocked(context, dependencies, (journal) => { recoveryJournal = journal; });
+      return await resetHostDomainUnlocked(context, dependencies, lease, (journal) => { recoveryJournal = journal; });
     } catch (error) {
       throw normalizeResetRecoveryError(context, recoveryJournal, error);
     }
@@ -71,6 +74,7 @@ export async function resetHostDomain(
 async function resetHostDomainUnlocked(
   context: AriavaProfileCliContext,
   dependencies: HostDomainResetPrimitive,
+  lease: HostIdentityOperationLease,
   recordRecoveryJournal: (journal: HostDomainResetJournalV1) => void,
 ): Promise<HostDomainResetResult> {
   context.validation.descriptor();
@@ -82,13 +86,9 @@ async function resetHostDomainUnlocked(
   if (journal) recordRecoveryJournal(journal);
   let coordinator: ReturnType<AriavaProfileCliContext['runtimeCoordinator']['acquire']> | undefined;
 
-  const advance = (patch: Parameters<typeof advanceHostDomainResetJournal>[2]) => {
-    journal = advanceHostDomainResetJournal(
-      resources,
-      journal!,
-      { ...patch, updatedAt: new Date().toISOString() },
-      { operationLockHeld: true },
-    );
+  const now = (): string => new Date().toISOString();
+  const advance = (transition: HostDomainResetJournalTransition) => {
+    journal = advanceHostDomainResetJournal(resources, journal!, transition, lease);
     recordRecoveryJournal(journal);
     dependencies.hooks?.afterPhase?.(journal.phase);
     return journal;
@@ -127,7 +127,7 @@ async function resetHostDomainUnlocked(
       revoke: { state: 'not-attempted', outcome: null },
       service,
     };
-    writeHostDomainResetJournal(resources, journal);
+    createHostDomainResetJournal(resources, journal, lease);
     recordRecoveryJournal(journal);
   }
 
@@ -140,11 +140,11 @@ async function resetHostDomainUnlocked(
   }
   let replacement: HostIdentity;
   try {
-    if (journal.phase === 'quarantine-pending') advance({ phase: 'quarantined' });
+    if (journal.phase === 'quarantine-pending') advance({ kind: 'advance', phase: 'quarantined', at: now() });
     const store = context.identity.create(resources, context.platform);
     if (journal.phase === 'quarantined') {
       journal = await prepareIdentityInspectionJournal(
-        context, resources, store, journal, dependencies, recordRecoveryJournal,
+        context, resources, store, journal, lease, dependencies, recordRecoveryJournal,
       );
     }
 
@@ -172,30 +172,29 @@ async function resetHostDomainUnlocked(
       }
       coordinator.dispose();
       coordinator = undefined;
-      const processRunning = context.hostDomainResetLifecycle.restoreAndConfirm(
-        journal.service, publicIdentityMetadata(recoveredReplacement).privateKeyStorage,
+      const identityReference = publicIdentityMetadata(recoveredReplacement).privateKeyStorage;
+      const { processRunning, confirmation } = restoreHostDomainServiceAndConfirm(
+        resources,
+        journal,
+        lease,
+        identityReference,
+        (snapshot, reference) => context.hostDomainResetLifecycle.restoreAndConfirm(snapshot, reference),
       );
-      removeHostDomainResetJournal(resources);
+      removeAfterServiceRestoreConfirmed(resources, journal, lease, confirmation);
       return resetResult(journal, recoveredReplacement, processRunning);
     }
     const oldIdentity = await loadExpectedOldIdentity(store, journal);
     if (journal.phase === 'prepared') {
-      if (oldIdentity) advance({ phase: 'revoke-pending', revoke: { state: 'pending', outcome: null } });
-      else advance({
-        phase: 'signing-replacement-pending',
-        signingReplacementAttemptedAt: new Date().toISOString(),
-      });
+      if (oldIdentity) advance({ kind: 'start-revoke', at: now() });
+      else advance({ kind: 'begin-signing-replacement', at: now() });
     }
     if (journal.phase === 'revoke-pending') {
       if (!oldIdentity) throw recoveryRequired('Old Host identity is unavailable while Relay revoke is pending');
       const outcome = await dependencies.revoke(oldIdentity, resolved.relayBaseUrl);
-      advance({ phase: 'old-identity-revoked', revoke: { state: 'complete', outcome } });
+      advance({ kind: 'complete-revoke', at: now(), outcome });
     }
     if (journal.phase === 'old-identity-revoked') {
-      advance({
-        phase: 'signing-replacement-pending',
-        signingReplacementAttemptedAt: new Date().toISOString(),
-      });
+      advance({ kind: 'begin-signing-replacement', at: now() });
     }
 
     replacement = await adoptOrReplaceSigningIdentity(store, journal, dependencies);
@@ -204,7 +203,12 @@ async function resetHostDomainUnlocked(
     }
     if (journal.phase === 'signing-replacement-pending') {
       dependencies.hooks?.afterEffect?.('signing-replaced');
-      advance({ phase: 'signing-identity-replaced', newHostId: replacement.hostId, newKeyId: replacement.keyId });
+      advance({
+        kind: 'complete-signing-replacement',
+        at: now(),
+        newHostId: replacement.hostId,
+        newKeyId: replacement.keyId,
+      });
     }
     replacement = await requireReplacement(store, journal);
     store.completeExplicitReset?.(journal.operationId);
@@ -229,7 +233,7 @@ async function resetHostDomainUnlocked(
     }
     dependencies.hooks?.afterEffect?.('encryption-replaced');
     if (phaseBefore(journal.phase, 'encryption-identity-replaced')) {
-      advance({ phase: 'encryption-identity-replaced', encryptionIdentityReplacedAt: new Date().toISOString() });
+      advance({ kind: 'complete-encryption-replacement', at: now() });
     }
     encryptionStore.completeReset?.(journal.operationId);
 
@@ -241,7 +245,7 @@ async function resetHostDomainUnlocked(
     );
     dependencies.hooks?.afterEffect?.('artifacts-cleared');
     if (phaseBefore(journal.phase, 'runtime-artifacts-cleared')) {
-      advance({ phase: 'runtime-artifacts-cleared', runtimeArtifactsClearedAt: new Date().toISOString() });
+      advance({ kind: 'complete-artifact-cleanup', at: now() });
     }
 
     const expectedConfig = { ...baseConfig, identity: publicIdentityMetadata(replacement) };
@@ -252,7 +256,7 @@ async function resetHostDomainUnlocked(
     }
     dependencies.hooks?.afterEffect?.('config-saved');
     if (phaseBefore(journal.phase, 'config-saved')) {
-      advance({ phase: 'config-saved', configSavedAt: new Date().toISOString() });
+      advance({ kind: 'complete-config-save', at: now() });
     }
 
     await dependencies.enroll(resolved.relayBaseUrl, replacement, {
@@ -262,7 +266,7 @@ async function resetHostDomainUnlocked(
     }, encryptionIdentity);
     dependencies.hooks?.afterEffect?.('enrolled');
     if (phaseBefore(journal.phase, 'enrolled')) {
-      advance({ phase: 'enrolled', enrolledAt: new Date().toISOString() });
+      advance({ kind: 'complete-enrollment', at: now() });
     }
 
     context.hostDomainResetLifecycle.synchronizeMetadata(
@@ -270,20 +274,23 @@ async function resetHostDomainUnlocked(
     );
     dependencies.hooks?.afterEffect?.('service-metadata-synchronized');
     if (phaseBefore(journal.phase, 'service-metadata-synchronized')) {
-      advance({
-        phase: 'service-metadata-synchronized',
-        serviceMetadataSynchronizedAt: new Date().toISOString(),
-      });
+      advance({ kind: 'complete-metadata-sync', at: now() });
     }
-    if (phaseBefore(journal.phase, 'service-restore-pending')) advance({ phase: 'service-restore-pending' });
+    if (phaseBefore(journal.phase, 'service-restore-pending')) advance({ kind: 'complete-restore-intent', at: now() });
   } finally {
     coordinator?.dispose();
   }
 
   const identityReference = publicIdentityMetadata(replacement!).privateKeyStorage;
-  const processRunning = context.hostDomainResetLifecycle.restoreAndConfirm(journal.service, identityReference);
+  const { processRunning, confirmation } = restoreHostDomainServiceAndConfirm(
+    resources,
+    journal,
+    lease,
+    identityReference,
+    (snapshot, reference) => context.hostDomainResetLifecycle.restoreAndConfirm(snapshot, reference),
+  );
   dependencies.hooks?.afterEffect?.('service-restored');
-  removeHostDomainResetJournal(resources);
+  removeAfterServiceRestoreConfirmed(resources, journal, lease, confirmation);
   return resetResult(journal, replacement!, processRunning);
 }
 
@@ -391,6 +398,7 @@ async function prepareIdentityInspectionJournal(
   resources: Parameters<typeof hostDomainResourceDigest>[0],
   store: ReturnType<AriavaProfileCliContext['identity']['create']>,
   journal: HostDomainResetJournalV1,
+  lease: HostIdentityOperationLease,
   dependencies: HostDomainResetPrimitive,
   recordRecoveryJournal: (journal: HostDomainResetJournalV1) => void,
 ): Promise<HostDomainResetJournalV1> {
@@ -410,7 +418,8 @@ async function prepareIdentityInspectionJournal(
   }
   const oldEncryptionIdentity = context.encryptionIdentity.create(resources, context.platform).load();
   const prepared = advanceHostDomainResetJournal(resources, journal, {
-    phase: 'prepared',
+    kind: 'bind-prepared',
+    at: new Date().toISOString(),
     oldHostId: oldIdentity?.hostId ?? legacyEvidence?.oldHostId ?? null,
     oldKeyId: oldIdentity?.keyId ?? legacyEvidence?.oldKeyId ?? null,
     oldEncryptionKeyId: oldEncryptionIdentity?.encryptionKeyId ?? null,
@@ -423,8 +432,7 @@ async function prepareIdentityInspectionJournal(
       interruptedCreationAccount: legacyEvidence.cleanup?.interruptedCreationAccount ?? null,
     } : null,
     revoke: oldIdentity ? { state: 'not-attempted', outcome: null } : { state: 'skipped', outcome: 'old-identity-unreadable' },
-    updatedAt: new Date().toISOString(),
-  }, { operationLockHeld: true });
+  }, lease);
   recordRecoveryJournal(prepared);
   dependencies.hooks?.afterPhase?.(prepared.phase);
   return prepared;

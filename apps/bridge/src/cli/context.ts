@@ -1,4 +1,4 @@
-import { withHostIdentityOperationLock } from './operations/host-identity-operation-lock';
+import { withHostIdentityOperationLock, type HostIdentityOperationLease } from './operations/host-identity-operation-lock';
 import { unmanagedHostDomainResetLifecycle, type HostDomainResetLifecycleAdapter } from './operations/host-domain-reset';
 import { createRuntimeHostReplacementSpoolKeyStore, type HostReplacementSpoolKeyStore } from '../e2e/local-spool';
 import { acquireRuntimeCoordinator, type RuntimeCoordinator } from '../runtime-lock';
@@ -140,7 +140,7 @@ export interface ProfileHostReplacementSpoolKeyFactory {
 }
 
 export interface ProfileHostIdentityOperationLock {
-  run<T>(resources: ResolvedProfileResources, operation: () => Promise<T>): Promise<T>;
+  run<T>(resources: ResolvedProfileResources, operation: (lease: HostIdentityOperationLease) => Promise<T>): Promise<T>;
 }
 
 export interface AriavaProfileCliContext {

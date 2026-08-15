@@ -15,6 +15,7 @@ import type {
   HostIdentityStore,
 } from '../../src/identity';
 import type { AriavaProfileDescriptor, AriavaProfileId } from '../../src/cli/profile';
+import { withHostIdentityOperationLock } from '../../src/cli/operations/host-identity-operation-lock';
 
 export const PROFILE_ACCESS_KINDS = [
   'filesystemReads',
@@ -121,7 +122,7 @@ export function createProfileCliHarness(): ProfileCliHarness {
           await previous;
           events.push({ profile: profile.id, initiatedBy: profile.id, action: 'hostIdentityOperationLock.run', path: lockPath });
           try {
-            return await operation();
+            return await withHostIdentityOperationLock(resources, operation);
           } finally {
             release();
             if (hostIdentityOperationTails.get(lockPath) === tail) hostIdentityOperationTails.delete(lockPath);

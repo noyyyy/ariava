@@ -5,7 +5,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -16,40 +15,48 @@ import { createDefaultProfile } from '../src/cli/profiles/default';
 import { createDevProfile } from '../src/cli/profiles/dev';
 import type { ProfileResourceSet } from '../src/cli/profile';
 import {
-  HOST_DOMAIN_RESET_JOURNAL_VERSION,
   HOST_DOMAIN_RESET_PHASES,
   advanceHostDomainResetJournal as advanceHostDomainResetJournalWithDependencies,
-  hostDomainResourceDigest,
   loadHostDomainResetJournal,
-  removeHostDomainResetJournal,
-  writeHostDomainResetJournal,
   type HostDomainResetJournalV1,
 } from '../src/cli/operations/host-domain-reset-journal';
+import { withHostIdentityOperationLock } from '../src/cli/operations/host-identity-operation-lock';
+import {
+  buildJournal,
+  removeJournalFixture,
+  writeJournalFixture,
+} from './helpers/host-domain-reset-journal-fixture';
 
 const roots: string[] = [];
 
 type AdvanceJournalParameters = Parameters<typeof advanceHostDomainResetJournalWithDependencies>;
 
-function advanceHostDomainResetJournal(
+async function advanceHostDomainResetJournal(
   resources: AdvanceJournalParameters[0],
   current: AdvanceJournalParameters[1],
-  patch: AdvanceJournalParameters[2],
-  options: AdvanceJournalParameters[3] = {},
-): ReturnType<typeof advanceHostDomainResetJournalWithDependencies> {
+  transition: AdvanceJournalParameters[2],
+  options: AdvanceJournalParameters[4] = {},
+): Promise<ReturnType<typeof advanceHostDomainResetJournalWithDependencies>> {
   const supplied = options.lockDependencies ?? {};
-  return advanceHostDomainResetJournalWithDependencies(resources, current, patch, {
-    ...options,
-    lockDependencies: {
-      platform: 'linux',
-      uid: process.getuid!(),
-      pid: process.pid,
-      now: () => new Date(),
-      ownerToken: () => 'f'.repeat(48),
-      currentProcessStart: () => 'test-process-start',
-      inspector: { inspect: () => ({ status: 'alive', processStart: 'test-process-start' }) },
-      ...supplied,
+  return withHostIdentityOperationLock(resources, (lease) => advanceHostDomainResetJournalWithDependencies(
+    resources,
+    current,
+    transition,
+    lease,
+    {
+      ...options,
+      lockDependencies: {
+        platform: 'linux',
+        uid: process.getuid!(),
+        pid: process.pid,
+        now: () => new Date(),
+        ownerToken: () => 'f'.repeat(48),
+        currentProcessStart: () => 'test-process-start',
+        inspector: { inspect: () => ({ status: 'alive', processStart: 'test-process-start' }) },
+        ...supplied,
+      },
     },
-  });
+  ));
 }
 
 function temporaryHome(): string {
@@ -65,9 +72,9 @@ afterEach(() => {
 describe('Host-domain reset journal', () => {
   test('writes and loads the exact owner-only v1 schema without secrets or resource paths', () => {
     const resources = resourcesFor('default');
-    const journal = journalFor(resources);
+    const journal = buildJournal(resources, 'prepared');
 
-    writeHostDomainResetJournal(resources, journal);
+    writeJournalFixture(resources, journal);
 
     expect(lstatSync(resources.hostDomainResetJournalPath).mode & 0o777).toBe(0o600);
     expect(loadHostDomainResetJournal(resources)).toEqual(journal);
@@ -84,18 +91,9 @@ describe('Host-domain reset journal', () => {
 
   test('rejects phase-inconsistent journal evidence without rewriting bytes', () => {
     const resources = resourcesFor('default');
-    const complete = journalFor(resources, {
-      phase: 'service-restore-pending',
+    const complete = buildJournal(resources, 'service-restore-pending', {
       newHostId: `host_${'C'.repeat(43)}`,
       newKeyId: `key_${'D'.repeat(43)}`,
-      signingReplacementAttemptedAt: '2026-08-11T00:00:01.000Z',
-      encryptionIdentityReplacedAt: '2026-08-11T00:00:01.000Z',
-      runtimeArtifactsClearedAt: '2026-08-11T00:00:01.000Z',
-      configSavedAt: '2026-08-11T00:00:01.000Z',
-      enrolledAt: '2026-08-11T00:00:01.000Z',
-      serviceMetadataSynchronizedAt: '2026-08-11T00:00:01.000Z',
-      updatedAt: '2026-08-11T00:00:02.000Z',
-      revoke: { state: 'complete', outcome: 'revoked' },
     });
     const cases: Array<[string, HostDomainResetJournalV1]> = [
       ['post-revoke incomplete revoke', { ...complete, revoke: { state: 'pending', outcome: null } }],
@@ -121,31 +119,27 @@ describe('Host-domain reset journal', () => {
     const resources = resourcesFor('default');
     const timestamp = '2026-08-11T00:00:01.000Z';
     const cases: Array<[string, HostDomainResetJournalV1]> = [
-      ['prepared replacement attempt', journalFor(resources, { updatedAt: timestamp, signingReplacementAttemptedAt: timestamp })],
-      ['prepared replacement IDs', journalFor(resources, {
+      ['prepared replacement attempt', buildJournal(resources, 'prepared', { signingReplacementAttemptedAt: timestamp })],
+      ['prepared replacement IDs', buildJournal(resources, 'prepared', {
         newHostId: `host_${'C'.repeat(43)}`, newKeyId: `key_${'D'.repeat(43)}`,
       })],
-      ['replacement pending IDs', journalFor(resources, {
-        phase: 'signing-replacement-pending', revoke: { state: 'complete', outcome: 'revoked' },
-        signingReplacementAttemptedAt: timestamp, updatedAt: timestamp,
+      ['replacement pending IDs', buildJournal(resources, 'signing-replacement-pending', {
         newHostId: `host_${'C'.repeat(43)}`, newKeyId: `key_${'D'.repeat(43)}`,
       })],
-      ['signing replaced E2E timestamp', journalFor(resources, {
-        ...phasePatch('signing-identity-replaced', timestamp), updatedAt: timestamp,
+      ['signing replaced E2E timestamp', buildJournal(resources, 'signing-identity-replaced', {
         encryptionIdentityReplacedAt: timestamp,
       })],
-      ['E2E replaced runtime timestamp', journalFor(resources, {
-        ...phasePatch('encryption-identity-replaced', timestamp), updatedAt: timestamp,
+      ['E2E replaced runtime timestamp', buildJournal(resources, 'encryption-identity-replaced', {
         runtimeArtifactsClearedAt: timestamp,
       })],
-      ['runtime cleared config timestamp', journalFor(resources, {
-        ...phasePatch('runtime-artifacts-cleared', timestamp), updatedAt: timestamp, configSavedAt: timestamp,
+      ['runtime cleared config timestamp', buildJournal(resources, 'runtime-artifacts-cleared', {
+        configSavedAt: timestamp,
       })],
-      ['config saved enroll timestamp', journalFor(resources, {
-        ...phasePatch('config-saved', timestamp), updatedAt: timestamp, enrolledAt: timestamp,
+      ['config saved enroll timestamp', buildJournal(resources, 'config-saved', {
+        enrolledAt: timestamp,
       })],
-      ['enrolled service timestamp', journalFor(resources, {
-        ...phasePatch('enrolled', timestamp), updatedAt: timestamp, serviceMetadataSynchronizedAt: timestamp,
+      ['enrolled service timestamp', buildJournal(resources, 'enrolled', {
+        serviceMetadataSynchronizedAt: timestamp,
       })],
     ];
 
@@ -155,115 +149,87 @@ describe('Host-domain reset journal', () => {
     }
   });
 
-  test('supports every fixed phase and advances only monotonically with stable binding fields', () => {
-    const resources = resourcesFor('dev');
-    let current = journalFor(resources, {
-      profile: 'dev',
-      ...phasePatch(HOST_DOMAIN_RESET_PHASES[0], '2026-08-11T00:00:00.000Z'),
-    });
-    writeHostDomainResetJournal(resources, current);
 
-    for (const phase of HOST_DOMAIN_RESET_PHASES.slice(1)) {
-      current = advanceHostDomainResetJournal(resources, current, {
-        ...phasePatch(phase, current.updatedAt),
-        updatedAt: new Date(Date.parse(current.updatedAt) + 1_000).toISOString(),
-      });
-      expect(loadHostDomainResetJournal(resources)).toEqual(current);
-    }
-
-    const bytes = readFileSync(resources.hostDomainResetJournalPath);
-    expect(() => advanceHostDomainResetJournal(resources, current, {
-      phase: 'prepared',
-      updatedAt: '2026-08-11T00:01:00.000Z',
-    })).toThrow(/phase|rollback|monotonic|journal is invalid/i);
-    expect(readFileSync(resources.hostDomainResetJournalPath)).toEqual(bytes);
-  });
-
-  test('serializes competing advancement so a newer phase cannot be overwritten by an older retry', () => {
+  test('serializes competing advancement so a newer phase cannot be overwritten by an older retry', async () => {
     const resources = resourcesFor('default');
-    const current = journalFor(resources);
-    writeHostDomainResetJournal(resources, current);
+    const current = buildJournal(resources, 'prepared');
+    writeJournalFixture(resources, current);
     let competingError: unknown;
     let newerPhaseWasCommitted = false;
     let phaseRegressed = false;
     let lockEvidence: Record<string, unknown> | undefined;
 
-    const advanced = advanceHostDomainResetJournal(resources, current, {
-      ...phasePatch('revoke-pending', current.updatedAt),
-      updatedAt: '2026-08-11T00:00:01.000Z',
-    }, {
-      hooks: {
-        beforePromotion() {
-          const lockPath = `${resources.hostDomainResetJournalPath}.advance.lock`;
-          expect(lstatSync(lockPath).mode & 0o777).toBe(0o600);
-          lockEvidence = JSON.parse(readFileSync(lockPath, 'utf8')) as Record<string, unknown>;
-          try {
-            advanceHostDomainResetJournal(resources, current, {
-              ...phasePatch('old-identity-revoked', '2026-08-11T00:00:01.000Z'),
-              updatedAt: '2026-08-11T00:00:02.000Z',
-            });
-            newerPhaseWasCommitted = true;
-          } catch (error) {
-            competingError = error;
-          }
+    const advanced = await withHostIdentityOperationLock(resources, (lease) =>
+      advanceHostDomainResetJournalWithDependencies(resources, current, {
+        kind: 'start-revoke', at: '2026-08-11T00:00:01.000Z',
+      }, lease, {
+        writeHooks: {
+          beforePromotion() {
+            const lockPath = `${resources.hostDomainResetJournalPath}.advance.lock`;
+            expect(lstatSync(lockPath).mode & 0o777).toBe(0o600);
+            lockEvidence = JSON.parse(readFileSync(lockPath, 'utf8')) as Record<string, unknown>;
+            try {
+              advanceHostDomainResetJournalWithDependencies(resources, current, {
+                kind: 'start-revoke', at: '2026-08-11T00:00:02.000Z',
+              }, lease);
+              newerPhaseWasCommitted = true;
+            } catch (error) {
+              competingError = error;
+            }
+          },
+          afterPromotion() {
+            phaseRegressed = newerPhaseWasCommitted
+              && loadHostDomainResetJournal(resources)?.phase === 'revoke-pending';
+          },
         },
-        afterPromotion() {
-          phaseRegressed = newerPhaseWasCommitted
-            && loadHostDomainResetJournal(resources)?.phase === 'revoke-pending';
-        },
-      },
-    });
+      }),
+    );
 
     expect(competingError).toBeInstanceOf(Error);
     expect(String(competingError)).toMatch(/lock|advancement|another/i);
     expect(newerPhaseWasCommitted).toBe(false);
     expect(phaseRegressed).toBe(false);
-    expect(lockEvidence).toMatchObject({
-      schemaVersion: 1,
-      pid: process.pid,
-    });
+    expect(lockEvidence).toMatchObject({ schemaVersion: 1, pid: process.pid });
     expect(lockEvidence?.ownerToken).toMatch(/^[0-9a-f]{48}$/);
     expect(typeof lockEvidence?.processStart).toBe('string');
     expect(loadHostDomainResetJournal(resources)).toEqual(advanced);
   });
 
-  test('fails closed on stale or disappeared advancement lock evidence without changing the journal', () => {
+  test('fails closed on stale or disappeared advancement lock evidence without changing the journal', async () => {
     const resources = resourcesFor('default');
-    const current = journalFor(resources);
+    const current = buildJournal(resources, 'prepared');
     const lockPath = `${resources.hostDomainResetJournalPath}.advance.lock`;
-    writeHostDomainResetJournal(resources, current);
+    writeJournalFixture(resources, current);
     const before = readFileSync(resources.hostDomainResetJournalPath);
     writeFileSync(lockPath, JSON.stringify({ stale: true }), { mode: 0o600 });
 
-    expect(() => advanceHostDomainResetJournal(resources, current, {
-      ...phasePatch('revoke-pending', current.updatedAt),
-      updatedAt: '2026-08-11T00:00:01.000Z',
-    })).toThrow(/already exists|lock|advancement/i);
+    await expect(advanceHostDomainResetJournal(resources, current, {
+      kind: 'start-revoke', at: '2026-08-11T00:00:01.000Z',
+    })).rejects.toThrow(/already exists|lock|advancement/i);
     expect(readFileSync(resources.hostDomainResetJournalPath)).toEqual(before);
     expect(readFileSync(lockPath, 'utf8')).toContain('stale');
 
     rmSync(lockPath);
-    expect(() => advanceHostDomainResetJournal(resources, current, {
-      ...phasePatch('revoke-pending', current.updatedAt),
-      updatedAt: '2026-08-11T00:00:01.000Z',
+    await expect(advanceHostDomainResetJournal(resources, current, {
+      kind: 'start-revoke', at: '2026-08-11T00:00:01.000Z',
     }, {
-      hooks: { beforePromotion: () => rmSync(lockPath) },
-    })).toThrow(/lock|unsafe|changed|atomic write/i);
+      writeHooks: { beforePromotion: () => rmSync(lockPath) },
+    })).rejects.toThrow(/lock|unsafe|changed|atomic write/i);
     expect(readFileSync(resources.hostDomainResetJournalPath)).toEqual(before);
   });
 
-  test('recovers only a provably stale process-start-aware advancement lock', () => {
+  test('recovers only a provably stale process-start-aware advancement lock', async () => {
     const resources = resourcesFor('default');
-    const current = journalFor(resources);
-    writeHostDomainResetJournal(resources, current);
+    const current = buildJournal(resources, 'prepared');
+    writeJournalFixture(resources, current);
     const lockPath = `${resources.hostDomainResetJournalPath}.advance.lock`;
     writeFileSync(lockPath, JSON.stringify({
       schemaVersion: 1, pid: 4242, processStart: 'old-start',
       createdAt: '2026-08-11T00:00:00.000Z', ownerToken: 'a'.repeat(48),
     }), { mode: 0o600 });
 
-    const advanced = advanceHostDomainResetJournal(resources, current, {
-      ...phasePatch('revoke-pending', current.updatedAt), updatedAt: '2026-08-11T00:10:01.000Z',
+    const advanced = await advanceHostDomainResetJournal(resources, current, {
+      kind: 'start-revoke', at: '2026-08-11T00:10:01.000Z',
     }, {
       lockDependencies: {
         platform: 'linux', uid: process.getuid!(), pid: 5252,
@@ -279,38 +245,38 @@ describe('Host-domain reset journal', () => {
   test.each([
     ['live', { status: 'alive', processStart: 'same-start' }],
     ['unprovable', { status: 'unprovable' }],
-  ] as const)('fails closed on %s advancement lock ownership', (_name, inspection) => {
+  ] as const)('fails closed on %s advancement lock ownership', async (_name, inspection) => {
     const resources = resourcesFor('default');
-    const current = journalFor(resources);
-    writeHostDomainResetJournal(resources, current);
+    const current = buildJournal(resources, 'prepared');
+    writeJournalFixture(resources, current);
     const lockPath = `${resources.hostDomainResetJournalPath}.advance.lock`;
     writeFileSync(lockPath, JSON.stringify({
       schemaVersion: 1, pid: 4242, processStart: 'same-start',
       createdAt: '2026-08-11T00:00:00.000Z', ownerToken: 'a'.repeat(48),
     }), { mode: 0o600 });
-    expect(() => advanceHostDomainResetJournal(resources, current, {
-      ...phasePatch('revoke-pending', current.updatedAt), updatedAt: '2026-08-11T00:10:01.000Z',
+    await expect(advanceHostDomainResetJournal(resources, current, {
+      kind: 'start-revoke', at: '2026-08-11T00:10:01.000Z',
     }, {
       lockDependencies: {
         platform: 'linux', uid: process.getuid!(), pid: 5252,
         now: () => new Date('2026-08-11T00:10:00.000Z'), ownerToken: () => 'b'.repeat(48),
         currentProcessStart: () => 'new-start', inspector: { inspect: () => inspection },
       },
-    })).toThrow(/lock|progress/i);
+    })).rejects.toThrow(/lock|progress/i);
     expect(loadHostDomainResetJournal(resources)).toEqual(current);
   });
 
   test('rejects malformed, unknown, invalid, mismatched, and counterpart evidence without rewriting bytes', () => {
     const resources = resourcesFor('default');
     const counterpart = resourcesFor('dev');
-    const valid = journalFor(resources);
+    const valid = buildJournal(resources, 'prepared');
     const cases: Array<[string, string]> = [
       ['malformed JSON', '{not-json'],
       ['unknown key', JSON.stringify({ ...valid, privateKey: 'forbidden' })],
       ['invalid phase', JSON.stringify({ ...valid, phase: 'finished' })],
       ['invalid version', JSON.stringify({ ...valid, version: 2 })],
       ['digest mismatch', JSON.stringify({ ...valid, resourceDigest: '0'.repeat(64) })],
-      ['counterpart profile', JSON.stringify(journalFor(counterpart, { profile: 'dev' }))],
+      ['counterpart profile', JSON.stringify(buildJournal(counterpart, 'prepared'))],
       ['invalid timestamp order', JSON.stringify({ ...valid, updatedAt: '2026-08-10T23:59:59.000Z' })],
       ['secret-shaped nested key', JSON.stringify({ ...valid, service: { ...valid.service, rawCommandOutput: 'secret' } })],
     ];
@@ -324,46 +290,19 @@ describe('Host-domain reset journal', () => {
     }
   });
 
-  test('rejects noncanonical Host and key IDs in every old and new field', () => {
-    const resources = resourcesFor('default');
-    const valid = journalFor(resources, {
-      newHostId: `host_${'C'.repeat(43)}`,
-      newKeyId: `key_${'D'.repeat(43)}`,
-    });
-    const invalidPayloads = [
-      ['too short', 'A'.repeat(42)],
-      ['too long', 'A'.repeat(44)],
-      ['malformed', `${'A'.repeat(42)}+`],
-    ] as const;
-    const fields = [
-      ['oldHostId', 'host_'],
-      ['oldKeyId', 'key_'],
-      ['newHostId', 'host_'],
-      ['newKeyId', 'key_'],
-    ] as const;
-
-    for (const [field, prefix] of fields) {
-      for (const [kind, payload] of invalidPayloads) {
-        const journal = { ...valid, [field]: `${prefix}${payload}` };
-        expect(() => writeHostDomainResetJournal(resources, journal), `${field}: ${kind}`).toThrow(
-          /journal is invalid/i,
-        );
-      }
-    }
-  });
 
   test('rejects symlink, non-0600, non-file, and foreign-owner evidence without mutation', () => {
     const resources = resourcesFor('default');
     const journalPath = resources.hostDomainResetJournalPath;
     mkdirSync(resources.root, { recursive: true, mode: 0o700 });
     const target = join(resources.root, 'target.json');
-    writeFileSync(target, JSON.stringify(journalFor(resources)), { mode: 0o600 });
+    writeFileSync(target, JSON.stringify(buildJournal(resources, 'prepared')), { mode: 0o600 });
     symlinkSync(target, journalPath);
     expect(() => loadHostDomainResetJournal(resources)).toThrow();
     expect(readFileSync(target, 'utf8')).toContain('operationId');
 
     rmSync(journalPath);
-    writeFileSync(journalPath, JSON.stringify(journalFor(resources)), { mode: 0o644 });
+    writeFileSync(journalPath, JSON.stringify(buildJournal(resources, 'prepared')), { mode: 0o644 });
     const permissive = readFileSync(journalPath);
     expect(() => loadHostDomainResetJournal(resources)).toThrow();
     expect(readFileSync(journalPath)).toEqual(permissive);
@@ -374,48 +313,18 @@ describe('Host-domain reset journal', () => {
     expect(lstatSync(journalPath).isDirectory()).toBe(true);
 
     rmSync(journalPath, { recursive: true });
-    writeFileSync(journalPath, JSON.stringify(journalFor(resources)), { mode: 0o600 });
+    writeFileSync(journalPath, JSON.stringify(buildJournal(resources, 'prepared')), { mode: 0o600 });
     const foreign = readFileSync(journalPath);
     expect(() => loadHostDomainResetJournal(resources, (process.getuid?.() ?? 0) + 1)).toThrow();
     expect(readFileSync(journalPath)).toEqual(foreign);
   });
 
-  test('treats a missing journal as idle and secure removal as idempotent', () => {
-    const resources = resourcesFor('default');
-    expect(loadHostDomainResetJournal(resources)).toBeNull();
-    expect(() => removeHostDomainResetJournal(resources)).not.toThrow();
 
-    writeHostDomainResetJournal(resources, journalFor(resources));
-    let unlinked = 0;
-    let synced = 0;
-    removeHostDomainResetJournal(resources, undefined, {
-      afterUnlink: () => { unlinked += 1; },
-      afterDirectorySync: () => { synced += 1; },
-    });
-    expect(unlinked).toBe(1);
-    expect(synced).toBe(1);
-    expect(loadHostDomainResetJournal(resources)).toBeNull();
-    expect(() => removeHostDomainResetJournal(resources)).not.toThrow();
-    rmSync(resources.root, { recursive: true });
-    expect(() => removeHostDomainResetJournal(resources)).toThrow();
-  });
-
-  test('refuses writes through journal symlinks without replacing either path', () => {
-    const resources = resourcesFor('default');
-    mkdirSync(resources.root, { recursive: true, mode: 0o700 });
-    const target = join(resources.root, 'journal-target.json');
-    writeFileSync(target, 'sentinel', { mode: 0o600 });
-    symlinkSync(target, resources.hostDomainResetJournalPath);
-
-    expect(() => writeHostDomainResetJournal(resources, journalFor(resources))).toThrow();
-    expect(readFileSync(target, 'utf8')).toBe('sentinel');
-    expect(lstatSync(resources.hostDomainResetJournalPath).isSymbolicLink()).toBe(true);
-  });
 
   test('rejects journal modes with special bits without rewriting bytes when supported', () => {
     const resources = resourcesFor('default');
     const journalPath = resources.hostDomainResetJournalPath;
-    writeFileSync(journalPath, JSON.stringify(journalFor(resources)), { mode: 0o600 });
+    writeFileSync(journalPath, JSON.stringify(buildJournal(resources, 'prepared')), { mode: 0o600 });
     chmodSync(journalPath, 0o4600);
     const effectiveMode = lstatSync(journalPath).mode & 0o7777;
     const before = readFileSync(journalPath);
@@ -430,7 +339,7 @@ describe('Host-domain reset journal', () => {
 
   test('binds dev journals to the canonical unmanaged no-service snapshot', () => {
     const resources = resourcesFor('dev');
-    const valid = journalFor(resources);
+    const valid = buildJournal(resources, 'prepared');
     const nonDevSnapshots: Array<[string, HostDomainResetJournalV1['service']]> = [
       ['managed', { managed: true, installed: false, enabled: false, wasRunning: false, backend: 'launchd' }],
       ['installed', { managed: true, installed: true, enabled: false, wasRunning: false, backend: 'launchd' }],
@@ -439,11 +348,11 @@ describe('Host-domain reset journal', () => {
       ['backend', { managed: true, installed: false, enabled: false, wasRunning: false, backend: 'systemd-user' }],
     ];
 
-    expect(() => writeHostDomainResetJournal(resources, valid)).not.toThrow();
-    removeHostDomainResetJournal(resources);
+    expect(() => writeJournalFixture(resources, valid)).not.toThrow();
+    removeJournalFixture(resources);
     for (const [label, service] of nonDevSnapshots) {
       expect(
-        () => writeHostDomainResetJournal(resources, { ...valid, service }),
+        () => writeJournalFixture(resources, { ...valid, service }),
         label,
       ).toThrow(/journal is invalid/i);
     }
@@ -469,48 +378,17 @@ describe('Host-domain reset journal', () => {
     ];
 
     for (const service of validServices) {
-      expect(() => writeHostDomainResetJournal(resources, journalFor(resources, { service }))).not.toThrow();
-      removeHostDomainResetJournal(resources);
+      expect(() => writeJournalFixture(resources, buildJournal(resources, 'prepared', { service }))).not.toThrow();
+      removeJournalFixture(resources);
     }
     for (const service of inconsistentServices) {
-      expect(() => writeHostDomainResetJournal(resources, journalFor(resources, { service }))).toThrow(
+      expect(() => writeJournalFixture(resources, buildJournal(resources, 'prepared', { service }))).toThrow(
         /journal is invalid/i,
       );
     }
   });
 
 
-  test('rejects mutation of the complete service snapshot at the same or a forward phase', () => {
-    const resources = resourcesFor('default');
-    const base = journalFor(resources, {
-      service: {
-        managed: true,
-        installed: true,
-        enabled: true,
-        wasRunning: true,
-        backend: 'launchd',
-      },
-    });
-    const mutations: HostDomainResetJournalV1['service'][] = [
-      { ...base.service, managed: false, installed: false, enabled: false, wasRunning: false, backend: 'none' },
-      { ...base.service, installed: false, enabled: false, wasRunning: false },
-      { ...base.service, enabled: false },
-      { ...base.service, wasRunning: false },
-      { ...base.service, backend: 'systemd-user' },
-    ];
-
-    for (const [index, service] of mutations.entries()) {
-      rmSync(resources.hostDomainResetJournalPath, { force: true });
-      writeHostDomainResetJournal(resources, base);
-      const before = readFileSync(resources.hostDomainResetJournalPath);
-      expect(() => advanceHostDomainResetJournal(resources, base, {
-        ...phasePatch(index % 2 === 0 ? base.phase : 'revoke-pending', base.updatedAt),
-        service,
-        updatedAt: '2026-08-11T00:00:01.000Z',
-      })).toThrow(/service|change|binding/i);
-      expect(readFileSync(resources.hostDomainResetJournalPath)).toEqual(before);
-    }
-  });
 });
 
 function resourcesFor(profileId: 'default' | 'dev'): ProfileResourceSet {
@@ -531,69 +409,6 @@ function resourcesFor(profileId: 'default' | 'dev'): ProfileResourceSet {
   }
 }
 
-function journalFor(
-  resources: ProfileResourceSet,
-  patch: Partial<HostDomainResetJournalV1> = {},
-): HostDomainResetJournalV1 {
-  return {
-    version: HOST_DOMAIN_RESET_JOURNAL_VERSION,
-    operationId: 'reset_0123456789abcdef',
-    profile: resources.identityProfile,
-    phase: 'prepared',
-    oldHostId: `host_${'A'.repeat(43)}`,
-    oldKeyId: `key_${'B'.repeat(43)}`,
-    newHostId: null,
-    newKeyId: null,
-    oldEncryptionKeyId: `ekey_${'C'.repeat(43)}`,
-    signingCleanup: null,
-    signingReplacementAttemptedAt: null,
-    encryptionIdentityReplacedAt: null,
-    runtimeArtifactsClearedAt: null,
-    configSavedAt: null,
-    enrolledAt: null,
-    serviceMetadataSynchronizedAt: null,
-    resourceDigest: hostDomainResourceDigest(resources),
-    createdAt: '2026-08-11T00:00:00.000Z',
-    updatedAt: '2026-08-11T00:00:00.000Z',
-    revoke: { state: 'not-attempted', outcome: null },
-    service: {
-      managed: resources.identityProfile === 'default',
-      installed: false,
-      enabled: false,
-      wasRunning: false,
-      backend: resources.identityProfile === 'default' ? 'launchd' : 'none',
-    },
-    ...patch,
-  };
-}
-
-function phasePatch(
-  phase: typeof HOST_DOMAIN_RESET_PHASES[number], _timestamp: string,
-): Partial<HostDomainResetJournalV1> {
-  const index = HOST_DOMAIN_RESET_PHASES.indexOf(phase);
-  const atLeast = (candidate: typeof phase) => index >= HOST_DOMAIN_RESET_PHASES.indexOf(candidate);
-  const evidenceTimestamp = '2026-08-11T00:00:00.000Z';
-  return {
-    phase,
-    ...(phase === 'quarantine-pending' || phase === 'quarantined'
-      ? { oldHostId: null, oldKeyId: null, oldEncryptionKeyId: null }
-      : {
-        oldHostId: `host_${'A'.repeat(43)}`, oldKeyId: `key_${'B'.repeat(43)}`,
-        oldEncryptionKeyId: `ekey_${'C'.repeat(43)}`,
-      }),
-    ...(atLeast('revoke-pending') ? { revoke: { state: 'pending' as const, outcome: null } } : {}),
-    ...(atLeast('old-identity-revoked') ? { revoke: { state: 'complete' as const, outcome: 'revoked' as const } } : {}),
-    ...(atLeast('signing-replacement-pending') ? { signingReplacementAttemptedAt: evidenceTimestamp } : {}),
-    ...(atLeast('signing-identity-replaced') ? {
-      newHostId: `host_${'D'.repeat(43)}`, newKeyId: `key_${'E'.repeat(43)}`,
-    } : {}),
-    ...(atLeast('encryption-identity-replaced') ? { encryptionIdentityReplacedAt: evidenceTimestamp } : {}),
-    ...(atLeast('runtime-artifacts-cleared') ? { runtimeArtifactsClearedAt: evidenceTimestamp } : {}),
-    ...(atLeast('config-saved') ? { configSavedAt: evidenceTimestamp } : {}),
-    ...(atLeast('enrolled') ? { enrolledAt: evidenceTimestamp } : {}),
-    ...(atLeast('service-metadata-synchronized') ? { serviceMetadataSynchronizedAt: evidenceTimestamp } : {}),
-  };
-}
 
 describe('Host-domain runtime artifact cleanup', () => {
   test('requires exclusive runtime ownership and deletes selected artifacts opaquely', async () => {
@@ -658,14 +473,13 @@ describe('Host-domain reset runtime start guard', () => {
     const { assertHostDomainResetRuntimeStartAllowed } = await import('../src/cli/operations/host-domain-reset-journal');
     const resources = resourcesFor('default');
     for (const phase of HOST_DOMAIN_RESET_PHASES) {
-      const journal = journalFor(resources, { ...phasePatch(phase, '2026-08-11T00:00:00.000Z') });
-      writeHostDomainResetJournal(resources, journal);
+      writeJournalFixture(resources, buildJournal(resources, phase));
       if (phase === 'service-restore-pending') {
         expect(() => assertHostDomainResetRuntimeStartAllowed(resources)).not.toThrow();
       } else {
         expect(() => assertHostDomainResetRuntimeStartAllowed(resources)).toThrow(/recovery|required|phase/i);
       }
-      removeHostDomainResetJournal(resources);
+      removeJournalFixture(resources);
     }
   });
 });

@@ -21,6 +21,7 @@ import commandFixture from '../../../packages/protocol/test/fixtures/command-e2e
 import type { ServiceManager } from '../src/host-manager';
 import { createDefaultProfile } from '../src/cli/profiles/default';
 import { FakeKeychain } from './fixtures/fake-keychain';
+import { withHostIdentityOperationLock } from '../src/cli/operations/host-identity-operation-lock';
 
 const roots: string[] = [];
 const originalFetch = globalThis.fetch;
@@ -373,7 +374,7 @@ describe('identity-safe public CLI', () => {
     const deps = cliDeps(profile.resources.root, identityPath, () => config, (next) => { config = next; }, output, errors);
     deps.createProfile = () => profile;
     deps.createHostIdentityStore = (path: string) => new MacOSKeychainHostIdentityStore(path, keychain);
-    deps.hostIdentityOperationLock = { run: (_resources, operation) => operation() };
+    deps.hostIdentityOperationLock = { run: withHostIdentityOperationLock };
     expect(await runPublicCli(['identity', 'reset', '--confirm', '--json'], deps)).toBe(1);
     expect(JSON.parse(errors[0]!)).toMatchObject({
       code: 'ERR_HOST_RESET_RECOVERY_REQUIRED',

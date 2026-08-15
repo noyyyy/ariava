@@ -15,7 +15,11 @@ import type { AriavaUserConfig } from '../src/host-manager/config';
 import { SecureFileError } from '../src/host-manager/secure-files';
 import { AriavaCliError } from '../src/host-manager/service/errors';
 import { acquireOnboardingLock } from '../src/host-manager/onboarding/lock';
-import { hostIdentityOperationLockPath } from '../src/cli/operations/host-identity-operation-lock';
+import {
+  hostIdentityOperationLockPath,
+  withHostIdentityOperationLock,
+} from '../src/cli/operations/host-identity-operation-lock';
+import type { HostIdentityOperationLease } from '../src/cli/operations/host-identity-operation-lock';
 import { RESET_ONLY_IDENTITY_EVIDENCE_SOURCE } from '../src/identity/reset-only-evidence-source';
 import { HostIdentityError } from '../src/identity/errors';
 import { enrollCurrentIdentity } from '../src/identity/manager';
@@ -32,21 +36,8 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-const activeTestHostIdentityLocks = new Set<string>();
-
 const deterministicHostIdentityOperationLock = {
-  async run<T>(resources: { hostDomainResetJournalPath: string }, operation: () => Promise<T>): Promise<T> {
-    const key = resources.hostDomainResetJournalPath;
-    if (activeTestHostIdentityLocks.has(key)) {
-      throw new AriavaCliError('ERR_HOST_RESET_IN_PROGRESS', 'Another Host identity transition is already in progress.', { retryable: true });
-    }
-    activeTestHostIdentityLocks.add(key);
-    try {
-      return await operation();
-    } finally {
-      activeTestHostIdentityLocks.delete(key);
-    }
-  },
+  run: withHostIdentityOperationLock,
 };
 
 function fixture(useProductionLock = false) {
@@ -129,7 +120,7 @@ function crashOnceAfterEffect(effect: Parameters<NonNullable<HostDomainResetHook
     value.context.hostIdentityOperationLock = {
       async run(resources, operation) {
         resetLocks.push(resources.hostDomainResetJournalPath);
-        return operation();
+        return withHostIdentityOperationLock(resources, operation);
       },
     };
     await initializeProfile(value.context);

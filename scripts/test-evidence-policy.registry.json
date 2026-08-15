@@ -166,5 +166,47 @@
     "testName": "negative mutation: rebuilding in the publish job is rejected",
     "ruleId": "STRUCT001",
     "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
+    "testName": "schema codec module imports only its pure leaves",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
+    "testName": "policy module imports no store or effect modules",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
+    "testName": "store module imports no coordinator or executor modules",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
+    "testName": "compatibility barrel exposes exactly the frozen §9 surface",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
+    "testName": "daemon, profile probe, and status reach journal API only through the barrel",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
+  },
+  {
+    "repository": "public",
+    "path": "apps/bridge/test/host-domain-reset-journal-boundary.policy.test.ts",
+    "testName": "production never imports the test-tree journal fixture helper",
+    "ruleId": "STRUCT001",
+    "propositionClass": "structural"
   }
 ]
