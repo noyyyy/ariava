@@ -18,7 +18,7 @@ import {
   buildEncryptionBindingBytes, buildLinkTranscriptBytes, contentSha256, deriveCommandReceiptDigest, deriveEncryptedCommandDigest,
   type CommandReceiptEnvelopeV1, type CommandResult, type EncryptedCommandEnvelopeV1,
 } from '@ariava/protocol';
-import { BridgeStateStore } from '../src/state-store';
+import { BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, BridgeStateStore } from '../src/state-store';
 import { LocalLinkKeyring, type ActiveLinkPinV2 } from '../src/e2e/link-keyring';
 import { deterministicCommandKeyringMaterial, withDeterministicCommandTime } from './fixtures/command-execution-keyring';
 import type { HostEncryptionIdentity } from '../src/identity';
@@ -379,7 +379,9 @@ describe('BridgeDaemon', () => {
     const daemon = new BridgeDaemon(config, [], identityStore);
     expect(JSON.parse(readFileSync(statePath, 'utf8')).schemaVersion).toBe(2);
     await (daemon as any).validateStartup();
-    expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject({ schemaVersion: 4, recentEvents: [], sessions: {} });
+    expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject({
+      schemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, recentEvents: [], sessions: {},
+    });
     daemon.stop();
   });
 

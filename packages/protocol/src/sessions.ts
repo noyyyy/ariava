@@ -1,4 +1,4 @@
-import type { ActionablePrompt, SessionStatus } from './events.js';
+import type { SessionStatus } from './events.js';
 
 export const SESSION_PRESENCES = ['active', 'ended'] as const;
 export type SessionPresence = (typeof SESSION_PRESENCES)[number];
@@ -12,10 +12,8 @@ export interface CanonicalSessionState {
   openingText?: string;
   latestActivityText?: string;
   workingDirectory?: string;
-  hbaseSessionKey?: string;
   harnessProvider?: string;
   status: SessionStatus;
-  actionablePrompt?: ActionablePrompt;
   updatedAt: string;
   lastEventId?: string;
   snoozedUntil?: string;
@@ -41,7 +39,6 @@ export interface SessionSummaryAssistant {
   openingText?: string;
   latestActivityText?: string;
   workingDirectory?: string;
-  hbaseSessionKey?: string;
   harnessProvider?: string;
   status: SessionStatus;
   updatedAt: string;

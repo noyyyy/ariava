@@ -9,7 +9,6 @@ export interface PiSessionInfo {
   provider: 'pi';
   projectName: string;
   cwd: string;
-  hbaseSessionKey?: string;
   harnessProvider?: 'pi';
   rawSessionName?: string;
   nameText: string;
@@ -31,10 +30,10 @@ type SessionManagerLike = NonNullable<ExtensionContext['sessionManager']> & {
 
 export function deriveSessionId(ctx: ExtensionContext): string {
   const sessionId = ctx.sessionManager?.getSessionId?.();
-  if (sessionId) {
-    return sessionId;
+  if (typeof sessionId !== 'string' || !sessionId.trim()) {
+    throw new Error('Pi session manager did not provide a stable native session ID');
   }
-  return `pi-${process.pid}-${Date.now()}`;
+  return sessionId;
 }
 
 export function deriveProjectName(ctx: ExtensionContext): string {
@@ -173,18 +172,17 @@ export function normalizeAssistantTextForEvent(
   return fallbackAssistantForEventType(type, session);
 }
 
-export function deriveSession(ctx: ExtensionContext): PiSessionInfo {
+export function deriveSession(ctx: ExtensionContext, nativeSessionId = deriveSessionId(ctx)): PiSessionInfo {
   const cwd = ctx.cwd ?? process.cwd();
   const projectName = deriveProjectName(ctx);
   const rawSessionName = deriveSessionName(ctx);
   const { firstUserText } = deriveMessageTexts(ctx);
 
   return {
-    sessionId: deriveSessionId(ctx),
+    sessionId: nativeSessionId,
     provider: 'pi',
     projectName,
     cwd,
-    hbaseSessionKey: deriveSessionId(ctx),
     harnessProvider: 'pi',
     rawSessionName,
     nameText: deriveNameText(rawSessionName, projectName),

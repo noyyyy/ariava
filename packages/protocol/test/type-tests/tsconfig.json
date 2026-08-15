@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.build.json",
+  "compilerOptions": {
+    "declaration": false,
+    "emitDeclarationOnly": false,
+    "noEmit": true,
+    "rootDir": "../..",
+    "types": []
+  },
+  "files": [
+    "current-v3-contract.ts",
+    "retired-exports.ts"
+  ]
+}

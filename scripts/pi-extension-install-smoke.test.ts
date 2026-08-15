@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
+import { AGENT_ADAPTER_PROTOCOL_HEADER, AGENT_ADAPTER_PROTOCOL_VERSION } from '../packages/protocol/src/agent-adapter';
 
 const repositoryRoot = join(import.meta.dir, '..');
 const installScript = join(repositoryRoot, 'scripts', 'install-pi-extension.sh');
@@ -62,12 +63,14 @@ if (!discoveryPath.startsWith(expectedHome + '/')) throw new Error('discovery pa
 
 const requests = [];
 const secret = 'temporary-loopback-secret';
+const agentAdapterProtocolHeader = ${JSON.stringify(AGENT_ADAPTER_PROTOCOL_HEADER)};
+const agentAdapterProtocolVersion = ${AGENT_ADAPTER_PROTOCOL_VERSION};
 const server = Bun.serve({
   hostname: '127.0.0.1',
   port: 0,
   async fetch(request) {
     const url = new URL(request.url);
-    const protocolVersion = request.headers.get('x-ariava-agent-adapter-version');
+    const protocolVersion = request.headers.get(agentAdapterProtocolHeader);
     requests.push({
       method: request.method,
       path: url.pathname,
@@ -75,7 +78,7 @@ const server = Bun.serve({
       protocolVersion,
     });
     if (request.headers.get('authorization') !== 'Bearer ' + secret) return new Response('Unauthorized', { status: 401 });
-    if (protocolVersion !== '2') return new Response('Upgrade Required', { status: 426 });
+    if (protocolVersion !== String(agentAdapterProtocolVersion)) return new Response('Upgrade Required', { status: 426 });
     if (request.method === 'POST' && url.pathname === '/v1/agent/sessions') {
       const session = await request.json();
       return Response.json({ sessionId: session.sessionId, registeredAt: '2026-07-22T00:00:00Z' });
@@ -90,7 +93,7 @@ mkdirSync(new URL('.', pathToFileURL(discoveryPath)), { recursive: true, mode: 0
 writeFileSync(discoveryPath, JSON.stringify({
   url: server.url.toString().replace(/\/$/, ''),
   secret,
-  protocolVersion: 2,
+  protocolVersion: agentAdapterProtocolVersion,
 }), { mode: 0o600 });
 chmodSync(discoveryPath, 0o600);
 
@@ -180,7 +183,7 @@ describe('pi extension disposable-home install and discovery smoke', () => {
         method: 'POST',
         path: '/v1/agent/sessions',
         authorization: 'Bearer temporary-loopback-secret',
-        protocolVersion: '2',
+        protocolVersion: String(AGENT_ADAPTER_PROTOCOL_VERSION),
       });
       expect(discoveryPath).toStartWith(home);
       expect(installRoot).toStartWith(home);

@@ -26,8 +26,8 @@ export const E2E_EPOCH_OPERATIONS = [
 export type E2EEpochOperation = (typeof E2E_EPOCH_OPERATIONS)[number];
 export type E2EDirection = 'bridge-to-watch' | 'watch-to-bridge';
 export type ProtectedPayloadKind =
-  | 'event-content-v2'
-  | 'session-content-v2'
+  | 'event-content-v3'
+  | 'session-content-v3'
   | 'reply-content-v1'
   | 'interrupt-content-v1'
   | 'command-receipt-content-v1'
@@ -48,8 +48,6 @@ export const E2E_LIMITS = {
   notificationPreviewBodyTextBytes: 4_000,
   notificationPreviewIdentifierBytes: 256,
   notificationPreviewContentIdBytes: 256,
-  promptOptions: 10,
-  promptOptionBytes: 500,
 } as const;
 
 export interface EncryptionKeyBindingV1 {
@@ -154,35 +152,24 @@ export interface E2ERecipientSnapshotV1 {
   recipients: E2ERecipientV1[];
 }
 
-export interface ProtectedActionablePromptV1 {
-  promptId: string;
-  type: 'question';
-  label: string;
-  options?: string[];
-  expiresAt?: string;
-}
 
-export interface ProtectedEventContentV2 {
-  version: 2;
+export interface ProtectedEventContentV3 {
+  version: 3;
   agentText: string;
   humanText?: string;
   projectName?: string;
-  contextText?: string;
   workingDirectory?: string;
-  hbaseSessionKey?: string;
   harnessProvider?: string;
-  actionablePrompt?: ProtectedActionablePromptV1;
   needHuman?: NeedHumanContext;
 }
 
-export interface ProtectedSessionContentV2 {
-  version: 2;
+export interface ProtectedSessionContentV3 {
+  version: 3;
   projectName: string;
   nameText: string;
   openingText?: string;
   latestActivityText?: string;
   workingDirectory?: string;
-  hbaseSessionKey?: string;
   harnessProvider?: string;
 }
 
@@ -223,16 +210,15 @@ export interface EncryptedNotificationPreviewPlaintextV2 {
   truncated: boolean;
 }
 
-interface RelayEventMetadataBaseV2 {
+interface RelayEventMetadataBaseV3 {
   eventId: string;
   hostId: string;
   sessionId: string;
   provider: string;
-  correlationId?: string;
   createdAt: string;
 }
 
-export type RelayEventMetadataV2 = RelayEventMetadataBaseV2 & (
+export type RelayEventMetadataV3 = RelayEventMetadataBaseV3 & (
   | { type: 'done'; status: 'idle' }
   | { type: 'need_human'; status: 'need_human' }
 );
@@ -247,39 +233,44 @@ export interface RelaySessionMetadataV2 {
   snoozedUntil?: string;
 }
 
-export type EncryptedEventProjectionV2 = RelayEventMetadataV2 & {
-  content: EncryptedContentV1 & { payloadKind: 'event-content-v2' };
+export type EncryptedEventProjectionV3 = RelayEventMetadataV3 & {
+  content: EncryptedContentV1 & { payloadKind: 'event-content-v3' };
   keyWrap: RecipientKeyWrapV1;
 };
 
-export interface EncryptedSessionProjectionV2 extends RelaySessionMetadataV2 {
+export interface EncryptedSessionProjectionV3 extends RelaySessionMetadataV2 {
   revision: number;
-  content: EncryptedContentV1 & { payloadKind: 'session-content-v2' };
+  content: EncryptedContentV1 & { payloadKind: 'session-content-v3' };
   keyWrap: RecipientKeyWrapV1;
 }
 
-export type EncryptedEventUploadV2 = RelayEventMetadataV2 & {
+export type EncryptedEventUploadV3 = RelayEventMetadataV3 & {
   recipientSetVersion: number;
-  content: EncryptedContentV1 & { payloadKind: 'event-content-v2' };
+  content: EncryptedContentV1 & { payloadKind: 'event-content-v3' };
   keyWraps: RecipientKeyWrapV1[];
   notificationPreviews?: NotificationPreviewEnvelopeV2[];
 };
 
-export interface EncryptedSessionSnapshotUploadV2 extends RelaySessionMetadataV2 {
+export interface EncryptedSessionSnapshotUploadV3 extends RelaySessionMetadataV2 {
   revision: number;
   recipientSetVersion: number;
-  content: EncryptedContentV1 & { payloadKind: 'session-content-v2' };
+  content: EncryptedContentV1 & { payloadKind: 'session-content-v3' };
   keyWraps: RecipientKeyWrapV1[];
 }
 
-export interface EncryptedSessionCurrentProjectionV2 {
+export interface E2EEventAndSessionUploadV3 {
+  event: EncryptedEventUploadV3;
+  session: EncryptedSessionSnapshotUploadV3;
+}
+
+export interface EncryptedSessionCurrentProjectionV3 {
   hostId: string;
   sessionId: string;
   currentRevision: number;
-  snapshot: EncryptedSessionProjectionV2;
+  snapshot: EncryptedSessionProjectionV3;
 }
 
-export type EventContentAADInput = RelayEventMetadataV2 & { contentId: string };
+export type EventContentAADInput = RelayEventMetadataV3 & { contentId: string };
 export interface SessionContentAADInput extends RelaySessionMetadataV2 { revision: number; contentId: string }
 export interface ReplyContentAADInput {
   hostId: string;
@@ -396,18 +387,15 @@ export function buildEncryptionBindingBytes(binding: Omit<EncryptionKeyBindingV1
   ]);
 }
 
-export function buildProtectedEventContentBytes(content: ProtectedEventContentV2): Uint8Array {
-  const actionablePrompt = assertProtectedEventContent(content);
+export function buildProtectedEventContentBytes(content: ProtectedEventContentV3): Uint8Array {
+  assertProtectedEventContent(content);
   const canonical = {
-    version: 2,
+    version: 3,
     agentText: content.agentText,
     ...(content.humanText === undefined ? {} : { humanText: content.humanText }),
     ...(content.projectName === undefined ? {} : { projectName: content.projectName }),
-    ...(content.contextText === undefined ? {} : { contextText: content.contextText }),
     ...(content.workingDirectory === undefined ? {} : { workingDirectory: content.workingDirectory }),
-    ...(content.hbaseSessionKey === undefined ? {} : { hbaseSessionKey: content.hbaseSessionKey }),
     ...(content.harnessProvider === undefined ? {} : { harnessProvider: content.harnessProvider }),
-    ...(actionablePrompt === undefined ? {} : { actionablePrompt }),
     ...(content.needHuman === undefined ? {} : { needHuman: canonicalNeedHumanContext(content.needHuman) }),
   };
   const bytes = encoder.encode(JSON.stringify(canonical));
@@ -415,16 +403,15 @@ export function buildProtectedEventContentBytes(content: ProtectedEventContentV2
   return bytes;
 }
 
-export function buildProtectedSessionContentBytes(content: ProtectedSessionContentV2): Uint8Array {
+export function buildProtectedSessionContentBytes(content: ProtectedSessionContentV3): Uint8Array {
   assertProtectedSessionContent(content);
   const bytes = encoder.encode(JSON.stringify({
-    version: 2,
+    version: 3,
     projectName: content.projectName,
     nameText: content.nameText,
     ...(content.openingText === undefined ? {} : { openingText: content.openingText }),
     ...(content.latestActivityText === undefined ? {} : { latestActivityText: content.latestActivityText }),
     ...(content.workingDirectory === undefined ? {} : { workingDirectory: content.workingDirectory }),
-    ...(content.hbaseSessionKey === undefined ? {} : { hbaseSessionKey: content.hbaseSessionKey }),
     ...(content.harnessProvider === undefined ? {} : { harnessProvider: content.harnessProvider }),
   }));
   if (bytes.byteLength > E2E_LIMITS.sessionPlaintextBytes) throw new TypeError('protected session content is invalid');
@@ -538,14 +525,13 @@ export function buildEventContentAAD(input: EventContentAADInput): Uint8Array {
     || !isBoundedWellFormedString(input.sessionId, E2E_LIMITS.notificationPreviewIdentifierBytes)
     || !isBoundedWellFormedString(input.provider, E2E_LIMITS.notificationPreviewIdentifierBytes)
     || !isBoundedWellFormedString(input.eventId, E2E_LIMITS.notificationPreviewIdentifierBytes)
-    || !isCanonicalOptionalAADString(input.correlationId)
     || !isCanonicalTimestamp(input.createdAt)
     || !isBoundedWellFormedString(input.contentId, E2E_LIMITS.notificationPreviewContentIdBytes)) {
     throw new TypeError('event content AAD input is invalid');
   }
   return encodeLengthPrefixedFields([
-    'ariava-event-content-aad-v2', 'bridge-to-watch', input.hostId, input.sessionId, input.provider,
-    input.eventId, input.type, input.status, input.correlationId ?? '', input.createdAt, input.contentId, 'event-content-v2',
+    'ariava-event-content-aad-v3', 'bridge-to-watch', input.hostId, input.sessionId, input.provider,
+    input.eventId, input.type, input.status, input.createdAt, input.contentId, 'event-content-v3',
   ]);
 }
 
@@ -560,9 +546,9 @@ export function buildSessionContentAAD(input: SessionContentAADInput): Uint8Arra
     throw new TypeError('session content AAD input is invalid');
   }
   return encodeLengthPrefixedFields([
-    'ariava-session-content-aad-v2', 'bridge-to-watch', input.hostId, input.sessionId, input.provider,
+    'ariava-session-content-aad-v3', 'bridge-to-watch', input.hostId, input.sessionId, input.provider,
     input.status, input.updatedAt, input.lastEventId ?? '', input.snoozedUntil ?? '',
-    String(input.revision), input.contentId, 'session-content-v2',
+    String(input.revision), input.contentId, 'session-content-v3',
   ]);
 }
 
@@ -627,7 +613,7 @@ export function buildNotificationPreviewAAD(input: NotificationPreviewAADInput):
 export function buildWrapAAD(input: WrapAADInput): Uint8Array {
   if ((input.direction !== 'bridge-to-watch' && input.direction !== 'watch-to-bridge')
     || !([
-      'event-content-v2', 'session-content-v2', 'reply-content-v1', 'interrupt-content-v1',
+      'event-content-v3', 'session-content-v3', 'reply-content-v1', 'interrupt-content-v1',
       'command-receipt-content-v1', 'notification-preview-v2',
     ] as readonly unknown[]).includes(input.payloadKind)
     || !isBoundedWellFormedString(input.linkId, E2E_LIMITS.notificationPreviewIdentifierBytes)
@@ -685,10 +671,10 @@ export function validateEncryptedContentV1(value: unknown): value is EncryptedCo
   if (!isExactRecord(value, ['version', 'suite', 'contentId', 'payloadKind', 'nonce', 'ciphertext'])) return false;
   let maxPlaintextBytes: number;
   switch (value.payloadKind) {
-    case 'event-content-v2':
+    case 'event-content-v3':
       maxPlaintextBytes = E2E_LIMITS.eventPlaintextBytes;
       break;
-    case 'session-content-v2':
+    case 'session-content-v3':
       maxPlaintextBytes = E2E_LIMITS.sessionPlaintextBytes;
       break;
     case 'reply-content-v1':
@@ -853,19 +839,17 @@ function assertValidEncryptionBinding(binding: Omit<EncryptionKeyBindingV1, 'bin
   if (!validateEncryptionKeyBindingV1(candidate)) throw new TypeError('encryption key binding is not canonical');
 }
 
-function assertProtectedEventContent(content: ProtectedEventContentV2): ProtectedActionablePromptV1 | undefined {
+function assertProtectedEventContent(content: ProtectedEventContentV3): void {
   assertExactKeys(
     content,
-    ['version', 'agentText', 'humanText', 'projectName', 'contextText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider', 'actionablePrompt', 'needHuman'],
+    ['version', 'agentText', 'humanText', 'projectName', 'workingDirectory', 'harnessProvider', 'needHuman'],
     'protected event content',
     ['version', 'agentText'],
   );
-  if (content.version !== 2 || typeof content.agentText !== 'string'
+  if (content.version !== 3 || typeof content.agentText !== 'string'
     || (content.humanText !== undefined && typeof content.humanText !== 'string')
     || (content.projectName !== undefined && typeof content.projectName !== 'string')
-    || (content.contextText !== undefined && typeof content.contextText !== 'string')
     || (content.workingDirectory !== undefined && typeof content.workingDirectory !== 'string')
-    || (content.hbaseSessionKey !== undefined && typeof content.hbaseSessionKey !== 'string')
     || (content.harnessProvider !== undefined && typeof content.harnessProvider !== 'string')) {
     throw new TypeError('protected event content is invalid');
   }
@@ -873,50 +857,6 @@ function assertProtectedEventContent(content: ProtectedEventContentV2): Protecte
     && !validateCanonicalEventInvariant({ type: 'need_human', status: 'need_human', needHuman: content.needHuman }).success) {
     throw new TypeError('protected needHuman context is invalid');
   }
-  const prompt = content.actionablePrompt;
-  if (prompt === undefined) return undefined;
-  assertExactKeys(
-    prompt, ['promptId', 'type', 'label', 'options', 'expiresAt'], 'protected actionable prompt', ['promptId', 'type', 'label'],
-  );
-  if (typeof prompt.promptId !== 'string' || prompt.type !== 'question' || typeof prompt.label !== 'string'
-    || (prompt.expiresAt !== undefined && !isCanonicalTimestamp(prompt.expiresAt))) {
-    throw new TypeError('protected actionable prompt is invalid');
-  }
-  const options = prompt.options === undefined ? undefined : canonicalPromptOptions(prompt.options);
-  return {
-    promptId: prompt.promptId,
-    type: 'question',
-    label: prompt.label,
-    ...(options === undefined ? {} : { options }),
-    ...(prompt.expiresAt === undefined ? {} : { expiresAt: prompt.expiresAt }),
-  };
-}
-
-function canonicalPromptOptions(value: unknown): string[] {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || 'toJSON' in value) {
-    throw new TypeError('protected actionable prompt options are invalid');
-  }
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (!lengthDescriptor || !('value' in lengthDescriptor) || typeof lengthDescriptor.value !== 'number'
-    || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0
-    || lengthDescriptor.value > E2E_LIMITS.promptOptions || lengthDescriptor.enumerable !== false
-    || lengthDescriptor.configurable !== false || lengthDescriptor.writable !== true
-    || Reflect.ownKeys(value).length !== lengthDescriptor.value + 1) {
-    throw new TypeError('protected actionable prompt options are invalid');
-  }
-  const length = lengthDescriptor.value;
-  const options: string[] = [];
-  for (let index = 0; index < length; index += 1) {
-    const descriptor = descriptors[String(index)];
-    if (!descriptor || !descriptor.enumerable || descriptor.configurable !== true || descriptor.writable !== true
-      || !('value' in descriptor) || typeof descriptor.value !== 'string'
-      || encoder.encode(descriptor.value).byteLength > E2E_LIMITS.promptOptionBytes) {
-      throw new TypeError('protected actionable prompt options are invalid');
-    }
-    options.push(descriptor.value);
-  }
-  return options;
 }
 
 function canonicalNeedHumanContext(context: NeedHumanContext): NeedHumanContext {
@@ -930,18 +870,17 @@ function canonicalNeedHumanContext(context: NeedHumanContext): NeedHumanContext 
     : { reason: context.reason };
 }
 
-function assertProtectedSessionContent(content: ProtectedSessionContentV2): void {
+function assertProtectedSessionContent(content: ProtectedSessionContentV3): void {
   assertExactKeys(
     content,
-    ['version', 'projectName', 'nameText', 'openingText', 'latestActivityText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider'],
+    ['version', 'projectName', 'nameText', 'openingText', 'latestActivityText', 'workingDirectory', 'harnessProvider'],
     'protected session content',
     ['version', 'projectName', 'nameText'],
   );
-  if (content.version !== 2 || typeof content.projectName !== 'string' || typeof content.nameText !== 'string'
+  if (content.version !== 3 || typeof content.projectName !== 'string' || typeof content.nameText !== 'string'
     || (content.openingText !== undefined && typeof content.openingText !== 'string')
     || (content.latestActivityText !== undefined && typeof content.latestActivityText !== 'string')
     || (content.workingDirectory !== undefined && typeof content.workingDirectory !== 'string')
-    || (content.hbaseSessionKey !== undefined && typeof content.hbaseSessionKey !== 'string')
     || (content.harnessProvider !== undefined && typeof content.harnessProvider !== 'string')) {
     throw new TypeError('protected session content is invalid');
   }

@@ -147,19 +147,24 @@ function fixture(overrides: Partial<StrictReadinessInput> = {}, depOverrides: Pa
 
 describe('strict onboarding readiness', () => {
   test('validates exact secure loopback discovery shape', () => {
-    const v2 = { url: 'http://127.0.0.1:7272', secret: 's', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION };
-    expect(validateAgentAdapterDiscovery(v2, 7272)).toEqual(v2);
-    expect(validateAgentAdapterDiscovery({ ...v2, url: 'http://[::1]:7272' }, 7272).url).toBe('http://[::1]:7272');
+    const currentDiscovery = {
+      url: 'http://127.0.0.1:7272',
+      secret: 's',
+      protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+    };
+    expect(validateAgentAdapterDiscovery(currentDiscovery, 7272)).toEqual(currentDiscovery);
+    expect(validateAgentAdapterDiscovery({ ...currentDiscovery, url: 'http://[::1]:7272' }, 7272).url).toBe('http://[::1]:7272');
     for (const value of [
-      { url: 'http://localhost:7272', secret: 's', protocolVersion: 2 },
-      { url: 'http://10.0.0.1:7272', secret: 's', protocolVersion: 2 },
-      { url: 'https://127.0.0.1:7272', secret: 's', protocolVersion: 2 },
-      { url: 'http://user@127.0.0.1:7272', secret: 's', protocolVersion: 2 },
-      { url: 'http://127.0.0.1:7272/path', secret: 's', protocolVersion: 2 },
-      { url: 'http://127.0.0.1:7272', secret: '', protocolVersion: 2 },
+      { ...currentDiscovery, url: 'http://localhost:7272' },
+      { ...currentDiscovery, url: 'http://10.0.0.1:7272' },
+      { ...currentDiscovery, url: 'https://127.0.0.1:7272' },
+      { ...currentDiscovery, url: 'http://user@127.0.0.1:7272' },
+      { ...currentDiscovery, url: 'http://127.0.0.1:7272/path' },
+      { ...currentDiscovery, secret: '' },
       { url: 'http://127.0.0.1:7272', secret: 's' },
-      { url: 'http://127.0.0.1:7272', secret: 's', protocolVersion: 1 },
-      { url: 'http://127.0.0.1:7272', secret: 's', protocolVersion: 2, extra: true },
+      { ...currentDiscovery, protocolVersion: 1 },
+      { ...currentDiscovery, protocolVersion: 2 },
+      { ...currentDiscovery, extra: true },
     ]) expect(() => validateAgentAdapterDiscovery(value, 7272)).toThrow();
   });
 

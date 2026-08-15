@@ -33,9 +33,7 @@ describe('canonical terminal event builders', () => {
       agentText: 'Finished safely.',
       humanText: 'Please finish.',
       projectName: 'demo',
-      contextText: 'Demo session · demo',
       workingDirectory: '/tmp/demo',
-      hbaseSessionKey: 'session-1',
       harnessProvider: 'pi',
       createdAt: '2026-08-07T00:00:00.000Z',
     });
@@ -48,11 +46,17 @@ describe('canonical terminal event builders', () => {
       reason: 'question',
       agentText: 'Which target should I use?',
       createdAt: '2026-08-07T00:00:00.000Z',
-    })).toMatchObject({
+    })).toEqual({
+      sessionId: 'session-1',
+      provider: 'pi',
       type: 'need_human',
       status: 'need_human',
+      agentText: 'Which target should I use?',
+      projectName: 'demo',
+      workingDirectory: '/tmp/demo',
+      harnessProvider: 'pi',
+      createdAt: '2026-08-07T00:00:00.000Z',
       needHuman: { reason: 'question' },
-      actionablePrompt: { type: 'question', label: 'Reply' },
     });
     expect(buildNeedHumanEvent(session, {
       reason: 'blocked',

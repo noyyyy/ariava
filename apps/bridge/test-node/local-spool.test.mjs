@@ -15,7 +15,7 @@ test('production Node seals local retry spool without plaintext persistence', ()
   try {
     const path = join(dir, 'spool.json');
     const spool = new LocalEncryptedSpool(path, 'host-test', new LinuxSpoolKeyStore(join(dir, 'key.json')));
-    spool.enqueue({ spoolItemId: 'item', sessionId: 'session', eventId: 'event', payloadKind: 'event-upload-v2',
+    spool.enqueue({ spoolItemId: 'item', sessionId: 'session', eventId: 'event', payloadKind: 'event-upload-v3',
       createdAt: '2026-07-20T00:00:00.000Z', plaintext: new TextEncoder().encode('NODE_SPOOL_SECRET_MARKER') });
     assert.doesNotMatch(readFileSync(path, 'utf8'), /NODE_SPOOL_SECRET_MARKER/);
     assert.equal(new TextDecoder().decode(spool.open(spool.list()[0])), 'NODE_SPOOL_SECRET_MARKER');
@@ -29,7 +29,7 @@ test('recovery preserves every byte across a transient key-store outage and succ
     const path = join(dir, 'spool.json');
     const key = new Uint8Array(32).fill(9);
     const spool = new LocalEncryptedSpool(path, 'host-test', { loadOrCreate: () => new Uint8Array(key) });
-    spool.enqueue({ spoolItemId: 'item', sessionId: 'session', eventId: 'event', payloadKind: 'event-upload-v2',
+    spool.enqueue({ spoolItemId: 'item', sessionId: 'session', eventId: 'event', payloadKind: 'event-upload-v3',
       createdAt: '2026-07-20T00:00:00.000Z', plaintext: new TextEncoder().encode('RETRY_ME') });
     const before = readFileSync(path);
     let unavailable = true;
@@ -54,7 +54,7 @@ test('recovery quarantines only ciphertext that fails authentication with a know
     const keyStore = { loadOrCreate: () => new Uint8Array(32).fill(9) };
     const spool = new LocalEncryptedSpool(path, 'host-test', keyStore);
     for (const id of ['good', 'bad']) spool.enqueue({ spoolItemId: id, sessionId: 'session', eventId: id,
-      payloadKind: 'event-upload-v2', createdAt: '2026-07-20T00:00:00.000Z', plaintext: new TextEncoder().encode(id) });
+      payloadKind: 'event-upload-v3', createdAt: '2026-07-20T00:00:00.000Z', plaintext: new TextEncoder().encode(id) });
     const file = JSON.parse(readFileSync(path, 'utf8'));
     const corrupt = file.items.find((item) => item.spoolItemId === 'bad');
     const bytes = Buffer.from(corrupt.ciphertext, 'base64url');
@@ -76,7 +76,7 @@ test('missing Linux key never creates a replacement and restored-key retry prese
     const keyPath = join(dir, 'key.json');
     const backupPath = join(dir, 'key.backup.json');
     const spool = new LocalEncryptedSpool(path, 'host-test', new LinuxSpoolKeyStore(keyPath));
-    spool.enqueue({ spoolItemId: 'item', sessionId: 'session', eventId: 'event', payloadKind: 'event-upload-v2',
+    spool.enqueue({ spoolItemId: 'item', sessionId: 'session', eventId: 'event', payloadKind: 'event-upload-v3',
       createdAt: '2026-07-20T00:00:00.000Z', plaintext: new TextEncoder().encode('RESTORE_ME') });
     const spoolBytes = readFileSync(path);
     const keyBytes = readFileSync(keyPath);
@@ -99,12 +99,12 @@ test('replaced Linux key fails before item quarantine and original-key retry res
     const keyPath = join(dir, 'key.json');
     const spool = new LocalEncryptedSpool(path, 'host-test', new LinuxSpoolKeyStore(keyPath));
     for (const id of ['one', 'two']) spool.enqueue({ spoolItemId: id, sessionId: 'session', eventId: id,
-      payloadKind: 'event-upload-v2', createdAt: '2026-07-20T00:00:00.000Z', plaintext: new TextEncoder().encode(id) });
+      payloadKind: 'event-upload-v3', createdAt: '2026-07-20T00:00:00.000Z', plaintext: new TextEncoder().encode(id) });
     const spoolBytes = readFileSync(path);
     const keyBytes = readFileSync(keyPath);
     rmSync(keyPath);
     const replacementSpool = new LocalEncryptedSpool(join(dir, 'replacement-spool.json'), 'host-test', new LinuxSpoolKeyStore(keyPath));
-    replacementSpool.enqueue({ spoolItemId: 'replacement', sessionId: 'session', eventId: 'replacement', payloadKind: 'event-upload-v2',
+    replacementSpool.enqueue({ spoolItemId: 'replacement', sessionId: 'session', eventId: 'replacement', payloadKind: 'event-upload-v3',
       createdAt: '2026-07-20T00:00:00.000Z', plaintext: new TextEncoder().encode('replacement') });
     const restarted = new LocalEncryptedSpool(path, 'host-test', new LinuxSpoolKeyStore(keyPath));
     assert.throws(() => restarted.recoverUnreadable(), /recovery is required/);
@@ -122,7 +122,7 @@ test('empty persisted spool never creates a replacement Linux key and restored k
   try {
     const path = join(dir, 'spool.json'); const keyPath = join(dir, 'key.json'); const backupPath = join(dir, 'key.backup.json');
     const initial = new LocalEncryptedSpool(path, 'host-test', new LinuxSpoolKeyStore(keyPath));
-    initial.enqueue({ spoolItemId: 'item', sessionId: 'session', eventId: 'event', payloadKind: 'event-upload-v2',
+    initial.enqueue({ spoolItemId: 'item', sessionId: 'session', eventId: 'event', payloadKind: 'event-upload-v3',
       createdAt: '2026-07-20T00:00:00.000Z', plaintext: new TextEncoder().encode('temporary') });
     initial.remove('item');
     const spoolBytes = readFileSync(path); const keyBytes = readFileSync(keyPath);

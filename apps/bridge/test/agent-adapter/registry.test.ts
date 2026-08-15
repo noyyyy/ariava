@@ -3,11 +3,16 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CommandEnvelope, CommandResult } from '@ariava/protocol';
-import { AgentAdapterRegistry, type AgentAdapterEventInput } from '../../src/agent-adapter/registry';
-import { BridgeStateStore } from '../../src/state-store';
+import {
+  AgentAdapterRegistry,
+  AgentAdapterRequestValidationError,
+  type AgentAdapterEventInput,
+} from '../../src/agent-adapter/registry';
+import { BridgeStateStore, runtimeSchemaFloorPathForState } from '../../src/state-store';
 import { spoolPathForState } from '../../src/e2e/local-spool';
 
 mock.module('../../src/e2e/node-crypto', () => ({
+  ChaChaPolyAuthenticationError: class ChaChaPolyAuthenticationError extends Error {},
   chachaPolySeal: (_key: Uint8Array, plaintext: Uint8Array) => ({
     nonce: new Uint8Array(12).fill(1), ciphertext: new Uint8Array([...plaintext, ...new Uint8Array(16)]),
   }),
@@ -38,9 +43,7 @@ function doneEvent(overrides: Partial<AgentAdapterEventInput> = {}): AgentAdapte
     status: 'idle',
     agentText: 'Finished successfully',
     projectName: 'project',
-    contextText: 'Task · project',
     workingDirectory: '/project',
-    hbaseSessionKey: 'sess-1',
     harnessProvider: 'pi',
     createdAt: '2026-08-07T00:00:01.000Z',
     ...overrides,
@@ -55,11 +58,8 @@ function needHumanEvent(overrides: Partial<AgentAdapterEventInput> = {}): AgentA
     status: 'need_human',
     agentText: 'Which environment should I target?',
     projectName: 'project',
-    contextText: 'Task · project',
     workingDirectory: '/project',
-    hbaseSessionKey: 'sess-1',
     harnessProvider: 'pi',
-    actionablePrompt: { promptId: 'question-1', type: 'question', label: 'Reply' },
     needHuman: { reason: 'question' },
     createdAt: '2026-08-07T00:00:02.000Z',
     ...overrides,
@@ -119,13 +119,137 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  test('keeps normalized owner immutable across restart using persisted Session authority', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-owner-restart-'));
+    try {
+      const store = initializedStore(dir);
+      const first = new AgentAdapterRegistry('host-1', store);
+      first.register({
+        sessionId: 'owned-session', provider: 'adapter', harnessProvider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+      });
+      const beforeDrivers = store.getDriverNameForSession('owned-session');
+      const beforeEvents = structuredClone(store.peekPendingEvents());
+      const beforeHandles = structuredClone(store.peekPendingSessionHandles());
+      store.dispose();
+
+      const restartedStore = initializedStore(dir);
+      const restarted = new AgentAdapterRegistry('host-1', restartedStore);
+      expect(() => restarted.register({
+        sessionId: 'owned-session', provider: 'adapter', harnessProvider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+      })).not.toThrow();
+      const afterSameOwner = readFileSync(join(dir, 'state.json'), 'utf8');
+      const sessionsAfterSameOwner = structuredClone(restartedStore.listSessions());
+      expect(() => restarted.register({
+        sessionId: 'owned-session', provider: 'adapter', harnessProvider: 'codex', projectName: 'other', cwd: '/other', nameText: 'other',
+      })).toThrow(expect.objectContaining({ code: 'session_id_collision' }));
+      expect(readFileSync(join(dir, 'state.json'), 'utf8')).toBe(afterSameOwner);
+      expect(restartedStore.listSessions()).toEqual(sessionsAfterSameOwner);
+      expect(restartedStore.getDriverNameForSession('owned-session')).toBe(beforeDrivers);
+      expect(restartedStore.peekPendingEvents()).toEqual(beforeEvents);
+      expect(restartedStore.peekPendingSessionHandles()).toEqual(beforeHandles);
+      expect(restarted.hasPendingCommandWork('owned-session')).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('preserves normalized owner through schema 3 to 4 migration and rejects collision before mutation', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-owner-migration-'));
+    const statePath = join(dir, 'state.json');
+    const spoolPath = spoolPathForState(statePath);
+    try {
+      const schema4Store = initializedStore(dir);
+      const original = new AgentAdapterRegistry('host-1', schema4Store);
+      original.register({
+        sessionId: 'migrated-owner', provider: 'adapter', harnessProvider: 'pi',
+        projectName: 'project', cwd: '/project', nameText: 'Migrated owner',
+      });
+      schema4Store.dispose();
+
+      const schema3State = JSON.parse(readFileSync(statePath, 'utf8'));
+      const schema3Spool = JSON.parse(readFileSync(spoolPath, 'utf8'));
+      schema3State.schemaVersion = 3;
+      delete schema3State.commandExecutions;
+      schema3State.commandResults = {};
+      schema3State.seenCommands = {};
+      schema3Spool.runtimeStateSchemaVersion = 3;
+      rmSync(runtimeSchemaFloorPathForState(statePath), { force: true });
+      writeFileSync(statePath, `${JSON.stringify(schema3State)}\n`, { mode: 0o600 });
+      writeFileSync(spoolPath, `${JSON.stringify(schema3Spool)}\n`, { mode: 0o600 });
+
+      const migratedStore = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+      migratedStore.initializeEncryptedSpool('host-1', join(dir, 'identity.json'), 'linux', {
+        loadOrCreate: () => new Uint8Array(32).fill(7),
+      });
+      expect(JSON.parse(readFileSync(statePath, 'utf8')).schemaVersion).toBe(4);
+      expect(migratedStore.listSessions()).toEqual([expect.objectContaining({
+        sessionId: 'migrated-owner', provider: 'adapter', harnessProvider: 'pi',
+      })]);
+      migratedStore.dispose();
+
+      const restartedStore = initializedStore(dir);
+      const restarted = new AgentAdapterRegistry('host-1', restartedStore);
+      const stateBeforeCollision = readFileSync(statePath);
+      const spoolBeforeCollision = readFileSync(spoolPath);
+      const sessionsBeforeCollision = structuredClone(restartedStore.listSessions());
+      const driversBeforeCollision = restartedStore.getDriverNameForSession('migrated-owner');
+      const eventsBeforeCollision = structuredClone(restartedStore.peekPendingEvents());
+      const handlesBeforeCollision = structuredClone(restartedStore.peekPendingSessionHandles());
+
+      expect(() => restarted.register({
+        sessionId: 'migrated-owner', provider: 'adapter', harnessProvider: 'codex',
+        projectName: 'other', cwd: '/other', nameText: 'Conflicting owner',
+      })).toThrow(expect.objectContaining({ code: 'session_id_collision' }));
+      expect(readFileSync(statePath)).toEqual(stateBeforeCollision);
+      expect(readFileSync(spoolPath)).toEqual(spoolBeforeCollision);
+      expect(restartedStore.listSessions()).toEqual(sessionsBeforeCollision);
+      expect(restartedStore.getDriverNameForSession('migrated-owner')).toBe(driversBeforeCollision);
+      expect(restartedStore.peekPendingEvents()).toEqual(eventsBeforeCollision);
+      expect(restartedStore.peekPendingSessionHandles()).toEqual(handlesBeforeCollision);
+      expect(restarted.hasPendingCommandWork('migrated-owner')).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('registration checks persisted owner even when live state reports the requested owner', () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const persisted = new AgentAdapterRegistry('host-1', store);
+      persisted.register({ sessionId: 'masked-owner', provider: 'persisted', projectName: 'p', cwd: '/', nameText: 'p' });
+      const registry = new AgentAdapterRegistry('host-1', store);
+      (registry as any).sessions.set('masked-owner', {
+        sessionId: 'masked-owner', provider: 'requested', projectName: 'live', cwd: '/live', nameText: 'live',
+        hostId: 'host-1', registeredAt: '2026-08-07T00:00:00.000Z', lastHeartbeatAt: '2026-08-07T00:00:00.000Z',
+        status: 'idle', semanticUpdatedAt: '2026-08-07T00:00:00.000Z',
+      });
+      const beforeSessions = structuredClone(store.listSessions());
+      expect(() => registry.register({
+        sessionId: 'masked-owner', provider: 'requested', projectName: 'new', cwd: '/new', nameText: 'new',
+      })).toThrow(expect.objectContaining({ code: 'session_id_collision' }));
+      expect(store.listSessions()).toEqual(beforeSessions);
+      expect(store.peekPendingEvents()).toEqual([]);
+      expect(store.peekPendingSessionHandles()).toEqual([]);
+      expect(registry.hasPendingCommandWork('masked-owner')).toBe(false);
+    } finally { cleanup(); }
+  });
+
+  test('rejects an unregistered Event with a typed error before mutation', () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const registry = new AgentAdapterRegistry('host-1', store);
+      const beforeSessions = structuredClone(store.listSessions());
+      expect(() => registry.pushEvent('missing', doneEvent({ sessionId: 'missing' })))
+        .toThrow(AgentAdapterRequestValidationError);
+      expect(store.listSessions()).toEqual(beforeSessions);
+      expect(store.peekPendingEvents()).toEqual([]);
+      expect(store.peekPendingSessionHandles()).toEqual([]);
+    } finally { cleanup(); }
+  });
+
   test('deduplicates the complete producer DTO immediately, after delay, and after restart', () => {
     const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-dedupe-'));
     try {
       const store = initializedStore(dir);
       const registry = new AgentAdapterRegistry('host-1', store);
       register(registry);
-      const producer = doneEvent({ correlationId: 'loop-1' });
+      const producer = doneEvent();
       const first = registry.pushEvent('sess-1', producer);
       expect(registry.pushEvent('sess-1', producer)).toBe(first);
       const persisted = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'));
@@ -133,9 +257,9 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       expect(Object.values(persisted.producerEventReservations)[0]).toEqual(expect.objectContaining({
         version: 1, eventId: first, sessionId: 'sess-1', fingerprint: expect.any(String),
       }));
-      expect(registry.pushEvent('sess-1', doneEvent({ correlationId: 'loop-2' }))).not.toBe(first);
-      expect(registry.pushEvent('sess-1', doneEvent({ correlationId: 'loop-1', createdAt: '2026-08-07T00:00:03.000Z' }))).not.toBe(first);
-      const delayed = needHumanEvent({ correlationId: 'delayed-1' });
+      expect(registry.pushEvent('sess-1', doneEvent({ agentText: 'Different content' }))).not.toBe(first);
+      expect(registry.pushEvent('sess-1', doneEvent({ createdAt: '2026-08-07T00:00:03.000Z' }))).not.toBe(first);
+      const delayed = needHumanEvent({ createdAt: '2026-08-07T00:00:04.000Z' });
       registry.enqueueCommand(makeCommand('sess-1'));
       const delayedId = registry.pushEvent('sess-1', delayed);
       expect(registry.pushEvent('sess-1', delayed)).toBe(delayedId);
@@ -156,28 +280,20 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       const registry = new AgentAdapterRegistry('host-1', store);
       register(registry);
       const first = needHumanEvent({
-        correlationId: 'nested-immediate',
-        actionablePrompt: { promptId: 'question-1', type: 'question', label: 'Reply', expiresAt: '2026-08-07T00:05:00.000Z' },
         needHuman: { reason: 'error', error: { kind: 'provider_failure', message: 'Provider failed safely.', providerCode: 'E_PROVIDER', retryExhausted: true } },
       });
       const reordered = needHumanEvent({
-        correlationId: 'nested-immediate',
-        actionablePrompt: { expiresAt: '2026-08-07T00:05:00.000Z', label: 'Reply', type: 'question', promptId: 'question-1' },
         needHuman: { error: { retryExhausted: true, providerCode: 'E_PROVIDER', message: 'Provider failed safely.', kind: 'provider_failure' }, reason: 'error' },
       });
       const immediateId = registry.pushEvent('sess-1', first);
       expect(registry.pushEvent('sess-1', reordered)).toBe(immediateId);
       expect(registry.pushEvent('sess-1', {
         ...structuredClone(reordered),
-        actionablePrompt: { ...structuredClone(reordered.actionablePrompt!), label: 'Different prompt' },
-      })).not.toBe(immediateId);
-      expect(registry.pushEvent('sess-1', {
-        ...structuredClone(reordered),
         needHuman: { reason: 'error', error: { ...structuredClone((reordered.needHuman as any).error), message: 'Different error' } },
       })).not.toBe(immediateId);
 
-      const delayed = { ...structuredClone(first), correlationId: 'nested-delayed', createdAt: '2026-08-07T00:00:04.000Z' };
-      const delayedReordered = { ...structuredClone(reordered), correlationId: 'nested-delayed', createdAt: '2026-08-07T00:00:04.000Z' };
+      const delayed = { ...structuredClone(first), createdAt: '2026-08-07T00:00:04.000Z' };
+      const delayedReordered = { ...structuredClone(reordered), createdAt: '2026-08-07T00:00:04.000Z' };
       registry.enqueueCommand(makeCommand('sess-1'));
       const delayedId = registry.pushEvent('sess-1', delayed);
       expect(registry.pushEvent('sess-1', delayedReordered)).toBe(delayedId);
@@ -203,7 +319,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       store.initializeEncryptedSpool('host-1', join(dir, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
       const registry = new AgentAdapterRegistry('host-1', store);
       register(registry);
-      const producer = doneEvent({ correlationId: 'lost-response' });
+      const producer = doneEvent();
       expect(() => registry.pushEvent('sess-1', producer)).toThrow('lost reservation metadata response');
       store.dispose();
       const restartedStore = initializedStore(dir);
@@ -380,9 +496,13 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     ['producer hostId', { ...doneEvent(), hostId: 'producer-host' }],
     ['excess field', { ...doneEvent(), unknownField: true }],
     ['legacy typeLabel', { ...doneEvent(), typeLabel: 'Task complete' }],
-    ...(['projectName', 'contextText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider'] as const).map((key) => [
+    ...(['projectName', 'workingDirectory', 'harnessProvider'] as const).map((key) => [
       `omitted ${key}`, Object.fromEntries(Object.entries(doneEvent()).filter(([field]) => field !== key)),
     ]),
+    ['retired actionablePrompt', { ...doneEvent(), actionablePrompt: { promptId: 'old', type: 'question', label: 'Reply' } }],
+    ['retired contextText', { ...doneEvent(), contextText: 'old' }],
+    ['retired correlationId', { ...doneEvent(), correlationId: 'old' }],
+    ['retired hbaseSessionKey', { ...doneEvent(), hbaseSessionKey: 'old' }],
     ['oversized protected payload', { ...doneEvent(), agentText: 'x'.repeat(33_000) }],
   ])('rejects %s before Session mutation or Event persistence', (_name, candidate) => {
     const { store, cleanup } = makeStore();
@@ -409,9 +529,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
   test.each([
     ['provider', { provider: 'other' }],
     ['projectName', { projectName: 'other' }],
-    ['contextText', { contextText: 'other' }],
     ['workingDirectory', { workingDirectory: '/other' }],
-    ['hbaseSessionKey', { hbaseSessionKey: 'other' }],
     ['harnessProvider', { harnessProvider: 'other' }],
   ])('rejects mismatched %s before allocating or persisting an Event', (_name, override) => {
     const { store, cleanup } = makeStore();
@@ -521,7 +639,6 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       registry.enqueueCommand(command);
       const producerEvent = needHumanEvent({ agentText: 'Delayed question' });
       const eventId = registry.pushEvent('sess-1', producerEvent);
-      (producerEvent.actionablePrompt as { label: string }).label = 'Mutated producer prompt';
       (producerEvent.needHuman as { reason: string }).reason = 'blocked';
       const before = registry.listSessions()[0];
       await registry.dequeueCommand('sess-1', 0);
@@ -551,7 +668,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       expect(attempts.every(([event]) => event === attempts[0]![0])).toBe(true);
       expect(attempts.every(([, session]) => session === attempts[0]![1])).toBe(true);
       expect(attempts[0]![0]).toMatchObject({
-        eventId, agentText: 'Delayed question', actionablePrompt: { label: 'Reply' }, needHuman: { reason: 'question' },
+        eventId, agentText: 'Delayed question', needHuman: { reason: 'question' },
       });
       expect(store.peekPendingUploads()[0]).toEqual(JSON.parse(JSON.stringify({ event: attempts[0]![0], session: attempts[0]![1] })));
       expect(registry.listSessions()[0]).toMatchObject({ status: 'need_human', lastEventId: eventId });
@@ -600,7 +717,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       register(registry);
       const command = makeCommand('sess-1');
       registry.enqueueCommand(command);
-      const producer = doneEvent({ correlationId: `cancel-${boundary}` });
+      const producer = doneEvent({ agentText: `cancel-` });
       const eventId = registry.pushEvent('sess-1', producer);
       await registry.dequeueCommand('sess-1', 0);
       const originalQueuePendingEvent = store.queuePendingEvent.bind(store);
@@ -636,7 +753,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       register(registry);
       const command = makeCommand('sess-1');
       registry.enqueueCommand(command);
-      const eventId = registry.pushEvent('sess-1', doneEvent({ correlationId: 'intent-only' }));
+      const eventId = registry.pushEvent('sess-1', doneEvent());
       await registry.dequeueCommand('sess-1', 0);
       store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,
@@ -665,7 +782,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
         register(registry);
         const command = makeCommand('sess-1');
         registry.enqueueCommand(command);
-        const eventId = registry.pushEvent('sess-1', doneEvent({ correlationId: mutation }));
+        const eventId = registry.pushEvent('sess-1', doneEvent({ agentText: mutation }));
         await registry.dequeueCommand('sess-1', 0);
         store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
         registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,
@@ -708,7 +825,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       register(registry);
       const command = makeCommand('sess-1');
       registry.enqueueCommand(command);
-      const eventId = registry.pushEvent('sess-1', doneEvent({ correlationId: boundary }));
+      const eventId = registry.pushEvent('sess-1', doneEvent({ agentText: boundary }));
       await registry.dequeueCommand('sess-1', 0);
       store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,
@@ -753,7 +870,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       register(registry);
       const command = makeCommand('sess-1');
       registry.enqueueCommand(command);
-      registry.pushEvent('sess-1', doneEvent({ correlationId: 'late-write' }));
+      registry.pushEvent('sess-1', doneEvent());
       await registry.dequeueCommand('sess-1', 0);
       store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId,
@@ -778,7 +895,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       register(registry);
       const command = makeCommand('sess-1');
       registry.enqueueCommand(command);
-      const eventId = registry.pushEvent('sess-1', doneEvent({ correlationId: 'recovery-retry' }));
+      const eventId = registry.pushEvent('sess-1', doneEvent());
       await registry.dequeueCommand('sess-1', 0);
       store.queuePendingEvent = (() => { throw new Error('retry unavailable'); }) as typeof store.queuePendingEvent;
       registry.resolveCommand(command.commandId, { commandId: command.commandId, hostId: command.hostId,

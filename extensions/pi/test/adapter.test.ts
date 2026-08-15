@@ -15,6 +15,163 @@ mock.module('../../../apps/bridge/src/e2e/node-crypto', () => ({
   chachaPolyOpen: (_key: Uint8Array, _nonce: Uint8Array, ciphertext: Uint8Array) => ciphertext.slice(0, -16),
 }));
 
+function makeSequencingSession(sessionId: string): PiSessionInfo {
+  return {
+    sessionId, provider: 'pi', projectName: 'demo', cwd: '/tmp/demo', nameText: 'Demo session',
+    openingText: 'Start task', latestActivityText: 'Working', status: 'idle', pid: 1234,
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((promiseResolve) => { resolve = promiseResolve; });
+  return { promise, resolve };
+}
+
+describe('AgentAdapterClient sequencing', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  function response(status: number, body: unknown = {}): Response {
+    return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  }
+
+  test('orders an in-flight old register before newer heartbeat semantics', async () => {
+    const blocked = deferred<Response>();
+    const requests: Array<{ method: string; path: string; body?: any }> = [];
+    globalThis.fetch = (async (input, init) => {
+      const request = { method: init?.method ?? 'GET', path: new URL(String(input)).pathname,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined };
+      requests.push(request);
+      if (requests.length === 1) return blocked.promise;
+      return response(200, {});
+    }) as typeof fetch;
+    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
+    const oldSession = makeSequencingSession('ordered-session');
+    const oldRegister = sequenced.registerSession(oldSession);
+    const newest = { ...oldSession, status: 'working' as const, latestActivityText: 'Newest semantics' };
+    const heartbeat = sequenced.heartbeat(newest.sessionId, newest.status, newest.latestActivityText, newest);
+    await Bun.sleep(10);
+    expect(requests).toHaveLength(1);
+    blocked.resolve(response(201, { sessionId: oldSession.sessionId, registeredAt: 'now' }));
+    await Promise.all([oldRegister, heartbeat]);
+    expect(requests.map(({ path }) => path)).toEqual([
+      '/v1/agent/sessions', '/v1/agent/sessions/ordered-session/heartbeat',
+    ]);
+    expect(requests[1]?.body).toMatchObject({ status: 'working', latestActivityText: 'Newest semantics' });
+  });
+
+  test('orders shutdown unregister after an in-flight register', async () => {
+    const blocked = deferred<Response>();
+    const methods: string[] = [];
+    globalThis.fetch = (async (_input, init) => {
+      methods.push(init?.method ?? 'GET');
+      if (methods.length === 1) return blocked.promise;
+      return response(200);
+    }) as typeof fetch;
+    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
+    const registration = sequenced.registerSession(makeSequencingSession('shutdown-order'));
+    const unregister = sequenced.unregisterSession('shutdown-order');
+    await Bun.sleep(10);
+    expect(methods).toEqual(['POST']);
+    blocked.resolve(response(201, { sessionId: 'shutdown-order', registeredAt: 'now' }));
+    await Promise.all([registration, unregister]);
+    expect(methods).toEqual(['POST', 'DELETE']);
+  });
+
+  test('heartbeat 404 recovery completes without reentrant queue deadlock', async () => {
+    const paths: string[] = [];
+    globalThis.fetch = (async (input, init) => {
+      paths.push(`${init?.method} ${new URL(String(input)).pathname}`);
+      if (paths.length === 1) return response(404, { error: 'Session not found' });
+      if (paths.length === 2) return response(201, { sessionId: 'recover', registeredAt: 'now' });
+      return response(200);
+    }) as typeof fetch;
+    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
+    const session = makeSequencingSession('recover');
+    await expect(Promise.race([
+      sequenced.heartbeat(session.sessionId, 'working', 'Recovered', session).then(() => 'done'),
+      Bun.sleep(250).then(() => 'timeout'),
+    ])).resolves.toBe('done');
+    expect(paths).toEqual([
+      'POST /v1/agent/sessions/recover/heartbeat',
+      'POST /v1/agent/sessions',
+      'POST /v1/agent/sessions/recover/heartbeat',
+    ]);
+  });
+
+  test('late poll 404 cannot resurrect a session after unregister completes', async () => {
+    const blockedPoll = deferred<Response>();
+    const requests: string[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const request = `${init?.method} ${new URL(String(input)).pathname}`;
+      requests.push(request);
+      if (request.startsWith('GET ')) return blockedPoll.promise;
+      return response(200);
+    }) as typeof fetch;
+    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
+    const session = makeSequencingSession('shutdown-race');
+
+    const poll = sequenced.pollCommands(session.sessionId, 30_000, session);
+    await Bun.sleep(0);
+    await sequenced.unregisterSession(session.sessionId);
+    blockedPoll.resolve(response(404, { error: 'Session not found' }));
+
+    await expect(poll).resolves.toBeNull();
+    expect(requests).toEqual([
+      'GET /v1/agent/sessions/shutdown-race/commands',
+      'DELETE /v1/agent/sessions/shutdown-race',
+    ]);
+  });
+
+  test.each(['heartbeat', 'register'] as const)('%s invalidates stale poll recovery', async (newerOperation) => {
+    const blockedPoll = deferred<Response>();
+    const requests: string[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const request = `${init?.method} ${new URL(String(input)).pathname}`;
+      requests.push(request);
+      if (request.startsWith('GET ') && requests.length === 1) return blockedPoll.promise;
+      return response(request === 'POST /v1/agent/sessions' ? 201 : 200, {
+        sessionId: 'newer-lifecycle', registeredAt: 'now',
+      });
+    }) as typeof fetch;
+    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
+    const session = makeSequencingSession('newer-lifecycle');
+
+    const poll = sequenced.pollCommands(session.sessionId, 30_000, session);
+    await Bun.sleep(0);
+    if (newerOperation === 'heartbeat') await sequenced.heartbeat(session.sessionId, 'working');
+    else await sequenced.registerSession({ ...session, latestActivityText: 'newest' });
+    blockedPoll.resolve(response(404, { error: 'Session not found' }));
+
+    await expect(poll).resolves.toBeNull();
+    expect(requests.filter((request) => request === 'POST /v1/agent/sessions')).toHaveLength(
+      newerOperation === 'register' ? 1 : 0,
+    );
+  });
+
+  test('sequential poll 404 still re-registers and retries', async () => {
+    const requests: string[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const request = `${init?.method} ${new URL(String(input)).pathname}`;
+      requests.push(request);
+      if (requests.length === 1) return response(404, { error: 'Session not found' });
+      if (requests.length === 2) return response(201, { sessionId: 'poll-recover', registeredAt: 'now' });
+      return new Response(null, { status: 204 });
+    }) as typeof fetch;
+    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
+    const session = makeSequencingSession('poll-recover');
+
+    await expect(sequenced.pollCommands(session.sessionId, 0, session)).resolves.toBeNull();
+    expect(requests).toEqual([
+      'GET /v1/agent/sessions/poll-recover/commands',
+      'POST /v1/agent/sessions',
+      'GET /v1/agent/sessions/poll-recover/commands',
+    ]);
+  });
+});
+
 describe('AgentAdapterClient', () => {
   let dir: string;
   let secret: string;
@@ -69,6 +226,34 @@ describe('AgentAdapterClient', () => {
     };
   }
 
+  test('preserves one exact native ID across every adapter/server route', async () => {
+    const sessionId = ' /native% id?# ';
+    const commandId = ' /command% id?# ';
+    const session = makeSession(sessionId);
+    expect((await client.registerSession(session)).sessionId).toBe(sessionId);
+    await client.heartbeat(sessionId, 'working', 'Exact native ID');
+    const event = await client.pushEvent({
+      sessionId, provider: 'pi', type: 'done', status: 'idle', agentText: 'Done',
+      projectName: session.projectName, workingDirectory: session.cwd, harnessProvider: 'pi',
+      createdAt: '2026-08-07T00:00:00.000Z',
+    });
+    expect((await client.handleSession(sessionId, { handledThroughEventId: event.eventId })).sessionId).toBe(sessionId);
+    registry.enqueueCommand({
+      commandId, hostId: 'host-1', sessionId, type: 'reply', payload: {},
+      issuedAt: '2026-06-30T09:59:00.000Z', expiresAt: '2026-06-30T10:05:00.000Z',
+      nonce: 'exact', watchDeviceId: 'watch-1',
+    });
+    expect(await client.pollCommands(sessionId, 0)).toMatchObject({ commandId, sessionId });
+    const result: CommandResult = {
+      commandId, hostId: 'host-1', sessionId, accepted: true, status: 'executed',
+      updatedAt: '2026-06-30T10:00:00.000Z',
+    };
+    await client.submitResult(commandId, result);
+    expect(await registry.waitForResult(commandId, { timeoutMs: 50 })).toEqual(result);
+    await client.unregisterSession(sessionId);
+    expect(registry.hasSession(sessionId)).toBe(false);
+  });
+
   test('registerSession omits extension-only session fields', async () => {
     const session = { ...makeSession('sess-1'), rawSessionName: 'Local Pi branch name' };
     const result = await client.registerSession(session);
@@ -93,9 +278,7 @@ describe('AgentAdapterClient', () => {
       status: 'idle',
       agentText: 'Tests passed',
       projectName: session.projectName,
-      contextText: 'Demo session · demo',
       workingDirectory: session.cwd,
-      hbaseSessionKey: session.sessionId,
       harnessProvider: 'pi',
       createdAt: '2026-08-07T00:00:00.000Z',
     });
@@ -108,8 +291,8 @@ describe('AgentAdapterClient', () => {
     await client.registerSession(session);
     const event = await client.pushEvent({
       sessionId: session.sessionId, provider: session.provider, type: 'done', status: 'idle',
-      agentText: 'Done', projectName: session.projectName, contextText: 'Demo session · demo', workingDirectory: session.cwd,
-      hbaseSessionKey: session.sessionId, harnessProvider: 'pi', createdAt: '2026-07-16T00:00:00.000Z',
+      agentText: 'Done', projectName: session.projectName, workingDirectory: session.cwd,
+      harnessProvider: 'pi', createdAt: '2026-07-16T00:00:00.000Z',
     });
     const result = await client.handleSession(session.sessionId, {
       handledThroughEventId: event.eventId, handledAt: '2026-07-16T00:00:00Z', action: 'pi_input',
@@ -221,6 +404,7 @@ describe('AgentAdapterClient', () => {
     ['unknown', { accepted: true, status: 'unknown' }],
     ['expired', { accepted: false, status: 'expired' }],
     ['correlationId', { correlationId: 'correlation-1' }],
+    ['non-canonical timestamp', { updatedAt: '2026-06-30T10:00:00Z' }],
   ])('submitResult rejects non-exact result field or status: %s', async (_label, override) => {
     const result = {
       commandId: 'cmd-invalid', hostId: 'host-1', sessionId: 'sess-1',
@@ -266,13 +450,13 @@ describe('AgentAdapterClient', () => {
     expect(result.sessionId).toBe('sess-environment');
   });
 
-  test('rejects discovery files without the exact v2 protocol version', async () => {
+  test('rejects discovery files without the exact v3 protocol version', async () => {
     const configPath = join(dir, 'legacy-agent-adapter.json');
     writeFileSync(configPath, JSON.stringify({ url: baseUrl, secret }));
     await expect(new AgentAdapterClient({ configPath }).registerSession(makeSession('legacy'))).rejects.toThrow(
       'Invalid agent adapter discovery file',
     );
-    writeFileSync(configPath, JSON.stringify({ ...discovery(secret), protocolVersion: 1 }));
+    writeFileSync(configPath, JSON.stringify({ ...discovery(secret), protocolVersion: 2 }));
     await expect(new AgentAdapterClient({ configPath }).registerSession(makeSession('wrong-version'))).rejects.toThrow(
       'Invalid agent adapter discovery file',
     );

@@ -1,5 +1,4 @@
 import type {
-  ActionablePrompt,
   NeedHumanContext,
   NeedHumanError,
   NeedHumanErrorKind,
@@ -62,14 +61,12 @@ export type NeedHumanEventInput = {
   agentText: string;
   humanText?: string;
   createdAt?: string;
-  correlationId?: string;
 } | {
   reason: 'error';
   error: NeedHumanError;
   agentText?: string;
   humanText?: string;
   createdAt?: string;
-  correlationId?: string;
 };
 
 export function buildDoneEvent(
@@ -97,21 +94,11 @@ export function buildNeedHumanEvent(session: PiSessionInfo, input: NeedHumanEven
   const agentText = input.reason === 'error'
     ? input.agentText ?? input.error.message
     : input.agentText;
-  const actionablePrompt: ActionablePrompt | undefined = input.reason === 'question'
-    ? {
-        promptId: `question-${Date.parse(createdAt)}`,
-        type: 'question',
-        label: 'Reply',
-      }
-    : undefined;
-
   return {
     ...buildEventBase(session, {
       agentText: normalizeAssistantTextForEvent('need_human', session, agentText),
       humanText: input.humanText,
       createdAt,
-      correlationId: input.correlationId,
-      actionablePrompt,
     }),
     type: 'need_human',
     status: 'need_human',
@@ -251,8 +238,6 @@ function buildEventBase(
     agentText: string;
     humanText?: string;
     createdAt: string;
-    actionablePrompt?: ActionablePrompt;
-    correlationId?: string;
   },
 ): Omit<AgentAdapterEvent, 'type' | 'status' | 'needHuman'> {
   return {
@@ -261,12 +246,8 @@ function buildEventBase(
     agentText: input.agentText,
     ...(input.humanText !== undefined ? { humanText: input.humanText } : {}),
     projectName: session.projectName,
-    contextText: buildContextText(session),
     workingDirectory: session.cwd,
-    hbaseSessionKey: session.hbaseSessionKey ?? session.sessionId,
     harnessProvider: session.harnessProvider ?? session.provider,
-    ...(input.actionablePrompt ? { actionablePrompt: input.actionablePrompt } : {}),
-    ...(input.correlationId ? { correlationId: input.correlationId } : {}),
     createdAt: input.createdAt,
   };
 }
@@ -374,11 +355,4 @@ function truncateUtf8(value: string, maxBytes: number): string {
     byteLength += characterBytes;
   }
   return `${result.trimEnd()}${ellipsis}`;
-}
-
-function buildContextText(session: Pick<PiSessionInfo, 'nameText' | 'projectName'>): string {
-  const name = session.nameText.trim();
-  const project = session.projectName.trim();
-  if (name && project && name !== project) return `${name} · ${project}`;
-  return project || name;
 }

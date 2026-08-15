@@ -17,13 +17,13 @@ import {
 import { ChaChaPolyAuthenticationError, chachaPolyOpen, chachaPolySeal } from './node-crypto';
 
 const LOCAL_SPOOL_PAYLOAD_KINDS = [
-  'event-source-v2',
-  'event-reservation-v2',
-  'event-dead-letter-v2',
-  'session-source-v2',
-  'event-upload-v2',
-  'session-upload-v2',
-  'terminal-cancellation-v2',
+  'event-source-v3',
+  'event-reservation-v3',
+  'event-dead-letter-v3',
+  'session-source-v3',
+  'event-upload-v3',
+  'session-upload-v3',
+  'terminal-cancellation-v3',
 ] as const;
 export type LocalSpoolPayloadKind = typeof LOCAL_SPOOL_PAYLOAD_KINDS[number];
 export interface LocalEncryptedPendingPayloadV1 {

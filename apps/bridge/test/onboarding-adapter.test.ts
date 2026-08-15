@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { AGENT_ADAPTER_PROTOCOL_VERSION } from '@ariava/protocol';
 import type { HostEncryptionIdentity } from '../src/identity/host-encryption-key';
 import type { HostIdentity, HostIdentityInspection, HostIdentityStore } from '../src/identity/types';
 import type {
@@ -390,7 +391,11 @@ function fixture(options: { ephemeralCli?: boolean; initialized?: boolean; persi
       expect(dependencies.fetch).toBe(readinessFetch);
       expect(dependencies.readDiscovery).toBe(readinessReadDiscovery);
       return {
-        discovery: { url: 'http://127.0.0.1:7272', secret: 'isolated-secret', protocolVersion: 2 },
+        discovery: {
+          url: 'http://127.0.0.1:7272',
+          secret: 'isolated-secret',
+          protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+        },
         health: { status: 'healthy', drivers: [] },
       };
     },

@@ -30,7 +30,7 @@ function fixture() {
 function terminalSession(overrides: Partial<CanonicalSessionState> = {}): CanonicalSessionState {
   return {
     sessionId: 'session-test', hostId: 'host-test', provider: 'pi', projectName: 'secret-project', nameText: 'Session',
-    latestActivityText: 'terminal activity', workingDirectory: '/secret/project', hbaseSessionKey: 'hbase-secret',
+    latestActivityText: 'terminal activity', workingDirectory: '/secret/project',
     harnessProvider: 'pi', status: 'idle', updatedAt: '2026-08-07T00:00:01.000Z',
     lastEventId: 'event-test', ...overrides,
   };
@@ -40,7 +40,7 @@ function doneEvent(overrides: Partial<CanonicalEvent> = {}): CanonicalEvent {
   return {
     eventId: 'event-test', hostId: 'host-test', sessionId: 'session-test', provider: 'pi', type: 'done', status: 'idle',
     agentText: 'terminal activity', projectName: 'secret-project',
-    workingDirectory: '/secret/project', hbaseSessionKey: 'hbase-secret', harnessProvider: 'pi',
+    workingDirectory: '/secret/project', harnessProvider: 'pi',
     createdAt: '2026-08-07T00:00:01.000Z', ...overrides,
   } as CanonicalEvent;
 }
@@ -88,9 +88,9 @@ describe('EncryptedUploadOrchestrator canonical Event binding', () => {
     };
     const flushed = await new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any).flushPendingEvents();
     expect(flushed).toBe(1);
-    expect(uploads[0].event).toMatchObject({ type: 'done', status: 'idle', content: { payloadKind: 'event-content-v2' } });
-    expect(uploads[0].session).toMatchObject({ status: 'idle', updatedAt: terminal.updatedAt, lastEventId: 'event-test', content: { payloadKind: 'session-content-v2' } });
-    expect(openMockedContent(uploads[0].session.content)).toMatchObject({ version: 2, latestActivityText: 'terminal activity' });
+    expect(uploads[0].event).toMatchObject({ type: 'done', status: 'idle', content: { payloadKind: 'event-content-v3' } });
+    expect(uploads[0].session).toMatchObject({ status: 'idle', updatedAt: terminal.updatedAt, lastEventId: 'event-test', content: { payloadKind: 'session-content-v3' } });
+    expect(openMockedContent(uploads[0].session.content)).toEqual({ version: 3, projectName: 'secret-project', nameText: 'Session', latestActivityText: 'terminal activity', workingDirectory: '/secret/project', harnessProvider: 'pi' });
   });
 
   test('rejects Event persistence without a real matching terminal Session snapshot', () => {
@@ -121,7 +121,7 @@ describe('EncryptedUploadOrchestrator canonical Event binding', () => {
     expect(retried.event).toMatchObject({ type: 'need_human', status: 'need_human', recipientSetVersion: 2 });
     expect(retried.session).toMatchObject({ status: 'need_human', lastEventId: 'event-test', recipientSetVersion: 2 });
     expect(openMockedContent(retried.event.content)).toMatchObject({
-      version: 2, needHuman: { reason: 'error', error: { providerCode: 'E_PROVIDER', retryExhausted: true } },
+      version: 3, needHuman: { reason: 'error', error: { providerCode: 'E_PROVIDER', retryExhausted: true } },
     });
     expect(retried.event.notificationPreviews[0]).toMatchObject({ eventType: 'need_human', content: { payloadKind: 'notification-preview-v2' } });
   });
@@ -148,7 +148,7 @@ describe('EncryptedUploadOrchestrator canonical Event binding', () => {
       .toEqual(['ekey-historical', 'ekey-current']);
   });
 
-  test('transient retry preserves one inflight v2 tuple rather than rebuilding classification', async () => {
+  test('transient retry preserves one inflight v3 tuple rather than rebuilding classification', async () => {
     const store = fixture(); const terminal = terminalSession();
     store.replaceDriverSessions('pi', [terminal]); store.queuePendingEvent(doneEvent(), terminal); store.setRecipientSetVersion(1);
     const published: any[] = []; let offline = true;
@@ -162,6 +162,42 @@ describe('EncryptedUploadOrchestrator canonical Event binding', () => {
     offline = false;
     expect(await orchestrator.flushPendingEvents()).toBe(1);
     expect(published[1]).toEqual(inflight);
+  });
+
+  test('same-version recipient conflict defers once without ciphertext churn or hot loop', async () => {
+    const store = fixture();
+    store.replaceDriverSessions('pi', [terminalSession()]);
+    let recipientReads = 0;
+    let publishAttempts = 0;
+    let reconcileAttempts = 0;
+    const client = {
+      recipientSnapshot: async () => {
+        recipientReads += 1;
+        return { version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] };
+      },
+      publishEncryptedSession: async () => {
+        publishAttempts += 1;
+        throw new RelayClientError(409, 'recipient changed', { error: 'e2e_recipient_set_changed' });
+      },
+      reconcileEncryptedSession: async () => { reconcileAttempts += 1; return false; },
+    };
+    const orchestrator = new EncryptedUploadOrchestrator(
+      store, client as any, { reconcileRecipients: () => [] } as any,
+    );
+
+    expect(await orchestrator.flushPendingEvents()).toBe(0);
+    const inflight = store.getInflightSessionUpload('session-test');
+    expect(inflight).toBeDefined();
+    expect({ recipientReads, publishAttempts, reconcileAttempts }).toEqual({
+      recipientReads: 2, publishAttempts: 1, reconcileAttempts: 1,
+    });
+
+    const beforeRetry = structuredClone(inflight);
+    expect(await orchestrator.flushPendingEvents()).toBe(0);
+    expect(store.getInflightSessionUpload('session-test')).toEqual(beforeRetry);
+    expect({ recipientReads, publishAttempts, reconcileAttempts }).toEqual({
+      recipientReads: 4, publishAttempts: 2, reconcileAttempts: 2,
+    });
   });
 
   test('no-recipient authority performs one bounded snapshot pass and does not hot-loop', async () => {

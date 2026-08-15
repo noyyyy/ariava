@@ -41,6 +41,8 @@ export class AgentAdapterClient implements AgentAdapter {
   private readonly configPath: string;
   private cachedDiscovery: AgentAdapterDiscoveryFile | null = null;
   private readonly pinnedDiscovery: boolean;
+  private readonly sessionMutationTails = new Map<string, Promise<void>>();
+  private readonly sessionLifecycleGenerations = new Map<string, number>();
 
   constructor(options: AgentAdapterClientOptions = {}) {
     this.configPath = resolveAgentAdapterConfigPath(options.configPath);
@@ -55,22 +57,36 @@ export class AgentAdapterClient implements AgentAdapter {
   }
 
   async registerSession(session: PiSessionInfo): Promise<{ sessionId: string; registeredAt: string }> {
+    this.invalidatePollRecovery(session.sessionId);
+    return this.enqueueSessionMutation(session.sessionId, () => this.registerSessionCore(session));
+  }
+
+  private async registerSessionCore(session: PiSessionInfo): Promise<{ sessionId: string; registeredAt: string }> {
     const {
       sessionId, provider, projectName, cwd, nameText, openingText, latestActivityText,
-      hbaseSessionKey, harnessProvider, pid, status,
+      harnessProvider, pid, status,
     } = session;
     const response = await this.fetch('POST', '/v1/agent/sessions', {
       sessionId, provider, projectName, cwd, nameText, openingText, latestActivityText,
-      hbaseSessionKey, harnessProvider, pid, status,
+      harnessProvider, pid, status,
     });
     return (await response.json()) as { sessionId: string; registeredAt: string };
   }
 
   async unregisterSession(sessionId: string): Promise<void> {
+    this.invalidatePollRecovery(sessionId);
+    await this.enqueueSessionMutation(sessionId, () => this.unregisterSessionCore(sessionId));
+  }
+
+  private async unregisterSessionCore(sessionId: string): Promise<void> {
     await this.fetch('DELETE', `/v1/agent/sessions/${encodeURIComponent(sessionId)}`, undefined);
   }
 
   async pushEvent(event: AgentAdapterEvent): Promise<{ eventId: string }> {
+    return this.enqueueSessionMutation(event.sessionId, () => this.pushEventCore(event));
+  }
+
+  private async pushEventCore(event: AgentAdapterEvent): Promise<{ eventId: string }> {
     const response = await this.fetch(
       'POST', `/v1/agent/sessions/${encodeURIComponent(event.sessionId)}/events`, event,
     );
@@ -78,11 +94,23 @@ export class AgentAdapterClient implements AgentAdapter {
   }
 
   async handleSession(sessionId: string, request: HandleSessionRequest): Promise<{ ok: true; hostId: string; sessionId: string; handledThroughEventId: string }> {
+    return this.enqueueSessionMutation(sessionId, () => this.handleSessionCore(sessionId, request));
+  }
+
+  private async handleSessionCore(sessionId: string, request: HandleSessionRequest): Promise<{ ok: true; hostId: string; sessionId: string; handledThroughEventId: string }> {
     const response = await this.fetch('POST', `/v1/agent/sessions/${encodeURIComponent(sessionId)}/handle`, request);
     return (await response.json()) as { ok: true; hostId: string; sessionId: string; handledThroughEventId: string };
   }
 
   async heartbeat(sessionId: string, status: SessionStatus, latestActivityText?: string | null, session?: PiSessionInfo): Promise<void> {
+    this.invalidatePollRecovery(sessionId);
+    await this.enqueueSessionMutation(
+      sessionId,
+      () => this.heartbeatCore(sessionId, status, latestActivityText, session),
+    );
+  }
+
+  private async heartbeatCore(sessionId: string, status: SessionStatus, latestActivityText?: string | null, session?: PiSessionInfo): Promise<void> {
     const currentSession = session ? { ...session, status, latestActivityText: latestActivityText ?? undefined } : undefined;
     const body: Record<string, unknown> = { status };
     if (latestActivityText !== undefined) body.latestActivityText = latestActivityText;
@@ -90,13 +118,11 @@ export class AgentAdapterClient implements AgentAdapter {
       body.openingText = currentSession.openingText ?? null;
       body.projectName = currentSession.projectName;
       body.nameText = currentSession.nameText;
-      body.hbaseSessionKey = currentSession.hbaseSessionKey ?? currentSession.sessionId;
-      body.harnessProvider = currentSession.harnessProvider ?? currentSession.provider;
     }
     const path = `/v1/agent/sessions/${encodeURIComponent(sessionId)}/heartbeat`;
     const response = await this.fetchResponse('POST', path, body);
     if (response.status === 404 && currentSession) {
-      await this.registerSession(currentSession);
+      await this.registerSessionCore(currentSession);
       await this.fetch('POST', path, body);
       return;
     }
@@ -104,10 +130,17 @@ export class AgentAdapterClient implements AgentAdapter {
   }
 
   async pollCommands(sessionId: string, timeoutMs: number, session?: PiSessionInfo): Promise<CommandEnvelope | null> {
+    const lifecycleGeneration = this.getLifecycleGeneration(sessionId);
     const path = `/v1/agent/sessions/${encodeURIComponent(sessionId)}/commands?timeout=${timeoutMs}`;
     let response = await this.fetchResponse('GET', path, undefined);
     if (response.status === 404 && session) {
-      await this.registerSession(session);
+      if (this.getLifecycleGeneration(sessionId) !== lifecycleGeneration) return null;
+      const recovered = await this.enqueueSessionMutation(sessionId, async () => {
+        if (this.getLifecycleGeneration(sessionId) !== lifecycleGeneration) return false;
+        await this.registerSessionCore(session);
+        return true;
+      });
+      if (!recovered) return null;
       response = await this.fetchResponse('GET', path, undefined);
     }
     await this.requireOk(response, 'GET', path);
@@ -128,6 +161,25 @@ export class AgentAdapterClient implements AgentAdapter {
       `/v1/agent/sessions/${encodeURIComponent(result.sessionId)}/commands/${encodeURIComponent(commandId)}/result`,
       structuredClone(result),
     );
+  }
+
+  private invalidatePollRecovery(sessionId: string): void {
+    this.sessionLifecycleGenerations.set(sessionId, this.getLifecycleGeneration(sessionId) + 1);
+  }
+
+  private getLifecycleGeneration(sessionId: string): number {
+    return this.sessionLifecycleGenerations.get(sessionId) ?? 0;
+  }
+
+  private enqueueSessionMutation<Result>(sessionId: string, operation: () => Promise<Result>): Promise<Result> {
+    const previous = this.sessionMutationTails.get(sessionId) ?? Promise.resolve();
+    const result = previous.catch(() => undefined).then(operation);
+    const tail = result.then(() => undefined, () => undefined);
+    this.sessionMutationTails.set(sessionId, tail);
+    void tail.finally(() => {
+      if (this.sessionMutationTails.get(sessionId) === tail) this.sessionMutationTails.delete(sessionId);
+    });
+    return result;
   }
 
   private async fetch(

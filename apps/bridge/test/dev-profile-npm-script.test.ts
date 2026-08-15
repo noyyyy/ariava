@@ -44,6 +44,7 @@ function recordUnsupportedChildAction(api: string): (...args: unknown[]) => neve
 }
 
 const { writeAgentAdapterConfig } = await import('../src/agent-adapter/config');
+const { AGENT_ADAPTER_PROTOCOL_VERSION } = await import('@ariava/protocol');
 const { createDefaultDevProfileDependencies, runDevProfileCommand } = await import('../src/dev-profile-app');
 const { resolveAriavaDevProfilePaths } = await import('../src/host-manager/dev-profile');
 const { createDevProfile } = await import('../src/cli/profiles/dev');
@@ -282,7 +283,8 @@ async function prepareActionCase(command: string, dependencies: DevProfileDepend
     mkdirSync(dependencies.paths.root, { recursive: true, mode: 0o700 });
     writeAgentAdapterConfig(dependencies.paths.agentAdapterConfigPath, {
       url: 'http://127.0.0.1:7273',
-      secret: 'dev-secret', protocolVersion: 2,
+      secret: 'dev-secret',
+      protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
     });
     dependencies.pathExists = (path) => path === dependencies.paths.agentAdapterConfigPath
       || path === dependencies.sourcePiExtensionPath;

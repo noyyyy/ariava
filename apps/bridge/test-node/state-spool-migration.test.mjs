@@ -8,17 +8,25 @@ import { join } from 'node:path';
 import {
   BRIDGE_RUNTIME_STATE_SCHEMA_VERSION,
   BridgeStateStore,
+  runtimeMigrationIntentPathForState,
   runtimeResetIntentPathForState,
   runtimeSchemaFloorPathForState,
 } from '../dist/state-store.js';
 import {
-  base64UrlEncode, buildEncryptedCommandEnvelopeBindingBytes,
+  E2E_SUITE_V1,
+  base64UrlDecode,
+  base64UrlEncode,
+  buildEncryptedCommandEnvelopeBindingBytes,
+  buildSessionContentAAD,
+  buildWrapAAD,
+  pairRootInfo,
 } from '../../../packages/protocol/dist/index.js';
 import commandVectors from '../../../packages/protocol/test/fixtures/command-e2e-v1-vectors.json' with { type: 'json' };
 import { LinuxSpoolKeyStore, spoolKeyIdForKey, spoolPathForState } from '../dist/e2e/local-spool.js';
 import { BridgeDaemon } from '../dist/daemon.js';
 import { EncryptedUploadOrchestrator } from '../dist/e2e/upload-orchestrator.js';
 import { generateHostEncryptionIdentity } from '../dist/identity/host-encryption-key.js';
+import { chachaPolyOpen, hkdfSha256, x25519SharedSecret } from '../dist/e2e/node-crypto.js';
 
 const HOST_ID = commandVectors.link.hostId;
 const CREATED_AT = '2026-08-07T00:00:00.000Z';
@@ -29,6 +37,55 @@ const OLD_KINDS = [
   'event-upload-v1',
   'session-upload-v1',
 ];
+
+function activeRecipient(hostIdentity) {
+  const watchIdentity = generateHostEncryptionIdentity(HOST_ID, 2);
+  const watchDeviceId = commandVectors.link.watchDeviceId;
+  const transcriptDigest = base64UrlEncode(new Uint8Array(32).fill(6));
+  return {
+    recipient: {
+      linkId: 'link-test', linkGeneration: 1, watchDeviceId, epoch: 1, state: 'active',
+      transcriptDigest,
+      hostIdentity,
+      hostBinding: {
+        version: 1, entityType: 'host', entityId: hostIdentity.hostId, identityKeyId: 'host-identity-key',
+        encryptionKeyId: hostIdentity.encryptionKeyId, suite: E2E_SUITE_V1, publicKey: hostIdentity.publicKey,
+        sequence: hostIdentity.sequence, createdAt: hostIdentity.createdAt,
+        bindingSignature: base64UrlEncode(new Uint8Array(64).fill(3)),
+      },
+      watchBinding: {
+        version: 1, entityType: 'watch', entityId: watchDeviceId, identityKeyId: 'watch-identity-key',
+        encryptionKeyId: watchIdentity.encryptionKeyId, suite: E2E_SUITE_V1, publicKey: watchIdentity.publicKey,
+        sequence: 1, createdAt: CREATED_AT, bindingSignature: base64UrlEncode(new Uint8Array(64).fill(4)),
+      },
+    },
+    openSession(upload) {
+      const wrap = upload.keyWraps[0];
+      const salt = base64UrlDecode(transcriptDigest, 32, 'test transcript digest');
+      const shared = x25519SharedSecret(watchIdentity.privateKeyPkcs8, base64UrlDecode(hostIdentity.publicKey, 32, 'Host public key'));
+      const root = hkdfSha256(shared, salt, pairRootInfo(wrap.linkId, wrap.linkGeneration, wrap.epoch));
+      const wrapKey = hkdfSha256(root, salt, new TextEncoder().encode('ariava:e2e:v1:wrap:bridge-to-watch'));
+      try {
+        const dek = chachaPolyOpen(wrapKey, base64UrlDecode(wrap.nonce, 12, 'wrap nonce'),
+          base64UrlDecode(wrap.ciphertext, 48, 'wrapped DEK'), buildWrapAAD({
+            direction: 'bridge-to-watch', linkId: wrap.linkId, linkGeneration: wrap.linkGeneration, epoch: wrap.epoch,
+            hostId: upload.hostId, watchDeviceId, senderEncryptionKeyId: wrap.senderEncryptionKeyId,
+            recipientEncryptionKeyId: wrap.recipientEncryptionKeyId, contentId: upload.content.contentId,
+            payloadKind: 'session-content-v3',
+          }));
+        try {
+          const plaintext = chachaPolyOpen(dek, base64UrlDecode(upload.content.nonce, 12, 'content nonce'),
+            base64UrlDecode(upload.content.ciphertext, undefined, 'session ciphertext'), buildSessionContentAAD({
+              hostId: upload.hostId, sessionId: upload.sessionId, provider: upload.provider, status: upload.status,
+              updatedAt: upload.updatedAt, snoozedUntil: upload.snoozedUntil, revision: upload.revision,
+              contentId: upload.content.contentId,
+            }));
+          try { return JSON.parse(new TextDecoder().decode(plaintext)); } finally { plaintext.fill(0); }
+        } finally { dek.fill(0); }
+      } finally { shared.fill(0); root.fill(0); wrapKey.fill(0); salt.fill(0); }
+    },
+  };
+}
 
 function oldState() {
   const session = {
@@ -218,6 +275,91 @@ function claimCommand(store, commandId) {
   return claim.execution;
 }
 
+function setupSchema3Runtime() {
+  const fixture = setupOldRuntime();
+  const epoch = '00000000-0000-4000-8000-000000000003';
+  const session = {
+    sessionId: 'session', hostId: HOST_ID, provider: 'adapter', projectName: 'project', nameText: 'name',
+    openingText: 'opening', latestActivityText: 'latest', workingDirectory: '/workspace', harnessProvider: 'pi',
+    status: 'need_human', updatedAt: CREATED_AT, lastEventId: 'event', snoozedUntil: '2026-08-07T00:05:00.000Z',
+  };
+  const event = {
+    eventId: 'event', hostId: HOST_ID, sessionId: 'session', provider: 'adapter', type: 'need_human',
+    status: 'need_human', agentText: 'legacy question', projectName: 'project', contextText: 'legacy context',
+    workingDirectory: '/workspace', hbaseSessionKey: 'legacy-key', harnessProvider: 'pi',
+    actionablePrompt: { promptId: 'prompt', type: 'question', label: 'Reply' }, correlationId: 'legacy-correlation',
+    needHuman: { reason: 'question' }, createdAt: CREATED_AT,
+  };
+  const state = {
+    schemaVersion: 3, runtimeResetEpoch: epoch,
+    host: { hostId: HOST_ID, hostName: 'Preserved Host', platform: 'linux', bridgeVersion: '0.3.0',
+      registeredAt: CREATED_AT, lastSeenAt: CREATED_AT, bridgeStatus: 'degraded' },
+    sessions: { session }, sessionDrivers: { session: 'adapter' }, reconciledDrivers: { adapter: true },
+    recentEvents: [event], sessionRevisions: { session: 11 }, recipientSetVersion: 9,
+    eventUploadCompletions: { event: { version: 1, eventId: 'event', sessionId: 'session', revision: 11,
+      eventContentId: 'event-content', sessionContentId: 'session-content', committedAt: CREATED_AT } },
+    producerEventReservations: { ['session\nfingerprint']: {
+      version: 1, eventId: 'event', sessionId: 'session', fingerprint: 'fingerprint', createdAt: CREATED_AT } },
+    terminalCancellations: { event: { version: 1, sessionId: 'session', eventId: 'event',
+      fingerprint: 'fingerprint', removeSession: false, createdAt: CREATED_AT } },
+    pendingHandles: { [`${HOST_ID}:session`]: { hostId: HOST_ID, sessionId: 'session',
+      handledThroughEventId: 'event', handledThroughEventCreatedAt: CREATED_AT, handledAt: CREATED_AT,
+      action: 'pi_input', updatedAt: CREATED_AT } },
+    commandResults: { command: { commandId: 'command', hostId: HOST_ID, sessionId: 'session', accepted: true,
+      status: 'executed', message: 'done', correlationId: 'command-correlation', updatedAt: CREATED_AT } },
+    seenCommands: { command: CREATED_AT },
+    currentSessionsSnapshot: { version: 1, lastAllocatedRevision: 12, lastAcceptedRevision: 14,
+      lastAcceptedDigest: 'digest', lastAcceptedContentDigest: 'content-digest', lastAcceptedRecipientSetVersion: 9 },
+    runtimeHealth: { status: 'degraded', drivers: [{ driver: 'adapter', code: 'driver_reconciliation_failed',
+      count: 2, firstSeenAt: CREATED_AT, lastSeenAt: CREATED_AT, nextRetryAt: '2026-08-07T00:01:00.000Z' }],
+      relayPresence: { code: 'relay_presence_refresh_failed', count: 1, firstSeenAt: CREATED_AT,
+        lastSeenAt: CREATED_AT, nextRetryAt: '2026-08-07T00:01:00.000Z' } },
+  };
+  const keyId = spoolKeyIdForKey(new Uint8Array(32).fill(7));
+  const kinds = ['event-source-v2', 'event-reservation-v2', 'event-dead-letter-v2', 'session-source-v2',
+    'event-upload-v2', 'session-upload-v2', 'terminal-cancellation-v2'];
+  const spool = { version: 2, runtimeStateSchemaVersion: 3, runtimeResetEpoch: epoch, hostId: HOST_ID, keyId,
+    items: kinds.map((kind) => spoolItem(kind, standaloneSpoolBinding(kind))) };
+  writeFileSync(fixture.statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  writeFileSync(fixture.spoolPath, `${JSON.stringify(spool)}\n`, { mode: 0o600 });
+  return fixture;
+}
+
+function assertSelectiveSchema4Migration(fixture, store) {
+  const state = JSON.parse(readFileSync(fixture.statePath, 'utf8'));
+  const spool = JSON.parse(readFileSync(fixture.spoolPath, 'utf8'));
+  assert.equal(state.schemaVersion, 4);
+  assert.equal(spool.runtimeStateSchemaVersion, 4);
+  assert.equal(state.runtimeResetEpoch, spool.runtimeResetEpoch);
+  assert.deepEqual(state.host, { hostId: HOST_ID, hostName: 'Preserved Host', platform: 'linux', bridgeVersion: '0.3.0',
+    registeredAt: CREATED_AT, lastSeenAt: CREATED_AT, bridgeStatus: 'degraded' });
+  assert.deepEqual(state.sessions, { session: { sessionId: 'session', hostId: HOST_ID, provider: 'adapter',
+    projectName: 'project', nameText: 'name', openingText: 'opening', latestActivityText: 'latest',
+    workingDirectory: '/workspace', harnessProvider: 'pi', status: 'need_human', updatedAt: CREATED_AT,
+    snoozedUntil: '2026-08-07T00:05:00.000Z' } });
+  assert.deepEqual(state.sessionDrivers, { session: 'adapter' });
+  assert.deepEqual(state.reconciledDrivers, { adapter: true });
+  assert.deepEqual(state.sessionRevisions, { session: 11 });
+  assert.equal(state.recipientSetVersion, 9);
+  assert.deepEqual(state.runtimeHealth, { status: 'degraded', drivers: [{ driver: 'adapter',
+    code: 'driver_reconciliation_failed', count: 2, firstSeenAt: CREATED_AT, lastSeenAt: CREATED_AT,
+    nextRetryAt: '2026-08-07T00:01:00.000Z' }], relayPresence: { code: 'relay_presence_refresh_failed',
+    count: 1, firstSeenAt: CREATED_AT, lastSeenAt: CREATED_AT, nextRetryAt: '2026-08-07T00:01:00.000Z' } });
+  assert.deepEqual(state.recentEvents, []);
+  assert.deepEqual(state.pendingHandles, {});
+  assert.deepEqual(state.commandExecutions, {});
+  assert.equal(state.commandResults, undefined);
+  assert.equal(state.seenCommands, undefined);
+  for (const key of ['eventUploadCompletions', 'producerEventReservations', 'terminalCancellations']) assert.equal(state[key], undefined);
+  assert.deepEqual(state.currentSessionsSnapshot, { version: 1, lastAllocatedRevision: 14, lastAcceptedRevision: 0 });
+  assert.deepEqual(spool.items, []);
+  assert.deepEqual(store.listSessions(), [state.sessions.session]);
+  assert.equal(store.getDriverNameForSession('session'), 'adapter');
+  assert.equal(store.getCommandExecution('command'), undefined);
+  assert.deepEqual(store.peekPendingUploads(), []);
+  assert.deepEqual(store.peekPendingSessionHandles(), []);
+  assert.equal(lstatSync(runtimeMigrationIntentPathForState(fixture.statePath), { throwIfNoEntry: false }), undefined);
+}
 function openDeferred(statePath) {
   return new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
 }
@@ -232,6 +374,98 @@ function initialize(fixture, hook) {
     throw error;
   }
 }
+
+test('schema 3 rejects a Session driver that disagrees with retained provider before intent creation', () => {
+  const fixture = setupSchema3Runtime();
+  try {
+    const state = JSON.parse(readFileSync(fixture.statePath, 'utf8'));
+    state.sessionDrivers.session = 'other';
+    writeFileSync(fixture.statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    const stateBytes = readFileSync(fixture.statePath);
+    const spoolBytes = readFileSync(fixture.spoolPath);
+    assert.throws(() => initialize(fixture), /preflight failed closed/i);
+    assert.deepEqual(readFileSync(fixture.statePath), stateBytes);
+    assert.deepEqual(readFileSync(fixture.spoolPath), spoolBytes);
+    assert.equal(lstatSync(runtimeMigrationIntentPathForState(fixture.statePath), { throwIfNoEntry: false }), undefined);
+  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test('schema 3 migration republishes exact encrypted Session v3 at revision 12 and commits its cursor', async () => {
+  const fixture = setupSchema3Runtime();
+  try {
+    const store = initialize(fixture);
+    assertSelectiveSchema4Migration(fixture, store);
+    const hostIdentity = generateHostEncryptionIdentity(HOST_ID);
+    const material = activeRecipient(hostIdentity);
+    const published = [];
+    const orchestrator = new EncryptedUploadOrchestrator(store, {
+      publishEncryptedSession: async (session) => { published.push(session); },
+      reconcileEncryptedSession: async () => false,
+    }, { reconcileRecipients: () => [material.recipient] });
+    const snapshot = { version: 1, hostId: HOST_ID, recipientSetVersion: 9, recipients: [material.recipient] };
+    const committed = await orchestrator.publishAuthoritativeSnapshots(snapshot, [material.recipient], ['session']);
+    assert.deepEqual(committed && Object.fromEntries(committed.revisions), { session: 12 });
+    assert.equal(published.length, 1);
+    assert.equal(published[0].content.payloadKind, 'session-content-v3');
+    assert.equal(published[0].revision, 12);
+    assert.equal(published[0].revision > 11, true);
+    assert.deepEqual(material.openSession(published[0]), {
+      version: 3, projectName: 'project', nameText: 'name', openingText: 'opening', latestActivityText: 'latest',
+      workingDirectory: '/workspace', harnessProvider: 'pi',
+    });
+    assert.equal(store.currentSessionRevision('session'), 12);
+    assert.equal(JSON.parse(readFileSync(fixture.statePath, 'utf8')).sessionRevisions.session, 12);
+  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+for (const boundary of ['before-intent', 'after-intent', 'after-spool', 'after-state', 'after-cleanup']) {
+  test(`schema 3 to 4 migration recovers deterministically after ${boundary}`, () => {
+    const fixture = setupSchema3Runtime();
+    let crashed = false;
+    try {
+      assert.throws(() => initialize(fixture, (phase) => {
+        if (!crashed && phase === boundary) { crashed = true; throw new Error(`crash:${phase}`); }
+      }), /preflight failed closed/i);
+      assert.equal(crashed, true);
+      if (boundary !== 'before-intent' && boundary !== 'after-cleanup') {
+        const intent = JSON.parse(readFileSync(runtimeMigrationIntentPathForState(fixture.statePath), 'utf8'));
+        assert.deepEqual([intent.fromSchemaVersion, intent.toSchemaVersion], [3, 4]);
+        for (const key of ['stateSourceHash', 'spoolSourceHash', 'stateTargetHash', 'spoolTargetHash']) {
+          assert.match(intent[key], /^[A-Za-z0-9_-]{43}$/u);
+        }
+      }
+      const recovered = initialize(fixture);
+      assertSelectiveSchema4Migration(fixture, recovered);
+    } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+  });
+}
+
+test('schema 3 to 4 recovery rejects source, target, journal, and path tampering byte-identically', () => {
+  for (const tamper of ['state', 'spool', 'journal-hash', 'journal-path']) {
+    const fixture = setupSchema3Runtime();
+    try {
+      assert.throws(() => initialize(fixture, (phase) => { if (phase === 'after-intent') throw new Error('crash'); }),
+        /preflight failed closed/i);
+      const intentPath = runtimeMigrationIntentPathForState(fixture.statePath);
+      if (tamper === 'state') writeFileSync(fixture.statePath, '{"tampered":true}\n', { mode: 0o600 });
+      if (tamper === 'spool') writeFileSync(fixture.spoolPath, '{"tampered":true}\n', { mode: 0o600 });
+      if (tamper.startsWith('journal')) {
+        const intent = JSON.parse(readFileSync(intentPath, 'utf8'));
+        if (tamper === 'journal-hash') intent.stateTargetHash = 'A'.repeat(43);
+        else intent.statePath = join(fixture.dir, 'other-state.json');
+        writeFileSync(intentPath, `${JSON.stringify(intent)}\n`, { mode: 0o600 });
+      }
+      const stateBytes = readFileSync(fixture.statePath);
+      const spoolBytes = readFileSync(fixture.spoolPath);
+      const journalBytes = readFileSync(intentPath);
+      assert.throws(() => initialize(fixture), /preflight failed closed/i);
+      assert.deepEqual(readFileSync(fixture.statePath), stateBytes);
+      assert.deepEqual(readFileSync(fixture.spoolPath), spoolBytes);
+      assert.deepEqual(readFileSync(intentPath), journalBytes);
+    } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+  }
+});
+
 
 function assertReset(fixture, store) {
   const state = JSON.parse(readFileSync(fixture.statePath, 'utf8'));
@@ -883,7 +1117,7 @@ test('recognized reset repopulates only live v2 Agent Adapter Sessions through p
       publishEncryptedSession: async (session) => { published.push(session); },
       reconcileEncryptedSession: async () => false,
       recipientSnapshot: async () => ({ version: 1, hostId: HOST_ID, recipientSetVersion: 1, recipients: [] }),
-    }, generateHostEncryptionIdentity(HOST_ID), { reconcileRecipients: () => [] });
+    }, { reconcileRecipients: () => [] });
     assert.equal(await orchestrator.publishRecipientChangeSnapshots(
       { version: 1, hostId: HOST_ID, recipientSetVersion: 1, recipients: [] }, [],
     ), true);
@@ -897,8 +1131,8 @@ test('recognized reset repopulates only live v2 Agent Adapter Sessions through p
 });
 
 const secureWriteCrashChild = String.raw`
-  import { BridgeStateStore } from './apps/bridge/dist/state-store.js';
-  const [statePath, identityPath, member, boundary] = process.argv.slice(1);
+  const [bridgeDistUrl, statePath, identityPath, member, boundary] = process.argv.slice(1);
+  const { BridgeStateStore } = await import(new URL('state-store.js', bridgeDistUrl));
   const store = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
   const suffix = member === 'intent' ? '.runtime-reset.json' : member === 'spool' ? '.spool.json' : 'state.json';
   const crash = (path) => { if (path.endsWith(suffix)) process.kill(process.pid, 'SIGKILL'); };
@@ -911,7 +1145,7 @@ for (const member of ['intent', 'spool', 'state']) {
       const fixture = setupOldRuntime();
       try {
         const result = spawnSync(process.execPath, ['--input-type=module', '--eval', secureWriteCrashChild,
-          fixture.statePath, fixture.identityPath, member, boundary], { cwd: process.cwd(), encoding: 'utf8' });
+          new URL('../dist/', import.meta.url).href, fixture.statePath, fixture.identityPath, member, boundary], { cwd: process.cwd(), encoding: 'utf8' });
         assert.equal(result.signal, 'SIGKILL', result.stderr);
         const recovered = initialize(fixture);
         assertReset(fixture, recovered);
@@ -923,8 +1157,8 @@ for (const member of ['intent', 'spool', 'state']) {
 }
 
 const secureCleanupCrashChild = String.raw`
-  import { BridgeStateStore } from './apps/bridge/dist/state-store.js';
-  const [statePath, identityPath, boundary] = process.argv.slice(1);
+  const [bridgeDistUrl, statePath, identityPath, boundary] = process.argv.slice(1);
+  const { BridgeStateStore } = await import(new URL('state-store.js', bridgeDistUrl));
   const store = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
   store.initializeEncryptedSpool('host_If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk', identityPath, 'linux', undefined, undefined, {
     remove: { [boundary]: () => process.kill(process.pid, 'SIGKILL') },
@@ -936,7 +1170,7 @@ for (const boundary of ['afterUnlink', 'afterDirectorySync']) {
     const fixture = setupOldRuntime();
     try {
       const result = spawnSync(process.execPath, ['--input-type=module', '--eval', secureCleanupCrashChild,
-        fixture.statePath, fixture.identityPath, boundary], { cwd: process.cwd(), encoding: 'utf8' });
+        new URL('../dist/', import.meta.url).href, fixture.statePath, fixture.identityPath, boundary], { cwd: process.cwd(), encoding: 'utf8' });
       assert.equal(result.signal, 'SIGKILL', result.stderr);
       const recovered = initialize(fixture);
       assertReset(fixture, recovered);

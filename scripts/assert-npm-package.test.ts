@@ -21,6 +21,7 @@ const required = [
   'packages/protocol/dist/fixtures/command-e2e-v1-vectors.json',
   'packages/protocol/dist/fixtures/ed25519-request-vectors.json',
   'packages/protocol/dist/fixtures/e2e-v2-vectors.json',
+  'packages/protocol/dist/fixtures/e2e-v3-vectors.json',
   'packages/protocol/dist/fixtures/notification-preview-v2-vector.json',
   'packages/protocol/dist/fixtures/need-human-error-validation-v2.json',
   'packages/shared-utils/dist/index.js', 'packages/shared-utils/dist/index.d.ts',
@@ -54,6 +55,11 @@ const validRuntimeFixtures: Record<string, string> = {
   }),
   'packages/protocol/dist/fixtures/e2e-v2-vectors.json': JSON.stringify({
     version: 2, event: { contentId: 'event', contentAAD: 'aad' }, session: { contentId: 'session', contentAAD: 'aad' },
+  }),
+  'packages/protocol/dist/fixtures/e2e-v3-vectors.json': JSON.stringify({
+    version: 3,
+    event: { contentId: 'event-v3', contentAAD: 'event-aad-v3', plaintext: 'event-plaintext-v3' },
+    session: { contentId: 'session-v3', contentAAD: 'session-aad-v3', plaintext: 'session-plaintext-v3' },
   }),
   'packages/protocol/dist/fixtures/notification-preview-v2-vector.json': JSON.stringify({
     version: 2, preview: { contentId: 'preview', contentAAD: 'aad' },
@@ -377,7 +383,7 @@ describe('npm package artifact assertion', () => {
     expect(result.exitCode, result.stderr.toString()).toBe(0);
   });
 
-  test('validates packaged command E2E v1, runtime v2, and parity fixture contents', async () => {
+  test('validates packaged command E2E v1, runtime v2/v3, and parity fixture contents', async () => {
     const invalidCommand = await runTarball(required, 'root', {
       'packages/protocol/dist/fixtures/command-e2e-v1-vectors.json': JSON.stringify({
         version: 1, suite: 'x25519-hkdf-sha256-chachapoly-v1', interrupt: { envelope: { type: 'interrupt' } },
@@ -394,6 +400,16 @@ describe('npm package artifact assertion', () => {
     });
     expect(wrongVersion.exitCode).toBe(1);
     expect(wrongVersion.stderr.toString()).toContain('runtime v2 interoperability fixture');
+
+    const wrongCurrentVersion = await runTarball(required, 'root', {
+      'packages/protocol/dist/fixtures/e2e-v3-vectors.json': JSON.stringify({
+        version: 2,
+        event: { contentId: 'event-v3', contentAAD: 'event-aad-v3', plaintext: 'event-plaintext-v3' },
+        session: { contentId: 'session-v3', contentAAD: 'session-aad-v3', plaintext: 'session-plaintext-v3' },
+      }),
+    });
+    expect(wrongCurrentVersion.exitCode).toBe(1);
+    expect(wrongCurrentVersion.stderr.toString()).toContain('runtime v3 interoperability fixture');
 
     const emptyParity = await runTarball(required, 'root', {
       'packages/protocol/dist/fixtures/need-human-error-validation-v2.json': JSON.stringify({ version: 2, cases: [] }),

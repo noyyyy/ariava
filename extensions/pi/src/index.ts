@@ -92,6 +92,8 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   let registrationWarningTimer: ReturnType<typeof setTimeout> | null = null;
   let registrationRetryTimer: ReturnType<typeof setTimeout> | null = null;
   let deliverySequence = 0;
+  let activeSessionManager: ExtensionContext['sessionManager'] | undefined;
+  let registrationGeneration = 0;
 
   const heartbeatContext: HeartbeatContext = {
     sessionId: '',
@@ -419,29 +421,33 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     registrationRetryTimer = null;
   }
 
-  function registerSessionInBackground(ctx: ExtensionContext, sessionInfo: NonNullable<typeof session>) {
+  function registerSessionInBackground(ctx: ExtensionContext, sessionId: string) {
     clearRegistrationWarningTimer();
     clearRegistrationRetryTimer();
+    const generation = ++registrationGeneration;
     let settled = false;
     registrationWarningTimer = setTimeout(() => {
       registrationWarningTimer = null;
-      if (settled || heartbeatContext.sessionId !== sessionInfo.sessionId) return;
+      if (settled || generation !== registrationGeneration || heartbeatContext.sessionId !== sessionId) return;
       const notify = (ctx as { ui?: { notify?: (message: string, level?: string) => void } }).ui?.notify;
       notify?.(REGISTRATION_WARNING_MESSAGE, 'warning');
     }, REGISTRATION_WARNING_MS);
     registrationWarningTimer.unref?.();
 
     const attemptRegistration = () => {
-      void adapter.registerSession(sessionInfo)
+      if (settled || generation !== registrationGeneration || heartbeatContext.sessionId !== sessionId) return;
+      const currentSession = session;
+      if (!currentSession || currentSession.sessionId !== sessionId) return;
+      void adapter.registerSession(currentSession)
         .then(() => {
-          if (heartbeatContext.sessionId !== sessionInfo.sessionId) return;
+          if (generation !== registrationGeneration || heartbeatContext.sessionId !== sessionId) return;
           settled = true;
           clearRegistrationWarningTimer();
           clearRegistrationRetryTimer();
         })
         .catch((error) => {
           logExtensionEvent('session_register_failed');
-          if (heartbeatContext.sessionId !== sessionInfo.sessionId || settled) return;
+          if (generation !== registrationGeneration || heartbeatContext.sessionId !== sessionId || settled) return;
           registrationRetryTimer = setTimeout(attemptRegistration, REGISTRATION_RETRY_MS);
           registrationRetryTimer.unref?.();
         });
@@ -480,8 +486,9 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     commandPoller = null;
 
     clearQuietTimer(state);
-    session = deriveSession(ctx);
     const sessionId = deriveSessionId(ctx);
+    activeSessionManager = ctx.sessionManager;
+    session = deriveSession(ctx, sessionId);
     heartbeatContext.sessionId = sessionId;
     heartbeatContext.latestActivityText = session.latestActivityText;
     heartbeatContext.status = session.status;
@@ -494,7 +501,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       onCommand: (command) => handleCommand(pi, ctx, command),
       getSession: () => session,
     });
-    registerSessionInBackground(ctx, session);
+    registerSessionInBackground(ctx, sessionId);
   });
 
   pi.on('session_shutdown', async (_event, ctx) => {
@@ -518,6 +525,8 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     heartbeatContext.status = 'idle';
     heartbeatContext.latestActivityText = undefined;
     session = null;
+    activeSessionManager = undefined;
+    registrationGeneration += 1;
     state = null;
     resetEmittedFingerprints();
   });
@@ -539,9 +548,9 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   });
 
   pi.on('agent_start', async (_event, ctx) => {
-    const eventSessionId = deriveSessionId(ctx);
-    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId) return;
-    session = deriveSession(ctx);
+    const eventSessionId = heartbeatContext.sessionId;
+    if (!eventSessionId || ctx.sessionManager !== activeSessionManager) return;
+    session = deriveSession(ctx, eventSessionId);
     const loopState = ensureLoopState(session.sessionId, deriveActiveLeafId(ctx));
     beginNewLowLevelRun(loopState);
     await pushWorking(ctx, deriveLatestActivityText(ctx));
@@ -550,10 +559,10 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   // Pi exposes no low-level loop identity. Consume at most one agent_end per
   // observed agent_start, but defer all terminal classification to agent_settled.
   pi.on('agent_end', async (event, ctx) => {
-    const eventSessionId = deriveSessionId(ctx);
-    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId) return;
+    const eventSessionId = heartbeatContext.sessionId;
+    if (!eventSessionId || ctx.sessionManager !== activeSessionManager) return;
 
-    session = deriveSession(ctx);
+    session = deriveSession(ctx, eventSessionId);
     const loopState = ensureLoopState(session.sessionId, deriveActiveLeafId(ctx));
     const runGeneration = loopState.currentRunGeneration;
     if (!loopState.loopRunning || runGeneration === undefined) return;
@@ -564,8 +573,8 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   });
 
   pi.on('agent_settled', async (_event, ctx) => {
-    const eventSessionId = deriveSessionId(ctx);
-    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId || !state || !session) return;
+    const eventSessionId = heartbeatContext.sessionId;
+    if (!eventSessionId || ctx.sessionManager !== activeSessionManager || !state || !session) return;
     const loopState = state;
     if (loopState.sessionId !== eventSessionId || loopState.latestPendingAlert) return;
     const runGeneration = loopState.currentRunGeneration;
@@ -616,15 +625,15 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
   });
 
   pi.on('session_tree', async (event, ctx) => {
-    const eventSessionId = deriveSessionId(ctx);
-    if (!heartbeatContext.sessionId || eventSessionId !== heartbeatContext.sessionId || !state) return;
+    const eventSessionId = heartbeatContext.sessionId;
+    if (!eventSessionId || ctx.sessionManager !== activeSessionManager || !state) return;
     const treeEvent = event as { newLeafId?: string };
     const loopState = state;
     loopState.activeLeafId = treeEvent.newLeafId ?? deriveActiveLeafId(ctx) ?? loopState.activeLeafId;
     loopState.lastTreeSwitchAt = Date.now();
     clearBranchSensitiveState(loopState);
     const currentSession = withSessionStatus(
-      deriveSession(ctx), heartbeatContext.status, deriveLatestActivityText(ctx),
+      deriveSession(ctx, eventSessionId), heartbeatContext.status, deriveLatestActivityText(ctx),
     );
     session = currentSession;
     heartbeatContext.latestActivityText = currentSession.latestActivityText;

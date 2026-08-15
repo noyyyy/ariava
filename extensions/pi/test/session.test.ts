@@ -43,10 +43,12 @@ function makeContext(options: {
   contextMessages?: AgentMessage[];
   branchMessages?: AgentMessage[];
   leafId?: string;
+  sessionId?: string;
 } = {}): ExtensionContext {
   return {
     cwd: '/tmp/test',
     sessionManager: {
+      getSessionId: () => options.sessionId ?? 'native-session-1',
       getEntries: () => entries(options.entries ?? []),
       buildSessionContext: options.contextMessages ? () => ({ messages: options.contextMessages }) : undefined,
       getLeafId: () => options.leafId,
@@ -62,6 +64,16 @@ describe('active preview extraction', () => {
     expect(session.status).toBe('idle');
     expect(session.openingText).toBe('Start here');
     expect(JSON.stringify(session)).not.toContain('unknown');
+  });
+
+  test('preserves exact nonblank native Pi IDs and fails closed without one', () => {
+    expect(deriveSession(makeContext({ sessionId: '  native-pi-session  ' })).sessionId).toBe('  native-pi-session  ');
+    expect(deriveSession(makeContext({ sessionId: 'native-pi-session' })).sessionId)
+      .not.toBe(deriveSession(makeContext({ sessionId: ' native-pi-session ' })).sessionId);
+    expect(() => deriveSession(makeContext({ sessionId: '   ' }))).toThrow(/stable native session ID/u);
+    const missing = makeContext();
+    (missing.sessionManager as { getSessionId?: () => string }).getSessionId = undefined;
+    expect(() => deriveSession(missing)).toThrow(/stable native session ID/u);
   });
 
   test('prefers agent_end event messages over getEntries', () => {

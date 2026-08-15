@@ -46,6 +46,7 @@ if (packageName === 'protocol') {
     'command-e2e-v1-vectors.json',
     'ed25519-request-vectors.json',
     'e2e-v2-vectors.json',
+    'e2e-v3-vectors.json',
     'notification-preview-v2-vector.json',
     'need-human-error-validation-v2.json',
   ]) {

@@ -68,6 +68,7 @@ function assertPackedProtocolDeclarations(tarball) {
 const runtimeFixturePaths = {
   command: 'packages/protocol/dist/fixtures/command-e2e-v1-vectors.json',
   vectors: 'packages/protocol/dist/fixtures/e2e-v2-vectors.json',
+  currentVectors: 'packages/protocol/dist/fixtures/e2e-v3-vectors.json',
   preview: 'packages/protocol/dist/fixtures/notification-preview-v2-vector.json',
   parity: 'packages/protocol/dist/fixtures/need-human-error-validation-v2.json',
 };
@@ -75,14 +76,16 @@ const runtimeFixturePaths = {
 function assertRuntimeFixtureContents(tarball) {
   let command;
   let vectors;
+  let currentVectors;
   let preview;
   let parity;
   try {
     command = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.command));
     vectors = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.vectors));
+    currentVectors = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.currentVectors));
     preview = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.preview));
     parity = JSON.parse(readTarEntry(tarball, runtimeFixturePaths.parity));
-  } catch { fail('command E2E v1, runtime v2, and parity fixtures must be valid JSON'); }
+  } catch { fail('command E2E v1, runtime v2/v3, preview v2, and parity fixtures must be valid JSON'); }
   if (command.version !== 1 || command.suite !== 'x25519-hkdf-sha256-chachapoly-v1'
     || command.interrupt?.envelope?.type !== 'interrupt'
     || command.interrupt?.envelope?.payload?.content?.payloadKind !== 'interrupt-content-v1'
@@ -96,6 +99,11 @@ function assertRuntimeFixtureContents(tarball) {
   if (vectors.version !== 2 || vectors.event?.contentId === undefined || vectors.session?.contentId === undefined
     || !String(vectors.event?.contentAAD ?? '').trim() || !String(vectors.session?.contentAAD ?? '').trim()) {
     fail('runtime v2 interoperability fixture is invalid');
+  }
+  if (currentVectors.version !== 3 || currentVectors.event?.contentId === undefined || currentVectors.session?.contentId === undefined
+    || !String(currentVectors.event?.contentAAD ?? '').trim() || !String(currentVectors.session?.contentAAD ?? '').trim()
+    || !String(currentVectors.event?.plaintext ?? '').trim() || !String(currentVectors.session?.plaintext ?? '').trim()) {
+    fail('runtime v3 interoperability fixture is invalid');
   }
   if (preview.version !== 2 || preview.preview?.contentId === undefined || !String(preview.preview?.contentAAD ?? '').trim()) {
     fail('notification preview v2 fixture is invalid');

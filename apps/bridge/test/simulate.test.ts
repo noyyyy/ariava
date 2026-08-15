@@ -11,15 +11,10 @@ describe('Bridge event simulator', () => {
     const event = buildSimulatedEvent(session, scenario);
 
     expect(event).toMatchObject({ type, status });
-    if (reason) {
-      expect(event).toMatchObject({ needHuman: { reason } });
-    } else {
-      expect(event.needHuman).toBeUndefined();
-    }
-    if (scenario === 'question') {
-      expect(event.actionablePrompt).toMatchObject({ type: 'question' });
-    } else {
-      expect(event.actionablePrompt).toBeUndefined();
-    }
+    expect(event.needHuman).toEqual(reason ? { reason } : undefined);
+    expect(Object.keys(event).sort()).toEqual([
+      'agentText', 'createdAt', 'eventId', 'harnessProvider', 'hostId', 'needHuman', 'projectName', 'provider',
+      'sessionId', 'status', 'type', 'workingDirectory',
+    ].filter((key) => key !== 'needHuman' || reason !== undefined).sort());
   });
 });

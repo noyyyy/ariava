@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import vectors from '../../../packages/protocol/test/fixtures/e2e-v2-vectors.json' with { type: 'json' };
+import vectors from '../../../packages/protocol/test/fixtures/e2e-v3-vectors.json' with { type: 'json' };
 import { base64UrlDecode, E2E_SUITE_V1 } from '../../../packages/protocol/dist/index.js';
 import { decryptReplyForPin, encryptEventUpload } from '../dist/e2e/envelope.js';
 
@@ -36,11 +36,11 @@ test('decrypts the reviewed encrypted reply vector only with matching AAD and pi
 
 test('uses fresh DEKs/content and wrap nonces for every upload attempt', () => {
     const input = { event: { eventId: 'event', hostId: vectors.link.hostId, sessionId: 'session', provider: 'pi',
-      type: 'need_human', status: 'need_human', correlationId: 'correlation', createdAt: '2026-07-20T00:00:00.000Z' },
-      protectedEvent: { version: 2, agentText: 'secret', needHuman: { reason: 'blocked' } },
+      type: 'need_human', status: 'need_human', createdAt: '2026-07-20T00:00:00.000Z' },
+      protectedEvent: { version: 3, agentText: 'secret', needHuman: { reason: 'blocked' } },
       session: { hostId: vectors.link.hostId, sessionId: 'session', provider: 'pi', status: 'need_human',
         updatedAt: '2026-07-20T00:00:01.000Z', lastEventId: 'event', snoozedUntil: '2026-07-20T00:10:00.000Z' },
-      protectedSession: { version: 2, projectName: 'p', nameText: 'n' },
+      protectedSession: { version: 3, projectName: 'p', nameText: 'n' },
       revision: 1, recipientSetVersion: 1, hostIdentity, recipients: [{ linkId: vectors.link.linkId,
         linkGeneration: vectors.link.linkGeneration, watchDeviceId: vectors.link.watchDeviceId, epoch: vectors.link.epoch,
         state: 'active', transcriptDigest: vectors.transcript.digest, hostBinding: vectors.bindings.host,
@@ -50,3 +50,17 @@ test('uses fresh DEKs/content and wrap nonces for every upload attempt', () => {
     assert.notEqual(first.event.keyWraps[0].nonce, second.event.keyWraps[0].nonce);
     assert.notEqual(first.session.content.ciphertext, second.session.content.ciphertext);
   });
+
+test('emits exact v3 Event and Session payload kinds and visible metadata', () => {
+  const input = { event: { eventId: 'event', hostId: vectors.link.hostId, sessionId: 'session', provider: 'pi',
+    type: 'done', status: 'idle', createdAt: '2026-07-20T00:00:00.000Z' },
+    protectedEvent: { version: 3, agentText: 'secret' },
+    session: { hostId: vectors.link.hostId, sessionId: 'session', provider: 'pi', status: 'idle',
+      updatedAt: '2026-07-20T00:00:01.000Z' },
+    protectedSession: { version: 3, projectName: 'p', nameText: 'n' }, revision: 2, recipientSetVersion: 1,
+    hostIdentity, recipients: [] };
+  const upload = encryptEventUpload(input);
+  assert.deepEqual(Object.keys(upload.event), ['eventId', 'hostId', 'sessionId', 'provider', 'type', 'status', 'createdAt', 'recipientSetVersion', 'content', 'keyWraps']);
+  assert.equal(upload.event.content.payloadKind, 'event-content-v3');
+  assert.equal(upload.session.content.payloadKind, 'session-content-v3');
+});

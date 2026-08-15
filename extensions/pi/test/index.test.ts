@@ -589,6 +589,54 @@ describe('ariavaPiExtension settled lifecycle', () => {
 });
 
 describe('unchanged extension integration behavior', () => {
+  test('reads the exact native ID once per session lifecycle', async () => {
+    let reads = 0;
+    const registered: string[] = [];
+    const harness = createHarness({
+      sessionId: ' exact-native-id ',
+      adapter: { registerSession: async (session) => {
+        registered.push(session.sessionId);
+        return { sessionId: session.sessionId, registeredAt: '2026-07-08T00:00:00Z' };
+      } },
+    });
+    const manager = harness.ctx.sessionManager as { getSessionId: () => string };
+    manager.getSessionId = () => {
+      reads += 1;
+      return reads === 1 ? ' exact-native-id ' : 'different-on-second-read';
+    };
+
+    await harness.start();
+    await harness.emit('agent_start');
+    await harness.emit('agent_end', { messages: [assistantMessage({ stopReason: 'stop', text: 'done' })] });
+    await harness.emit('agent_settled');
+    expect(reads).toBe(1);
+    expect(registered).toEqual([' exact-native-id ']);
+    expect(harness.heartbeats.every((call) => call.sessionId === ' exact-native-id ')).toBe(true);
+    await harness.shutdown();
+  });
+
+  test('retries registration with only the newest authoritative Session snapshot', async () => {
+    const attempts: Array<{ status: string; latestActivityText?: string }> = [];
+    let first = true;
+    const harness = createHarness({
+      adapter: {
+        registerSession: async (session) => {
+          attempts.push({ status: session.status, latestActivityText: session.latestActivityText });
+          if (first) { first = false; throw new Error('temporary registration failure'); }
+          return { sessionId: session.sessionId, registeredAt: '2026-07-08T00:00:00Z' };
+        },
+      },
+    });
+    await harness.start();
+    await harness.emit('agent_start');
+    await Bun.sleep(1_100);
+    expect(attempts).toEqual([
+      { status: 'idle', latestActivityText: undefined },
+      { status: 'working', latestActivityText: undefined },
+    ]);
+    await harness.shutdown();
+  });
+
   test('session_start does not wait for adapter registration and warns in TUI after 5 seconds', async () => {
     const notifications: Array<{ message: string; level?: string }> = [];
     let resolveRegistration!: (value: { sessionId: string; registeredAt: string }) => void;

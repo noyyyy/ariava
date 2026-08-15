@@ -18,16 +18,17 @@ import {
   validateProtectedInterruptContentV1,
   type CommandEnvelope,
   type E2ERecipientV1,
+  type E2EEventAndSessionUploadV3,
   type EncryptedCommandEnvelopeV1,
   type EncryptedContentV1,
-  type EncryptedEventUploadV2,
+  type EncryptedEventUploadV3,
   type EncryptedNotificationPreviewPlaintextV2,
-  type EncryptedSessionSnapshotUploadV2,
+  type EncryptedSessionSnapshotUploadV3,
   type NotificationPreviewEnvelopeV2,
-  type ProtectedEventContentV2,
-  type ProtectedSessionContentV2,
+  type ProtectedEventContentV3,
+  type ProtectedSessionContentV3,
   type RecipientKeyWrapV1,
-  type RelayEventMetadataV2,
+  type RelayEventMetadataV3,
   type RelaySessionMetadataV2,
 } from '@ariava/protocol';
 import { chachaPolyOpen, chachaPolySeal, hkdfSha256, x25519SharedSecret } from './node-crypto';
@@ -43,34 +44,34 @@ export interface ActiveRecipientMaterial extends E2ERecipientV1 {
 }
 
 export function encryptEventUpload(input: {
-  event: RelayEventMetadataV2;
-  protectedEvent: ProtectedEventContentV2;
+  event: RelayEventMetadataV3;
+  protectedEvent: ProtectedEventContentV3;
   session: RelaySessionMetadataV2;
-  protectedSession: ProtectedSessionContentV2;
+  protectedSession: ProtectedSessionContentV3;
   revision: number;
   recipientSetVersion: number;
   recipients: ActiveRecipientMaterial[];
-}): { event: EncryptedEventUploadV2; session: EncryptedSessionSnapshotUploadV2 } {
+}): E2EEventAndSessionUploadV3 {
   const eventContentId = crypto.randomUUID();
   const sessionContentId = crypto.randomUUID();
-  const eventContent = sealContent('event-content-v2', eventContentId,
+  const eventContent = sealContent('event-content-v3', eventContentId,
     buildProtectedEventContentBytes(input.protectedEvent), buildEventContentAAD({ ...input.event, contentId: eventContentId }));
-  const sessionContent = sealContent('session-content-v2', sessionContentId,
+  const sessionContent = sealContent('session-content-v3', sessionContentId,
     buildProtectedSessionContentBytes(input.protectedSession), buildSessionContentAAD({ ...input.session, revision: input.revision, contentId: sessionContentId }));
   try {
     return {
       event: { ...input.event, recipientSetVersion: input.recipientSetVersion,
-        content: eventContent.content as EncryptedEventUploadV2['content'],
-        keyWraps: wrapDekForRecipients(eventContent.dek, eventContentId, 'event-content-v2', input.recipients) },
+        content: eventContent.content as EncryptedEventUploadV3['content'],
+        keyWraps: wrapDekForRecipients(eventContent.dek, eventContentId, 'event-content-v3', input.recipients) },
       session: { ...input.session, revision: input.revision, recipientSetVersion: input.recipientSetVersion,
-        content: sessionContent.content as EncryptedSessionSnapshotUploadV2['content'],
-        keyWraps: wrapDekForRecipients(sessionContent.dek, sessionContentId, 'session-content-v2', input.recipients) },
+        content: sessionContent.content as EncryptedSessionSnapshotUploadV3['content'],
+        keyWraps: wrapDekForRecipients(sessionContent.dek, sessionContentId, 'session-content-v3', input.recipients) },
     };
   } finally { eventContent.dek.fill(0); sessionContent.dek.fill(0); }
 }
 
 export function encryptNotificationPreviews({ event, plaintext, recipients }: {
-  event: RelayEventMetadataV2;
+  event: RelayEventMetadataV3;
   plaintext: EncryptedNotificationPreviewPlaintextV2;
   recipients: ActiveRecipientMaterial[];
 }): NotificationPreviewEnvelopeV2[] {
@@ -95,18 +96,18 @@ export function encryptNotificationPreviews({ event, plaintext, recipients }: {
 
 export function encryptSessionSnapshot(input: {
   session: RelaySessionMetadataV2;
-  protectedSession: ProtectedSessionContentV2;
+  protectedSession: ProtectedSessionContentV3;
   revision: number;
   recipientSetVersion: number;
   recipients: ActiveRecipientMaterial[];
-}): EncryptedSessionSnapshotUploadV2 {
+}): EncryptedSessionSnapshotUploadV3 {
   const contentId = crypto.randomUUID();
-  const sealed = sealContent('session-content-v2', contentId, buildProtectedSessionContentBytes(input.protectedSession),
+  const sealed = sealContent('session-content-v3', contentId, buildProtectedSessionContentBytes(input.protectedSession),
     buildSessionContentAAD({ ...input.session, revision: input.revision, contentId }));
   try {
     return { ...input.session, revision: input.revision, recipientSetVersion: input.recipientSetVersion,
-      content: sealed.content as EncryptedSessionSnapshotUploadV2['content'],
-      keyWraps: wrapDekForRecipients(sealed.dek, contentId, 'session-content-v2', input.recipients) };
+      content: sealed.content as EncryptedSessionSnapshotUploadV3['content'],
+      keyWraps: wrapDekForRecipients(sealed.dek, contentId, 'session-content-v3', input.recipients) };
   } finally { sealed.dek.fill(0); }
 }
 

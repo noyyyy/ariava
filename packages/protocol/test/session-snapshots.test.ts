@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   SESSION_SNAPSHOT_ERROR_CODES,
   canonicalE2ECurrentSessionsDigestV1,
+  e2eCurrentSessionsSemanticDigestV1,
   validateReplaceE2ECurrentSessionsRequestV1,
   type ReplaceE2ECurrentSessionsRequestV1,
 } from '../src';
@@ -46,5 +47,35 @@ describe('E2E current-session lifecycle manifest', () => {
       { sessionId: 'zebra', sessionRevision: 6 },
     ] };
     expect(await canonicalE2ECurrentSessionsDigestV1(vector)).toBe('kAu-niMo0JphM1LCLnP1XRYpYwcKyPDW6aJ9svoyyC8');
+  });
+
+  test('semantic digest projects only retained canonical Session fields', async () => {
+    const session = {
+      sessionId: 'session-a', hostId: 'host-1', provider: 'pi', projectName: 'ariava', nameText: 'Task 1',
+      openingText: 'Opening', latestActivityText: 'Working', workingDirectory: '/workspace/ariava',
+      harnessProvider: 'pi', status: 'working', updatedAt: '2026-07-29T00:00:00.000Z',
+      lastEventId: 'event-1', snoozedUntil: '2026-07-29T01:00:00.000Z', presence: 'active', sessionRevision: 7,
+    } as const;
+    const baseline = await e2eCurrentSessionsSemanticDigestV1('host-1', [session]);
+    for (const extra of [
+      { unknownRuntimeProperty: 'ignored' },
+      { hbaseSessionKey: 'retired-session-key' },
+      { actionablePrompt: { promptId: 'retired', type: 'question', label: 'Reply' } },
+    ]) expect(await e2eCurrentSessionsSemanticDigestV1(
+      'host-1', [{ ...session, ...extra } as typeof session],
+    )).toBe(baseline);
+    for (const retained of [
+      { sessionId: 'session-b' }, { provider: 'codex' }, { projectName: 'other' }, { nameText: 'Other task' },
+      { openingText: 'Other opening' }, { latestActivityText: 'Done' }, { workingDirectory: '/workspace/other' },
+      { harnessProvider: 'other' }, { status: 'idle' }, { lastEventId: 'event-2' },
+      { snoozedUntil: '2026-07-29T02:00:00.000Z' },
+    ]) expect(await e2eCurrentSessionsSemanticDigestV1('host-1', [{ ...session, ...retained }])).not.toBe(baseline);
+    expect(await e2eCurrentSessionsSemanticDigestV1('host-2', [session])).not.toBe(baseline);
+    expect(await e2eCurrentSessionsSemanticDigestV1(
+      'host-1', [{ ...session, updatedAt: '2026-07-30T00:00:00.000Z' } as typeof session],
+    )).toBe(baseline);
+    expect(await e2eCurrentSessionsSemanticDigestV1(
+      'host-1', [{ ...session, sessionRevision: 8 } as typeof session],
+    )).toBe(baseline);
   });
 });

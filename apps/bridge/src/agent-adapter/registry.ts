@@ -30,7 +30,6 @@ export interface RegisteredSession {
   nameText: string;
   openingText?: string;
   latestActivityText?: string;
-  hbaseSessionKey?: string;
   harnessProvider?: string;
   pid?: number;
   hostId: string;
@@ -49,23 +48,37 @@ export interface RegisterSessionInput {
   nameText: string;
   openingText?: string;
   latestActivityText?: string;
-  hbaseSessionKey?: string;
   harnessProvider?: string;
   pid?: number;
   status?: SessionStatus;
 }
 
+export class AgentAdapterRequestValidationError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'AgentAdapterRequestValidationError';
+  }
+}
+
+export class SessionIdCollisionError extends Error {
+  readonly code = 'session_id_collision' as const;
+
+  constructor(sessionId: string) {
+    super(`Session ID ${sessionId} is already owned by a different adapter`);
+    this.name = 'SessionIdCollisionError';
+  }
+}
+
 const SESSION_TTL_MS = 45_000;
 const TERMINAL_RETRY_DELAYS_MS = [100, 500, 2_000, 5_000] as const;
 const EVENT_KEYS = [
-  'sessionId', 'provider', 'type', 'status', 'agentText', 'humanText', 'projectName', 'contextText',
-  'workingDirectory', 'hbaseSessionKey', 'harnessProvider', 'actionablePrompt', 'correlationId', 'createdAt', 'needHuman',
+  'sessionId', 'provider', 'type', 'status', 'agentText', 'humanText', 'projectName',
+  'workingDirectory', 'harnessProvider', 'createdAt', 'needHuman',
 ] as const;
 const EVENT_REQUIRED_KEYS = [
-  'sessionId', 'provider', 'type', 'status', 'agentText', 'projectName', 'contextText', 'workingDirectory',
-  'hbaseSessionKey', 'harnessProvider', 'createdAt',
+  'sessionId', 'provider', 'type', 'status', 'agentText', 'projectName', 'workingDirectory',
+  'harnessProvider', 'createdAt',
 ] as const;
-const PROMPT_KEYS = ['promptId', 'type', 'label', 'options', 'expiresAt'] as const;
 
 type PendingTerminal = { event: CanonicalEvent; session: CanonicalSessionState };
 export type RegistryMutationReason = 'register' | 'semantic' | 'handle' | 'unregister' | 'ttl';
@@ -114,14 +127,23 @@ export class AgentAdapterRegistry {
   }
 
   register(input: RegisterSessionInput): RegisteredSession {
-    const now = this.nowIso();
     const previous = this.sessions.get(input.sessionId);
+    const persistedSession = this.stateStore.getSession(input.sessionId);
+    const requestedOwner = normalizedOwner(input);
+    const liveOwner = previous ? normalizedOwner(previous) : undefined;
+    const persistedOwner = persistedSession ? normalizedOwner(persistedSession) : undefined;
+    if ((liveOwner && !sameOwner(liveOwner, requestedOwner))
+      || (persistedOwner && !sameOwner(persistedOwner, requestedOwner))) {
+      throw new SessionIdCollisionError(input.sessionId);
+    }
+
+    const now = this.nowIso();
     const projectName = input.projectName;
     const nameText = input.nameText;
     const session: RegisteredSession = {
       sessionId: input.sessionId, provider: input.provider, projectName, cwd: input.cwd, nameText,
       openingText: input.openingText, latestActivityText: input.latestActivityText,
-      hbaseSessionKey: input.hbaseSessionKey, harnessProvider: input.harnessProvider, pid: input.pid,
+      harnessProvider: input.harnessProvider, pid: input.pid,
       hostId: this.hostId, registeredAt: previous?.registeredAt ?? now, lastHeartbeatAt: now,
       status: input.status ?? 'idle', semanticUpdatedAt: previous?.semanticUpdatedAt ?? now,
       lastEventId: previous?.lastEventId,
@@ -129,7 +151,6 @@ export class AgentAdapterRegistry {
     const changed = !previous || semanticFingerprint(previous) !== semanticFingerprint(session);
     if (changed && previous) session.semanticUpdatedAt = now;
     const contextChanged = previous && producerContextFingerprint(previous) !== producerContextFingerprint(session);
-    const persistedSession = this.stateStore.getSession(input.sessionId);
     const persistedContextChanged = !previous && persistedSession
       && canonicalProducerContextFingerprint(persistedSession) !== producerContextFingerprint(session);
     const persistedCancellation = this.stateStore.getTerminalEventCancellation(input.sessionId);
@@ -189,7 +210,7 @@ export class AgentAdapterRegistry {
   }
 
   heartbeat(sessionId: string, status: SessionStatus, latestActivityText?: string | null,
-    metadata: { openingText?: string | null; projectName?: string; nameText?: string; hbaseSessionKey?: string; harnessProvider?: string } = {},
+    metadata: { openingText?: string | null; projectName?: string; nameText?: string } = {},
   ): RegisteredSession | undefined {
     const session = this.sessions.get(sessionId); if (!session) return undefined;
     const before = semanticFingerprint(session); const contextBefore = producerContextFingerprint(session); const now = this.nowIso();
@@ -198,8 +219,6 @@ export class AgentAdapterRegistry {
     if (metadata.openingText !== undefined) next.openingText = metadata.openingText ?? undefined;
     if (metadata.projectName !== undefined) next.projectName = metadata.projectName;
     if (metadata.nameText !== undefined) next.nameText = metadata.nameText;
-    if (metadata.hbaseSessionKey !== undefined) next.hbaseSessionKey = metadata.hbaseSessionKey;
-    if (metadata.harnessProvider !== undefined) next.harnessProvider = metadata.harnessProvider;
     if (producerContextFingerprint(next) !== contextBefore) this.cancelTerminalRetry(sessionId);
     if (semanticFingerprint(next) !== before) { next.semanticUpdatedAt = now; this.onMutation('semantic'); }
     this.sessions.set(sessionId, next);
@@ -222,11 +241,17 @@ export class AgentAdapterRegistry {
 
   pushEvent(sessionId: string, value: unknown): string {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`Session ${sessionId} is not registered`);
-    const input = parseCanonicalProducerEvent(value);
-    if (input.sessionId !== sessionId) throw new TypeError('canonical Event sessionId does not match the request path');
-    if (input.provider !== session.provider) throw new TypeError('canonical Event provider does not match the registered Session');
-    assertProducerContextMatchesSession(input, session);
+    if (!session) throw new AgentAdapterRequestValidationError(`Session ${sessionId} is not registered`);
+    let input: AgentAdapterEventInput;
+    try {
+      input = parseCanonicalProducerEvent(value);
+      if (input.sessionId !== sessionId) throw new TypeError('canonical Event sessionId does not match the request path');
+      if (input.provider !== session.provider) throw new TypeError('canonical Event provider does not match the registered Session');
+      assertProducerContextMatchesSession(input, session);
+    } catch (error) {
+      if (error instanceof TypeError) throw new AgentAdapterRequestValidationError(error.message, { cause: error });
+      throw error;
+    }
 
     const fingerprint = producerEventFingerprint(input);
     const existing = this.delayedTerminalEvents.get(sessionId);
@@ -269,8 +294,8 @@ export class AgentAdapterRegistry {
 
   handleSession(sessionId: string, request: HandleSessionRequest): { ok: true; hostId: string; sessionId: string; handledThroughEventId: string } {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new TypeError(`Session ${sessionId} is not registered`);
-    if (!request.handledThroughEventId?.trim()) throw new TypeError('handledThroughEventId is required');
+    if (!session) throw new AgentAdapterRequestValidationError(`Session ${sessionId} is not registered`);
+    if (!request.handledThroughEventId?.trim()) throw new AgentAdapterRequestValidationError('handledThroughEventId is required');
     const handledAt = normalizeHandledAt(request.handledAt, isoNow());
     this.stateStore.queuePendingSessionHandle({ hostId: session.hostId, sessionId,
       handledThroughEventId: request.handledThroughEventId, handledThroughEventCreatedAt: request.handledThroughEventCreatedAt,
@@ -348,7 +373,7 @@ export class AgentAdapterRegistry {
     if (!binding || commandId !== result.commandId || resultSessionId !== result.sessionId
       || binding.hostId !== result.hostId || binding.sessionId !== result.sessionId
       || !session || session.hostId !== binding.hostId || session.provider !== binding.provider) {
-      throw new TypeError('command result does not match its queued adapter command and registered Session');
+      throw new AgentAdapterRequestValidationError('command result does not match its queued adapter command and registered Session');
     }
     const commandResult = asCommandResult(result);
     this.results.set(commandId, commandResult); this.clearCommandInFlight(binding.sessionId, commandId);
@@ -456,7 +481,7 @@ export class AgentAdapterRegistry {
   private toCanonicalSession(session: RegisteredSession): CanonicalSessionState {
     return { sessionId: session.sessionId, hostId: session.hostId, provider: session.provider, projectName: session.projectName,
       nameText: session.nameText, openingText: session.openingText, latestActivityText: session.latestActivityText,
-      workingDirectory: session.cwd, hbaseSessionKey: session.hbaseSessionKey, harnessProvider: session.harnessProvider,
+      workingDirectory: session.cwd, harnessProvider: session.harnessProvider,
       status: session.status, updatedAt: session.semanticUpdatedAt, lastEventId: session.lastEventId };
   }
   private nowIso(): string { return this.now().toISOString(); }
@@ -477,33 +502,21 @@ export class AgentAdapterRegistry {
 
 function parseCanonicalProducerEvent(value: unknown): AgentAdapterEventInput {
   const event = exactRecord(value, EVENT_KEYS, EVENT_REQUIRED_KEYS, 'canonical Event');
-  for (const key of ['sessionId', 'provider', 'agentText', 'projectName', 'contextText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider', 'createdAt'] as const) requireString(event, key);
-  for (const key of ['humanText', 'correlationId'] as const) optionalString(event, key);
+  for (const key of ['sessionId', 'provider', 'agentText', 'projectName', 'workingDirectory', 'harnessProvider', 'createdAt'] as const) requireString(event, key);
+  optionalString(event, 'humanText');
   if (!isCanonicalTimestamp(event.createdAt)) throw new TypeError('canonical Event createdAt is invalid');
   const invariant = validateCanonicalEventInvariant({ type: event.type, status: event.status, ...(Object.hasOwn(event, 'needHuman') ? { needHuman: event.needHuman } : {}) });
   if (!invariant.success) throw new TypeError(`canonical Event invariant is invalid: ${invariant.issues.join(', ')}`);
-  if (event.actionablePrompt !== undefined) parsePrompt(event.actionablePrompt);
   buildProtectedEventContentBytes({
-    version: 2,
+    version: 3,
     agentText: event.agentText as string,
     ...(event.humanText !== undefined ? { humanText: event.humanText as string } : {}),
     projectName: event.projectName as string,
-    contextText: event.contextText as string,
     workingDirectory: event.workingDirectory as string,
-    hbaseSessionKey: event.hbaseSessionKey as string,
     harnessProvider: event.harnessProvider as string,
-    ...(event.actionablePrompt !== undefined ? { actionablePrompt: event.actionablePrompt as never } : {}),
     ...(event.needHuman !== undefined ? { needHuman: event.needHuman as never } : {}),
   });
   return event as unknown as AgentAdapterEventInput;
-}
-
-function parsePrompt(value: unknown): void {
-  const prompt = exactRecord(value, PROMPT_KEYS, ['promptId', 'type', 'label'], 'canonical Event actionablePrompt');
-  requireString(prompt, 'promptId'); requireString(prompt, 'label');
-  if (prompt.type !== 'question') throw new TypeError('canonical Event actionablePrompt.type is invalid');
-  if (prompt.options !== undefined && (!Array.isArray(prompt.options) || prompt.options.some((option) => typeof option !== 'string'))) throw new TypeError('canonical Event actionablePrompt.options is invalid');
-  if (prompt.expiresAt !== undefined && !isCanonicalTimestamp(prompt.expiresAt)) throw new TypeError('canonical Event actionablePrompt.expiresAt is invalid');
 }
 
 function exactRecord(value: unknown, allowedKeys: readonly string[], requiredKeys: readonly string[], label: string): Record<string, unknown> {
@@ -535,9 +548,7 @@ function normalizeHandledAt(value: string | undefined, fallback: string): string
 function assertProducerContextMatchesSession(event: AgentAdapterEventInput, session: RegisteredSession): void {
   const expected = {
     projectName: session.projectName,
-    contextText: buildContextText(session),
     workingDirectory: session.cwd,
-    hbaseSessionKey: session.hbaseSessionKey ?? session.sessionId,
     harnessProvider: session.harnessProvider ?? session.provider,
   };
   for (const [key, value] of Object.entries(expected)) {
@@ -547,25 +558,15 @@ function assertProducerContextMatchesSession(event: AgentAdapterEventInput, sess
   }
 }
 
-function buildContextText(session: Pick<RegisteredSession, 'nameText' | 'projectName'>): string {
-  const name = session.nameText.trim();
-  const project = session.projectName.trim();
-  if (name && project && name !== project) return `${name} · ${project}`;
-  return project || name;
-}
-
 function producerEventFingerprint(event: AgentAdapterEventInput | CanonicalEvent): string {
   const producer = event as CanonicalEvent;
   const protectedContent = buildProtectedEventContentBytes({
-    version: 2,
+    version: 3,
     agentText: producer.agentText,
     ...(producer.humanText === undefined ? {} : { humanText: producer.humanText }),
     ...(producer.projectName === undefined ? {} : { projectName: producer.projectName }),
-    ...(producer.contextText === undefined ? {} : { contextText: producer.contextText }),
     ...(producer.workingDirectory === undefined ? {} : { workingDirectory: producer.workingDirectory }),
-    ...(producer.hbaseSessionKey === undefined ? {} : { hbaseSessionKey: producer.hbaseSessionKey }),
     ...(producer.harnessProvider === undefined ? {} : { harnessProvider: producer.harnessProvider }),
-    ...(producer.actionablePrompt === undefined ? {} : { actionablePrompt: producer.actionablePrompt }),
     ...(producer.needHuman === undefined ? {} : { needHuman: producer.needHuman }),
   });
   const publicMetadata = JSON.stringify({
@@ -573,7 +574,6 @@ function producerEventFingerprint(event: AgentAdapterEventInput | CanonicalEvent
     provider: producer.provider,
     type: producer.type,
     status: producer.status,
-    ...(producer.correlationId === undefined ? {} : { correlationId: producer.correlationId }),
     createdAt: producer.createdAt,
   });
   const canonical = encodeLengthPrefixedFields([
@@ -583,12 +583,10 @@ function producerEventFingerprint(event: AgentAdapterEventInput | CanonicalEvent
   ]);
   return createHash('sha256').update(canonical).digest('base64url');
 }
-function producerContextFingerprint(session: Pick<RegisteredSession, 'projectName' | 'nameText' | 'cwd' | 'hbaseSessionKey' | 'harnessProvider' | 'provider' | 'sessionId'>): string {
+function producerContextFingerprint(session: Pick<RegisteredSession, 'projectName' | 'cwd' | 'harnessProvider' | 'provider'>): string {
   return JSON.stringify({
     projectName: session.projectName,
-    contextText: buildContextText(session),
     workingDirectory: session.cwd,
-    hbaseSessionKey: session.hbaseSessionKey ?? session.sessionId,
     harnessProvider: session.harnessProvider ?? session.provider,
   });
 }
@@ -596,16 +594,22 @@ function producerContextFingerprint(session: Pick<RegisteredSession, 'projectNam
 function canonicalProducerContextFingerprint(session: CanonicalSessionState): string {
   return JSON.stringify({
     projectName: session.projectName,
-    contextText: buildContextText(session),
     workingDirectory: session.workingDirectory ?? '',
-    hbaseSessionKey: session.hbaseSessionKey ?? session.sessionId,
     harnessProvider: session.harnessProvider ?? session.provider,
   });
+}
+
+function normalizedOwner(session: Pick<RegisterSessionInput, 'provider' | 'harnessProvider'>): readonly [string, string] {
+  return [session.provider, session.harnessProvider ?? session.provider] as const;
+}
+
+function sameOwner(left: readonly [string, string], right: readonly [string, string]): boolean {
+  return left[0] === right[0] && left[1] === right[1];
 }
 
 function semanticFingerprint(session: RegisteredSession): string {
   return JSON.stringify({ sessionId: session.sessionId, provider: session.provider, projectName: session.projectName, cwd: session.cwd,
     nameText: session.nameText, openingText: session.openingText, latestActivityText: session.latestActivityText,
-    hbaseSessionKey: session.hbaseSessionKey, harnessProvider: session.harnessProvider, pid: session.pid,
+    harnessProvider: session.harnessProvider, pid: session.pid,
     hostId: session.hostId, status: session.status, lastEventId: session.lastEventId });
 }

@@ -27,14 +27,6 @@ export type NeedHumanContext =
   | { reason: Exclude<NeedHumanReason, 'error'>; error?: never }
   | { reason: 'error'; error: NeedHumanError };
 
-export interface ActionablePrompt {
-  promptId: string;
-  type: 'question';
-  label: string;
-  options?: string[];
-  expiresAt?: string;
-}
-
 interface CanonicalEventBase {
   eventId: string;
   hostId: string;
@@ -43,12 +35,8 @@ interface CanonicalEventBase {
   agentText: string;
   humanText?: string;
   projectName?: string;
-  contextText?: string;
   workingDirectory?: string;
-  hbaseSessionKey?: string;
   harnessProvider?: string;
-  actionablePrompt?: ActionablePrompt;
-  correlationId?: string;
   createdAt: string;
 }
 

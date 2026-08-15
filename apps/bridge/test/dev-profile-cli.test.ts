@@ -4,6 +4,7 @@ import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
+import { AGENT_ADAPTER_PROTOCOL_VERSION } from '@ariava/protocol';
 import { writeAgentAdapterConfig } from '../src/agent-adapter/config';
 import {
   createDefaultDevProfileDependencies,
@@ -384,7 +385,9 @@ describe('source dev profile commands', () => {
     harness.deps.createBridge = (config) => ({
       start: async () => {
         writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
-          url: `http://127.0.0.1:${config.agentAdapter.port}`, secret: 'dev-secret', protocolVersion: 2,
+          url: `http://127.0.0.1:${config.agentAdapter.port}`,
+          secret: 'dev-secret',
+          protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
         });
       },
       runForever: () => new Promise<void>((resolveRun) => { finishBridge = resolveRun; }),
@@ -534,7 +537,11 @@ describe('source dev profile commands', () => {
     expect(harness.errorOutput()).toContain('discovery is missing');
     expect(spawns).toBe(0);
 
-    writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, { url: 'http://127.0.0.1:7273', secret: 'secret', protocolVersion: 2 });
+    writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
+      url: 'http://127.0.0.1:7273',
+      secret: 'secret',
+      protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+    });
     harness.deps.sourcePiExtensionPath = join(harness.root, 'missing-index.ts');
     expect(await runDevProfileCommand(['pi'], harness.deps)).toBe(1);
     expect(harness.errorOutput()).toContain('Source pi extension is missing');
@@ -543,7 +550,11 @@ describe('source dev profile commands', () => {
 
   test('pi launches the source extension with only dev Ariava overrides', async () => {
     const harness = createHarness();
-    writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, { url: 'http://127.0.0.1:7273', secret: 'secret', protocolVersion: 2 });
+    writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
+      url: 'http://127.0.0.1:7273',
+      secret: 'secret',
+      protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+    });
     const extensionPath = join(harness.root, 'index.ts');
     writeFileSync(extensionPath, 'export default {}', { mode: 0o600 });
     harness.deps.sourcePiExtensionPath = extensionPath;
@@ -581,7 +592,8 @@ describe('source dev profile commands', () => {
     writeFileSync(join(defaultRoot, 'config.json'), '{not-json', { mode: 0o600 });
     writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
       url: 'http://127.0.0.1:7273',
-      secret: 'must-not-appear', protocolVersion: 2,
+      secret: 'must-not-appear',
+      protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
     });
     const offset = harness.output().length;
     expect(await runDevProfileCommand(['status'], harness.deps)).toBe(0);
@@ -604,7 +616,8 @@ describe('source dev profile commands', () => {
     await runDevProfileCommand(['init'], harness.deps);
     writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
       url: 'http://127.0.0.1:7273',
-      secret: 'source-only-secret', protocolVersion: 2,
+      secret: 'source-only-secret',
+      protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
     });
     mkdirSync(join(harness.deps.paths.statePath, '..'), { recursive: true, mode: 0o700 });
     writeFileSync(harness.deps.paths.statePath, '{}', { mode: 0o600 });
@@ -665,7 +678,8 @@ describe('source dev profile commands', () => {
     await runDevProfileCommand(['init'], harness.deps);
     writeAgentAdapterConfig(harness.deps.paths.agentAdapterConfigPath, {
       url: 'http://127.0.0.1:7272',
-      secret: 'dev-wrong-port-secret', protocolVersion: 2,
+      secret: 'dev-wrong-port-secret',
+      protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
     });
     mkdirSync(join(harness.deps.paths.statePath, '..'), { recursive: true, mode: 0o700 });
     writeFileSync(harness.deps.paths.statePath, '{}', { mode: 0o600 });

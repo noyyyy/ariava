@@ -74,6 +74,7 @@ function exactLegacyState() {
 
 
 mock.module('../src/e2e/node-crypto', () => ({
+  ChaChaPolyAuthenticationError: class ChaChaPolyAuthenticationError extends Error {},
   chachaPolySeal: (_key: Uint8Array, plaintext: Uint8Array) => ({
     nonce: new Uint8Array(12).fill(1), ciphertext: new Uint8Array([...plaintext, ...new Uint8Array(16)]),
   }),
@@ -195,10 +196,14 @@ describe('BridgeStateStore', () => {
     migrated.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
     expect(migrated.getHost()?.hostName).toBe('Host');
     expect(migrated.listSessions().map((session) => session.sessionId)).toEqual(['sess-1']);
-    expect(migrated.peekPendingSessionHandles()).toHaveLength(1); expect(migrated.listCommandExecutions()).toEqual([]);
+    expect(migrated.peekPendingSessionHandles()).toEqual([]);
+    expect(migrated.peekPendingEvents()).toEqual([]);
+    expect(migrated.listCommandExecutions()).toEqual([]);
     const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
-    expect(persisted).toMatchObject({ schemaVersion: 4, commandExecutions: {} });
-    expect(persisted).not.toHaveProperty('commandResults'); expect(persisted).not.toHaveProperty('seenCommands');
+    expect(persisted).toMatchObject({ schemaVersion: 4, recentEvents: [], pendingHandles: {}, commandExecutions: {} });
+    expect(persisted.sessions['sess-1']).not.toHaveProperty('lastEventId');
+    expect(persisted).not.toHaveProperty('commandResults');
+    expect(persisted).not.toHaveProperty('seenCommands');
     expect(JSON.parse(readFileSync(runtimeSchemaFloorPathForState(statePath), 'utf8'))).toEqual({
       version: 1, hostId: 'host-1', minSchemaVersion: 4, statePath, spoolPath: spoolPathForState(statePath),
     });
@@ -513,12 +518,12 @@ describe('BridgeStateStore', () => {
     const keyStore = { loadOrCreate: () => new Uint8Array(32).fill(7) };
     const event = {
       eventId: 'evt-atomic', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
-      agentText: 'Finished', projectName: 'project', contextText: 'Task · project',
-      workingDirectory: '/project', hbaseSessionKey: 'sess-1', harnessProvider: 'pi', createdAt: '2026-08-07T00:00:01.000Z',
+      agentText: 'Finished', projectName: 'project',
+      workingDirectory: '/project', harnessProvider: 'pi', createdAt: '2026-08-07T00:00:01.000Z',
     } satisfies CanonicalEvent;
     const session = {
       sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'project', nameText: 'Task',
-      latestActivityText: 'Finished', workingDirectory: '/project', hbaseSessionKey: 'sess-1', harnessProvider: 'pi',
+      latestActivityText: 'Finished', workingDirectory: '/project', harnessProvider: 'pi',
       status: 'idle', updatedAt: event.createdAt, lastEventId: event.eventId,
     } satisfies CanonicalSessionState;
 

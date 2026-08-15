@@ -6,9 +6,21 @@ import {
   SESSION_STATUSES,
   type SessionStatus,
 } from '@ariava/protocol';
-import type { AgentAdapterRegistry, RegisterSessionInput } from './registry';
+import {
+  AgentAdapterRequestValidationError,
+  SessionIdCollisionError,
+  type AgentAdapterRegistry,
+  type RegisterSessionInput,
+} from './registry';
 import type { BridgeRuntimeHealth } from '../types';
 import { parseAgentAdapterCommandResult, type AgentAdapterCommandResult } from './result';
+
+export class AgentAdapterClientInputError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'AgentAdapterClientInputError';
+  }
+}
 
 export interface AgentAdapterServerConfig {
   port: number;
@@ -90,22 +102,25 @@ export class AgentAdapterServer {
 
       const unregisterMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)$/);
       if (unregisterMatch && method === 'DELETE') {
-        this.registry.unregister(unregisterMatch[1]);
+        const sessionId = decodePathIdentity(unregisterMatch[1], 'sessionId');
+        this.registry.unregister(sessionId);
         this.writeJson(response, 200, { ok: true });
         return;
       }
 
       const eventMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/events$/);
       if (eventMatch && method === 'POST') {
-        const eventId = this.registry.pushEvent(eventMatch[1], await this.readJson(request));
+        const sessionId = decodePathIdentity(eventMatch[1], 'sessionId');
+        const eventId = this.registry.pushEvent(sessionId, await this.readJson(request));
         this.writeJson(response, 200, { eventId });
         return;
       }
 
       const handleMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/handle$/);
       if (handleMatch && method === 'POST') {
+        const sessionId = decodePathIdentity(handleMatch[1], 'sessionId');
         const result = this.registry.handleSession(
-          handleMatch[1],
+          sessionId,
           parseHandleInput(await this.readJson(request)),
         );
         this.writeJson(response, 200, result);
@@ -115,9 +130,10 @@ export class AgentAdapterServer {
 
       const heartbeatMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/heartbeat$/);
       if (heartbeatMatch && method === 'POST') {
-        const { status, latestActivityText, openingText, projectName, nameText, hbaseSessionKey, harnessProvider } = parseHeartbeatInput(await this.readJson(request));
-        const session = this.registry.heartbeat(heartbeatMatch[1], status, latestActivityText, {
-          openingText, projectName, nameText, hbaseSessionKey, harnessProvider,
+        const sessionId = decodePathIdentity(heartbeatMatch[1], 'sessionId');
+        const { status, latestActivityText, openingText, projectName, nameText } = parseHeartbeatInput(await this.readJson(request));
+        const session = this.registry.heartbeat(sessionId, status, latestActivityText, {
+          openingText, projectName, nameText,
         });
         if (!session) {
           this.writeJson(response, 404, { error: 'Session not found' });
@@ -129,12 +145,13 @@ export class AgentAdapterServer {
 
       const commandMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/commands$/);
       if (commandMatch && method === 'GET') {
-        if (!this.registry.hasSession(commandMatch[1])) {
+        const sessionId = decodePathIdentity(commandMatch[1], 'sessionId');
+        if (!this.registry.hasSession(sessionId)) {
           this.writeJson(response, 404, { error: 'Session not found' });
           return;
         }
         const timeout = Math.min(Math.max(parseInt(url.searchParams.get('timeout') ?? '30000', 10), 0), 120_000);
-        const command = await this.registry.dequeueCommand(commandMatch[1], timeout);
+        const command = await this.registry.dequeueCommand(sessionId, timeout);
         if (!command) {
           response.statusCode = 204;
           response.end();
@@ -146,8 +163,10 @@ export class AgentAdapterServer {
 
       const resultMatch = pathname.match(/^\/v1\/agent\/sessions\/([^/]+)\/commands\/([^/]+)\/result$/);
       if (resultMatch && method === 'POST') {
-        const result = parseResultInput(await this.readJson(request), resultMatch[2]);
-        this.registry.resolveCommand(resultMatch[2], result, resultMatch[1]);
+        const sessionId = decodePathIdentity(resultMatch[1], 'sessionId');
+        const commandId = decodePathIdentity(resultMatch[2], 'commandId');
+        const result = parseResultInput(await this.readJson(request), commandId);
+        this.registry.resolveCommand(commandId, result, sessionId);
         this.writeJson(response, 200, { ok: true });
         return;
       }
@@ -155,8 +174,15 @@ export class AgentAdapterServer {
       this.writeJson(response, 404, { error: 'Not found' });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = error instanceof TypeError ? 400 : 500;
-      this.writeJson(response, status, { error: message });
+      if (error instanceof SessionIdCollisionError) {
+        this.writeJson(response, 409, { error: message, code: error.code });
+        return;
+      }
+      if (error instanceof AgentAdapterClientInputError || error instanceof AgentAdapterRequestValidationError) {
+        this.writeJson(response, 400, { error: message });
+        return;
+      }
+      this.writeJson(response, 500, { error: message });
     }
   }
 
@@ -166,7 +192,11 @@ export class AgentAdapterServer {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
     if (chunks.length === 0) return {};
-    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+    try {
+      return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+    } catch (error) {
+      throw new AgentAdapterClientInputError('Request body must contain valid JSON', { cause: error });
+    }
   }
 
   private writeJson(response: ServerResponse, status: number, body: unknown): void {
@@ -176,15 +206,23 @@ export class AgentAdapterServer {
   }
 }
 
+function decodePathIdentity(value: string, label: 'sessionId' | 'commandId'): string {
+  try {
+    return decodeURIComponent(value);
+  } catch (error) {
+    throw new AgentAdapterClientInputError(`${label} path segment contains malformed percent encoding`, { cause: error });
+  }
+}
+
 function parseRegisterInput(value: unknown): RegisterSessionInput {
-  if (typeof value !== 'object' || value === null) {
-    throw new Error('Request body must be an object');
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new AgentAdapterClientInputError('Request body must be an object');
   }
 
   const obj = value as Record<string, unknown>;
   assertExactKeys(obj,
     ['sessionId', 'provider', 'projectName', 'cwd', 'nameText'],
-    ['openingText', 'latestActivityText', 'hbaseSessionKey', 'harnessProvider', 'pid', 'status'],
+    ['openingText', 'latestActivityText', 'harnessProvider', 'pid', 'status'],
     'register Session',
   );
   return {
@@ -195,7 +233,6 @@ function parseRegisterInput(value: unknown): RegisterSessionInput {
     nameText: requireString(obj, 'nameText'),
     openingText: optionalString(obj, 'openingText'),
     latestActivityText: optionalString(obj, 'latestActivityText'),
-    hbaseSessionKey: optionalString(obj, 'hbaseSessionKey'),
     harnessProvider: optionalString(obj, 'harnessProvider'),
     pid: optionalNumber(obj, 'pid'),
     status: optionalStatus(obj, 'status'),
@@ -204,7 +241,7 @@ function parseRegisterInput(value: unknown): RegisterSessionInput {
 
 function parseHandleInput(value: unknown): import('@ariava/protocol').HandleSessionRequest {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new TypeError('handle body must be an object');
+    throw new AgentAdapterClientInputError('handle body must be an object');
   }
   const obj = value as Record<string, unknown>;
   assertExactKeys(
@@ -215,7 +252,7 @@ function parseHandleInput(value: unknown): import('@ariava/protocol').HandleSess
   );
   const action = optionalString(obj, 'action');
   if (action !== undefined && action !== 'pi_input' && action !== 'bridge_recovery') {
-    throw new TypeError('handle.action is invalid');
+    throw new AgentAdapterClientInputError('handle.action is invalid');
   }
   return {
     handledThroughEventId: requireString(obj, 'handledThroughEventId'),
@@ -231,20 +268,18 @@ function parseHeartbeatInput(value: unknown): {
   openingText?: string | null;
   projectName?: string;
   nameText?: string;
-  hbaseSessionKey?: string;
-  harnessProvider?: string;
 } {
-  if (typeof value !== 'object' || value === null) {
-    throw new Error('Request body must be an object');
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new AgentAdapterClientInputError('Request body must be an object');
   }
 
   const obj = value as Record<string, unknown>;
   assertExactKeys(obj, ['status'], [
-    'latestActivityText', 'openingText', 'projectName', 'nameText', 'hbaseSessionKey', 'harnessProvider',
+    'latestActivityText', 'openingText', 'projectName', 'nameText',
   ], 'heartbeat');
   const statusValue = requireString(obj, 'status');
   if (!SESSION_STATUSES.includes(statusValue as SessionStatus)) {
-    throw new Error(`Invalid status: ${statusValue}`);
+    throw new AgentAdapterClientInputError(`Invalid status: ${statusValue}`);
   }
 
   return {
@@ -253,8 +288,6 @@ function parseHeartbeatInput(value: unknown): {
     openingText: optionalNullableString(obj, 'openingText'),
     projectName: optionalString(obj, 'projectName'),
     nameText: optionalString(obj, 'nameText'),
-    hbaseSessionKey: optionalString(obj, 'hbaseSessionKey'),
-    harnessProvider: optionalString(obj, 'harnessProvider'),
   };
 }
 
@@ -266,30 +299,37 @@ function assertExactKeys(
 ): void {
   const allowed = new Set([...required, ...optional]);
   for (const key of Object.keys(obj)) {
-    if (!allowed.has(key)) throw new TypeError(`${label}.${key} is unsupported`);
+    if (!allowed.has(key)) throw new AgentAdapterClientInputError(`${label}.${key} is unsupported`);
   }
   for (const key of required) {
-    if (!hasOwn(obj, key)) throw new TypeError(`${label}.${key} is required`);
+    if (!hasOwn(obj, key)) throw new AgentAdapterClientInputError(`${label}.${key} is required`);
   }
 }
 
 function optionalStatus(obj: Record<string, unknown>, key: string): SessionStatus | undefined {
   const value = optionalString(obj, key);
   if (value === undefined) return undefined;
-  if (!SESSION_STATUSES.includes(value as SessionStatus)) throw new Error(`Invalid status: ${value}`);
+  if (!SESSION_STATUSES.includes(value as SessionStatus)) throw new AgentAdapterClientInputError(`Invalid status: ${value}`);
   return value as SessionStatus;
 }
 
 function parseResultInput(value: unknown, expectedCommandId: string): AgentAdapterCommandResult {
-  const result = parseAgentAdapterCommandResult(value);
-  if (result.commandId !== expectedCommandId) throw new TypeError('commandId in result does not match URL');
+  let result: AgentAdapterCommandResult;
+  try {
+    result = parseAgentAdapterCommandResult(value);
+  } catch (error) {
+    throw new AgentAdapterClientInputError('Agent Adapter command result is invalid', { cause: error });
+  }
+  if (result.commandId !== expectedCommandId) {
+    throw new AgentAdapterClientInputError('commandId in result does not match URL');
+  }
   return result;
 }
 
 function requireString(obj: Record<string, unknown>, key: string): string {
   const value = obj[key];
   if (typeof value !== 'string') {
-    throw new Error(`Missing or invalid field: ${key}`);
+    throw new AgentAdapterClientInputError(`Missing or invalid field: ${key}`);
   }
   return value;
 }
@@ -302,7 +342,7 @@ function optionalNullableString(obj: Record<string, unknown>, key: string): stri
   const value = obj[key];
   if (value === undefined || value === null) return value;
   if (typeof value !== 'string') {
-    throw new Error(`Invalid field: ${key}`);
+    throw new AgentAdapterClientInputError(`Invalid field: ${key}`);
   }
   return value;
 }
@@ -311,7 +351,7 @@ function optionalString(obj: Record<string, unknown>, key: string): string | und
   const value = obj[key];
   if (value === undefined) return undefined;
   if (typeof value !== 'string') {
-    throw new Error(`Invalid field: ${key}`);
+    throw new AgentAdapterClientInputError(`Invalid field: ${key}`);
   }
   return value;
 }
@@ -320,15 +360,7 @@ function optionalNumber(obj: Record<string, unknown>, key: string): number | und
   const value = obj[key];
   if (value === undefined) return undefined;
   if (typeof value !== 'number') {
-    throw new Error(`Invalid field: ${key}`);
-  }
-  return value;
-}
-
-function requireBoolean(obj: Record<string, unknown>, key: string): boolean {
-  const value = obj[key];
-  if (typeof value !== 'boolean') {
-    throw new Error(`Missing or invalid field: ${key}`);
+    throw new AgentAdapterClientInputError(`Invalid field: ${key}`);
   }
   return value;
 }

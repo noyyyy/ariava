@@ -115,4 +115,8 @@ describe('public protocol barrel', () => {
   test('exports the reviewed runtime contract and no private implementation symbols', () => {
     expect(Object.keys(protocol).sort()).toEqual([...INTENDED_RUNTIME_EXPORTS].sort());
   });
+
+  test('requires Adapter protocol v3', () => {
+    expect(protocol.AGENT_ADAPTER_PROTOCOL_VERSION).toBe(3);
+  });
 });

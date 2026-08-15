@@ -58,6 +58,10 @@ const LEGACY_RUNTIME_STATE_SCHEMA_VERSION = 1 as const;
 const RESET_INTENT_VERSION = 1 as const;
 const MIGRATION_INTENT_VERSION = 1 as const;
 const ABSENT_HASH = 'absent';
+const PRIOR_V2_SPOOL_KINDS = new Set([
+  'event-source-v2', 'event-reservation-v2', 'event-dead-letter-v2', 'session-source-v2',
+  'event-upload-v2', 'session-upload-v2', 'terminal-cancellation-v2',
+]);
 const MAX_RECENT_EVENTS = 200;
 const EMPTY_SNAPSHOT: PersistedCurrentSessionsSnapshotState = {
   version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0,
@@ -215,7 +219,7 @@ export class BridgeStateStore {
     try {
       const migrationIntentPath = runtimeMigrationIntentPathForState(this.filePath);
       if (pathHasFilesystemEvidence(migrationIntentPath)) {
-        return this.resumeRuntimeMigration(hostId, resetWriteHooks, resetRemoveHooks);
+        return this.resumeRuntimeMigration(hostId, resetStep, resetWriteHooks, resetRemoveHooks);
       }
       const floorPath = runtimeSchemaFloorPathForState(this.filePath);
       const floorBytes = readOptionalSecureBytes(floorPath);
@@ -254,7 +258,7 @@ export class BridgeStateStore {
       if (stateRecord && spoolRecord && isPriorStateRecordV3(stateRecord, hostId)
         && isSpoolRecordForSchema(spoolRecord, PRIOR_RUNTIME_STATE_SCHEMA_VERSION, hostId, stateRecord.runtimeResetEpoch as string, 'current')) {
         return this.beginRuntimeMigration(
-          hostId, stateRecord, spoolRecord, stateBytes!, spoolBytes!, resetWriteHooks, resetRemoveHooks,
+          hostId, stateRecord, spoolRecord, stateBytes!, spoolBytes!, resetStep, resetWriteHooks, resetRemoveHooks,
         );
       }
       if (!stateRecord && !spoolRecord) {
@@ -379,7 +383,7 @@ export class BridgeStateStore {
 
   private beginRuntimeMigration(
     hostId: string, stateSource: Record<string, unknown>, spoolSource: Record<string, unknown>,
-    stateSourceBytes: Buffer, spoolSourceBytes: Buffer,
+    stateSourceBytes: Buffer, spoolSourceBytes: Buffer, resetStep?: (phase: RuntimeResetPhase) => void,
     writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
   ): PersistedBridgeState {
     const stateTarget = migrateStateV3ToV4(stateSource, hostId);
@@ -395,20 +399,22 @@ export class BridgeStateStore {
       floorTargetHash: hashBytes(serializeSecureJson(floorTarget)), stateTarget, spoolTarget, floorTarget,
       createdAt: new Date().toISOString(),
     };
+    resetStep?.('before-intent');
     writeSecureJsonExclusive(intent.intentPath, intent, undefined, writeHooks);
-    return this.finishRuntimeMigration(intent, writeHooks, removeHooks);
+    resetStep?.('after-intent');
+    return this.finishRuntimeMigration(intent, resetStep, writeHooks, removeHooks);
   }
-
   private resumeRuntimeMigration(
-    hostId: string, writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
+    hostId: string, resetStep?: (phase: RuntimeResetPhase) => void,
+    writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
   ): PersistedBridgeState {
     const intent = parseMigrationIntent(readSecureJson<unknown>(runtimeMigrationIntentPathForState(this.filePath)), this.filePath);
     if (intent.hostId !== hostId) throw new Error('Bridge runtime migration intent Host mismatch');
-    return this.finishRuntimeMigration(intent, writeHooks, removeHooks);
+    return this.finishRuntimeMigration(intent, resetStep, writeHooks, removeHooks);
   }
-
   private finishRuntimeMigration(
-    intent: RuntimeMigrationIntentV1, writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
+    intent: RuntimeMigrationIntentV1, resetStep?: (phase: RuntimeResetPhase) => void,
+    writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
   ): PersistedBridgeState {
     assertMigrationIntentTargets(intent);
     const stateBytes = readOptionalSecureBytes(this.filePath);
@@ -420,13 +426,16 @@ export class BridgeStateStore {
     if (hashOptional(spoolBytes) !== intent.spoolTargetHash) {
       writeSecureJson(spoolPathForState(this.filePath), intent.spoolTarget, undefined, writeHooks);
     }
+    resetStep?.('after-spool');
     if (hashOptional(stateBytes) !== intent.stateTargetHash) {
       writeSecureJson(this.filePath, intent.stateTarget, undefined, writeHooks);
     }
+    resetStep?.('after-state');
     if (hashOptional(floorBytes) !== intent.floorTargetHash) {
       writeSecureJson(runtimeSchemaFloorPathForState(this.filePath), intent.floorTarget, undefined, writeHooks);
     }
     removeSecureFile(runtimeMigrationIntentPathForState(this.filePath), undefined, removeHooks);
+    resetStep?.('after-cleanup');
     return parseCurrentState(intent.stateTarget, intent.hostId);
   }
 
@@ -603,16 +612,16 @@ export class BridgeStateStore {
     this.commit(nextState);
   }
   getProducerEventTuple(eventId: string, fingerprint: string): { event: CanonicalEvent; session: CanonicalSessionState } | undefined {
-    return this.openProducerTuple('event-reservation-v2', eventId, fingerprint)
-      ?? this.openProducerTuple('event-source-v2', eventId, fingerprint);
+    return this.openProducerTuple('event-reservation-v3', eventId, fingerprint)
+      ?? this.openProducerTuple('event-source-v3', eventId, fingerprint);
   }
   reserveProducerEventTuple(event: CanonicalEvent, terminalSession: CanonicalSessionState, fingerprint: string): void {
-    this.enqueuePendingEvent(event, terminalSession, fingerprint, 'event-reservation-v2');
+    this.enqueuePendingEvent(event, terminalSession, fingerprint, 'event-reservation-v3');
   }
   getTerminalEventCancellation(sessionId: string): PersistedProducerEventReservationV1 | undefined {
     const reservation = Object.values(this.state.producerEventReservations ?? {}).find((candidate) => {
       if (candidate.sessionId !== sessionId) return false;
-      return this.spool?.get(candidate.eventId)?.payloadKind === 'event-reservation-v2';
+      return this.spool?.get(candidate.eventId)?.payloadKind === 'event-reservation-v3';
     });
     return reservation && structuredClone(reservation);
   }
@@ -622,7 +631,7 @@ export class BridgeStateStore {
     const reservationKey = producerReservationKey(input.sessionId, input.fingerprint);
     const reservation = this.state.producerEventReservations?.[reservationKey];
     const source = this.spool.get(input.eventId);
-    if ((!reservation || reservation.eventId !== input.eventId) && source?.payloadKind !== 'event-reservation-v2') return;
+    if ((!reservation || reservation.eventId !== input.eventId) && source?.payloadKind !== 'event-reservation-v3') return;
     const requested: PersistedTerminalCancellationV1 = {
       version: 1, sessionId: input.sessionId, eventId: input.eventId, fingerprint: input.fingerprint,
       removeSession: input.removeSession === true, createdAt: input.createdAt ?? new Date().toISOString(),
@@ -636,7 +645,7 @@ export class BridgeStateStore {
     }
     const cancellation = existingIntent ?? requested;
     if (!existingIntent) this.spool.enqueue({ spoolItemId: itemId, sessionId: input.sessionId, eventId: input.eventId,
-      payloadKind: 'terminal-cancellation-v2', createdAt: cancellation.createdAt,
+      payloadKind: 'terminal-cancellation-v3', createdAt: cancellation.createdAt,
       plaintext: new TextEncoder().encode(JSON.stringify(cancellation)) });
     const nextState = structuredClone(this.state);
     delete nextState.producerEventReservations?.[reservationKey];
@@ -662,12 +671,12 @@ export class BridgeStateStore {
     if (!this.spool) return;
     const source = this.spool.get(cancellation.eventId);
     if (!source) return;
-    if (source.payloadKind !== 'event-reservation-v2'
+    if (source.payloadKind !== 'event-reservation-v3'
       || source.eventId !== cancellation.eventId
       || source.sessionId !== cancellation.sessionId) {
       throw new TypeError('terminal cancellation source conflicts with state');
     }
-    const tuple = this.openProducerTuple('event-reservation-v2', cancellation.eventId, cancellation.fingerprint);
+    const tuple = this.openProducerTuple('event-reservation-v3', cancellation.eventId, cancellation.fingerprint);
     if (!tuple || tuple.event.eventId !== cancellation.eventId || tuple.event.sessionId !== cancellation.sessionId
       || tuple.session.sessionId !== cancellation.sessionId) {
       throw new TypeError('terminal cancellation source conflicts with state');
@@ -698,7 +707,7 @@ export class BridgeStateStore {
   }
   private reconcileTerminalCancellations(): void {
     if (!this.spool) return;
-    const intents = new Map(this.spool.list('terminal-cancellation-v2').map((item) => [item.eventId, item]));
+    const intents = new Map(this.spool.list('terminal-cancellation-v3').map((item) => [item.eventId, item]));
     for (const cancellation of Object.values(this.state.terminalCancellations ?? {})) {
       const item = intents.get(cancellation.eventId);
       if (item) {
@@ -720,7 +729,7 @@ export class BridgeStateStore {
       const reservation = this.state.producerEventReservations?.[reservationKey];
       const source = this.spool.get(cancellation.eventId);
       if (!reservation || reservation.eventId !== cancellation.eventId
-        || source?.payloadKind !== 'event-reservation-v2' || source.sessionId !== cancellation.sessionId) {
+        || source?.payloadKind !== 'event-reservation-v3' || source.sessionId !== cancellation.sessionId) {
         throw new TypeError('terminal cancellation recovery journal conflicts with pending Event evidence');
       }
       this.assertTerminalCancellationSource(cancellation);
@@ -751,10 +760,10 @@ export class BridgeStateStore {
     assertEventSessionBinding(event, terminalSession);
     if (!this.spool) throw new Error('encrypted spool is not initialized');
     const existingKind = this.spool.get(event.eventId)?.payloadKind;
-    if (producerFingerprint && existingKind === 'event-reservation-v2') {
+    if (producerFingerprint && existingKind === 'event-reservation-v3') {
       this.promoteProducerEventTuple(event, terminalSession, producerFingerprint);
-    } else if (producerFingerprint && existingKind === 'event-source-v2') {
-      const existing = this.openProducerTuple('event-source-v2', event.eventId, producerFingerprint);
+    } else if (producerFingerprint && existingKind === 'event-source-v3') {
+      const existing = this.openProducerTuple('event-source-v3', event.eventId, producerFingerprint);
       if (!existing || JSON.stringify(existing) !== JSON.stringify({ event, session: terminalSession })) {
         throw new TypeError('pending Event retry journal conflicts with the bound tuple');
       }
@@ -791,7 +800,7 @@ export class BridgeStateStore {
     };
   }
   private enqueuePendingEvent(event: CanonicalEvent, terminalSession: CanonicalSessionState, producerFingerprint?: string,
-    payloadKind: 'event-source-v2' | 'event-reservation-v2' = 'event-source-v2'): void {
+    payloadKind: 'event-source-v3' | 'event-reservation-v3' = 'event-source-v3'): void {
     if (!this.spool) throw new Error('encrypted spool is not initialized');
     const serialized = JSON.stringify({ event, session: terminalSession, ...(producerFingerprint ? { producerFingerprint } : {}) });
     const payload = new TextEncoder().encode(serialized);
@@ -807,14 +816,14 @@ export class BridgeStateStore {
   private promoteProducerEventTuple(event: CanonicalEvent, terminalSession: CanonicalSessionState, fingerprint: string): void {
     if (!this.spool) throw new Error('encrypted spool is not initialized');
     const serialized = JSON.stringify({ event, session: terminalSession, producerFingerprint: fingerprint });
-    const existing = this.openProducerTuple('event-reservation-v2', event.eventId, fingerprint);
+    const existing = this.openProducerTuple('event-reservation-v3', event.eventId, fingerprint);
     if (!existing || JSON.stringify(existing) !== JSON.stringify({ event, session: terminalSession })) {
       throw new TypeError('pending Event retry journal conflicts with the bound tuple');
     }
     this.spool.replace([event.eventId], [{ spoolItemId: event.eventId, sessionId: event.sessionId, eventId: event.eventId,
-      payloadKind: 'event-source-v2', createdAt: event.createdAt, plaintext: new TextEncoder().encode(serialized) }]);
+      payloadKind: 'event-source-v3', createdAt: event.createdAt, plaintext: new TextEncoder().encode(serialized) }]);
   }
-  private openProducerTuple(kind: 'event-source-v2' | 'event-reservation-v2', eventId: string, fingerprint: string):
+  private openProducerTuple(kind: 'event-source-v3' | 'event-reservation-v3', eventId: string, fingerprint: string):
     { event: CanonicalEvent; session: CanonicalSessionState } | undefined {
     if (!this.spool) return undefined;
     const item = this.spool.list(kind).find((candidate) => candidate.eventId === eventId);
@@ -832,7 +841,7 @@ export class BridgeStateStore {
   private reconcileProducerEventReservations(): void {
     if (!this.spool) return;
     let changed = false;
-    for (const item of this.spool.list('event-reservation-v2')) {
+    for (const item of this.spool.list('event-reservation-v3')) {
       const bytes = this.spool.open(item);
       try {
         const pending = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as {
@@ -874,7 +883,7 @@ export class BridgeStateStore {
   }
   private peekPendingUploadRecords(): Array<{ event: CanonicalEvent; session: CanonicalSessionState; producerFingerprint?: string }> {
     if (!this.spool) return [];
-    return this.spool.list('event-source-v2')
+    return this.spool.list('event-source-v3')
       .filter((item) => !item.eventId || !this.state.terminalCancellations?.[item.eventId])
       .map((item) => { const bytes = this.spool!.open(item); try {
         const pending = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as {
@@ -895,26 +904,26 @@ export class BridgeStateStore {
   getInflightEventUpload(eventId: string): unknown | undefined { return this.openSpoolJson(`inflight:event:${eventId}`); }
   persistInflightEventUpload(eventId: string, sessionId: string, upload: unknown): void {
     if (!this.spool) throw new Error('encrypted spool is not initialized');
-    this.spool.enqueue({ spoolItemId: `inflight:event:${eventId}`, sessionId, eventId, payloadKind: 'event-upload-v2',
+    this.spool.enqueue({ spoolItemId: `inflight:event:${eventId}`, sessionId, eventId, payloadKind: 'event-upload-v3',
       createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) });
   }
   replaceInflightEventUpload(eventId: string, sessionId: string, upload: unknown): void {
     if (!this.spool) throw new Error('encrypted spool is not initialized');
     this.spool.replace([`inflight:event:${eventId}`], [{ spoolItemId: `inflight:event:${eventId}`, sessionId, eventId,
-      payloadKind: 'event-upload-v2', createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) }]);
+      payloadKind: 'event-upload-v3', createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) }]);
   }
   removeInflightEventUpload(eventId: string): void { this.spool?.remove(`inflight:event:${eventId}`); }
-  listInflightSessionIds(): string[] { return this.spool?.list('session-upload-v2').map((item) => item.sessionId) ?? []; }
+  listInflightSessionIds(): string[] { return this.spool?.list('session-upload-v3').map((item) => item.sessionId) ?? []; }
   getInflightSessionUpload(sessionId: string): unknown | undefined { return this.openSpoolJson(`inflight:session:${sessionId}`); }
   persistInflightSessionUpload(sessionId: string, upload: unknown): void {
     if (!this.spool) throw new Error('encrypted spool is not initialized');
-    this.spool.enqueue({ spoolItemId: `inflight:session:${sessionId}`, sessionId, payloadKind: 'session-upload-v2',
+    this.spool.enqueue({ spoolItemId: `inflight:session:${sessionId}`, sessionId, payloadKind: 'session-upload-v3',
       createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) });
   }
   replaceInflightSessionUpload(sessionId: string, upload: unknown): void {
     if (!this.spool) throw new Error('encrypted spool is not initialized');
     this.spool.replace([`inflight:session:${sessionId}`], [{ spoolItemId: `inflight:session:${sessionId}`, sessionId,
-      payloadKind: 'session-upload-v2', createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) }]);
+      payloadKind: 'session-upload-v3', createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) }]);
   }
   removeInflightSessionUpload(sessionId: string): void { this.spool?.remove(`inflight:session:${sessionId}`); }
   clearInflightSessionUploads(sessionIds?: readonly string[]): number {
@@ -922,7 +931,7 @@ export class BridgeStateStore {
     let removed = 0;
     if (!this.spool) return 0;
     const shouldRemove = (sessionId: string): boolean => !ids || ids.has(sessionId);
-    for (const item of this.spool.list('session-upload-v2')) {
+    for (const item of this.spool.list('session-upload-v3')) {
       if (!shouldRemove(item.sessionId)) continue;
       this.spool.remove(item.spoolItemId);
       removed += 1;
@@ -958,7 +967,7 @@ export class BridgeStateStore {
       spoolItemId: `dead-letter:event:${eventId}`,
       sessionId,
       eventId,
-      payloadKind: 'event-dead-letter-v2',
+      payloadKind: 'event-dead-letter-v3',
       createdAt: quarantinedAt,
       plaintext: new TextEncoder().encode(JSON.stringify(record)),
     }]);
@@ -1417,12 +1426,12 @@ function inferCurrentStateHostId(state: PersistedBridgeState): string {
 function isPriorStateRecordV3(value: Record<string, unknown>, hostId: string): boolean {
   if (!hasExactOptionalKeys(value, PRIOR_V3_STATE_REQUIRED_KEYS, CURRENT_STATE_OPTIONAL_KEYS)
     || value.schemaVersion !== PRIOR_RUNTIME_STATE_SCHEMA_VERSION || !isRuntimeEpoch(value.runtimeResetEpoch)
-    || !(value.host === null || isCurrentHost(value.host)) || !isValueMap(value.sessions, isCurrentSession)
+    || !(value.host === null || isCurrentHost(value.host)) || !isValueMap(value.sessions, isObsoleteSession)
     || !isStringMap(value.sessionDrivers) || !isTrueMap(value.reconciledDrivers)
-    || !Array.isArray(value.recentEvents) || !value.recentEvents.every(isCurrentEvent)
+    || !Array.isArray(value.recentEvents) || !value.recentEvents.every(isObsoleteEvent)
     || !isNonNegativeIntegerMap(value.sessionRevisions) || !isValueMap(value.pendingHandles, isCurrentPendingHandle)
     || !isValueMap(value.commandResults, isPriorCommandResult) || !isStringMap(value.seenCommands)
-    || !isCurrentSnapshot(value.currentSessionsSnapshot)) return false;
+    || !isObsoleteSnapshot(value.currentSessionsSnapshot)) return false;
   if (value.recipientSetVersion !== undefined && !isPositiveSafeInteger(value.recipientSetVersion)) return false;
   if ((value.eventUploadCompletions !== undefined && !isValueMap(value.eventUploadCompletions, isCurrentEventCompletion))
     || (value.producerEventReservations !== undefined && !isValueMap(value.producerEventReservations, isCurrentProducerReservation))
@@ -1431,27 +1440,30 @@ function isPriorStateRecordV3(value: Record<string, unknown>, hostId: string): b
   try { assertPriorStateV3Relationships(value, hostId); return true; } catch { return false; }
 }
 function assertPriorStateV3Relationships(state: Record<string, unknown>, hostId: string): void {
-  const projection = state as unknown as { host: HostProjection | null; sessions: Record<string, CanonicalSessionState>;
-    sessionDrivers: Record<string, string>; recentEvents: CanonicalEvent[]; sessionRevisions: Record<string, number>;
-    pendingHandles: Record<string, PendingSessionHandle>; commandResults: Record<string, Record<string, unknown>>;
-    seenCommands: Record<string, string>; currentSessionsSnapshot: PersistedCurrentSessionsSnapshotState;
-    recipientSetVersion?: number; eventUploadCompletions?: Record<string, PersistedBridgeState['eventUploadCompletions'] extends infer T ? never : never>; };
-  if (projection.host && projection.host.hostId !== hostId) throw new Error('prior Host projection belongs to another Host');
-  const events = new Map<string, CanonicalEvent>();
-  for (const [sessionId, session] of Object.entries(projection.sessions)) {
+  const sessions = state.sessions as Record<string, Record<string, unknown>>;
+  const drivers = state.sessionDrivers as Record<string, string>;
+  const events = new Map<string, Record<string, unknown>>();
+  const handles = state.pendingHandles as Record<string, PendingSessionHandle>;
+  const results = state.commandResults as Record<string, Record<string, unknown>>;
+  const seen = state.seenCommands as Record<string, string>;
+  if (state.host && (state.host as HostProjection).hostId !== hostId) throw new Error('prior Host projection belongs to another Host');
+  for (const [sessionId, session] of Object.entries(sessions)) {
     if (sessionId !== session.sessionId || session.hostId !== hostId) throw new Error('prior Session binding is invalid');
   }
-  for (const [sessionId, driver] of Object.entries(projection.sessionDrivers)) {
-    if (!projection.sessions[sessionId] || projection.sessions[sessionId]!.provider !== driver) throw new Error('prior driver binding is invalid');
+  for (const [sessionId, driver] of Object.entries(drivers)) {
+    if (!sessions[sessionId] || sessions[sessionId]!.provider !== driver) throw new Error('prior driver binding is invalid');
   }
-  for (const event of projection.recentEvents) {
-    if (event.hostId !== hostId || events.has(event.eventId)) throw new Error('prior Event binding is invalid');
-    const session = projection.sessions[event.sessionId];
+  for (const event of state.recentEvents as Record<string, unknown>[]) {
+    const eventId = event.eventId as string;
+    if (event.hostId !== hostId || events.has(eventId)) throw new Error('prior Event binding is invalid');
+    const session = sessions[event.sessionId as string];
     if (session && session.provider !== event.provider) throw new Error('prior Event Session binding is invalid');
-    events.set(event.eventId, event);
+    events.set(eventId, event);
   }
-  for (const revision of Object.values(projection.sessionRevisions)) if (revision < 1) throw new Error('prior revision is invalid');
-  for (const [key, handle] of Object.entries(projection.pendingHandles)) {
+  for (const revision of Object.values(state.sessionRevisions as Record<string, number>)) {
+    if (revision < 1) throw new Error('prior revision is invalid');
+  }
+  for (const [key, handle] of Object.entries(handles)) {
     const event = events.get(handle.handledThroughEventId);
     if (key !== sessionHandleKey(hostId, handle.sessionId) || handle.hostId !== hostId || !event
       || event.sessionId !== handle.sessionId
@@ -1459,31 +1471,77 @@ function assertPriorStateV3Relationships(state: Record<string, unknown>, hostId:
       throw new Error('prior handle binding is invalid');
     }
   }
-  for (const [commandId, result] of Object.entries(projection.commandResults)) {
-    if (commandId !== result.commandId || result.hostId !== hostId || projection.seenCommands[commandId] !== result.updatedAt) {
-      throw new Error('prior command result binding is invalid');
+  for (const [commandId, result] of Object.entries(results)) {
+    const session = sessions[result.sessionId as string];
+    const lastEventId = session?.lastEventId as string | undefined;
+    if (commandId !== result.commandId || result.hostId !== hostId
+      || (lastEventId !== undefined && events.get(lastEventId)?.sessionId !== result.sessionId)
+      || seen[commandId] !== result.updatedAt) throw new Error('prior command result binding is invalid');
+  }
+  if (Object.keys(seen).some((commandId) => !results[commandId])) throw new Error('prior seen-command binding is invalid');
+  for (const [eventId, completion] of Object.entries(state.eventUploadCompletions as Record<string, EventUploadCompletionV1> | undefined ?? {})) {
+    const revision = (state.sessionRevisions as Record<string, number>)[completion.sessionId] ?? 0;
+    const event = events.get(eventId);
+    const revisionIsValid = revision === completion.revision
+      || (completion.revisionCommitted !== true && revision === completion.revision - 1);
+    if (eventId !== completion.eventId || (event && event.sessionId !== completion.sessionId) || !revisionIsValid
+      || (completion.inflightRemoved === true && completion.revisionCommitted !== true)
+      || (completion.sourceRemoved === true && completion.inflightRemoved !== true)) {
+      throw new Error('prior Event completion binding is invalid');
     }
   }
-  if (Object.keys(projection.seenCommands).some((commandId) => !projection.commandResults[commandId])) {
-    throw new Error('prior seen-command binding is invalid');
+  for (const [key, reservation] of Object.entries(state.producerEventReservations as Record<string, PersistedProducerEventReservationV1> | undefined ?? {})) {
+    const event = events.get(reservation.eventId);
+    if (key !== producerReservationKey(reservation.sessionId, reservation.fingerprint)
+      || (event && (event.sessionId !== reservation.sessionId || event.createdAt !== reservation.createdAt))) {
+      throw new Error('prior producer fingerprint binding is invalid');
+    }
   }
-  const compatible = { ...state, schemaVersion: 4, commandExecutions: {} } as Record<string, unknown>;
-  delete compatible.commandResults; delete compatible.seenCommands;
-  assertCurrentStateRelationships(compatible as unknown as PersistedBridgeState, hostId);
+  for (const [eventId, cancellation] of Object.entries(state.terminalCancellations as Record<string, PersistedTerminalCancellationV1> | undefined ?? {})) {
+    const event = events.get(eventId);
+    if (eventId !== cancellation.eventId || (event && event.sessionId !== cancellation.sessionId)) {
+      throw new Error('prior terminal cancellation binding is invalid');
+    }
+  }
+  const snapshot = state.currentSessionsSnapshot as PersistedCurrentSessionsSnapshotState;
+  const acceptedFields = [snapshot.lastAcceptedDigest, snapshot.lastAcceptedContentDigest, snapshot.lastAcceptedRecipientSetVersion];
+  if (snapshot.lastAcceptedRevision === 0 ? acceptedFields.some((value) => value !== undefined)
+    : acceptedFields.some((value) => value === undefined) || state.recipientSetVersion === undefined
+      || snapshot.lastAcceptedRecipientSetVersion! > (state.recipientSetVersion as number)) {
+    throw new Error('prior publication binding is invalid');
+  }
 }
-
-
 function migrateStateV3ToV4(value: Record<string, unknown>, hostId: string): PersistedBridgeState {
   if (!isPriorStateRecordV3(value, hostId)) throw new Error('Bridge runtime schema v3 is invalid');
-  const { commandResults: _commandResults, seenCommands: _seenCommands, schemaVersion: _schemaVersion, ...metadata } = value;
-  return parseCurrentState({ ...structuredClone(metadata), schemaVersion: 4, commandExecutions: {} }, hostId);
+  const sessions = Object.fromEntries(Object.entries(value.sessions as Record<string, Record<string, unknown>>).map(([sessionId, session]) => [
+    sessionId, {
+      sessionId: session.sessionId, hostId: session.hostId, provider: session.provider, projectName: session.projectName,
+      nameText: session.nameText,
+      ...(session.openingText === undefined ? {} : { openingText: session.openingText }),
+      ...(session.latestActivityText === undefined ? {} : { latestActivityText: session.latestActivityText }),
+      ...(session.workingDirectory === undefined ? {} : { workingDirectory: session.workingDirectory }),
+      ...(session.harnessProvider === undefined ? {} : { harnessProvider: session.harnessProvider }),
+      status: session.status, updatedAt: session.updatedAt,
+      ...(session.snoozedUntil === undefined ? {} : { snoozedUntil: session.snoozedUntil }),
+    },
+  ]));
+  const snapshot = value.currentSessionsSnapshot as PersistedCurrentSessionsSnapshotState;
+  return parseCurrentState({
+    schemaVersion: 4, runtimeResetEpoch: value.runtimeResetEpoch, host: structuredClone(value.host),
+    sessions, sessionDrivers: structuredClone(value.sessionDrivers), reconciledDrivers: structuredClone(value.reconciledDrivers),
+    recentEvents: [], sessionRevisions: structuredClone(value.sessionRevisions),
+    ...(value.recipientSetVersion === undefined ? {} : { recipientSetVersion: value.recipientSetVersion }),
+    pendingHandles: {}, commandExecutions: {},
+    currentSessionsSnapshot: { version: 1,
+      lastAllocatedRevision: Math.max(snapshot.lastAllocatedRevision, snapshot.lastAcceptedRevision), lastAcceptedRevision: 0 },
+    ...(value.runtimeHealth === undefined ? {} : { runtimeHealth: structuredClone(value.runtimeHealth) }),
+  }, hostId);
 }
-
 function migrateSpoolV3ToV4(value: Record<string, unknown>, hostId: string, epoch: string): LocalSpoolFileV2 {
   if (!isSpoolRecordForSchema(value, PRIOR_RUNTIME_STATE_SCHEMA_VERSION, hostId, epoch, 'current')) {
     throw new Error('Bridge runtime spool schema v3 is invalid');
   }
-  return { ...(structuredClone(value) as unknown as LocalSpoolFileV2), runtimeStateSchemaVersion: 4 };
+  return { ...(structuredClone(value) as unknown as LocalSpoolFileV2), runtimeStateSchemaVersion: 4, items: [] };
 }
 
 function isRecognizedPriorStateRecord(value: Record<string, unknown> | undefined, hostId: string): boolean {
@@ -1523,9 +1581,8 @@ function isRecognizedLegacyRuntime(
 function isRecognizedObsoleteRuntime(
   state: Record<string, unknown> | undefined, spool: Record<string, unknown> | undefined, hostId: string,
 ): boolean {
-  if (!state || !spool || !isObsoleteStateRecord(state, hostId) || !isSpoolRecordForSchema(
-    spool, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, hostId, state.runtimeResetEpoch as string, 'current',
-  )) return false;
+  if (!state || !spool || !isObsoleteStateRecord(state, hostId)
+    || !isSpoolRecordForSchema(spool, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, hostId, state.runtimeResetEpoch as string, 'current')) return false;
   return hasRecognizedPriorRuntimeRelationships(state, spool);
 }
 
@@ -1534,7 +1591,7 @@ function isObsoleteStateRecord(value: Record<string, unknown>, hostId: string): 
     || value.schemaVersion !== OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION || !isRuntimeEpoch(value.runtimeResetEpoch)
     || !(value.host === null || isCurrentHost(value.host)) || !isValueMap(value.sessions, isCurrentSession)
     || !isStringMap(value.sessionDrivers) || !isTrueMap(value.reconciledDrivers)
-    || !Array.isArray(value.recentEvents) || !value.recentEvents.every(isObsoleteEvent)
+    || !Array.isArray(value.recentEvents) || !value.recentEvents.every(isSchema2Event)
     || !isNonNegativeIntegerMap(value.sessionRevisions) || !isValueMap(value.pendingHandles, isCurrentPendingHandle)
     || !isValueMap(value.commandResults, isPriorCommandResult) || !isStringMap(value.seenCommands)
     || !isCurrentSnapshot(value.currentSessionsSnapshot)) return false;
@@ -1556,10 +1613,11 @@ function parseCurrentSpoolRecord(value: Record<string, unknown>, hostId: string,
 function isSpoolRecordForSchema(
   value: Record<string, unknown>, schemaVersion: 2 | 3 | 4, hostId: string, epoch: string, kind: 'current' | 'standalone-v2',
 ): boolean {
+  const spoolKind = schemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION ? 'current' : 'obsolete-v2';
   return hasExactKeys(value, ['version', 'runtimeStateSchemaVersion', 'runtimeResetEpoch', 'hostId', 'keyId', 'items'])
     && value.version === 2 && value.runtimeStateSchemaVersion === schemaVersion
     && value.runtimeResetEpoch === epoch && value.hostId === hostId && isVerifier(value.keyId)
-    && Array.isArray(value.items) && value.items.every((item) => isRawSpoolItem(item, hostId, kind));
+    && Array.isArray(value.items) && value.items.every((item) => isRawSpoolItem(item, hostId, spoolKind));
 }
 
 function isRecognizedPriorSpoolRecord(value: Record<string, unknown>, hostId: string): boolean {
@@ -1571,19 +1629,25 @@ function isRecognizedPriorSpoolRecord(value: Record<string, unknown>, hostId: st
     && hasRecognizedPriorSpoolRelationships(value.items as unknown[]);
 }
 
-function isRawSpoolItem(value: unknown, hostId: string, kind: 'current' | 'v1' | 'standalone-v2'): boolean {
+function isRawSpoolItem(value: unknown, hostId: string, kind: 'current' | 'v1' | 'standalone-v2' | 'obsolete-v2'): boolean {
   if (!isRecord(value) || !hasExactOptionalKeys(value,
     ['version', 'spoolItemId', 'hostId', 'sessionId', 'payloadKind', 'nonce', 'ciphertext', 'aadVersion', 'createdAt'],
     ['eventId'])) return false;
   if (value.version !== 1 || value.hostId !== hostId || !isNonEmptyString(value.spoolItemId)
     || !isNonEmptyString(value.sessionId) || (value.eventId !== undefined && !isNonEmptyString(value.eventId))
-    || !(kind === 'v1' ? PRIOR_V1_SPOOL_KINDS.has(value.payloadKind as string) : isRecognizedLocalSpoolPayloadKind(value.payloadKind))
+    || !isRecognizedRawSpoolPayloadKind(kind, value.payloadKind)
     || !isNonEmptyString(value.nonce) || !isNonEmptyString(value.ciphertext) || value.aadVersion !== 1
     || !isNonEmptyString(value.createdAt)) return false;
   try {
     base64UrlDecode(value.nonce, 12, 'spool nonce');
     return base64UrlDecode(value.ciphertext, undefined, 'spool ciphertext').length >= 16;
   } catch { return false; }
+}
+
+function isRecognizedRawSpoolPayloadKind(kind: 'current' | 'v1' | 'standalone-v2' | 'obsolete-v2', payloadKind: unknown): boolean {
+  if (kind === 'v1') return PRIOR_V1_SPOOL_KINDS.has(payloadKind as string);
+  if (kind === 'current') return isRecognizedLocalSpoolPayloadKind(payloadKind);
+  return PRIOR_V2_SPOOL_KINDS.has(payloadKind as string);
 }
 
 function parseResetIntent(value: unknown): RuntimeResetIntentV1 {
@@ -1609,10 +1673,6 @@ function isValidResetTransition(from: unknown, to: unknown): boolean {
 }
 
 function emptyStateForSchema(schemaVersion: 2 | 3, epoch: string): Record<string, unknown> {
-  if (schemaVersion === PRIOR_RUNTIME_STATE_SCHEMA_VERSION) {
-    const { commandExecutions: _commandExecutions, ...state } = emptyState(epoch);
-    return { ...state, schemaVersion, commandResults: {}, seenCommands: {} };
-  }
   const { commandExecutions: _commandExecutions, ...state } = emptyState(epoch);
   return { ...state, schemaVersion, commandResults: {}, seenCommands: {} };
 }
@@ -1684,7 +1744,7 @@ function assertResetSpoolMember(
     const spool = parseRawJson(bytes, 'Bridge runtime reset spool source');
     const valid = intent.fromSchemaVersion === LEGACY_RUNTIME_STATE_SCHEMA_VERSION
       ? !!spool && isRecognizedPriorSpoolRecord(spool, hostId)
-      : !!spool && isSpoolRecordForSchema(spool, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, hostId,
+      : !!spool && isSpoolRecordForSchema(spool, intent.fromSchemaVersion, hostId,
         (spool.runtimeResetEpoch as string), 'current');
     if (!valid) throw new Error('Bridge runtime reset spool source schema is invalid');
   }
@@ -1815,30 +1875,40 @@ const SESSION_REQUIRED_KEYS = [
 ] as const;
 const PRIOR_SESSION_REQUIRED_KEYS = [...SESSION_REQUIRED_KEYS, 'stateLabel'] as const;
 const SESSION_OPTIONAL_KEYS = [
-  'openingText', 'latestActivityText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider', 'actionablePrompt',
-  'lastEventId', 'snoozedUntil',
+  'openingText', 'latestActivityText', 'workingDirectory', 'harnessProvider', 'lastEventId', 'snoozedUntil',
+] as const;
+const OBSOLETE_SESSION_OPTIONAL_KEYS = [
+  ...SESSION_OPTIONAL_KEYS, 'hbaseSessionKey', 'actionablePrompt',
 ] as const;
 function isCurrentSession(value: unknown): boolean {
-  if (!isRecord(value) || !hasExactOptionalKeys(value, SESSION_REQUIRED_KEYS, SESSION_OPTIONAL_KEYS)
+  return isSessionForKeys(value, SESSION_OPTIONAL_KEYS);
+}
+function isObsoleteSession(value: unknown): boolean {
+  return isSessionForKeys(value, OBSOLETE_SESSION_OPTIONAL_KEYS);
+}
+function isSessionForKeys(value: unknown, optionalKeys: readonly string[]): boolean {
+  if (!isRecord(value) || !hasExactOptionalKeys(value, SESSION_REQUIRED_KEYS, optionalKeys)
     || !SESSION_REQUIRED_KEYS.filter((key) => key !== 'status').every((key) => isNonEmptyString(value[key]))
     || !['idle', 'working', 'need_human'].includes(value.status as string)) return false;
-  return SESSION_OPTIONAL_KEYS.every((key) => value[key] === undefined
+  return optionalKeys.every((key) => value[key] === undefined
     || (key === 'actionablePrompt' ? isCurrentActionablePrompt(value[key]) : typeof value[key] === 'string'));
 }
 const EVENT_REQUIRED_KEYS = [
   'eventId', 'hostId', 'sessionId', 'provider', 'type', 'status', 'agentText', 'createdAt',
 ] as const;
 const EVENT_OPTIONAL_KEYS = [
-  'humanText', 'projectName', 'contextText', 'workingDirectory', 'hbaseSessionKey', 'harnessProvider',
-  'actionablePrompt', 'correlationId', 'needHuman',
+  'humanText', 'projectName', 'workingDirectory', 'harnessProvider', 'needHuman',
 ] as const;
 function isCurrentEvent(value: unknown): boolean {
-  if (!isRecord(value) || !hasExactOptionalKeys(value, EVENT_REQUIRED_KEYS, EVENT_OPTIONAL_KEYS)
+  return isEventForKeys(value, EVENT_OPTIONAL_KEYS);
+}
+function isEventForKeys(value: unknown, optionalKeys: readonly string[]): boolean {
+  if (!isRecord(value) || !hasExactOptionalKeys(value, EVENT_REQUIRED_KEYS, optionalKeys)
     || !EVENT_REQUIRED_KEYS.filter((key) => key !== 'type' && key !== 'status').every((key) => isNonEmptyString(value[key]))) return false;
   if (value.type === 'done') { if (value.status !== 'idle' || value.needHuman !== undefined) return false; }
   else if (value.type === 'need_human') { if (value.status !== 'need_human' || !isCurrentNeedHuman(value.needHuman)) return false; }
   else return false;
-  return EVENT_OPTIONAL_KEYS.every((key) => value[key] === undefined || key === 'needHuman'
+  return optionalKeys.every((key) => value[key] === undefined || key === 'needHuman'
     || (key === 'actionablePrompt' ? isCurrentActionablePrompt(value[key]) : typeof value[key] === 'string'));
 }
 function isCurrentActionablePrompt(value: unknown): boolean {
@@ -1968,6 +2038,15 @@ function isCurrentTerminalCancellation(value: unknown): boolean {
     && value.version === 1 && ['sessionId', 'eventId', 'fingerprint', 'createdAt'].every((key) => isNonEmptyString(value[key]))
     && typeof value.removeSession === 'boolean';
 }
+function isObsoleteSnapshot(value: unknown): boolean {
+  if (!isRecord(value) || !hasExactOptionalKeys(value, ['version', 'lastAllocatedRevision', 'lastAcceptedRevision'],
+    ['lastAcceptedDigest', 'lastAcceptedContentDigest', 'lastAcceptedRecipientSetVersion']) || value.version !== 1
+    || !isNonNegativeSafeInteger(value.lastAllocatedRevision) || !isNonNegativeSafeInteger(value.lastAcceptedRevision)) return false;
+  if (value.lastAcceptedDigest !== undefined && typeof value.lastAcceptedDigest !== 'string') return false;
+  if (value.lastAcceptedContentDigest !== undefined && typeof value.lastAcceptedContentDigest !== 'string') return false;
+  return value.lastAcceptedRecipientSetVersion === undefined || isPositiveSafeInteger(value.lastAcceptedRecipientSetVersion);
+}
+
 function isCurrentSnapshot(value: unknown): boolean {
   if (!isRecord(value) || !hasExactOptionalKeys(value, ['version', 'lastAllocatedRevision', 'lastAcceptedRevision'],
     ['lastAcceptedDigest', 'lastAcceptedContentDigest', 'lastAcceptedRecipientSetVersion']) || value.version !== 1
@@ -2100,15 +2179,15 @@ function assertCurrentRuntimeRelationships(state: PersistedBridgeState, spool: L
   for (const item of spool.items) {
     if (ids.has(item.spoolItemId)) throw new Error('Bridge runtime spool item ID is duplicated');
     ids.add(item.spoolItemId);
-    const eventKind = item.payloadKind !== 'session-source-v2' && item.payloadKind !== 'session-upload-v2';
+    const eventKind = item.payloadKind !== 'session-source-v3' && item.payloadKind !== 'session-upload-v3';
     if (eventKind && !item.eventId) throw new Error('Bridge runtime spool Event binding is invalid');
-    if (item.payloadKind === 'event-source-v2') {
+    if (item.payloadKind === 'event-source-v3') {
       const event = state.recentEvents.find((candidate) => candidate.eventId === item.eventId);
       if (item.spoolItemId !== item.eventId || (event && event.sessionId !== item.sessionId)) {
         throw new Error('Bridge runtime Event source binding is invalid');
       }
     }
-    if (item.payloadKind === 'event-reservation-v2') {
+    if (item.payloadKind === 'event-reservation-v3') {
       const reservation = Object.values(state.producerEventReservations ?? {})
         .find((candidate) => candidate.eventId === item.eventId);
       const cancellation = state.terminalCancellations?.[item.eventId!];
@@ -2118,29 +2197,29 @@ function assertCurrentRuntimeRelationships(state: PersistedBridgeState, spool: L
         throw new Error('Bridge runtime Event reservation binding is invalid');
       }
     }
-    if (item.payloadKind === 'event-upload-v2') {
+    if (item.payloadKind === 'event-upload-v3') {
       const event = state.recentEvents.find((candidate) => candidate.eventId === item.eventId);
       if (item.spoolItemId !== `inflight:event:${item.eventId}` || (event && event.sessionId !== item.sessionId)) {
         throw new Error('Bridge runtime Event upload binding is invalid');
       }
     }
-    if (item.payloadKind === 'event-dead-letter-v2') {
+    if (item.payloadKind === 'event-dead-letter-v3') {
       const event = state.recentEvents.find((candidate) => candidate.eventId === item.eventId);
       if (item.spoolItemId !== `dead-letter:event:${item.eventId}` || (event && event.sessionId !== item.sessionId)) {
         throw new Error('Bridge runtime Event dead-letter binding is invalid');
       }
     }
-    if (item.payloadKind === 'session-upload-v2' && item.spoolItemId !== `inflight:session:${item.sessionId}`) {
+    if (item.payloadKind === 'session-upload-v3' && item.spoolItemId !== `inflight:session:${item.sessionId}`) {
       throw new Error('Bridge runtime Session upload binding is invalid');
     }
-    if (item.payloadKind === 'terminal-cancellation-v2') {
+    if (item.payloadKind === 'terminal-cancellation-v3') {
       const cancellation = state.terminalCancellations?.[item.eventId!];
       const source = spool.items.find((candidate) => candidate.spoolItemId === item.eventId);
       const reservation = Object.values(state.producerEventReservations ?? {})
         .find((candidate) => candidate.eventId === item.eventId);
       const recoverableIntentOnly = !cancellation
         && reservation?.sessionId === item.sessionId
-        && source?.payloadKind === 'event-reservation-v2'
+        && source?.payloadKind === 'event-reservation-v3'
         && source.eventId === item.eventId
         && source.sessionId === item.sessionId;
       if (item.spoolItemId !== terminalCancellationItemId(item.eventId!)
@@ -2153,8 +2232,8 @@ function assertCurrentRuntimeRelationships(state: PersistedBridgeState, spool: L
   for (const completion of Object.values(state.eventUploadCompletions ?? {})) {
     const inflight = spool.items.find((item) => item.spoolItemId === `inflight:event:${completion.eventId}`);
     const source = spool.items.find((item) => item.spoolItemId === completion.eventId);
-    if ((inflight && (inflight.payloadKind !== 'event-upload-v2' || inflight.sessionId !== completion.sessionId))
-      || (source && (source.payloadKind !== 'event-source-v2' || source.sessionId !== completion.sessionId))
+    if ((inflight && (inflight.payloadKind !== 'event-upload-v3' || inflight.sessionId !== completion.sessionId))
+      || (source && (source.payloadKind !== 'event-source-v3' || source.sessionId !== completion.sessionId))
       || (completion.inflightRemoved === true && inflight)
       || (completion.sourceRemoved === true && source)) {
       throw new Error('Bridge runtime Event completion spool binding is invalid');
@@ -2304,7 +2383,7 @@ function hasResetSourceRelationships(
     return hasRecognizedPriorRuntimeRelationships(state, spool);
   }
   return isObsoleteStateRecord(state, hostId)
-    && isSpoolRecordForSchema(spool, OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION, hostId,
+    && isSpoolRecordForSchema(spool, intent.fromSchemaVersion, hostId,
       state.runtimeResetEpoch as string, 'current')
     && hasRecognizedPriorRuntimeRelationships(state, spool);
 }
@@ -2346,36 +2425,41 @@ function isRecognizedPriorHost(value: unknown, hostId: string): boolean {
 }
 
 function isRecognizedPriorSession(value: unknown, hostId: string): boolean {
-  if (!isRecord(value) || !hasExactOptionalKeys(value, PRIOR_SESSION_REQUIRED_KEYS, SESSION_OPTIONAL_KEYS)
+  if (!isRecord(value) || !hasExactOptionalKeys(value, PRIOR_SESSION_REQUIRED_KEYS, OBSOLETE_SESSION_OPTIONAL_KEYS)
     || value.hostId !== hostId || !PRIOR_SESSION_REQUIRED_KEYS.filter((key) => key !== 'status').every((key) => isNonEmptyString(value[key]))
     || !['idle', 'working', 'blocked', 'done', 'unknown'].includes(value.status as string)) return false;
-  return SESSION_OPTIONAL_KEYS.every((key) => value[key] === undefined
+  return OBSOLETE_SESSION_OPTIONAL_KEYS.every((key) => value[key] === undefined
     || (key === 'actionablePrompt' ? isCurrentActionablePrompt(value[key]) : typeof value[key] === 'string'));
 }
 
 const OBSOLETE_EVENT_REQUIRED_KEYS = [...EVENT_REQUIRED_KEYS, 'typeLabel'] as const;
+const OBSOLETE_EVENT_OPTIONAL_KEYS = [
+  ...EVENT_OPTIONAL_KEYS, 'contextText', 'hbaseSessionKey', 'actionablePrompt', 'correlationId',
+] as const;
 
+function isSchema2Event(value: unknown): boolean {
+  return isRecord(value) && value.typeLabel !== undefined && isObsoleteEvent(value);
+}
 function isObsoleteEvent(value: unknown): boolean {
-  if (!isRecord(value) || !hasExactOptionalKeys(value, OBSOLETE_EVENT_REQUIRED_KEYS, EVENT_OPTIONAL_KEYS)
-    || !OBSOLETE_EVENT_REQUIRED_KEYS.filter((key) => key !== 'type' && key !== 'status')
-      .every((key) => isNonEmptyString(value[key]))) {
-    return false;
-  }
-  if (value.type === 'done') { if (value.status !== 'idle' || value.needHuman !== undefined) return false; }
-  else if (value.type === 'need_human') { if (value.status !== 'need_human' || !isCurrentNeedHuman(value.needHuman)) return false; }
-  else return false;
-  return EVENT_OPTIONAL_KEYS.every((key) => value[key] === undefined || key === 'needHuman'
-    || (key === 'actionablePrompt' ? isCurrentActionablePrompt(value[key]) : typeof value[key] === 'string'));
+  if (!isRecord(value)) return false;
+  const required = value.typeLabel === undefined ? EVENT_REQUIRED_KEYS : OBSOLETE_EVENT_REQUIRED_KEYS;
+  return isEventForKeys(value, [...OBSOLETE_EVENT_OPTIONAL_KEYS, ...(value.typeLabel === undefined ? [] : ['typeLabel'])])
+    || (hasExactOptionalKeys(value, required, OBSOLETE_EVENT_OPTIONAL_KEYS)
+      && required.filter((key) => key !== 'type' && key !== 'status').every((key) => isNonEmptyString(value[key]))
+      && ((value.type === 'done' && value.status === 'idle' && value.needHuman === undefined)
+        || (value.type === 'need_human' && value.status === 'need_human' && isCurrentNeedHuman(value.needHuman)))
+      && OBSOLETE_EVENT_OPTIONAL_KEYS.every((key) => value[key] === undefined || key === 'needHuman'
+        || (key === 'actionablePrompt' ? isCurrentActionablePrompt(value[key]) : typeof value[key] === 'string')));
 }
 
 function isRecognizedPriorEvent(value: unknown, hostId: string): boolean {
   return isRecord(value)
-    && hasExactOptionalKeys(value, OBSOLETE_EVENT_REQUIRED_KEYS, EVENT_OPTIONAL_KEYS.filter((key) => key !== 'needHuman'))
+    && hasExactOptionalKeys(value, OBSOLETE_EVENT_REQUIRED_KEYS, OBSOLETE_EVENT_OPTIONAL_KEYS.filter((key) => key !== 'needHuman'))
     && value.hostId === hostId && OBSOLETE_EVENT_REQUIRED_KEYS.filter((key) => key !== 'type' && key !== 'status')
       .every((key) => isNonEmptyString(value[key]))
     && ['working', 'blocked', 'done', 'question_requested'].includes(value.type as string)
     && ['idle', 'working', 'blocked', 'done', 'unknown'].includes(value.status as string)
-    && EVENT_OPTIONAL_KEYS.filter((key) => key !== 'needHuman').every((key) => value[key] === undefined
+    && OBSOLETE_EVENT_OPTIONAL_KEYS.filter((key) => key !== 'needHuman').every((key) => value[key] === undefined
       || (key === 'actionablePrompt' ? isCurrentActionablePrompt(value[key]) : typeof value[key] === 'string'));
 }
 

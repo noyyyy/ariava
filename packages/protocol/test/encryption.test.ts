@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash, createHmac, createPrivateKey, createPublicKey, diffieHellman, hkdfSync, verify } from 'node:crypto';
-import vectors from './fixtures/e2e-v2-vectors.json';
+import vectors from './fixtures/e2e-v3-vectors.json';
+import legacyVectors from './fixtures/e2e-v2-vectors.json';
 import previewVector from './fixtures/notification-preview-v2-vector.json';
 import commandVectors from './fixtures/command-e2e-v1-vectors.json';
 
@@ -60,7 +61,7 @@ import {
 
 const fixed = vectors;
 
-describe('E2E runtime protocol v2 and key ceremony v1', () => {
+describe('E2E runtime protocol v3 and key ceremony v1', () => {
   test('ties link identities and transcript digests to both canonical bindings', () => {
     expect(fixed.link.hostId).toBe(fixed.bindings.host.entityId);
     expect(fixed.link.watchDeviceId).toBe(fixed.bindings.watch.entityId);
@@ -85,7 +86,7 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
     expect(base64UrlEncode(buildSafetyCodeInput(fixed.transcript.digest, fixed.link.linkGeneration, fixed.link.epoch))).toBe(fixed.transcript.safetyCodeInput);
     expect(base64UrlEncode(buildEventContentAAD({
       hostId: fixed.link.hostId, sessionId: 'session_vector_01', provider: 'pi', eventId: 'event_vector_01',
-      type: 'need_human', status: 'need_human', correlationId: 'correlation_vector_01',
+      type: 'need_human', status: 'need_human',
       createdAt: '2026-07-20T00:00:00.000Z', contentId: fixed.event.contentId,
     }))).toBe(fixed.event.contentAAD);
     expect(base64UrlEncode(buildSessionContentAAD({
@@ -103,15 +104,15 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
       epoch: fixed.link.epoch, hostId: fixed.link.hostId, watchDeviceId: fixed.link.watchDeviceId,
       senderEncryptionKeyId: fixed.bindings.host.encryptionKeyId,
       recipientEncryptionKeyId: fixed.bindings.watch.encryptionKeyId,
-      contentId: fixed.event.contentId, payloadKind: 'event-content-v2',
+      contentId: fixed.event.contentId, payloadKind: 'event-content-v3',
     }))).toBe(fixed.event.wrapAAD);
   });
 
-  test('cryptographically verifies v2 event/session vectors and all metadata bindings', () => {
+  test('cryptographically verifies v3 event/session vectors and all metadata bindings', () => {
     const wrapKey = base64UrlDecode(fixed.derived.bridgeToWatchWrapKey);
     const eventAADInput = {
       hostId: fixed.link.hostId, sessionId: 'session_vector_01', provider: 'pi', eventId: 'event_vector_01',
-      type: 'need_human' as const, status: 'need_human' as const, correlationId: 'correlation_vector_01',
+      type: 'need_human' as const, status: 'need_human' as const,
       createdAt: '2026-07-20T00:00:00.000Z', contentId: fixed.event.contentId,
     };
     const eventWrapInput = {
@@ -119,7 +120,7 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
       epoch: fixed.link.epoch, hostId: fixed.link.hostId, watchDeviceId: fixed.link.watchDeviceId,
       senderEncryptionKeyId: fixed.bindings.host.encryptionKeyId,
       recipientEncryptionKeyId: fixed.bindings.watch.encryptionKeyId,
-      contentId: fixed.event.contentId, payloadKind: 'event-content-v2' as const,
+      contentId: fixed.event.contentId, payloadKind: 'event-content-v3' as const,
     };
     const eventAAD = buildEventContentAAD(eventAADInput);
     const eventWrapAAD = buildWrapAAD(eventWrapInput);
@@ -128,14 +129,14 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
     expect(base64UrlEncode(openChaChaPoly(eventDek, fixed.event.contentNonce, fixed.event.ciphertext, eventAAD))).toBe(fixed.event.plaintext);
     for (const mutation of [
       { hostId: 'host_other' }, { sessionId: 'session_other' }, { provider: 'other' }, { eventId: 'event_other' },
-      { type: 'done' as const, status: 'idle' as const }, { correlationId: undefined }, { correlationId: 'correlation_other' },
+      { type: 'done' as const, status: 'idle' as const },
       { createdAt: '2026-07-20T00:00:02.000Z' }, { contentId: 'content_other' },
     ]) expect(() => openChaChaPoly(eventDek, fixed.event.contentNonce, fixed.event.ciphertext, buildEventContentAAD({ ...eventAADInput, ...mutation }))).toThrow();
     for (const mutation of [
       { direction: 'watch-to-bridge' as const }, { hostId: 'host_other' }, { watchDeviceId: 'watch_other' },
       { linkId: 'link_other' }, { linkGeneration: 8 }, { epoch: 4 }, { senderEncryptionKeyId: 'ekey_other' },
       { recipientEncryptionKeyId: 'ekey_other' }, { contentId: 'content_other' },
-      { payloadKind: 'session-content-v2' as const },
+      { payloadKind: 'session-content-v3' as const },
     ]) expect(() => openChaChaPoly(wrapKey, fixed.event.wrapNonce, fixed.event.wrappedDek, buildWrapAAD({ ...eventWrapInput, ...mutation }))).toThrow();
 
     const sessionAADInput = {
@@ -143,7 +144,7 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
       updatedAt: '2026-07-20T00:00:01.000Z', lastEventId: 'event_vector_01',
       snoozedUntil: '2026-07-20T00:10:00.000Z', revision: 4, contentId: fixed.session.contentId,
     };
-    const sessionWrapInput = { ...eventWrapInput, contentId: fixed.session.contentId, payloadKind: 'session-content-v2' as const };
+    const sessionWrapInput = { ...eventWrapInput, contentId: fixed.session.contentId, payloadKind: 'session-content-v3' as const };
     const sessionAAD = buildSessionContentAAD(sessionAADInput);
     const sessionWrapAAD = buildWrapAAD(sessionWrapInput);
     const sessionDek = openChaChaPoly(wrapKey, fixed.session.wrapNonce, fixed.session.wrappedDek, sessionWrapAAD);
@@ -226,23 +227,30 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
     expect(base64UrlEncode(safetyHmac)).toBe(fixed.derived.safetyCodeHmac);
   });
 
-  test('encodes protected plaintext with dedicated deterministic key order', () => {
+  test('encodes protected v3 plaintext in exact key order and rejects retired keys', () => {
     expect(new TextDecoder().decode(buildProtectedEventContentBytes({
-      contextText: 'context', version: 2, agentText: 'answer', humanText: 'question',
-      needHuman: { reason: 'question' },
-      actionablePrompt: { type: 'question', promptId: 'prompt_1', label: 'Choose', options: ['A'], expiresAt: '2026-07-20T00:01:00.000Z' },
-    }))).toBe('{"version":2,"agentText":"answer","humanText":"question","contextText":"context","actionablePrompt":{"promptId":"prompt_1","type":"question","label":"Choose","options":["A"],"expiresAt":"2026-07-20T00:01:00.000Z"},"needHuman":{"reason":"question"}}');
-    expect(new TextDecoder().decode(buildProtectedSessionContentBytes({ latestActivityText: 'latest', version: 2, projectName: 'ariava', nameText: 'session' })))
-      .toBe('{"version":2,"projectName":"ariava","nameText":"session","latestActivityText":"latest"}');
+      projectName: 'ariava', version: 3, agentText: 'answer', humanText: 'question',
+      workingDirectory: '/workspace/ariava', harnessProvider: 'pi', needHuman: { reason: 'question' },
+    }))).toBe('{"version":3,"agentText":"answer","humanText":"question","projectName":"ariava","workingDirectory":"/workspace/ariava","harnessProvider":"pi","needHuman":{"reason":"question"}}');
+    expect(new TextDecoder().decode(buildProtectedSessionContentBytes({
+      latestActivityText: 'latest', openingText: 'opening', version: 3, projectName: 'ariava', nameText: 'session',
+      workingDirectory: '/workspace/ariava', harnessProvider: 'pi',
+    }))).toBe('{"version":3,"projectName":"ariava","nameText":"session","openingText":"opening","latestActivityText":"latest","workingDirectory":"/workspace/ariava","harnessProvider":"pi"}');
     expect(new TextDecoder().decode(buildProtectedReplyContentBytes({ text: 'continue', version: 1 })))
       .toBe('{"version":1,"text":"continue"}');
     expect(() => buildProtectedReplyContentBytes({ version: 1, text: 'continue', extra: true } as any)).toThrow();
-    expect(() => buildProtectedEventContentBytes({ version: 2, agentText: 'answer', extra: true } as any)).toThrow();
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: 'answer', extra: true } as any)).toThrow();
+    for (const retired of ['actionablePrompt', 'contextText', 'correlationId', 'hbaseSessionKey'] as const) {
+      expect(() => buildProtectedEventContentBytes({ version: 3, agentText: 'answer', [retired]: 'retired' } as never)).toThrow();
+    }
+    expect(() => buildProtectedSessionContentBytes({
+      version: 3, projectName: 'ariava', nameText: 'session', hbaseSessionKey: 'retired',
+    } as never)).toThrow();
   });
 
-  test('rejects inherited protected invariant fields before building bytes', () => {
+  test('rejects inherited protected invariant fields before building v3 bytes', () => {
     const inheritedNeedHuman = Object.assign(Object.create({ needHuman: { reason: 'blocked' } }), {
-      version: 2, agentText: 'answer',
+      version: 3, agentText: 'answer',
     });
     const inheritedContextError = Object.assign(Object.create({
       error: { kind: 'provider_failure', message: 'Provider failed.', retryExhausted: true },
@@ -253,99 +261,82 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
 
     expect(() => buildProtectedEventContentBytes(inheritedNeedHuman)).toThrow();
     expect(() => buildProtectedEventContentBytes({
-      version: 2, agentText: 'answer', needHuman: inheritedContextError,
+      version: 3, agentText: 'answer', needHuman: inheritedContextError,
     } as never)).toThrow();
     expect(() => buildProtectedEventContentBytes({
-      version: 2, agentText: 'answer',
+      version: 3, agentText: 'answer',
       needHuman: { reason: 'error', error: inheritedProviderCode },
     } as never)).toThrow();
   });
-
-  test('canonicalizes only dense exact actionable prompt option arrays', () => {
-    const build = (options: unknown) => buildProtectedEventContentBytes({
-      version: 2, agentText: 'answer',
-      actionablePrompt: { promptId: 'prompt_1', type: 'question', label: 'Choose', options },
-    } as never);
-    expect(new TextDecoder().decode(build(['A', 'B']))).toBe(
-      '{"version":2,"agentText":"answer","actionablePrompt":{"promptId":"prompt_1","type":"question","label":"Choose","options":["A","B"]}}',
-    );
-
-    const sparse = new Array<string>(2);
-    sparse[1] = 'B';
-    expect(() => build(sparse)).toThrow();
-
-    let getterCalls = 0;
-    const accessor = Object.defineProperty(['unused'], '0', {
-      enumerable: true, configurable: true, get: () => { getterCalls += 1; return 'A'; },
-    });
-    expect(() => build(accessor)).toThrow();
-    expect(getterCalls).toBe(0);
-
-    const hidden = ['A'];
-    Object.defineProperty(hidden, '0', { enumerable: false });
-    expect(() => build(hidden)).toThrow();
-
-    const ownToJSON = ['A'];
-    Object.defineProperty(ownToJSON, 'toJSON', { value: () => ['replacement'], enumerable: false });
-    expect(() => build(ownToJSON)).toThrow();
-
-    const inheritedToJSON = ['A'];
-    Object.setPrototypeOf(inheritedToJSON, Object.assign(Object.create(Array.prototype), {
-      toJSON: () => ['replacement'],
-    }));
-    expect(() => build(inheritedToJSON)).toThrow();
-
-    const symbol = ['A'];
-    Object.defineProperty(symbol, Symbol('unsupported'), { value: true });
-    expect(() => build(symbol)).toThrow();
-
-    const extraKey = ['A'];
-    Object.defineProperty(extraKey, 'extra', { value: true, enumerable: true });
-    expect(() => build(extraKey)).toThrow();
-
-    const objectReplacement = ['A'];
-    Object.defineProperty(objectReplacement, 'toJSON', { value: () => ({ replaced: true }) });
-    expect(() => build(objectReplacement)).toThrow();
-
-    const oversizedReplacement = ['A'];
-    Object.defineProperty(oversizedReplacement, 'toJSON', {
-      value: () => ['x'.repeat(E2E_LIMITS.promptOptionBytes + 1)],
-    });
-    expect(() => build(oversizedReplacement)).toThrow();
-    expect(() => build(['x'.repeat(E2E_LIMITS.promptOptionBytes + 1)])).toThrow();
+  test('uses byte-exact v2 Event and Session fixtures as current-v3 rejection evidence', () => {
+    expect(new TextDecoder().decode(base64UrlDecode(legacyVectors.event.plaintext)))
+      .toBe('{"version":2,"agentText":"E2E vector marker","needHuman":{"reason":"blocked"}}');
+    expect(new TextDecoder().decode(base64UrlDecode(legacyVectors.session.plaintext)))
+      .toBe('{"version":2,"projectName":"vector","nameText":"session"}');
+    expect(() => buildProtectedEventContentBytes(
+      JSON.parse(new TextDecoder().decode(base64UrlDecode(legacyVectors.event.plaintext))),
+    )).toThrow();
+    expect(() => buildProtectedSessionContentBytes(
+      JSON.parse(new TextDecoder().decode(base64UrlDecode(legacyVectors.session.plaintext))),
+    )).toThrow();
+    expect(validateEncryptedContentV1({
+      version: 1, suite: E2E_SUITE_V1, contentId: legacyVectors.event.contentId, payloadKind: 'event-content-v2',
+      nonce: legacyVectors.event.contentNonce, ciphertext: legacyVectors.event.ciphertext,
+    })).toBe(false);
+    expect(validateEncryptedContentV1({
+      version: 1, suite: E2E_SUITE_V1, contentId: legacyVectors.session.contentId, payloadKind: 'session-content-v2',
+      nonce: legacyVectors.session.contentNonce, ciphertext: legacyVectors.session.ciphertext,
+    })).toBe(false);
+    expect(() => openChaChaPoly(
+      base64UrlDecode(legacyVectors.event.dek), legacyVectors.event.contentNonce, legacyVectors.event.ciphertext,
+      buildEventContentAAD({
+        hostId: legacyVectors.link.hostId, sessionId: 'session_vector_01', provider: 'pi', eventId: 'event_vector_01',
+        type: 'need_human', status: 'need_human', createdAt: '2026-07-20T00:00:00.000Z', contentId: legacyVectors.event.contentId,
+      }),
+    )).toThrow();
+    expect(() => openChaChaPoly(
+      base64UrlDecode(legacyVectors.session.dek), legacyVectors.session.contentNonce, legacyVectors.session.ciphertext,
+      buildSessionContentAAD({
+        hostId: legacyVectors.link.hostId, sessionId: 'session_vector_01', provider: 'pi', status: 'need_human',
+        updatedAt: '2026-07-20T00:00:01.000Z', lastEventId: 'event_vector_01',
+        snoozedUntil: '2026-07-20T00:10:00.000Z', revision: 4, contentId: legacyVectors.session.contentId,
+      }),
+    )).toThrow();
   });
 
+
+
   test('enforces limits on emitted canonical bytes and rejects descriptor bypasses', () => {
-    const eventOverhead = buildProtectedEventContentBytes({ version: 2, agentText: '' }).byteLength;
+    const eventOverhead = buildProtectedEventContentBytes({ version: 3, agentText: '' }).byteLength;
     const maximumEvent = buildProtectedEventContentBytes({
-      version: 2, agentText: 'x'.repeat(E2E_LIMITS.eventPlaintextBytes - eventOverhead),
+      version: 3, agentText: 'x'.repeat(E2E_LIMITS.eventPlaintextBytes - eventOverhead),
     });
     expect(maximumEvent.byteLength).toBe(E2E_LIMITS.eventPlaintextBytes);
     expect(() => buildProtectedEventContentBytes({
-      version: 2, agentText: 'x'.repeat(E2E_LIMITS.eventPlaintextBytes - eventOverhead + 1),
+      version: 3, agentText: 'x'.repeat(E2E_LIMITS.eventPlaintextBytes - eventOverhead + 1),
     })).toThrow();
 
-    const sessionOverhead = buildProtectedSessionContentBytes({ version: 2, projectName: '', nameText: '' }).byteLength;
+    const sessionOverhead = buildProtectedSessionContentBytes({ version: 3, projectName: '', nameText: '' }).byteLength;
     const maximumSession = buildProtectedSessionContentBytes({
-      version: 2, projectName: '', nameText: 'x'.repeat(E2E_LIMITS.sessionPlaintextBytes - sessionOverhead),
+      version: 3, projectName: '', nameText: 'x'.repeat(E2E_LIMITS.sessionPlaintextBytes - sessionOverhead),
     });
     expect(maximumSession.byteLength).toBe(E2E_LIMITS.sessionPlaintextBytes);
     expect(() => buildProtectedSessionContentBytes({
-      version: 2, projectName: '', nameText: 'x'.repeat(E2E_LIMITS.sessionPlaintextBytes - sessionOverhead + 1),
+      version: 3, projectName: '', nameText: 'x'.repeat(E2E_LIMITS.sessionPlaintextBytes - sessionOverhead + 1),
     })).toThrow();
 
     let getterCalls = 0;
-    const accessorEvent = Object.defineProperty({ version: 2 }, 'agentText', {
+    const accessorEvent = Object.defineProperty({ version: 3 }, 'agentText', {
       enumerable: true, get: () => { getterCalls += 1; return 'hidden'; },
     });
     expect(() => buildProtectedEventContentBytes(accessorEvent as never)).toThrow();
     expect(getterCalls).toBe(0);
 
-    const hiddenSession = { version: 2, projectName: 'ariava', nameText: 'session' };
+    const hiddenSession = { version: 3, projectName: 'ariava', nameText: 'session' };
     Object.defineProperty(hiddenSession, 'latestActivityText', { enumerable: false, value: 'hidden' });
     expect(() => buildProtectedSessionContentBytes(hiddenSession)).toThrow();
-    const disguisedOversizeEvent = Object.create({ toJSON: () => ({ version: 2, agentText: '' }) }) as { version: 2; agentText: string };
-    disguisedOversizeEvent.version = 2;
+    const disguisedOversizeEvent = Object.create({ toJSON: () => ({ version: 3, agentText: '' }) }) as { version: 3; agentText: string };
+    disguisedOversizeEvent.version = 3;
     disguisedOversizeEvent.agentText = 'x'.repeat(E2E_LIMITS.eventPlaintextBytes);
     expect(JSON.stringify(disguisedOversizeEvent).length).toBeLessThan(E2E_LIMITS.eventPlaintextBytes);
     expect(() => buildProtectedEventContentBytes(disguisedOversizeEvent)).toThrow();
@@ -358,7 +349,7 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
       epoch: fixed.link.epoch, hostId: fixed.link.hostId, watchDeviceId: fixed.link.watchDeviceId,
       senderEncryptionKeyId: fixed.bindings.host.encryptionKeyId,
       recipientEncryptionKeyId: fixed.bindings.watch.encryptionKeyId,
-      contentId: fixed.event.contentId, payloadKind: 'event-content-v2' as const,
+      contentId: fixed.event.contentId, payloadKind: 'event-content-v3' as const,
     };
     expect(base64UrlEncode(buildWrapAAD({ ...input, linkGeneration: input.linkGeneration + 1 }))).not.toBe(baseline);
     expect(base64UrlEncode(buildWrapAAD({ ...input, epoch: input.epoch + 1 }))).not.toBe(baseline);
@@ -385,7 +376,7 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
     expect(validateEncryptionKeyBindingV1({ ...binding, identityKeyId: 'key_vector' })).toBe(false);
     expect(validateEncryptionKeyBindingV1({ ...binding, createdAt: '2026-07-20T00:00:00Z' })).toBe(false);
     expect(() => buildEncryptionBindingBytes({ ...binding, entityId: 'host_vector' })).toThrow();
-    const content = { version: 1, suite: E2E_SUITE_V1, contentId: fixed.event.contentId, payloadKind: 'event-content-v2', nonce: fixed.event.contentNonce, ciphertext: fixed.event.ciphertext } as const;
+    const content = { version: 1, suite: E2E_SUITE_V1, contentId: fixed.event.contentId, payloadKind: 'event-content-v3', nonce: fixed.event.contentNonce, ciphertext: fixed.event.ciphertext } as const;
     expect(validateEncryptedContentV1(content)).toBe(true);
     expect(validateEncryptedContentV1({ ...content, payloadKind: 'event-content-v1' })).toBe(false);
     expect(validateEncryptedContentV1({ ...content, nonce: base64UrlEncode(new Uint8Array(11)) })).toBe(false);
@@ -420,7 +411,7 @@ describe('E2E runtime protocol v2 and key ceremony v1', () => {
           direction: 'bridge-to-watch', linkId: wrap.linkId, linkGeneration: wrap.linkGeneration, epoch: wrap.epoch,
           hostId: fixed.link.hostId, watchDeviceId: fixed.link.watchDeviceId,
           senderEncryptionKeyId: wrap.senderEncryptionKeyId, recipientEncryptionKeyId: wrap.recipientEncryptionKeyId,
-          contentId: wrap.contentId, payloadKind: 'event-content-v2', [field]: invalid,
+          contentId: wrap.contentId, payloadKind: 'event-content-v3', [field]: invalid,
         })).toThrow();
       }
     }

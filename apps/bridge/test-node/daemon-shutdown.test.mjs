@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { base64UrlEncode } from '../../../packages/protocol/dist/index.js';
 import { BridgeDaemon } from '../dist/daemon.js';
 import { spoolPathForState } from '../dist/e2e/local-spool.js';
+import { BRIDGE_RUNTIME_STATE_SCHEMA_VERSION } from '../dist/state-store.js';
 
 const HOST_ID = `host_${'H'.repeat(43)}`;
 const HOST_KEY_ID = `key_${'H'.repeat(43)}`;
@@ -125,7 +126,7 @@ test('production daemon defers old-state decoding until startup preflight resets
     await daemon.validateStartup();
     const state = JSON.parse(readFileSync(statePath, 'utf8'));
     const spool = JSON.parse(readFileSync(spoolPathForState(statePath), 'utf8'));
-    assert.equal(state.schemaVersion, 4);
+    assert.equal(state.schemaVersion, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION);
     assert.equal(state.runtimeResetEpoch, spool.runtimeResetEpoch);
     assert.deepEqual(state.recentEvents, []);
     assert.deepEqual(spool.items, []);

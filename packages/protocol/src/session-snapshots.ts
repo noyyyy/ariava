@@ -1,6 +1,21 @@
 import { isCanonicalTimestamp } from './validation.js';
 import type { ValidationResult } from './validation.js';
+import type { SessionStatus } from './events.js';
 import { contentSha256 } from './request-signing.js';
+
+interface E2ECurrentSessionSemanticInput {
+  sessionId: string;
+  provider?: string;
+  projectName?: string;
+  nameText?: string;
+  openingText?: string;
+  latestActivityText?: string;
+  workingDirectory?: string;
+  harnessProvider?: string;
+  status?: SessionStatus;
+  lastEventId?: string;
+  snoozedUntil?: string;
+}
 
 export const SESSION_SNAPSHOT_ERROR_CODES = [
   'session_snapshot_stale',
@@ -40,7 +55,6 @@ export interface ReplaceE2ECurrentSessionsErrorResponseV1 {
 
 const REQUEST_KEYS = ['hostId', 'revision', 'observedAt', 'recipientSetVersion', 'sessions'] as const;
 const SESSION_KEYS = ['sessionId', 'sessionRevision'] as const;
-const SEMANTIC_OMITTED_KEYS = new Set(['hostId', 'updatedAt', 'presence', 'sessionRevision']);
 
 export function validateReplaceE2ECurrentSessionsRequestV1(
   value: unknown,
@@ -89,14 +103,21 @@ export async function canonicalE2ECurrentSessionsDigestV1(request: ReplaceE2ECur
 /** Digest used by Bridge change detection; excludes liveness and allocated revisions. */
 export async function e2eCurrentSessionsSemanticDigestV1(
   hostId: string,
-  sessions: readonly E2ECurrentSessionReferenceV1[] | readonly { sessionId: string }[],
+  sessions: readonly E2ECurrentSessionSemanticInput[],
 ): Promise<string> {
-  const semanticSessions = sessions.map((item) => {
-    const value = item as Record<string, unknown>;
-    return Object.fromEntries(Object.entries(value)
-      .filter(([key]) => !SEMANTIC_OMITTED_KEYS.has(key))
-      .sort(([left], [right]) => compareCanonicalStrings(left, right)));
-  }).sort((left, right) => compareCanonicalStrings(String(left.sessionId), String(right.sessionId)));
+  const semanticSessions = sessions.map((value) => ({
+    sessionId: value.sessionId,
+    ...(value.provider === undefined ? {} : { provider: value.provider }),
+    ...(value.projectName === undefined ? {} : { projectName: value.projectName }),
+    ...(value.nameText === undefined ? {} : { nameText: value.nameText }),
+    ...(value.openingText === undefined ? {} : { openingText: value.openingText }),
+    ...(value.latestActivityText === undefined ? {} : { latestActivityText: value.latestActivityText }),
+    ...(value.workingDirectory === undefined ? {} : { workingDirectory: value.workingDirectory }),
+    ...(value.harnessProvider === undefined ? {} : { harnessProvider: value.harnessProvider }),
+    ...(value.status === undefined ? {} : { status: value.status }),
+    ...(value.lastEventId === undefined ? {} : { lastEventId: value.lastEventId }),
+    ...(value.snoozedUntil === undefined ? {} : { snoozedUntil: value.snoozedUntil }),
+  })).sort((left, right) => compareCanonicalStrings(String(left.sessionId), String(right.sessionId)));
   return contentSha256(new TextEncoder().encode(stableJson({ hostId, sessions: semanticSessions })));
 }
 

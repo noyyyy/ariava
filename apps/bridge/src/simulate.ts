@@ -13,8 +13,7 @@ export function buildSimulatedSession(hostId: string, scenario: SimulationScenar
   return {
     sessionId: 'sim-session', hostId, provider: 'pi', projectName: 'deploy-tools', nameText: 'deploy-tools',
     openingText: 'Fix deploy script permissions', latestActivityText, workingDirectory: '/tmp/deploy-tools',
-    hbaseSessionKey: 'sim-session', harnessProvider: 'pi', status,
-    actionablePrompt: scenario === 'question' ? { promptId: 'prompt-simulated', type: 'question', label: 'Reply to the pending question' } : undefined,
+    harnessProvider: 'pi', status,
     updatedAt, lastEventId,
   };
 }
@@ -23,8 +22,8 @@ export function buildSimulatedEvent(session: CanonicalSessionState, scenario: Si
   const base = {
     eventId: session.lastEventId!, hostId: session.hostId, sessionId: session.sessionId, provider: session.provider,
     agentText: scenario === 'question' ? 'Which environment should the rollout target?' : session.latestActivityText ?? 'Agent update',
-    projectName: session.projectName, workingDirectory: session.workingDirectory, hbaseSessionKey: session.hbaseSessionKey,
-    harnessProvider: session.harnessProvider, actionablePrompt: session.actionablePrompt, createdAt: session.updatedAt,
+    projectName: session.projectName, workingDirectory: session.workingDirectory,
+    harnessProvider: session.harnessProvider, createdAt: session.updatedAt,
   };
   if (scenario === 'done') return { ...base, type: 'done', status: 'idle' };
   const needHuman: NeedHumanContext = { reason: scenario === 'question' ? 'question' : 'blocked' };

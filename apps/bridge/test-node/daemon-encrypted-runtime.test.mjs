@@ -22,8 +22,8 @@ function session(hostId, id) {
 }
 function event(hostId, id = 'event-1', sessionId = 'session-1') {
   return { eventId: id, hostId, sessionId, provider: 'pi', type: 'done', status: 'idle',
-    agentText: `SECRET-${id}`, projectName: `project-${sessionId}`, contextText: `name-${sessionId} · project-${sessionId}`,
-    hbaseSessionKey: sessionId, harnessProvider: 'pi', createdAt: '2026-07-20T00:00:01.000Z' };
+    agentText: `SECRET-${id}`, projectName: `project-${sessionId}`,
+    harnessProvider: 'pi', createdAt: '2026-07-20T00:00:01.000Z' };
 }
 function responseError(reason) { return new Response(JSON.stringify({ reason }), { status: 409, headers: { 'content-type': 'application/json' } }); }
 async function unwrap(response) {
@@ -87,7 +87,7 @@ async function seedEvent(f, value) {
   const terminal = {
     sessionId: value.sessionId, hostId: value.hostId, provider: value.provider, projectName: value.projectName,
     nameText: `name-${value.sessionId}`, latestActivityText: value.agentText, status: 'idle',
-    updatedAt: value.createdAt, lastEventId: value.eventId, hbaseSessionKey: value.hbaseSessionKey,
+    updatedAt: value.createdAt, lastEventId: value.eventId,
     harnessProvider: value.harnessProvider,
   };
   f.state.queuePendingEvent(value, terminal);
@@ -112,7 +112,7 @@ function terminalSessionFor(sourceEvent) {
   return {
     sessionId: sourceEvent.sessionId, hostId: sourceEvent.hostId, provider: 'pi', projectName: sourceEvent.projectName,
     nameText: `name-${sourceEvent.sessionId}`, latestActivityText: sourceEvent.agentText, status: 'idle',
-    updatedAt: sourceEvent.createdAt, lastEventId: sourceEvent.eventId, hbaseSessionKey: sourceEvent.hbaseSessionKey,
+    updatedAt: sourceEvent.createdAt, lastEventId: sourceEvent.eventId,
     harnessProvider: sourceEvent.harnessProvider,
   };
 }
@@ -301,7 +301,7 @@ test('restart finishes durable cancellation after dropping an unreadable cancell
   const { statePath, identityPath, spoolPath, hostId, keyStore, store, sourceEvent } =
     createDurableCancellation('cancel');
   store.dispose();
-  assert.equal(tamperSpoolCiphertexts(spoolPath, (item) => item.payloadKind === 'terminal-cancellation-v2'), 1);
+  assert.equal(tamperSpoolCiphertexts(spoolPath, (item) => item.payloadKind === 'terminal-cancellation-v3'), 1);
 
   const restarted = new BridgeStateStore(statePath);
   assert.deepEqual(restarted.initializeEncryptedSpool(hostId, identityPath, 'linux', keyStore),
@@ -314,9 +314,9 @@ test('restart finishes durable cancellation after dropping an unreadable cancell
 });
 
 for (const { name, unreadableKinds, reservationRemains, journalRemains } of [
-  { name: 'source', unreadableKinds: ['event-reservation-v2'], reservationRemains: false, journalRemains: true },
-  { name: 'journal', unreadableKinds: ['terminal-cancellation-v2'], reservationRemains: true, journalRemains: false },
-  { name: 'source-and-journal', unreadableKinds: ['event-reservation-v2', 'terminal-cancellation-v2'],
+  { name: 'source', unreadableKinds: ['event-reservation-v3'], reservationRemains: false, journalRemains: true },
+  { name: 'journal', unreadableKinds: ['terminal-cancellation-v3'], reservationRemains: true, journalRemains: false },
+  { name: 'source-and-journal', unreadableKinds: ['event-reservation-v3', 'terminal-cancellation-v3'],
     reservationRemains: false, journalRemains: false },
 ]) {
   test(`durable cancellation restart survives a second crash after unreadable ${name} recovery`, () => {
@@ -332,8 +332,8 @@ for (const { name, unreadableKinds, reservationRemains, journalRemains } of [
     }), /crash:after-unreadable-recovery/);
     interrupted.dispose();
     const afterRecovery = JSON.parse(readFileSync(spoolPath, 'utf8'));
-    assert.equal(afterRecovery.items.some((item) => item.payloadKind === 'event-reservation-v2'), reservationRemains);
-    assert.equal(afterRecovery.items.some((item) => item.payloadKind === 'terminal-cancellation-v2'), journalRemains);
+    assert.equal(afterRecovery.items.some((item) => item.payloadKind === 'event-reservation-v3'), reservationRemains);
+    assert.equal(afterRecovery.items.some((item) => item.payloadKind === 'terminal-cancellation-v3'), journalRemains);
 
     const restarted = new BridgeStateStore(statePath);
     assert.deepEqual(restarted.initializeEncryptedSpool(hostId, identityPath, 'linux', keyStore),
@@ -351,7 +351,7 @@ test('durable cancellation rejects a readable source with a mismatched fingerpri
     createDurableCancellation('source-conflict');
   store.spool.replace([sourceEvent.eventId], [{
     spoolItemId: sourceEvent.eventId, sessionId: sourceEvent.sessionId, eventId: sourceEvent.eventId,
-    payloadKind: 'event-reservation-v2', createdAt: sourceEvent.createdAt,
+    payloadKind: 'event-reservation-v3', createdAt: sourceEvent.createdAt,
     plaintext: new TextEncoder().encode(JSON.stringify({
       event: sourceEvent, session: terminal, producerFingerprint: 'wrong',
     })),

@@ -6,6 +6,7 @@ import { AriavaCliError, type OnboardingDetection, type OnboardingResult, type S
 import { HostIdentityError } from '../src/identity';
 import { RelayClientError } from '../src/relay-client';
 import { formatHumanCliFailure, normalizeCliFailure, runPublicCli } from '../src/public-cli-app';
+import { AGENT_ADAPTER_PROTOCOL_VERSION } from '@ariava/protocol';
 import { runSetupCommand } from '../src/cli/lifecycle/setup-command';
 import { decodeStableOnboardingChild } from '../src/cli/lifecycle/onboarding-adapter';
 import { createIsolatedPublicCliEnvironment } from './fixtures/isolated-public-cli-env';
@@ -1515,7 +1516,8 @@ describe('public ariava CLI', () => {
       secureJsonFixture(join(devRoot, 'bridge-state.json'), { sourceBridge: 'ready' });
       secureJsonFixture(join(devRoot, 'agent-adapter.json'), {
         url: 'http://127.0.0.1:7273',
-        secret: 'dev-only-secret', protocolVersion: 2,
+        secret: 'dev-only-secret',
+        protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
       });
       const cliVersion = JSON.parse(readFileSync(join(publicRepoRoot, 'package.json'), 'utf8')).version;
 

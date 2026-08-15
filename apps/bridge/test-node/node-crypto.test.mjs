@@ -14,7 +14,7 @@ import {
 } from '../../../packages/protocol/dist/index.js';
 
 const publicRepoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const vectorsPath = resolve(publicRepoRoot, 'packages/protocol/test/fixtures/e2e-v2-vectors.json');
+const vectorsPath = resolve(publicRepoRoot, 'packages/protocol/test/fixtures/e2e-v3-vectors.json');
 const vectors = JSON.parse(readFileSync(vectorsPath, 'utf8'));
 const decode = (value) => new Uint8Array(Buffer.from(value, 'base64url'));
 
@@ -87,7 +87,7 @@ test('generation and epoch tampering specifically fail content-key unwrap authen
     epoch: vectors.link.epoch, hostId: vectors.link.hostId, watchDeviceId: vectors.link.watchDeviceId,
     senderEncryptionKeyId: vectors.bindings.host.encryptionKeyId,
     recipientEncryptionKeyId: vectors.bindings.watch.encryptionKeyId,
-    contentId: vectors.event.contentId, payloadKind: 'event-content-v2',
+    contentId: vectors.event.contentId, payloadKind: 'event-content-v3',
   };
   assert.deepEqual(buildWrapAAD(baseline), decode(vectors.event.wrapAAD));
   assert.deepEqual(chachaPolyOpen(wrapKey, decode(vectors.event.wrapNonce), decode(vectors.event.wrappedDek), buildWrapAAD(baseline)), decode(vectors.event.dek));
