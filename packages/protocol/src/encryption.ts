@@ -39,8 +39,8 @@ export const E2E_LIMITS = {
   nonceBytes: 12,
   authenticationTagBytes: 16,
   wrappedDekBytes: 48,
-  eventPlaintextBytes: 32 * 1024,
-  sessionPlaintextBytes: 16 * 1024,
+  eventPlaintextBytes: 64 * 1024,
+  sessionPlaintextBytes: 64 * 1024,
   replyPlaintextBytes: 4_000,
   commandReceiptPlaintextBytes: 128,
   notificationPreviewPlaintextBytes: 4_000,
@@ -49,6 +49,21 @@ export const E2E_LIMITS = {
   notificationPreviewIdentifierBytes: 256,
   notificationPreviewContentIdBytes: 256,
 } as const;
+
+type ProtectedContentErrorCode = 'protected-session-invalid' | 'protected-event-invalid';
+
+export class ProtectedContentValidationError extends Error {
+  readonly code: ProtectedContentErrorCode;
+
+  constructor(
+    code: ProtectedContentErrorCode,
+    message = 'protected content is invalid',
+  ) {
+    super(message);
+    this.name = 'ProtectedContentValidationError';
+    this.code = code;
+  }
+}
 
 export interface EncryptionKeyBindingV1 {
   version: 1;
@@ -399,7 +414,9 @@ export function buildProtectedEventContentBytes(content: ProtectedEventContentV3
     ...(content.needHuman === undefined ? {} : { needHuman: canonicalNeedHumanContext(content.needHuman) }),
   };
   const bytes = encoder.encode(JSON.stringify(canonical));
-  if (bytes.byteLength > E2E_LIMITS.eventPlaintextBytes) throw new TypeError('protected event content is invalid');
+  if (bytes.byteLength > E2E_LIMITS.eventPlaintextBytes) {
+    throw new ProtectedContentValidationError('protected-event-invalid', 'protected event content is invalid');
+  }
   return bytes;
 }
 
@@ -414,7 +431,9 @@ export function buildProtectedSessionContentBytes(content: ProtectedSessionConte
     ...(content.workingDirectory === undefined ? {} : { workingDirectory: content.workingDirectory }),
     ...(content.harnessProvider === undefined ? {} : { harnessProvider: content.harnessProvider }),
   }));
-  if (bytes.byteLength > E2E_LIMITS.sessionPlaintextBytes) throw new TypeError('protected session content is invalid');
+  if (bytes.byteLength > E2E_LIMITS.sessionPlaintextBytes) {
+    throw new ProtectedContentValidationError('protected-session-invalid', 'protected session content is invalid');
+  }
   return bytes;
 }
 
@@ -839,23 +858,40 @@ function assertValidEncryptionBinding(binding: Omit<EncryptionKeyBindingV1, 'bin
   if (!validateEncryptionKeyBindingV1(candidate)) throw new TypeError('encryption key binding is not canonical');
 }
 
-function assertProtectedEventContent(content: ProtectedEventContentV3): void {
-  assertExactKeys(
-    content,
-    ['version', 'agentText', 'humanText', 'projectName', 'workingDirectory', 'harnessProvider', 'needHuman'],
-    'protected event content',
-    ['version', 'agentText'],
-  );
-  if (content.version !== 3 || typeof content.agentText !== 'string'
-    || (content.humanText !== undefined && typeof content.humanText !== 'string')
-    || (content.projectName !== undefined && typeof content.projectName !== 'string')
-    || (content.workingDirectory !== undefined && typeof content.workingDirectory !== 'string')
-    || (content.harnessProvider !== undefined && typeof content.harnessProvider !== 'string')) {
-    throw new TypeError('protected event content is invalid');
+
+
+/** Well-formed Unicode guard for the string fields of protected Event content. */
+function assertWellFormedProtectedStrings(value: object, fields: readonly string[]): void {
+  for (const field of fields) {
+    const candidate = (value as Record<string, unknown>)[field];
+    if (candidate !== undefined && !isWellFormedUnicode(candidate as string)) {
+      throw new TypeError('protected content contains malformed Unicode');
+    }
   }
-  if (content.needHuman !== undefined
-    && !validateCanonicalEventInvariant({ type: 'need_human', status: 'need_human', needHuman: content.needHuman }).success) {
-    throw new TypeError('protected needHuman context is invalid');
+}
+
+function assertProtectedEventContent(content: ProtectedEventContentV3): void {
+  try {
+    assertExactKeys(
+      content,
+      ['version', 'agentText', 'humanText', 'projectName', 'workingDirectory', 'harnessProvider', 'needHuman'],
+      'protected event content',
+      ['version', 'agentText'],
+    );
+    if (content.version !== 3 || typeof content.agentText !== 'string' || content.agentText.length === 0
+      || (content.humanText !== undefined && (typeof content.humanText !== 'string' || content.humanText.length === 0))
+      || (content.projectName !== undefined && (typeof content.projectName !== 'string' || content.projectName.length === 0))
+      || (content.workingDirectory !== undefined && (typeof content.workingDirectory !== 'string' || content.workingDirectory.length === 0))
+      || (content.harnessProvider !== undefined && (typeof content.harnessProvider !== 'string' || content.harnessProvider.length === 0))) {
+      throw new TypeError('protected event content is invalid');
+    }
+    assertWellFormedProtectedStrings(content, ['agentText', 'humanText', 'projectName', 'workingDirectory', 'harnessProvider']);
+    if (content.needHuman !== undefined
+      && !validateCanonicalEventInvariant({ type: 'need_human', status: 'need_human', needHuman: content.needHuman }).success) {
+      throw new TypeError('protected needHuman context is invalid');
+    }
+  } catch (error) {
+    throw asProtectedContentValidationError('protected-event-invalid', 'protected event content is invalid', error);
   }
 }
 
@@ -871,19 +907,37 @@ function canonicalNeedHumanContext(context: NeedHumanContext): NeedHumanContext 
 }
 
 function assertProtectedSessionContent(content: ProtectedSessionContentV3): void {
-  assertExactKeys(
-    content,
-    ['version', 'projectName', 'nameText', 'openingText', 'latestActivityText', 'workingDirectory', 'harnessProvider'],
-    'protected session content',
-    ['version', 'projectName', 'nameText'],
-  );
-  if (content.version !== 3 || typeof content.projectName !== 'string' || typeof content.nameText !== 'string'
-    || (content.openingText !== undefined && typeof content.openingText !== 'string')
-    || (content.latestActivityText !== undefined && typeof content.latestActivityText !== 'string')
-    || (content.workingDirectory !== undefined && typeof content.workingDirectory !== 'string')
-    || (content.harnessProvider !== undefined && typeof content.harnessProvider !== 'string')) {
-    throw new TypeError('protected session content is invalid');
+  try {
+    assertExactKeys(
+      content,
+      ['version', 'projectName', 'nameText', 'openingText', 'latestActivityText', 'workingDirectory', 'harnessProvider'],
+      'protected session content',
+      ['version', 'projectName', 'nameText'],
+    );
+    if (content.version !== 3 || typeof content.projectName !== 'string' || content.projectName.length === 0
+      || typeof content.nameText !== 'string' || content.nameText.length === 0
+      || (content.openingText !== undefined && (typeof content.openingText !== 'string' || content.openingText.length === 0))
+      || (content.latestActivityText !== undefined && (typeof content.latestActivityText !== 'string' || content.latestActivityText.length === 0))
+      || (content.workingDirectory !== undefined && (typeof content.workingDirectory !== 'string' || content.workingDirectory.length === 0))
+      || (content.harnessProvider !== undefined && (typeof content.harnessProvider !== 'string' || content.harnessProvider.length === 0))) {
+      throw new TypeError('protected session content is invalid');
+    }
+    assertWellFormedProtectedStrings(content, ['projectName', 'nameText', 'openingText', 'latestActivityText', 'workingDirectory', 'harnessProvider']);
+  } catch (error) {
+    throw asProtectedContentValidationError('protected-session-invalid', 'protected session content is invalid', error);
   }
+}
+
+function asProtectedContentValidationError(
+  code: ProtectedContentErrorCode,
+  fallbackMessage: string,
+  error: unknown,
+): ProtectedContentValidationError {
+  if (error instanceof ProtectedContentValidationError) return error;
+  return new ProtectedContentValidationError(
+    code,
+    error instanceof Error && error.message ? error.message : fallbackMessage,
+  );
 }
 
 function assertExactKeys(

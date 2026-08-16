@@ -31,7 +31,7 @@ function daemonFixture(drivers: Array<{ name: string; listSessions(hostId: strin
   (daemon as any).startupValidated = true;
   (daemon as any).registerHostPresence = async () => {};
   let manifests = 0;
-  (daemon as any).flushCurrentSessionsSnapshot = async () => { manifests += 1; return true; };
+  (daemon as any).flushCurrentSessionsSnapshot = async () => { manifests += 1; return { type: 'published' }; };
   (daemon as any).flushPendingEvents = async () => 0;
   (daemon as any).flushPendingHandles = async () => 0;
   (daemon as any).pullAndHandleCommands = async () => [];

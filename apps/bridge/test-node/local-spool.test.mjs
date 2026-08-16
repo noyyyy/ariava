@@ -23,6 +23,33 @@ test('production Node seals local retry spool without plaintext persistence', ()
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('post-promotion write failure adopts the exact replacement in memory and across restart', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ariava-node-spool-post-promotion-'));
+  try {
+    const path = join(dir, 'spool.json');
+    const keyStore = new LinuxSpoolKeyStore(join(dir, 'key.json'));
+    const initial = new LocalEncryptedSpool(path, 'host-test', keyStore);
+    initial.enqueue({ spoolItemId: 'event', sessionId: 'session', eventId: 'event', payloadKind: 'event-source-v3',
+      createdAt: '2026-08-16T00:00:00.000Z', plaintext: new TextEncoder().encode('source') });
+    initial.enqueue({ spoolItemId: 'inflight:event:event', sessionId: 'session', eventId: 'event', payloadKind: 'event-upload-v3',
+      createdAt: '2026-08-16T00:00:00.000Z', plaintext: new TextEncoder().encode('inflight') });
+    let promotions = 0;
+    const spool = new LocalEncryptedSpool(path, 'host-test', keyStore, 2, 'standalone', () => {}, {
+      afterPromotion: () => { promotions += 1; throw new Error('injected post-promotion failure'); },
+    });
+    assert.doesNotThrow(() => spool.replace(['event', 'inflight:event:event'], [{
+      spoolItemId: 'dead-letter:event:event', sessionId: 'session', eventId: 'event', payloadKind: 'event-dead-letter-v3',
+      createdAt: '2026-08-16T00:00:01.000Z', plaintext: new TextEncoder().encode('dead-letter'),
+    }]));
+    assert.equal(promotions, 1);
+    assert.deepEqual(spool.list().map((item) => item.spoolItemId), ['dead-letter:event:event']);
+    assert.equal(new TextDecoder().decode(spool.open(spool.list()[0])), 'dead-letter');
+    const restarted = new LocalEncryptedSpool(path, 'host-test', keyStore);
+    assert.deepEqual(restarted.list().map((item) => item.spoolItemId), ['dead-letter:event:event']);
+    assert.equal(new TextDecoder().decode(restarted.open(restarted.list()[0])), 'dead-letter');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('recovery preserves every byte across a transient key-store outage and succeeds on retry', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ariava-node-spool-outage-'));
   try {

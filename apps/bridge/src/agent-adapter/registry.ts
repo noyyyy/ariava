@@ -5,9 +5,11 @@ import type {
   HandleSessionRequest,
   SessionStatus,
 } from '@ariava/protocol';
+import { ProtectedContentValidationError } from '@ariava/protocol';
 import { createId, isoNow } from '@ariava/shared-utils';
 import { asCommandResult, parseAgentAdapterCommandResult } from './result';
 import {
+  assertCanonicalSessionWithinLimit,
   assertProducerContextMatchesSession,
   immutableCopy,
   normalizeHandledAt,
@@ -104,6 +106,14 @@ export class AgentAdapterRegistry {
       { previousLive: previous, persistedSession, terminalCancellation: persistedCancellation },
       input, this.hostId, now,
     );
+    try {
+      assertCanonicalSessionWithinLimit(toCanonicalSessionState(transition.nextSession));
+    } catch (error) {
+      if (error instanceof ProtectedContentValidationError) {
+        throw new AgentAdapterRequestValidationError(error.message, { cause: error });
+      }
+      throw error;
+    }
     if (transition.persistence.kind === 'durable-set-session-driver') {
       this.stateStore.setSessionDriver(input.sessionId, input.provider, toCanonicalSessionState(transition.nextSession));
     } else {
@@ -170,6 +180,14 @@ export class AgentAdapterRegistry {
     const session = this.sessions.get(sessionId); if (!session) return undefined;
     const now = this.nowIso();
     const transition = reduceHeartbeat(session, { status, latestActivityText, metadata }, now);
+    try {
+      assertCanonicalSessionWithinLimit(toCanonicalSessionState(transition.nextSession));
+    } catch (error) {
+      if (error instanceof ProtectedContentValidationError) {
+        throw new AgentAdapterRequestValidationError(error.message, { cause: error });
+      }
+      throw error;
+    }
     if (transition.contextChanged) this.cancelTerminalRetry(sessionId);
     if (transition.semanticChanged) this.onMutation('semantic');
     this.sessions.set(sessionId, transition.nextSession);
@@ -200,7 +218,9 @@ export class AgentAdapterRegistry {
       if (input.provider !== session.provider) throw new TypeError('canonical Event provider does not match the registered Session');
       assertProducerContextMatchesSession(input, session);
     } catch (error) {
-      if (error instanceof TypeError) throw new AgentAdapterRequestValidationError(error.message, { cause: error });
+      if (error instanceof ProtectedContentValidationError || error instanceof TypeError) {
+        throw new AgentAdapterRequestValidationError(error.message, { cause: error });
+      }
       throw error;
     }
 

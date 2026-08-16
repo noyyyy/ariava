@@ -179,7 +179,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       migratedStore.initializeEncryptedSpool('host-1', join(dir, 'identity.json'), 'linux', {
         loadOrCreate: () => new Uint8Array(32).fill(7),
       });
-      expect(JSON.parse(readFileSync(statePath, 'utf8')).schemaVersion).toBe(4);
+      expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject({ schemaVersion: 5 });
       expect(migratedStore.listSessions()).toEqual([expect.objectContaining({
         sessionId: 'migrated-owner', provider: 'adapter', harnessProvider: 'pi',
       })]);
@@ -503,7 +503,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     ['retired contextText', { ...doneEvent(), contextText: 'old' }],
     ['retired correlationId', { ...doneEvent(), correlationId: 'old' }],
     ['retired hbaseSessionKey', { ...doneEvent(), hbaseSessionKey: 'old' }],
-    ['oversized protected payload', { ...doneEvent(), agentText: 'x'.repeat(33_000) }],
+    ['oversized protected payload', { ...doneEvent(), agentText: 'x'.repeat(65_600) }],
   ])('rejects %s before Session mutation or Event persistence', (_name, candidate) => {
     const { store, cleanup } = makeStore();
     try {
@@ -994,4 +994,44 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     } finally { cleanup(); }
   });
 
+  describe('Session content limit enforcement (§3.4)', () => {
+    test('register with an oversized canonical Session is rejected before any mutation', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const registry = new AgentAdapterRegistry('host-1', store);
+        const before = store.listSessions();
+        expect(() => registry.register({
+          sessionId: 'big', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'n',
+          openingText: 'a'.repeat(65_500),
+        })).toThrow(AgentAdapterRequestValidationError);
+        expect(store.listSessions()).toEqual(before);
+        expect(registry.listSessions().some((s) => s.sessionId === 'big')).toBe(false);
+      } finally { cleanup(); }
+    });
+
+    test('heartbeat with an oversized canonical Session is rejected before mutation and the Session is unchanged', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const registry = new AgentAdapterRegistry('host-1', store);
+        register(registry);
+        const before = registry.listSessions()[0];
+        expect(() => registry.heartbeat('sess-1', 'working', 'a'.repeat(65_500))).toThrow(AgentAdapterRequestValidationError);
+        expect(registry.listSessions()[0]).toEqual(before);
+        expect(store.peekPendingEvents()).toEqual([]);
+      } finally { cleanup(); }
+    });
+
+    test('register with a legal large canonical Session is accepted', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const registry = new AgentAdapterRegistry('host-1', store);
+        const accepted = registry.register({
+          sessionId: 'ok', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'n',
+          openingText: 'a'.repeat(64_000),
+        });
+        expect(accepted.sessionId).toBe('ok');
+        expect(store.listSessions().some((s) => s.sessionId === 'ok')).toBe(true);
+      } finally { cleanup(); }
+    });
+  });
 });

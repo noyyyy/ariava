@@ -2,13 +2,14 @@ import { createHash } from 'node:crypto';
 import {
   base64UrlEncode,
   buildProtectedEventContentBytes,
+  buildProtectedSessionContentBytes,
   encodeLengthPrefixedFields,
   isCanonicalTimestamp,
   validateCanonicalEventInvariant,
   type CanonicalEvent,
   type CanonicalSessionState,
 } from '@ariava/protocol';
-import type { AgentAdapterEventInput, RegisteredSession } from './registry-types';
+import { isBoundedAgentAdapterIdentifier, type AgentAdapterEventInput, type RegisteredSession } from './registry-types';
 
 const EVENT_KEYS = [
   'sessionId', 'provider', 'type', 'status', 'agentText', 'humanText', 'projectName',
@@ -21,7 +22,8 @@ const EVENT_REQUIRED_KEYS = [
 
 export function parseCanonicalProducerEvent(value: unknown): AgentAdapterEventInput {
   const event = exactRecord(value, EVENT_KEYS, EVENT_REQUIRED_KEYS, 'canonical Event');
-  for (const key of ['sessionId', 'provider', 'agentText', 'projectName', 'workingDirectory', 'harnessProvider', 'createdAt'] as const) requireString(event, key);
+  for (const key of ['sessionId', 'provider', 'harnessProvider'] as const) requireIdentifier(event, key);
+  for (const key of ['agentText', 'projectName', 'workingDirectory', 'createdAt'] as const) requireString(event, key);
   optionalString(event, 'humanText');
   if (!isCanonicalTimestamp(event.createdAt)) throw new TypeError('canonical Event createdAt is invalid');
   const invariant = validateCanonicalEventInvariant({ type: event.type, status: event.status, ...(Object.hasOwn(event, 'needHuman') ? { needHuman: event.needHuman } : {}) });
@@ -36,6 +38,24 @@ export function parseCanonicalProducerEvent(value: unknown): AgentAdapterEventIn
     ...(event.needHuman !== undefined ? { needHuman: event.needHuman as never } : {}),
   });
   return event as unknown as AgentAdapterEventInput;
+}
+
+/**
+ * Enforce the full canonical `ProtectedSessionContentV3` ≤ 65,536 B boundary for
+ * register/heartbeat mappings (§3.4) before any registry mutation. Throws the
+ * dedicated `ProtectedContentValidationError` (mapped to a stable 400 by the
+ * server); never truncates.
+ */
+export function assertCanonicalSessionWithinLimit(session: CanonicalSessionState): void {
+  buildProtectedSessionContentBytes({
+    version: 3,
+    projectName: session.projectName,
+    nameText: session.nameText,
+    ...(session.openingText !== undefined ? { openingText: session.openingText } : {}),
+    ...(session.latestActivityText !== undefined ? { latestActivityText: session.latestActivityText } : {}),
+    ...(session.workingDirectory !== undefined ? { workingDirectory: session.workingDirectory } : {}),
+    ...(session.harnessProvider !== undefined ? { harnessProvider: session.harnessProvider } : {}),
+  });
 }
 
 function exactRecord(value: unknown, allowedKeys: readonly string[], requiredKeys: readonly string[], label: string): Record<string, unknown> {
@@ -61,6 +81,9 @@ function deepFreeze<Value>(value: Value): Value {
   return Object.freeze(value);
 }
 
+function requireIdentifier(value: Record<string, unknown>, key: string): void {
+  if (!isBoundedAgentAdapterIdentifier(value[key])) throw new TypeError(`canonical Event.${key} is invalid`);
+}
 function requireString(value: Record<string, unknown>, key: string): void { if (typeof value[key] !== 'string') throw new TypeError(`canonical Event.${key} is invalid`); }
 function optionalString(value: Record<string, unknown>, key: string): void { if (value[key] !== undefined && typeof value[key] !== 'string') throw new TypeError(`canonical Event.${key} is invalid`); }
 export function normalizeHandledAt(value: string | undefined, fallback: string): string { if (!value) return fallback; return Number.isFinite(new Date(value).getTime()) ? value : fallback; }

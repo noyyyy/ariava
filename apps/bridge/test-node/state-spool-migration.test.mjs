@@ -325,11 +325,13 @@ function setupSchema3Runtime() {
   return fixture;
 }
 
-function assertSelectiveSchema4Migration(fixture, store) {
+function assertSelectiveSchema5Migration(fixture, store) {
   const state = JSON.parse(readFileSync(fixture.statePath, 'utf8'));
   const spool = JSON.parse(readFileSync(fixture.spoolPath, 'utf8'));
-  assert.equal(state.schemaVersion, 4);
-  assert.equal(spool.runtimeStateSchemaVersion, 4);
+  // The v3→v4→v5 chain: v3 drops legacy command/journal state at the v3→v4 step,
+  // then v4→v5 bumps only the schema versions and preserves the spool.
+  assert.equal(state.schemaVersion, 5);
+  assert.equal(spool.runtimeStateSchemaVersion, 5);
   assert.equal(state.runtimeResetEpoch, spool.runtimeResetEpoch);
   assert.deepEqual(state.host, { hostId: HOST_ID, hostName: 'Preserved Host', platform: 'linux', bridgeVersion: '0.3.0',
     registeredAt: CREATED_AT, lastSeenAt: CREATED_AT, bridgeStatus: 'degraded' });
@@ -394,7 +396,7 @@ test('schema 3 migration republishes exact encrypted Session v3 at revision 12 a
   const fixture = setupSchema3Runtime();
   try {
     const store = initialize(fixture);
-    assertSelectiveSchema4Migration(fixture, store);
+    assertSelectiveSchema5Migration(fixture, store);
     const hostIdentity = generateHostEncryptionIdentity(HOST_ID);
     const material = activeRecipient(hostIdentity);
     const published = [];
@@ -403,7 +405,9 @@ test('schema 3 migration republishes exact encrypted Session v3 at revision 12 a
       reconcileEncryptedSession: async () => false,
     }, { reconcileRecipients: () => [material.recipient] });
     const snapshot = { version: 1, hostId: HOST_ID, recipientSetVersion: 9, recipients: [material.recipient] };
-    const committed = await orchestrator.publishAuthoritativeSnapshots(snapshot, [material.recipient], ['session']);
+    const active = store.listSessions()[0];
+    assert.equal(active.sessionId, 'session');
+    const committed = await orchestrator.publishAuthoritativeSnapshots(snapshot, [material.recipient], [active]);
     assert.deepEqual(committed && Object.fromEntries(committed.revisions), { session: 12 });
     assert.equal(published.length, 1);
     assert.equal(published[0].content.payloadKind, 'session-content-v3');
@@ -435,7 +439,7 @@ for (const boundary of ['before-intent', 'after-intent', 'after-spool', 'after-s
         }
       }
       const recovered = initialize(fixture);
-      assertSelectiveSchema4Migration(fixture, recovered);
+      assertSelectiveSchema5Migration(fixture, recovered);
     } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
   });
 }
@@ -499,18 +503,18 @@ function assertReset(fixture, store) {
   }
 }
 
-test('valid schema 3 runtime migrates exactly to v4 without a pre-existing floor', () => {
+test('valid schema 3 runtime migrates exactly to v5 (3→4→5 chain) without a pre-existing floor', () => {
   const fixture = setupPriorV3Runtime();
   try {
     assert.equal(lstatSync(runtimeSchemaFloorPathForState(fixture.statePath), { throwIfNoEntry: false }), undefined);
     const store = initialize(fixture);
     const state = JSON.parse(readFileSync(fixture.statePath, 'utf8'));
-    assert.equal(state.schemaVersion, 4);
+    assert.equal(state.schemaVersion, 5);
     assert.deepEqual(state.commandExecutions, {});
     assert.equal(state.commandResults, undefined);
     assert.equal(state.seenCommands, undefined);
     assert.equal(store.listSessions()[0]?.sessionId, 'session');
-    assert.equal(JSON.parse(readFileSync(runtimeSchemaFloorPathForState(fixture.statePath), 'utf8')).minSchemaVersion, 4);
+    assert.equal(JSON.parse(readFileSync(runtimeSchemaFloorPathForState(fixture.statePath), 'utf8')).minSchemaVersion, 5);
   } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
@@ -916,7 +920,9 @@ test('current v4 restart preserves valid runtime and uses key-verifier behavior'
     first.dispose();
     const restarted = initialize({ dir, statePath, identityPath });
     assert.equal(restarted.listSessions()[0]?.sessionId, 'session');
-    assert.deepEqual(restarted.getInflightSessionUpload('session'), { protected: 'CURRENT_V2' });
+    // Unknown evidence (a placeholder upload, not a canonical shape) is preserved
+    // byte-for-byte and classified recovery-required — never silently accepted.
+    assert.deepEqual(restarted.getSessionInflightLookup('session'), { kind: 'malformed' });
     assert.deepEqual(readFileSync(statePath), stateBytes);
     assert.deepEqual(readFileSync(spoolPathForState(statePath)), spoolBytes);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -1179,3 +1185,168 @@ for (const boundary of ['afterUnlink', 'afterDirectorySync']) {
     } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
   });
 }
+
+// ---------------------------------------------------------------------------
+// §4.5 / §9.5: schema 4 → 5 two-phase runtime migration
+// ---------------------------------------------------------------------------
+
+/**
+ * Byte-valid schema4 runtime: a live schema5 runtime downgraded to
+ * state.schemaVersion 4 / spool.runtimeStateSchemaVersion 4 / floor4, carrying a
+ * pending Event source, a legacy raw Event inflight, and a legacy Session
+ * inflight so the offline v4→v5 migration must byte-preserve every item.
+ */
+function setupSchema4Runtime() {
+  const dir = mkdtempSync(join(tmpdir(), 'ariava-runtime-v4-'));
+  const statePath = join(dir, 'state.json'); const identityPath = join(dir, 'identity.json');
+  const spoolPath = spoolPathForState(statePath);
+  const store = new BridgeStateStore(statePath);
+  store.initializeEncryptedSpool(HOST_ID, identityPath, 'linux');
+  store.setHost({ hostId: HOST_ID, hostName: 'Preserved Host', platform: 'linux', bridgeVersion: '0.4.0',
+    registeredAt: CREATED_AT, lastSeenAt: CREATED_AT, bridgeStatus: 'degraded' });
+  const session = { sessionId: 'session', hostId: HOST_ID, provider: 'adapter', projectName: 'project', nameText: 'name',
+    openingText: 'opening', latestActivityText: 'latest', workingDirectory: '/workspace', harnessProvider: 'pi',
+    status: 'need_human', updatedAt: CREATED_AT, lastEventId: 'event' };
+  store.replaceDriverSessions('adapter', [session]);
+  const event = { eventId: 'event', hostId: HOST_ID, sessionId: 'session', provider: 'adapter', type: 'need_human',
+    status: 'need_human', agentText: 'question', projectName: 'project', workingDirectory: '/workspace',
+    harnessProvider: 'pi', needHuman: { reason: 'question' }, createdAt: CREATED_AT };
+  store.queuePendingEvent(event, session);
+  store.persistInflightEventUpload('event', 'session', { hostId: HOST_ID, sessionId: 'session', provider: 'adapter',
+    status: 'need_human', revision: 1, recipientSetVersion: 1, event: { contentId: 'legacy-event' },
+    session: { contentId: 'legacy-session' }, createdAt: CREATED_AT });
+  store.persistInflightSessionUpload('session', { hostId: HOST_ID, sessionId: 'session', provider: 'adapter',
+    status: 'need_human', revision: 1, recipientSetVersion: 1, content: { contentId: 'legacy-session-content' },
+    createdAt: CREATED_AT });
+  store.dispose();
+  const state = JSON.parse(readFileSync(statePath, 'utf8'));
+  const spool = JSON.parse(readFileSync(spoolPath, 'utf8'));
+  state.schemaVersion = 4;
+  spool.runtimeStateSchemaVersion = 4;
+  writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  writeFileSync(spoolPath, `${JSON.stringify(spool)}\n`, { mode: 0o600 });
+  const floorPath = runtimeSchemaFloorPathForState(statePath);
+  const floor = JSON.parse(readFileSync(floorPath, 'utf8'));
+  floor.minSchemaVersion = 4;
+  writeFileSync(floorPath, `${JSON.stringify(floor)}\n`, { mode: 0o600 });
+  return { dir, statePath, identityPath, spoolPath, floorPath, items: spool.items };
+}
+
+function assertSchema5Preservation(fixture, store) {
+  const state = JSON.parse(readFileSync(fixture.statePath, 'utf8'));
+  const spool = JSON.parse(readFileSync(fixture.spoolPath, 'utf8'));
+  assert.equal(state.schemaVersion, 5);
+  assert.equal(spool.runtimeStateSchemaVersion, 5);
+  assert.equal(state.runtimeResetEpoch, spool.runtimeResetEpoch);
+  assert.equal(state.host.hostName, 'Preserved Host');
+  assert.deepEqual(state.sessions.session.provider, 'adapter');
+  // Offline v4→v5 byte-preserves EVERY schema4 spool item (metadata + ciphertext).
+  assert.deepEqual(spool.items, fixture.items);
+  assert.equal(JSON.parse(readFileSync(fixture.floorPath, 'utf8')).minSchemaVersion, 5);
+  assert.equal(lstatSync(runtimeMigrationIntentPathForState(fixture.statePath), { throwIfNoEntry: false }), undefined);
+  // The fixture's simplified legacy placeholder is not a canonical upload shape:
+  // it is preserved byte-for-byte and classified recovery-required.
+  assert.deepEqual(store.getSessionInflightLookup('session'), { kind: 'malformed' });
+}
+
+test('schema 4 runtime migrates to v5 preserving every spool item byte and the floor4→floor5 rewrite', () => {
+  const fixture = setupSchema4Runtime();
+  try {
+    const stateBytes = readFileSync(fixture.statePath);
+    const spoolBytes = readFileSync(fixture.spoolPath);
+    const store = initialize(fixture);
+    assertSchema5Preservation(fixture, store);
+    // The schema4 state and floor4 are rewritten by the migration (hash-bound intent).
+    assert.notDeepEqual(readFileSync(fixture.statePath), stateBytes);
+    assert.notDeepEqual(readFileSync(fixture.spoolPath), spoolBytes);
+    store.dispose();
+  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+for (const boundary of ['before-intent', 'after-intent', 'after-spool', 'after-state', 'after-cleanup']) {
+  test(`schema 4 to 5 migration recovers deterministically after ${boundary}`, () => {
+    const fixture = setupSchema4Runtime();
+    let crashed = false;
+    try {
+      assert.throws(() => initialize(fixture, (phase) => {
+        if (!crashed && phase === boundary) { crashed = true; throw new Error(`crash:${boundary}`); }
+      }), /preflight failed closed/i);
+      assert.equal(crashed, true);
+      if (boundary !== 'before-intent' && boundary !== 'after-cleanup') {
+        const intent = JSON.parse(readFileSync(runtimeMigrationIntentPathForState(fixture.statePath), 'utf8'));
+        assert.deepEqual([intent.version, intent.fromSchemaVersion, intent.toSchemaVersion], [2, 4, 5]);
+        for (const key of ['stateSourceHash', 'spoolSourceHash', 'floorSourceHash', 'stateTargetHash', 'spoolTargetHash', 'floorTargetHash']) {
+          assert.match(intent[key], /^[A-Za-z0-9_-]{43}$/u);
+        }
+      }
+      const recovered = initialize(fixture);
+      assertSchema5Preservation(fixture, recovered);
+      recovered.dispose();
+    } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+  });
+}
+
+test('schema 4 to 5 recovery rejects state, spool, journal, floor, and path tampering byte-identically', () => {
+  for (const tamper of ['state', 'spool', 'journal-hash', 'journal-path', 'floor']) {
+    const fixture = setupSchema4Runtime();
+    try {
+      assert.throws(() => initialize(fixture, (phase) => { if (phase === 'after-intent') throw new Error('crash'); }),
+        /preflight failed closed/i);
+      const intentPath = runtimeMigrationIntentPathForState(fixture.statePath);
+      if (tamper === 'state') writeFileSync(fixture.statePath, '{"tampered":true}\n', { mode: 0o600 });
+      if (tamper === 'spool') writeFileSync(fixture.spoolPath, '{"tampered":true}\n', { mode: 0o600 });
+      if (tamper === 'floor') writeFileSync(fixture.floorPath, '{"tampered":true}\n', { mode: 0o600 });
+      if (tamper.startsWith('journal')) {
+        const intent = JSON.parse(readFileSync(intentPath, 'utf8'));
+        if (tamper === 'journal-hash') intent.stateTargetHash = 'A'.repeat(43);
+        else intent.statePath = join(fixture.dir, 'other-state.json');
+        writeFileSync(intentPath, `${JSON.stringify(intent)}\n`, { mode: 0o600 });
+      }
+      const stateBytes = readFileSync(fixture.statePath);
+      const spoolBytes = readFileSync(fixture.spoolPath);
+      const journalBytes = readFileSync(intentPath);
+      const floorBytes = readFileSync(fixture.floorPath);
+      assert.throws(() => initialize(fixture), /preflight failed closed/i);
+      assert.deepEqual(readFileSync(fixture.statePath), stateBytes);
+      assert.deepEqual(readFileSync(fixture.spoolPath), spoolBytes);
+      assert.deepEqual(readFileSync(intentPath), journalBytes);
+      assert.deepEqual(readFileSync(fixture.floorPath), floorBytes);
+    } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+  }
+});
+
+test('established floor5 rejects a restored schema4 runtime (downgrade) and preserves every byte', () => {
+  const fixture = setupSchema4Runtime();
+  try {
+    const migrated = initialize(fixture);
+    migrated.dispose();
+    const stateBytes = readFileSync(fixture.statePath);
+    const spoolBytes = readFileSync(fixture.spoolPath);
+    const floorBytes = readFileSync(fixture.floorPath);
+    // Restore schema4 state/spool but KEEP floor5: the floor is the downgrade
+    // guard, so floor5 + schema4 must fail closed (§4.5.6, §9.5).
+    const v4State = JSON.parse(stateBytes); v4State.schemaVersion = 4;
+    const v4Spool = JSON.parse(spoolBytes); v4Spool.runtimeStateSchemaVersion = 4;
+    const v4StateBytes = Buffer.from(`${JSON.stringify(v4State)}\n`);
+    const v4SpoolBytes = Buffer.from(`${JSON.stringify(v4Spool)}\n`);
+    writeFileSync(fixture.statePath, v4StateBytes, { mode: 0o600 });
+    writeFileSync(fixture.spoolPath, v4SpoolBytes, { mode: 0o600 });
+    let keyAccessed = false;
+    assert.throws(() => openDeferred(fixture.statePath).initializeEncryptedSpool(HOST_ID, fixture.identityPath, 'linux', {
+      loadOrCreate: () => { keyAccessed = true; return new Uint8Array(32).fill(7); },
+    }), /preflight failed closed/i);
+    assert.equal(keyAccessed, false);
+    assert.deepEqual(readFileSync(fixture.statePath), v4StateBytes);
+    assert.deepEqual(readFileSync(fixture.spoolPath), v4SpoolBytes);
+    assert.deepEqual(readFileSync(fixture.floorPath), floorBytes);
+  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test('schema 3 to 5 chain: v3 spool items are dropped at 3→4, then 4→5 preserves the empty spool', () => {
+  const fixture = setupSchema3Runtime();
+  try {
+    const store = initialize(fixture);
+    assertSelectiveSchema5Migration(fixture, store);
+    store.dispose();
+  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+});

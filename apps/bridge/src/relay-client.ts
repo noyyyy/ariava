@@ -69,6 +69,13 @@ export class RelayClientError extends Error {
   }
 }
 
+export class RelayTransportError extends TypeError {
+  constructor(options?: ErrorOptions) {
+    super('Relay transport request failed', options);
+    this.name = 'RelayTransportError';
+  }
+}
+
 export class RelayClient {
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
@@ -111,24 +118,34 @@ export class RelayClient {
       timestamp: this.now().toISOString(),
       nonce: this.nonce(),
     });
-    const response = await this.fetchImpl(new URL(target, this.options.baseUrl), {
-      method,
-      headers: {
-        ...headers,
-        ...(bodyBytes === undefined ? {} : { 'content-type': 'application/json' }),
-      },
-      ...(bodyBytes === undefined ? {} : { body: bodyBytes }),
-      signal: this.requestSignal?.(),
-    });
+    let response: Response;
+    let responseText = '';
+    try {
+      response = await this.fetchImpl(new URL(target, this.options.baseUrl), {
+        method,
+        headers: {
+          ...headers,
+          ...(bodyBytes === undefined ? {} : { 'content-type': 'application/json' }),
+        },
+        ...(bodyBytes === undefined ? {} : { body: bodyBytes }),
+        signal: this.requestSignal?.(),
+      });
+      if (response.status !== 204) responseText = await response.text();
+    } catch (error) {
+      // Fetch and response-body stream failures are transport failures. JSON
+      // parsing stays outside this boundary so malformed Relay payloads remain
+      // local response-shape faults rather than false offline evidence.
+      throw new RelayTransportError({ cause: error });
+    }
     if (!response.ok) {
-      const text = (await response.text()).trim();
+      const text = responseText.trim();
       let errorBody: unknown;
       try { errorBody = text ? JSON.parse(text) : undefined; } catch { errorBody = undefined; }
       const message = errorMessage(errorBody) ?? (text || response.statusText || 'Relay request failed.');
       throw new RelayClientError(response.status, message, errorBody);
     }
     if (response.status === 204) return undefined as T;
-    return (await response.json()) as T;
+    return JSON.parse(responseText) as T;
   }
 
   enrollHost(request: HostEnrollmentRequest): Promise<HostEnrollmentResponse> {

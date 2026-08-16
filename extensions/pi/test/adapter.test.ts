@@ -4,7 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AGENT_ADAPTER_PROTOCOL_VERSION, type CommandEnvelope, type CommandResult } from '@ariava/protocol';
 import type { AgentAdapterRegistry } from '../../../apps/bridge/src/agent-adapter/registry';
-import { AgentAdapterClient, resolveAgentAdapterConfigPath } from '../src/adapter';
+import { AGENT_ADAPTER_REQUEST_BODY_BYTES, AgentAdapterClient, resolveAgentAdapterConfigPath } from '../src/adapter';
 import type { PiSessionInfo } from '../src/session';
 
 mock.module('../../../apps/bridge/src/e2e/node-crypto', () => ({
@@ -170,6 +170,25 @@ describe('AgentAdapterClient sequencing', () => {
       'GET /v1/agent/sessions/poll-recover/commands',
     ]);
   });
+
+  test('producer preflight permits exact 256 KiB and rejects cap+1 before fetch', async () => {
+    let fetches = 0; let sentBytes = 0;
+    globalThis.fetch = (async (_input, init) => {
+      fetches += 1;
+      sentBytes = new TextEncoder().encode(String(init?.body)).byteLength;
+      return response(200);
+    }) as typeof fetch;
+    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
+    const discovery = { url: 'http://127.0.0.1:1', secret: 'secret', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION };
+    const bodyAt = (bytes: number) => ({ value: 'x'.repeat(bytes - '{"value":""}'.length) });
+    await expect((sequenced as any).requestWithDiscovery(discovery, 'POST', '/test', bodyAt(AGENT_ADAPTER_REQUEST_BODY_BYTES)))
+      .resolves.toBeInstanceOf(Response);
+    expect(fetches).toBe(1);
+    expect(sentBytes).toBe(AGENT_ADAPTER_REQUEST_BODY_BYTES);
+    await expect((sequenced as any).requestWithDiscovery(discovery, 'POST', '/test', bodyAt(AGENT_ADAPTER_REQUEST_BODY_BYTES + 1)))
+      .rejects.toThrow('256 KiB');
+    expect(fetches).toBe(1);
+  });
 });
 
 describe('AgentAdapterClient', () => {
@@ -227,8 +246,8 @@ describe('AgentAdapterClient', () => {
   }
 
   test('preserves one exact native ID across every adapter/server route', async () => {
-    const sessionId = ' /native% id?# ';
-    const commandId = ' /command% id?# ';
+    const sessionId = ' native% id?# ';
+    const commandId = ' command% id?# ';
     const session = makeSession(sessionId);
     expect((await client.registerSession(session)).sessionId).toBe(sessionId);
     await client.heartbeat(sessionId, 'working', 'Exact native ID');

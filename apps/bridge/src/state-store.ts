@@ -11,14 +11,14 @@ import {
   type SecureFileRemoveHooks,
 } from './host-manager/secure-files';
 import type {
-  CanonicalEvent, CanonicalSessionState, CommandResult, EncryptedCommandEnvelopeV1, HostProjection,
-  ReplaceE2ECurrentSessionsRequestV1,
+  CanonicalEvent, CanonicalSessionState, CommandResult, E2EEventAndSessionUploadV3, EncryptedCommandEnvelopeV1,
+  EncryptedSessionSnapshotUploadV3, HostProjection, ReplaceE2ECurrentSessionsRequestV1,
 } from '@ariava/protocol';
 import {
   SIGNED_REQUEST_LIMITS,
-  base64UrlDecode, buildCommandReceiptEnvelopeBindingBytes, buildEncryptedCommandEnvelopeBindingBytes,
-  e2eCurrentSessionsSemanticDigestV1, isCanonicalTimestamp, validateCommandReceiptEnvelopeV1, validateCommandResult,
-  validateEncryptedCommandEnvelopeV1,
+  base64UrlDecode, base64UrlEncode, buildCommandReceiptEnvelopeBindingBytes, buildEncryptedCommandEnvelopeBindingBytes,
+  e2eCurrentSessionsSemanticDigestV1, isCanonicalTimestamp, validateCanonicalEventInvariant, validateCommandReceiptEnvelopeV1, validateCommandResult,
+  validateEncryptedCommandEnvelopeV1, validateEncryptedContentV1, validateNotificationPreviewEnvelopeV2, validateRecipientKeyWrapV1,
 } from '@ariava/protocol';
 import type {
   BridgeRuntimeHealth,
@@ -49,7 +49,8 @@ import {
   type RuntimeCoordinator,
 } from './runtime-lock';
 
-export const BRIDGE_RUNTIME_STATE_SCHEMA_VERSION = 4 as const;
+export const BRIDGE_RUNTIME_STATE_SCHEMA_VERSION = 5 as const;
+export const PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION = 4 as const;
 export const COMMAND_RECEIPT_RETENTION_DAYS = 30 as const;
 export const COMMAND_RECEIPT_RETENTION_MS = COMMAND_RECEIPT_RETENTION_DAYS * 24 * 60 * 60 * 1_000;
 const PRIOR_RUNTIME_STATE_SCHEMA_VERSION = 3 as const;
@@ -57,6 +58,7 @@ const OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION = 2 as const;
 const LEGACY_RUNTIME_STATE_SCHEMA_VERSION = 1 as const;
 const RESET_INTENT_VERSION = 1 as const;
 const MIGRATION_INTENT_VERSION = 1 as const;
+const MIGRATION_INTENT_V2_VERSION = 2 as const;
 const ABSENT_HASH = 'absent';
 const PRIOR_V2_SPOOL_KINDS = new Set([
   'event-source-v2', 'event-reservation-v2', 'event-dead-letter-v2', 'session-source-v2',
@@ -92,10 +94,13 @@ interface RuntimeResetIntentV1 {
   createdAt: string;
 }
 
+/** Schema 4 Bridge runtime state: identical shape to schema 5, only the version literal differs. */
+export type PriorV4BridgeState = Omit<PersistedBridgeState, 'schemaVersion'> & { schemaVersion: 4 };
+
 interface RuntimeSchemaFloorV1 {
   version: 1;
   hostId: string;
-  minSchemaVersion: 4;
+  minSchemaVersion: 4 | 5;
   statePath: string;
   spoolPath: string;
 }
@@ -104,6 +109,32 @@ interface RuntimeMigrationIntentV1 {
   version: 1;
   fromSchemaVersion: 3;
   toSchemaVersion: 4;
+  hostId: string;
+  statePath: string;
+  spoolPath: string;
+  floorPath: string;
+  intentPath: string;
+  stateSourceHash: string;
+  spoolSourceHash: string;
+  floorSourceHash: string;
+  stateTargetHash: string;
+  spoolTargetHash: string;
+  floorTargetHash: string;
+  stateTarget: PriorV4BridgeState;
+  spoolTarget: LocalSpoolFileV2;
+  floorTarget: RuntimeSchemaFloorV1;
+  createdAt: string;
+}
+
+/** v4→v5 two-phase migration intent (§4.5): hash-bound exact evidence written
+ * atomically (temp + fsync + exclusive rename) so a crash never leaves a
+ * partial intent; recovery proceeds from the intent only. The offline targets
+ * bump only the state schema version and the spool outer runtime schema while
+ * byte-preserving every schema4 spool item. */
+interface RuntimeMigrationIntentV2 {
+  version: 2;
+  fromSchemaVersion: 4;
+  toSchemaVersion: 5;
   hostId: string;
   statePath: string;
   spoolPath: string;
@@ -131,6 +162,219 @@ export interface RuntimeResetHooks {
 }
 export interface CommandExecutionPinResolver {
   resolvePinReference(linkId: string, linkGeneration: number, epoch: number): PersistedCommandPinReferenceV1 | undefined;
+}
+
+/** Minimal descriptor for one pending Event source item (§5.1); no payload decode. */
+export interface PendingEventDescriptor {
+  eventId: string;
+  sessionId: string;
+}
+
+/** Decoded pending Event source tuple (§5.2 step 4). */
+export interface PendingEventSource {
+  event: CanonicalEvent;
+  session: CanonicalSessionState;
+  producerFingerprint?: string;
+}
+
+/** New inflight inner wrapper introduced by the 64 KiB spec (§4.3). */
+export interface EventInflightRecordV2 {
+  version: 2;
+  sourceDigest: string;
+  upload: E2EEventAndSessionUploadV3;
+}
+
+export interface SessionInflightRecordV2 {
+  version: 2;
+  sourceDigest: string;
+  upload: EncryptedSessionSnapshotUploadV3;
+}
+
+/**
+ * Parsed inflight event evidence plus its raw AEAD-opened bytes (retained for
+ * the dead-letter archive only). Caller zeroes `raw` after use.
+ */
+export type LoadedEventInflight =
+  | { kind: 'v2'; raw: Uint8Array; sourceDigest: string; upload: E2EEventAndSessionUploadV3 }
+  | { kind: 'legacy'; raw: Uint8Array; upload: E2EEventAndSessionUploadV3 };
+
+/**
+ * Per-item load result (§5.2). Inflight is parsed first; a malformed inflight
+ * short-circuits with an `inflight-*` reason (recovery-required, never quarantined).
+ * A malformed source still carries the parsed inflight so the caller can reconcile
+ * it before deciding to dead-letter.
+ */
+export type LoadPendingEventPartsResult =
+  | { ok: true; source: PendingEventSource; inflight?: LoadedEventInflight }
+  | { ok: false; reason: 'source-utf8-invalid' | 'source-json-invalid' | 'source-shape-invalid' | 'source-binding-invalid' | 'source-missing'; inflight?: LoadedEventInflight }
+  | { ok: false; reason: 'inflight-utf8-invalid' | 'inflight-json-invalid' | 'inflight-shape-invalid' };
+
+/** Fixed dead-letter reason codes (§5.3); no exception text is ever stored. */
+export type EventDeadLetterReasonCode =
+  | 'protected-content-invalid'
+  | 'event-session-binding-invalid'
+  | 'source-utf8-invalid'
+  | 'source-json-invalid'
+  | 'relay-permanent-conflict';
+
+export interface EventDeadLetterRecordV2 {
+  version: 2;
+  eventId: string;
+  sessionId: string;
+  reasonCode: EventDeadLetterReasonCode;
+  quarantinedAt: string;
+  sourceArchive: { encoding: 'base64url'; bytes: string };
+  inflightArchive?: { encoding: 'base64url'; bytes: string };
+}
+
+const SOURCE_DIGEST_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+function isSourceDigest(value: unknown): value is string {
+  return typeof value === 'string' && SOURCE_DIGEST_PATTERN.test(value);
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  let difference = 0;
+  for (let index = 0; index < left.byteLength; index += 1) difference |= left[index]! ^ right[index]!;
+  return difference === 0;
+}
+
+
+/** Exact encrypted-upload shape guards (§4.3/§5.2): a shallow or structurally
+ * broken inflight must classify as malformed (recovery-required), never be
+ * completed, wrapped, or dead-lettered under a different identity. */
+function isEncryptedContentShape(value: unknown): boolean {
+  return validateEncryptedContentV1(value);
+}
+
+function isKeyWrapArrayShape(value: unknown): boolean {
+  return Array.isArray(value) && value.every((wrap) => validateRecipientKeyWrapV1(wrap));
+}
+
+function isPreviewArrayShape(value: unknown): boolean {
+  return Array.isArray(value) && value.every((preview) => validateNotificationPreviewEnvelopeV2(preview));
+}
+
+function isEncryptedEventUploadShape(value: unknown): value is E2EEventAndSessionUploadV3 {
+  if (!isRecord(value) || !hasExactOptionalKeys(value, ['event', 'session'], [])
+    || !isRecord(value.event) || !isRecord(value.session)) return false;
+  const event = value.event as Record<string, unknown>;
+  const session = value.session as Record<string, unknown>;
+  return hasExactOptionalKeys(event, ['eventId', 'hostId', 'sessionId', 'provider', 'type', 'status', 'createdAt', 'recipientSetVersion', 'content', 'keyWraps'], ['notificationPreviews'])
+    && typeof event.eventId === 'string' && typeof event.hostId === 'string' && typeof event.sessionId === 'string'
+    && typeof event.provider === 'string'
+    && (event.type === 'done' ? event.status === 'idle' : event.type === 'need_human' ? event.status === 'need_human' : false)
+    && typeof event.createdAt === 'string' && isCanonicalTimestamp(event.createdAt)
+    && Number.isSafeInteger(event.recipientSetVersion) && (event.recipientSetVersion as number) >= 1
+    && isEncryptedContentShape(event.content) && (event.content as { payloadKind?: unknown }).payloadKind === 'event-content-v3'
+    && isKeyWrapArrayShape(event.keyWraps)
+    && (event.notificationPreviews === undefined || isPreviewArrayShape(event.notificationPreviews))
+    && hasExactOptionalKeys(session, ['hostId', 'sessionId', 'provider', 'status', 'updatedAt', 'revision', 'recipientSetVersion', 'content', 'keyWraps'], ['lastEventId', 'snoozedUntil'])
+    && typeof session.hostId === 'string' && typeof session.sessionId === 'string' && typeof session.provider === 'string'
+    && (session.status === 'idle' || session.status === 'working' || session.status === 'need_human')
+    && typeof session.updatedAt === 'string' && isCanonicalTimestamp(session.updatedAt)
+    && (session.lastEventId === undefined || (typeof session.lastEventId === 'string' && session.lastEventId.length > 0))
+    && (session.snoozedUntil === undefined || isCanonicalTimestamp(session.snoozedUntil))
+    && Number.isSafeInteger(session.revision) && (session.revision as number) >= 1
+    && Number.isSafeInteger(session.recipientSetVersion) && (session.recipientSetVersion as number) >= 1
+    && isEncryptedContentShape(session.content) && (session.content as { payloadKind?: unknown }).payloadKind === 'session-content-v3'
+    && isKeyWrapArrayShape(session.keyWraps);
+}
+
+function isEncryptedSessionUploadShape(value: unknown): value is EncryptedSessionSnapshotUploadV3 {
+  if (!isRecord(value)) return false;
+  return hasExactOptionalKeys(value, ['hostId', 'sessionId', 'provider', 'status', 'updatedAt', 'revision', 'recipientSetVersion', 'content', 'keyWraps'], ['lastEventId', 'snoozedUntil'])
+    && typeof value.hostId === 'string' && typeof value.sessionId === 'string' && typeof value.provider === 'string'
+    && (value.status === 'idle' || value.status === 'working' || value.status === 'need_human')
+    && typeof value.updatedAt === 'string' && isCanonicalTimestamp(value.updatedAt)
+    && (value.lastEventId === undefined || (typeof value.lastEventId === 'string' && value.lastEventId.length > 0))
+    && (value.snoozedUntil === undefined || isCanonicalTimestamp(value.snoozedUntil))
+    && Number.isSafeInteger(value.revision) && (value.revision as number) >= 1
+    && Number.isSafeInteger(value.recipientSetVersion) && (value.recipientSetVersion as number) >= 1
+    && isEncryptedContentShape(value.content) && (value.content as { payloadKind?: unknown }).payloadKind === 'session-content-v3'
+    && isKeyWrapArrayShape(value.keyWraps);
+}
+
+function isEventInflightRecordV2(value: unknown): value is EventInflightRecordV2 {
+  return isRecord(value) && hasExactOptionalKeys(value, ['version', 'sourceDigest', 'upload'], [])
+    && value.version === 2 && isSourceDigest(value.sourceDigest)
+    && isEncryptedEventUploadShape(value.upload);
+}
+
+function isSessionInflightRecordV2(value: unknown): value is SessionInflightRecordV2 {
+  return isRecord(value) && hasExactOptionalKeys(value, ['version', 'sourceDigest', 'upload'], [])
+    && value.version === 2 && isSourceDigest(value.sourceDigest)
+    && isEncryptedSessionUploadShape(value.upload);
+}
+
+function isEncryptedEventUploadRecord(value: unknown): boolean {
+  return isEncryptedEventUploadShape(value);
+}
+
+/** §5.2: exact canonical Event shape — every key known, types and the
+ * type/status/needHuman invariant canonical. Unknown fields are rejected so a
+ * source can never be silently stripped and uploaded under a different shape.
+ */
+function isCanonicalEventShape(value: unknown): value is CanonicalEvent {
+  if (!isRecord(value)) return false;
+  if (!hasExactOptionalKeys(value, ['eventId', 'hostId', 'sessionId', 'provider', 'agentText', 'createdAt', 'type', 'status'],
+    ['humanText', 'projectName', 'workingDirectory', 'harnessProvider', 'needHuman'])) return false;
+  if (typeof value.eventId !== 'string' || typeof value.hostId !== 'string' || typeof value.sessionId !== 'string'
+    || typeof value.provider !== 'string' || typeof value.agentText !== 'string'
+    || typeof value.createdAt !== 'string' || !isCanonicalTimestamp(value.createdAt)) return false;
+  for (const key of ['humanText', 'projectName', 'workingDirectory', 'harnessProvider'] as const) {
+    if (value[key] !== undefined && typeof value[key] !== 'string') return false;
+  }
+  const invariant: Record<string, unknown> = { type: value.type, status: value.status };
+  if (value.needHuman !== undefined) invariant.needHuman = value.needHuman;
+  return validateCanonicalEventInvariant(invariant).success;
+}
+
+/** §5.2: exact canonical Session shape — every key known and typed; unknown
+ * fields are rejected for the same reason as the Event shape. */
+function isCanonicalSessionShape(value: unknown): value is CanonicalSessionState {
+  if (!isRecord(value)) return false;
+  if (!hasExactOptionalKeys(value, ['sessionId', 'hostId', 'provider', 'projectName', 'nameText', 'status', 'updatedAt'],
+    ['openingText', 'latestActivityText', 'workingDirectory', 'harnessProvider', 'lastEventId', 'snoozedUntil'])) return false;
+  return typeof value.sessionId === 'string' && typeof value.hostId === 'string' && typeof value.provider === 'string'
+    && typeof value.projectName === 'string' && typeof value.nameText === 'string'
+    && (value.status === 'idle' || value.status === 'working' || value.status === 'need_human')
+    && typeof value.updatedAt === 'string' && isCanonicalTimestamp(value.updatedAt)
+    && (value.lastEventId === undefined || (typeof value.lastEventId === 'string' && value.lastEventId.length > 0))
+    && (value.snoozedUntil === undefined || isCanonicalTimestamp(value.snoozedUntil));
+}
+
+/** §5.1: discriminated Session inflight lookup. `malformed` (unparseable or
+ * non-shape bytes) and `cross-bound` (a parseable upload whose inner sessionId
+ * differs from the outer spool key) are evidence that must stay byte-preserved
+ * and be surfaced as recovery-required — never silently rebuilt or removed.
+ */
+export type SessionInflightLookup =
+  | { kind: 'missing' }
+  | { kind: 'v2'; upload: EncryptedSessionSnapshotUploadV3 }
+  | { kind: 'legacy'; upload: EncryptedSessionSnapshotUploadV3 }
+  | { kind: 'cross-bound'; upload: EncryptedSessionSnapshotUploadV3 }
+  | { kind: 'malformed' };
+
+/** §4.4/§5.2: the encrypted tuple must be self-consistent AND bound to the outer
+ * spool descriptor; a cross-bound inflight (B's upload under A's key) must never
+ * be completed or wrapped under A's identity. */
+function uploadMatchesDescriptor(upload: E2EEventAndSessionUploadV3, descriptor: PendingEventDescriptor): boolean {
+  return upload.event.eventId === descriptor.eventId
+    && upload.session.sessionId === descriptor.sessionId
+    && upload.event.sessionId === upload.session.sessionId
+    && upload.event.hostId === upload.session.hostId
+    && upload.event.provider === upload.session.provider
+    && upload.event.status === upload.session.status
+    && upload.session.lastEventId === upload.event.eventId;
+}
+
+
+/** §4.3 inflight wrapper: bind the immutable source digest when available;
+ * absent digests keep the byte-preserved legacy unwrapped record. */
+function withSourceDigestWrapper(upload: unknown, sourceDigest?: string): unknown {
+  return isSourceDigest(sourceDigest) ? { version: 2 as const, sourceDigest, upload } : upload;
 }
 
 export class BridgeStateStore {
@@ -219,7 +463,14 @@ export class BridgeStateStore {
     try {
       const migrationIntentPath = runtimeMigrationIntentPathForState(this.filePath);
       if (pathHasFilesystemEvidence(migrationIntentPath)) {
-        return this.resumeRuntimeMigration(hostId, resetStep, resetWriteHooks, resetRemoveHooks);
+        const resumed = this.resumeRuntimeMigration(hostId, resetStep, resetWriteHooks, resetRemoveHooks);
+        if (resumed.schemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION) {
+          return parseCurrentState(resumed, hostId);
+        }
+        // A resumed v3→v4 intent converges to schema4; continue to the v4→v5
+        // migration (§4.5: v3→v4 completes strictly before the independent v4→v5
+        // intent is evaluated).
+        return this.preflightRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
       }
       const floorPath = runtimeSchemaFloorPathForState(this.filePath);
       const floorBytes = readOptionalSecureBytes(floorPath);
@@ -239,6 +490,19 @@ export class BridgeStateStore {
       const stateRecord = parseRawJson(stateBytes, 'Bridge runtime state');
       const spoolRecord = parseRawJson(spoolBytes, 'Bridge runtime spool');
       if (floor) {
+        if (floor.minSchemaVersion === PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION) {
+          // Established floor4: only an exact verified schema4 runtime may continue,
+          // and it must now migrate to schema5 (§4.5 allowed source: verified
+          // schema4/floor4). Everything else violates the established floor.
+          if (!stateRecord || !spoolRecord || !isPriorStateRecordV4(stateRecord, hostId)
+            || !isSpoolRecordForSchema(spoolRecord, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, hostId,
+              stateRecord.runtimeResetEpoch as string, 'current')) {
+            throw new Error('Bridge runtime artifacts violate the established schema floor');
+          }
+          return this.beginRuntimeMigrationV4ToV5(
+            hostId, stateRecord, spoolRecord, floorBytes, stateBytes!, spoolBytes!, resetStep, resetWriteHooks, resetRemoveHooks,
+          );
+        }
         if (!stateRecord || !spoolRecord || !isCurrentStateRecord(stateRecord)) {
           throw new Error('Bridge runtime artifacts violate the established schema floor');
         }
@@ -252,14 +516,26 @@ export class BridgeStateStore {
         if (!spoolRecord) throw new Error('current Bridge runtime spool is missing');
         const spool = parseCurrentSpoolRecord(spoolRecord, hostId, state.runtimeResetEpoch);
         assertCurrentRuntimeRelationships(state, spool, hostId);
-        writeSecureJson(floorPath, runtimeSchemaFloor(this.filePath, hostId), undefined, resetWriteHooks);
+        writeSecureJson(floorPath, runtimeSchemaFloor(this.filePath, hostId, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION), undefined, resetWriteHooks);
         return state;
+      }
+      if (stateRecord && spoolRecord && isPriorStateRecordV4(stateRecord, hostId)
+        && isSpoolRecordForSchema(spoolRecord, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, hostId,
+          stateRecord.runtimeResetEpoch as string, 'current')) {
+        // Schema4 runtime without an established floor (defensive): begin the
+        // independent v4→v5 intent with an absent floor source.
+        return this.beginRuntimeMigrationV4ToV5(
+          hostId, stateRecord, spoolRecord, undefined, stateBytes!, spoolBytes!, resetStep, resetWriteHooks, resetRemoveHooks,
+        );
       }
       if (stateRecord && spoolRecord && isPriorStateRecordV3(stateRecord, hostId)
         && isSpoolRecordForSchema(spoolRecord, PRIOR_RUNTIME_STATE_SCHEMA_VERSION, hostId, stateRecord.runtimeResetEpoch as string, 'current')) {
-        return this.beginRuntimeMigration(
+        this.beginRuntimeMigration(
           hostId, stateRecord, spoolRecord, stateBytes!, spoolBytes!, resetStep, resetWriteHooks, resetRemoveHooks,
         );
+        // v3→v4 converges to schema4 + floor4; the chain continues with the
+        // independent v4→v5 migration. Never merge 3→5 into one un-reviewed step.
+        return this.preflightRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
       }
       if (!stateRecord && !spoolRecord) {
         return this.initializeFreshRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
@@ -385,12 +661,13 @@ export class BridgeStateStore {
     hostId: string, stateSource: Record<string, unknown>, spoolSource: Record<string, unknown>,
     stateSourceBytes: Buffer, spoolSourceBytes: Buffer, resetStep?: (phase: RuntimeResetPhase) => void,
     writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
-  ): PersistedBridgeState {
+  ): PriorV4BridgeState {
     const stateTarget = migrateStateV3ToV4(stateSource, hostId);
     const spoolTarget = migrateSpoolV3ToV4(spoolSource, hostId, stateTarget.runtimeResetEpoch);
-    const floorTarget = runtimeSchemaFloor(this.filePath, hostId);
+    const floorTarget = runtimeSchemaFloor(this.filePath, hostId, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION);
     const intent: RuntimeMigrationIntentV1 = {
-      version: MIGRATION_INTENT_VERSION, fromSchemaVersion: 3, toSchemaVersion: 4, hostId,
+      version: MIGRATION_INTENT_VERSION, fromSchemaVersion: PRIOR_RUNTIME_STATE_SCHEMA_VERSION,
+      toSchemaVersion: PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, hostId,
       statePath: resolve(this.filePath), spoolPath: resolve(spoolPathForState(this.filePath)),
       floorPath: resolve(runtimeSchemaFloorPathForState(this.filePath)),
       intentPath: resolve(runtimeMigrationIntentPathForState(this.filePath)),
@@ -407,15 +684,25 @@ export class BridgeStateStore {
   private resumeRuntimeMigration(
     hostId: string, resetStep?: (phase: RuntimeResetPhase) => void,
     writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
-  ): PersistedBridgeState {
-    const intent = parseMigrationIntent(readSecureJson<unknown>(runtimeMigrationIntentPathForState(this.filePath)), this.filePath);
-    if (intent.hostId !== hostId) throw new Error('Bridge runtime migration intent Host mismatch');
-    return this.finishRuntimeMigration(intent, resetStep, writeHooks, removeHooks);
+  ): Record<string, unknown> {
+    const value = readSecureJson<unknown>(runtimeMigrationIntentPathForState(this.filePath));
+    if (!isRecord(value)) throw new Error('Bridge runtime migration intent is invalid');
+    if (value.version === MIGRATION_INTENT_VERSION) {
+      const intent = parseMigrationIntent(value, this.filePath);
+      if (intent.hostId !== hostId) throw new Error('Bridge runtime migration intent Host mismatch');
+      return this.finishRuntimeMigration(intent, resetStep, writeHooks, removeHooks);
+    }
+    if (value.version === MIGRATION_INTENT_V2_VERSION) {
+      const intent = parseMigrationIntentV2(value, this.filePath);
+      if (intent.hostId !== hostId) throw new Error('Bridge runtime migration intent Host mismatch');
+      return this.finishRuntimeMigrationV2(intent, resetStep, writeHooks, removeHooks);
+    }
+    throw new Error('Bridge runtime migration intent version is unknown');
   }
   private finishRuntimeMigration(
     intent: RuntimeMigrationIntentV1, resetStep?: (phase: RuntimeResetPhase) => void,
     writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
-  ): PersistedBridgeState {
+  ): PriorV4BridgeState {
     assertMigrationIntentTargets(intent);
     const stateBytes = readOptionalSecureBytes(this.filePath);
     const spoolBytes = readOptionalSecureBytes(spoolPathForState(this.filePath));
@@ -436,7 +723,73 @@ export class BridgeStateStore {
     }
     removeSecureFile(runtimeMigrationIntentPathForState(this.filePath), undefined, removeHooks);
     resetStep?.('after-cleanup');
-    return parseCurrentState(intent.stateTarget, intent.hostId);
+    return intent.stateTarget;
+  }
+
+  /**
+   * v4→v5 offline phase (§4.5.2-4): builds the independent hash-bound intent whose
+   * spool target byte-preserves every schema4 item and whose state target only
+   * bumps the schema version. Floor source may be absent (defensive) or the
+   * established floor4 bytes. The intent is written atomically (temp + fsync +
+   * exclusive rename via `writeSecureJsonExclusive`).
+   */
+  private beginRuntimeMigrationV4ToV5(
+    hostId: string, stateSource: Record<string, unknown>, spoolSource: Record<string, unknown>,
+    floorSourceBytes: Buffer | undefined, stateSourceBytes: Buffer, spoolSourceBytes: Buffer,
+    resetStep?: (phase: RuntimeResetPhase) => void,
+    writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
+  ): PersistedBridgeState {
+    const stateTarget = migrateStateV4ToV5(stateSource, hostId);
+    const spoolTarget = migrateSpoolV4ToV5(spoolSource, hostId, stateTarget.runtimeResetEpoch);
+    const floorTarget = runtimeSchemaFloor(this.filePath, hostId, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION);
+    const intent: RuntimeMigrationIntentV2 = {
+      version: MIGRATION_INTENT_V2_VERSION, fromSchemaVersion: PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION,
+      toSchemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, hostId,
+      statePath: resolve(this.filePath), spoolPath: resolve(spoolPathForState(this.filePath)),
+      floorPath: resolve(runtimeSchemaFloorPathForState(this.filePath)),
+      intentPath: resolve(runtimeMigrationIntentPathForState(this.filePath)),
+      stateSourceHash: hashBytes(stateSourceBytes), spoolSourceHash: hashBytes(spoolSourceBytes),
+      floorSourceHash: hashOptional(floorSourceBytes),
+      stateTargetHash: hashBytes(serializeSecureJson(stateTarget)), spoolTargetHash: hashBytes(serializeSecureJson(spoolTarget)),
+      floorTargetHash: hashBytes(serializeSecureJson(floorTarget)), stateTarget, spoolTarget, floorTarget,
+      createdAt: new Date().toISOString(),
+    };
+    resetStep?.('before-intent');
+    writeSecureJsonExclusive(intent.intentPath, intent, undefined, writeHooks);
+    resetStep?.('after-intent');
+    return this.finishRuntimeMigrationV2(intent, resetStep, writeHooks, removeHooks);
+  }
+
+  /**
+   * v4→v5 offline write order (§4.5.3): spool target → state target → floor5 target →
+   * intent removal, validating source/target hashes before and after every step;
+   * recovery after a crash proceeds from the intent only, never re-deriving targets.
+   */
+  private finishRuntimeMigrationV2(
+    intent: RuntimeMigrationIntentV2, resetStep?: (phase: RuntimeResetPhase) => void,
+    writeHooks?: SecureFileWriteHooks, removeHooks?: SecureFileRemoveHooks,
+  ): PersistedBridgeState {
+    assertMigrationIntentV2Targets(intent);
+    const stateBytes = readOptionalSecureBytes(this.filePath);
+    const spoolBytes = readOptionalSecureBytes(spoolPathForState(this.filePath));
+    const floorBytes = readOptionalSecureBytes(runtimeSchemaFloorPathForState(this.filePath));
+    assertMigrationMemberHash('state', stateBytes, intent.stateSourceHash, intent.stateTargetHash);
+    assertMigrationMemberHash('spool', spoolBytes, intent.spoolSourceHash, intent.spoolTargetHash);
+    assertMigrationMemberHash('schema floor', floorBytes, intent.floorSourceHash, intent.floorTargetHash);
+    if (hashOptional(spoolBytes) !== intent.spoolTargetHash) {
+      writeSecureJson(spoolPathForState(this.filePath), intent.spoolTarget, undefined, writeHooks);
+    }
+    resetStep?.('after-spool');
+    if (hashOptional(stateBytes) !== intent.stateTargetHash) {
+      writeSecureJson(this.filePath, intent.stateTarget, undefined, writeHooks);
+    }
+    resetStep?.('after-state');
+    if (hashOptional(floorBytes) !== intent.floorTargetHash) {
+      writeSecureJson(runtimeSchemaFloorPathForState(this.filePath), intent.floorTarget, undefined, writeHooks);
+    }
+    removeSecureFile(runtimeMigrationIntentPathForState(this.filePath), undefined, removeHooks);
+    resetStep?.('after-cleanup');
+    return intent.stateTarget;
   }
 
   private assertRuntimeAccess(): void {
@@ -567,7 +920,7 @@ export class BridgeStateStore {
     const current = this.state.currentSessionsSnapshot;
     if (current.lastAcceptedContentDigest === contentDigest
       && current.lastAcceptedRecipientSetVersion === recipientSetVersion && current.lastAcceptedRevision >= minimumRevision) return undefined;
-    const revision = Math.max(current.lastAllocatedRevision, current.lastAcceptedRevision, minimumRevision) + 1;
+    const revision = Math.max(current.lastAllocatedRevision + 1, current.lastAcceptedRevision + 1, minimumRevision);
     const request: ReplaceE2ECurrentSessionsRequestV1 = { hostId, revision, observedAt, recipientSetVersion, sessions: [] };
     this.state.currentSessionsSnapshot = { ...current, version: 1, lastAllocatedRevision: revision };
     this.persist();
@@ -860,7 +1213,13 @@ export class BridgeStateStore {
   private reconcilePendingEventJournal(): void {
     if (!this.spool) return;
     let changed = false;
-    for (const { event, session, producerFingerprint } of this.peekPendingUploadRecords()) {
+    // Per-item safe decode: malformed sources are left untouched for the upload
+    // processor (§5.2) instead of failing the whole startup, which is exactly the
+    // eager-decode head-of-line failure the 64 KiB spec eliminates.
+    for (const descriptor of this.listPendingEventDescriptors()) {
+      const loaded = this.openPendingEventSource(descriptor);
+      if (!loaded.ok) continue;
+      const { event, session, producerFingerprint } = loaded.source;
       const current = this.state.sessions[event.sessionId];
       const recent = this.state.recentEvents.some((candidate) => candidate.eventId === event.eventId);
       if (producerFingerprint) {
@@ -901,44 +1260,282 @@ export class BridgeStateStore {
     if (this.state.recentEvents.some((event) => event.eventId === eventId)) return;
     this.spool.remove(eventId);
   }
-  getInflightEventUpload(eventId: string): unknown | undefined { return this.openSpoolJson(`inflight:event:${eventId}`); }
-  persistInflightEventUpload(eventId: string, sessionId: string, upload: unknown): void {
-    if (!this.spool) throw new Error('encrypted spool is not initialized');
-    this.spool.enqueue({ spoolItemId: `inflight:event:${eventId}`, sessionId, eventId, payloadKind: 'event-upload-v3',
-      createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) });
+  /**
+   * §5.1 storage API: pending Event descriptors passing the current outer spool
+   * schema/relationship preflight, in stable order, WITHOUT decoding payloads.
+   */
+  listPendingEventDescriptors(): PendingEventDescriptor[] {
+    if (!this.spool) return [];
+    return this.spool.list('event-source-v3')
+      .filter((item) => !item.eventId || !this.state.terminalCancellations?.[item.eventId])
+      .map((item) => ({ eventId: item.eventId ?? item.spoolItemId, sessionId: item.sessionId }));
   }
-  replaceInflightEventUpload(eventId: string, sessionId: string, upload: unknown): void {
+
+  /**
+   * §4.5.5: every event-upload-v3 inflight item classified without opening the
+   * source: 'v2' (already converted), 'legacy' (parseable raw upload), or
+   * 'malformed' (unparseable/unsupported shape — byte-preserved, fail-closed).
+   */
+  listEventInflightRecords(): Array<{ eventId: string; sessionId: string; kind: 'v2' | 'legacy' | 'malformed' }> {
+    if (!this.spool) return [];
+    const records: Array<{ eventId: string; sessionId: string; kind: 'v2' | 'legacy' | 'malformed' }> = [];
+    for (const item of this.spool.list('event-upload-v3')) {
+      const eventId = item.eventId ?? item.spoolItemId.replace(/^inflight:event:/, '');
+      let parsed: unknown;
+      try { parsed = this.openSpoolJson(item.spoolItemId); } catch { parsed = undefined; }
+      let kind: 'v2' | 'legacy' | 'malformed';
+      if (isEventInflightRecordV2(parsed)) kind = 'v2';
+      else if (isEncryptedEventUploadRecord(parsed)) kind = 'legacy';
+      else kind = 'malformed';
+      records.push({ eventId, sessionId: item.sessionId ?? '', kind });
+    }
+    return records;
+  }
+
+
+  /**
+   * §5.1 storage API: open source and optional inflight for one descriptor and
+   * return an exact discriminated result. Inflight is parsed first (§5.2 step 2):
+   * a malformed inflight short-circuits to recovery-required. Spool AEAD / item
+   * invariant failures propagate (fail-closed) and are never mapped to a
+   * quarantine reason.
+   */
+  loadPendingEventParts(descriptor: PendingEventDescriptor): LoadPendingEventPartsResult {
     if (!this.spool) throw new Error('encrypted spool is not initialized');
+    const sourceResult = this.openPendingEventSource(descriptor);
+    const inflightItem = this.spool.get(`inflight:event:${descriptor.eventId}`);
+    let inflight: LoadedEventInflight | undefined;
+    if (inflightItem) {
+      const raw = this.spool.open(inflightItem);
+      let text: string;
+      try {
+        try { text = new TextDecoder('utf-8', { fatal: true }).decode(raw); }
+        catch { raw.fill(0); return { ok: false, reason: 'inflight-utf8-invalid' }; }
+        let parsed: unknown;
+        try { parsed = JSON.parse(text); } catch { raw.fill(0); return { ok: false, reason: 'inflight-json-invalid' }; }
+        if (isEventInflightRecordV2(parsed)) {
+          if (!uploadMatchesDescriptor(parsed.upload, descriptor)) {
+            raw.fill(0); return { ok: false, reason: 'inflight-shape-invalid' };
+          }
+          inflight = { kind: 'v2', raw, sourceDigest: parsed.sourceDigest, upload: parsed.upload };
+        } else if (isEncryptedEventUploadRecord(parsed)) {
+          if (!uploadMatchesDescriptor(parsed as E2EEventAndSessionUploadV3, descriptor)) {
+            raw.fill(0); return { ok: false, reason: 'inflight-shape-invalid' };
+          }
+          inflight = { kind: 'legacy', raw, upload: parsed as E2EEventAndSessionUploadV3 };
+        } else {
+          raw.fill(0); return { ok: false, reason: 'inflight-shape-invalid' };
+        }
+      } catch (error) {
+        raw.fill(0);
+        throw error;
+      }
+    }
+    if (!sourceResult.ok) return { ok: false, reason: sourceResult.reason, inflight };
+    return { ok: true, source: sourceResult.source, inflight };
+  }
+
+  /**
+   * §5.1 storage API: atomic raw dead-letter that does NOT depend on parsing the
+   * source JSON. Replaces the source (and the inflight only when its raw bytes
+   * are proven uncommitted) with one `event-dead-letter-v3` item via a SINGLE
+   * durable `spool.replace()`; no unrelated state persist follows.
+   */
+  quarantinePendingEventRaw(
+    descriptor: PendingEventDescriptor,
+    reasonCode: EventDeadLetterReasonCode,
+    provenUncommittedInflight?: Uint8Array,
+    quarantinedAt = new Date().toISOString(),
+  ): boolean {
+    if (!this.spool) throw new Error('encrypted spool is not initialized');
+    const sourceItem = this.spool.get(descriptor.eventId);
+    if (!sourceItem) return false;
+    const inflightItem = this.spool.get(`inflight:event:${descriptor.eventId}`);
+    if (inflightItem && !provenUncommittedInflight) {
+      throw new TypeError('pending Event inflight must be proven uncommitted before quarantine');
+    }
+    let currentInflight: Uint8Array | undefined;
+    if (inflightItem) {
+      currentInflight = this.spool.open(inflightItem);
+      if (!provenUncommittedInflight || !equalBytes(currentInflight, provenUncommittedInflight)) {
+        currentInflight.fill(0);
+        throw new TypeError('pending Event inflight evidence changed before quarantine');
+      }
+    }
+    const sourceRaw = this.spool.open(sourceItem);
+    try {
+      const record: EventDeadLetterRecordV2 = {
+        version: 2,
+        eventId: descriptor.eventId,
+        sessionId: descriptor.sessionId,
+        reasonCode,
+        quarantinedAt,
+        sourceArchive: { encoding: 'base64url', bytes: base64UrlEncode(sourceRaw) },
+        ...(provenUncommittedInflight ? { inflightArchive: { encoding: 'base64url', bytes: base64UrlEncode(provenUncommittedInflight) } } : {}),
+      };
+      this.spool.replace(
+        [descriptor.eventId, `inflight:event:${descriptor.eventId}`],
+        [{ spoolItemId: `dead-letter:event:${descriptor.eventId}`, sessionId: descriptor.sessionId, eventId: descriptor.eventId,
+          payloadKind: 'event-dead-letter-v3', createdAt: quarantinedAt,
+          plaintext: new TextEncoder().encode(JSON.stringify(record)) }],
+      );
+      return true;
+    } finally {
+      sourceRaw.fill(0);
+      currentInflight?.fill(0);
+      provenUncommittedInflight?.fill(0);
+    }
+  }
+
+  hasEventUploadCompletion(eventId: string): boolean {
+    return this.state.eventUploadCompletions?.[eventId] !== undefined;
+  }
+
+  private openPendingEventSource(
+    descriptor: PendingEventDescriptor,
+  ): { ok: true; source: PendingEventSource } | { ok: false; reason: 'source-utf8-invalid' | 'source-json-invalid' | 'source-shape-invalid' | 'source-binding-invalid' | 'source-missing' } {
+    if (!this.spool) throw new Error('encrypted spool is not initialized');
+    const item = this.spool.get(descriptor.eventId);
+    if (!item) return { ok: false, reason: 'source-missing' };
+    const raw = this.spool.open(item);
+    try {
+      let text: string;
+      try { text = new TextDecoder('utf-8', { fatal: true }).decode(raw); }
+      catch { return { ok: false, reason: 'source-utf8-invalid' }; }
+      let parsed: unknown;
+      try { parsed = JSON.parse(text); } catch { return { ok: false, reason: 'source-json-invalid' }; }
+      // §5.2 exact canonical shape: unknown fields, wrong types, or a broken
+      // type/status/needHuman invariant are NOT silently stripped — the tuple
+      // is rejected as shape-invalid and handled by the dead-letter/recovery path.
+      if (!isRecord(parsed) || !hasExactOptionalKeys(parsed, ['event', 'session'], ['producerFingerprint'])
+        || !isCanonicalEventShape(parsed.event) || !isCanonicalSessionShape(parsed.session)) {
+        return { ok: false, reason: 'source-shape-invalid' };
+      }
+      try {
+        assertEventSessionBinding(parsed.event as CanonicalEvent, parsed.session as CanonicalSessionState);
+      } catch {
+        return { ok: false, reason: 'source-binding-invalid' };
+      }
+      // §5.2: the decoded tuple must also be bound to the OUTER spool descriptor;
+      // an internally valid tuple B under descriptor A must never be published or
+      // journaled under A's identity.
+      if ((parsed.event as CanonicalEvent).eventId !== descriptor.eventId
+        || (parsed.session as CanonicalSessionState).sessionId !== descriptor.sessionId) {
+        return { ok: false, reason: 'source-binding-invalid' };
+      }
+      if (parsed.producerFingerprint !== undefined && typeof parsed.producerFingerprint !== 'string') {
+        return { ok: false, reason: 'source-json-invalid' };
+      }
+      return {
+        ok: true,
+        source: {
+          event: parsed.event as CanonicalEvent,
+          session: parsed.session as CanonicalSessionState,
+          ...(typeof parsed.producerFingerprint === 'string' ? { producerFingerprint: parsed.producerFingerprint } : {}),
+        },
+      };
+    } finally { raw.fill(0); }
+  }
+
+  openInflightEventRaw(eventId: string): Uint8Array | undefined {
+    if (!this.spool) throw new Error('encrypted spool is not initialized');
+    const item = this.spool.get(`inflight:event:${eventId}`);
+    return item ? this.spool.open(item) : undefined;
+  }
+
+  getInflightEventUpload(eventId: string): unknown | undefined {
+    let parsed: unknown;
+    try { parsed = this.openSpoolJson(`inflight:event:${eventId}`); } catch { return undefined; }
+    if (parsed === undefined) return undefined;
+    return isEventInflightRecordV2(parsed) ? parsed.upload : parsed;
+  }
+  persistInflightEventUpload(eventId: string, sessionId: string, upload: unknown, sourceDigest?: string): void {
+    if (!this.spool) throw new Error('encrypted spool is not initialized');
+    const record = withSourceDigestWrapper(upload, sourceDigest);
+    this.spool.enqueue({ spoolItemId: `inflight:event:${eventId}`, sessionId, eventId, payloadKind: 'event-upload-v3',
+      createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(record)) });
+  }
+  replaceInflightEventUpload(eventId: string, sessionId: string, upload: unknown, sourceDigest?: string): void {
+    if (!this.spool) throw new Error('encrypted spool is not initialized');
+    const record = withSourceDigestWrapper(upload, sourceDigest);
     this.spool.replace([`inflight:event:${eventId}`], [{ spoolItemId: `inflight:event:${eventId}`, sessionId, eventId,
-      payloadKind: 'event-upload-v3', createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) }]);
+      payloadKind: 'event-upload-v3', createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(record)) }]);
   }
   removeInflightEventUpload(eventId: string): void { this.spool?.remove(`inflight:event:${eventId}`); }
   listInflightSessionIds(): string[] { return this.spool?.list('session-upload-v3').map((item) => item.sessionId) ?? []; }
-  getInflightSessionUpload(sessionId: string): unknown | undefined { return this.openSpoolJson(`inflight:session:${sessionId}`); }
-  persistInflightSessionUpload(sessionId: string, upload: unknown): void {
-    if (!this.spool) throw new Error('encrypted spool is not initialized');
-    this.spool.enqueue({ spoolItemId: `inflight:session:${sessionId}`, sessionId, payloadKind: 'session-upload-v3',
-      createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) });
+  getInflightSessionUpload(sessionId: string): unknown | undefined {
+    const lookup = this.getSessionInflightLookup(sessionId);
+    if (lookup.kind === 'missing') return undefined;
+    if (lookup.kind === 'v2' || lookup.kind === 'legacy') return lookup.upload;
+    // §4.4/§5.1: malformed or cross-bound evidence must never be silently
+    // rebuilt over; the publication flow fails closed so recovery surfaces it.
+    throw new TypeError('Session inflight evidence is malformed or cross-bound (recovery required)');
   }
-  replaceInflightSessionUpload(sessionId: string, upload: unknown): void {
+  /**
+   * §5.1: discriminated Session inflight lookup. `malformed` (unparseable or
+   * non-shape bytes) and `cross-bound` (inner sessionId != outer spool key)
+   * stay byte-preserved and fail closed; `v2`/`legacy` are the usable forms.
+   */
+  getSessionInflightLookup(sessionId: string): SessionInflightLookup {
+    let parsed: unknown;
+    try { parsed = this.openSpoolJson(`inflight:session:${sessionId}`); } catch { return { kind: 'malformed' }; }
+    if (parsed === undefined) return { kind: 'missing' };
+    if (isSessionInflightRecordV2(parsed)) {
+      const upload = (parsed as SessionInflightRecordV2).upload;
+      return upload.sessionId === sessionId ? { kind: 'v2', upload } : { kind: 'cross-bound', upload };
+    }
+    if (isEncryptedSessionUploadShape(parsed)) {
+      const upload = parsed as unknown as EncryptedSessionSnapshotUploadV3;
+      return upload.sessionId === sessionId ? { kind: 'legacy', upload } : { kind: 'cross-bound', upload };
+    }
+    return { kind: 'malformed' };
+  }
+  /**
+   * §6.1/§4.4: returns the V2 source-digest wrapper for an existing Session inflight
+   * so the publication flow can prove whether the inflight matches the immutable
+   * current source before reuse or rebuild. Legacy (unwrapped) records and malformed
+   * bytes return undefined; the legacy raw record stays byte-preserved.
+   */
+  getSessionInflightRecordV2(sessionId: string): SessionInflightRecordV2 | undefined {
+    let parsed: unknown;
+    try { parsed = this.openSpoolJson(`inflight:session:${sessionId}`); } catch { return undefined; }
+    if (parsed === undefined || !isSessionInflightRecordV2(parsed)) return undefined;
+    return parsed as SessionInflightRecordV2;
+  }
+  /**
+   * §4.5.5 online conversion: returns the session inflight upload only when the
+   * persisted record is still the legacy raw form (no V2 source-digest wrapper).
+   * Malformed records return undefined and stay byte-preserved (recovery-required
+   * surfaces through the normal flows); the V2 wrapper is never returned here.
+   */
+  getLegacyInflightSessionUpload(sessionId: string): EncryptedSessionSnapshotUploadV3 | undefined {
+    const lookup = this.getSessionInflightLookup(sessionId);
+    return lookup.kind === 'legacy' ? lookup.upload : undefined;
+  }
+  persistInflightSessionUpload(sessionId: string, upload: unknown, sourceDigest?: string): void {
+    this.assertSessionUploadBoundTo(sessionId, upload);
     if (!this.spool) throw new Error('encrypted spool is not initialized');
+    const record = withSourceDigestWrapper(upload, sourceDigest);
+    this.spool.enqueue({ spoolItemId: `inflight:session:${sessionId}`, sessionId, payloadKind: 'session-upload-v3',
+      createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(record)) });
+  }
+  replaceInflightSessionUpload(sessionId: string, upload: unknown, sourceDigest?: string): void {
+    this.assertSessionUploadBoundTo(sessionId, upload);
+    if (!this.spool) throw new Error('encrypted spool is not initialized');
+    const record = withSourceDigestWrapper(upload, sourceDigest);
     this.spool.replace([`inflight:session:${sessionId}`], [{ spoolItemId: `inflight:session:${sessionId}`, sessionId,
-      payloadKind: 'session-upload-v3', createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(upload)) }]);
+      payloadKind: 'session-upload-v3', createdAt: new Date().toISOString(), plaintext: new TextEncoder().encode(JSON.stringify(record)) }]);
+  }
+  /** §4.4/§5.1: an inflight upload written under `sessionId` must carry the same
+   * inner sessionId — a cross-bound write is a local invariant violation and
+   * fails closed instead of corrupting the evidence cursor. */
+  private assertSessionUploadBoundTo(sessionId: string, upload: unknown): void {
+    if (isRecord(upload) && typeof upload.sessionId === 'string' && upload.sessionId !== sessionId) {
+      throw new TypeError('Session inflight upload is bound to a different Session');
+    }
   }
   removeInflightSessionUpload(sessionId: string): void { this.spool?.remove(`inflight:session:${sessionId}`); }
-  clearInflightSessionUploads(sessionIds?: readonly string[]): number {
-    const ids = sessionIds ? new Set(sessionIds) : undefined;
-    let removed = 0;
-    if (!this.spool) return 0;
-    const shouldRemove = (sessionId: string): boolean => !ids || ids.has(sessionId);
-    for (const item of this.spool.list('session-upload-v3')) {
-      if (!shouldRemove(item.sessionId)) continue;
-      this.spool.remove(item.spoolItemId);
-      removed += 1;
-    }
-    if (removed > 0) this.persist();
-    return removed;
-  }
+
   private openSpoolJson(itemId: string): unknown | undefined {
     const item = this.spool?.get(itemId); if (!item) return undefined; const bytes = this.spool!.open(item);
     try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); } finally { bytes.fill(0); }
@@ -1076,7 +1673,12 @@ export class BridgeStateStore {
     const uploads = [
       ...this.peekPendingUploads(),
       ...this.state.recentEvents.flatMap((event) => [this.getInflightEventUpload(event.eventId)]),
-      ...this.listInflightSessionIds().map((sessionId) => this.getInflightSessionUpload(sessionId)),
+      ...this.listInflightSessionIds().map((sessionId) => {
+        // §4.4/§5.1: malformed/cross-bound evidence must not break retention
+        // pinning; it contributes no decryptable upload references.
+        const lookup = this.getSessionInflightLookup(sessionId);
+        return lookup.kind === 'v2' || lookup.kind === 'legacy' ? lookup.upload : undefined;
+      }),
     ];
     for (const upload of uploads) collectEncryptedUploadPinReferences(upload, contentRetainedThrough, retainThrough);
     return Object.keys(contentRetainedThrough).length === 0 ? {} : { contentRetainedThrough };
@@ -1388,9 +1990,9 @@ function isRuntimeResetHooks(value: SecureFileWriteHooks | RuntimeResetHooks | u
   return value !== undefined && ('write' in value || 'remove' in value || 'recoveryStep' in value);
 }
 
-function isCurrentStateRecord(value: Record<string, unknown>): boolean {
+function isStateRecordOfShape(value: Record<string, unknown>, schemaVersion: number): boolean {
   if (!hasExactOptionalKeys(value, CURRENT_STATE_REQUIRED_KEYS, CURRENT_STATE_OPTIONAL_KEYS)
-    || value.schemaVersion !== BRIDGE_RUNTIME_STATE_SCHEMA_VERSION || !isRuntimeEpoch(value.runtimeResetEpoch)
+    || value.schemaVersion !== schemaVersion || !isRuntimeEpoch(value.runtimeResetEpoch)
     || !(value.host === null || isCurrentHost(value.host)) || !isValueMap(value.sessions, isCurrentSession)
     || !isStringMap(value.sessionDrivers) || !isTrueMap(value.reconciledDrivers)
     || !Array.isArray(value.recentEvents) || !value.recentEvents.every(isCurrentEvent)
@@ -1402,6 +2004,19 @@ function isCurrentStateRecord(value: Record<string, unknown>): boolean {
     && (value.producerEventReservations === undefined || isValueMap(value.producerEventReservations, isCurrentProducerReservation))
     && (value.terminalCancellations === undefined || isValueMap(value.terminalCancellations, isCurrentTerminalCancellation))
     && (value.runtimeHealth === undefined || isCurrentRuntimeHealth(value.runtimeHealth));
+}
+
+function isCurrentStateRecord(value: Record<string, unknown>): boolean {
+  return isStateRecordOfShape(value, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION);
+}
+
+/** Schema4 record: the exact current-state shape with the v4 version literal. */
+function isPriorStateRecordV4(value: Record<string, unknown>, hostId: string): boolean {
+  if (!isStateRecordOfShape(value, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION)) return false;
+  try {
+    assertCurrentStateRelationships(value as unknown as PersistedBridgeState, hostId);
+    return true;
+  } catch { return false; }
 }
 
 function parseCurrentState(value: unknown, hostId?: string): PersistedBridgeState {
@@ -1526,8 +2141,8 @@ function migrateStateV3ToV4(value: Record<string, unknown>, hostId: string): Per
     },
   ]));
   const snapshot = value.currentSessionsSnapshot as PersistedCurrentSessionsSnapshotState;
-  return parseCurrentState({
-    schemaVersion: 4, runtimeResetEpoch: value.runtimeResetEpoch, host: structuredClone(value.host),
+  const target = {
+    schemaVersion: PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, runtimeResetEpoch: value.runtimeResetEpoch, host: structuredClone(value.host),
     sessions, sessionDrivers: structuredClone(value.sessionDrivers), reconciledDrivers: structuredClone(value.reconciledDrivers),
     recentEvents: [], sessionRevisions: structuredClone(value.sessionRevisions),
     ...(value.recipientSetVersion === undefined ? {} : { recipientSetVersion: value.recipientSetVersion }),
@@ -1535,13 +2150,29 @@ function migrateStateV3ToV4(value: Record<string, unknown>, hostId: string): Per
     currentSessionsSnapshot: { version: 1,
       lastAllocatedRevision: Math.max(snapshot.lastAllocatedRevision, snapshot.lastAcceptedRevision), lastAcceptedRevision: 0 },
     ...(value.runtimeHealth === undefined ? {} : { runtimeHealth: structuredClone(value.runtimeHealth) }),
-  }, hostId);
+  };
+  if (!isPriorStateRecordV4(target, hostId)) throw new Error('migrated Bridge runtime schema v4 is invalid');
+  return target as unknown as PriorV4BridgeState;
 }
 function migrateSpoolV3ToV4(value: Record<string, unknown>, hostId: string, epoch: string): LocalSpoolFileV2 {
   if (!isSpoolRecordForSchema(value, PRIOR_RUNTIME_STATE_SCHEMA_VERSION, hostId, epoch, 'current')) {
     throw new Error('Bridge runtime spool schema v3 is invalid');
   }
   return { ...(structuredClone(value) as unknown as LocalSpoolFileV2), runtimeStateSchemaVersion: 4, items: [] };
+}
+
+function migrateStateV4ToV5(value: Record<string, unknown>, hostId: string): PersistedBridgeState {
+  if (!isPriorStateRecordV4(value, hostId)) throw new Error('Bridge runtime schema v4 is invalid');
+  const state = structuredClone(value) as Record<string, unknown>;
+  state.schemaVersion = BRIDGE_RUNTIME_STATE_SCHEMA_VERSION;
+  return parseCurrentState(state, hostId);
+}
+
+function migrateSpoolV4ToV5(value: Record<string, unknown>, hostId: string, epoch: string): LocalSpoolFileV2 {
+  if (!isSpoolRecordForSchema(value, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, hostId, epoch, 'current')) {
+    throw new Error('Bridge runtime spool schema v4 is invalid');
+  }
+  return { ...(structuredClone(value) as unknown as LocalSpoolFileV2), runtimeStateSchemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION };
 }
 
 function isRecognizedPriorStateRecord(value: Record<string, unknown> | undefined, hostId: string): boolean {
@@ -1610,10 +2241,19 @@ function parseCurrentSpoolRecord(value: Record<string, unknown>, hostId: string,
   return structuredClone(value) as unknown as LocalSpoolFileV2;
 }
 
+function parsePriorV4SpoolRecord(value: Record<string, unknown>, hostId: string, epoch: string): LocalSpoolFileV2 {
+  if (!isSpoolRecordForSchema(value, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, hostId, epoch, 'current')) {
+    throw new Error('prior Bridge runtime spool schema is invalid');
+  }
+  return structuredClone(value) as unknown as LocalSpoolFileV2;
+}
+
 function isSpoolRecordForSchema(
-  value: Record<string, unknown>, schemaVersion: 2 | 3 | 4, hostId: string, epoch: string, kind: 'current' | 'standalone-v2',
+  value: Record<string, unknown>, schemaVersion: 2 | 3 | 4 | 5, hostId: string, epoch: string, kind: 'current' | 'standalone-v2',
 ): boolean {
-  const spoolKind = schemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION ? 'current' : 'obsolete-v2';
+  // Schema4 and schema5 spools both carry the current v3 payload kinds; only
+  // schemas 2/3 use the obsolete-v2 kinds.
+  const spoolKind = schemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION || schemaVersion === PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION ? 'current' : 'obsolete-v2';
   return hasExactKeys(value, ['version', 'runtimeStateSchemaVersion', 'runtimeResetEpoch', 'hostId', 'keyId', 'items'])
     && value.version === 2 && value.runtimeStateSchemaVersion === schemaVersion
     && value.runtimeResetEpoch === epoch && value.hostId === hostId && isVerifier(value.keyId)
@@ -1750,10 +2390,10 @@ function assertResetSpoolMember(
   }
 }
 
-function runtimeSchemaFloor(statePath: string, hostId: string): RuntimeSchemaFloorV1 {
+function runtimeSchemaFloor(statePath: string, hostId: string, minSchemaVersion: 4 | 5): RuntimeSchemaFloorV1 {
   const resolvedStatePath = resolve(statePath);
   return {
-    version: 1, hostId, minSchemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION,
+    version: 1, hostId, minSchemaVersion,
     statePath: resolvedStatePath, spoolPath: resolve(spoolPathForState(resolvedStatePath)),
   };
 }
@@ -1763,10 +2403,11 @@ function parseRuntimeSchemaFloor(
  ): RuntimeSchemaFloorV1 {
   if (!value || !hasExactKeys(value, ['version', 'hostId', 'minSchemaVersion', 'statePath', 'spoolPath'])
     || value.version !== 1 || value.hostId !== hostId
-    || value.minSchemaVersion !== BRIDGE_RUNTIME_STATE_SCHEMA_VERSION) {
+    || (value.minSchemaVersion !== PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION
+      && value.minSchemaVersion !== BRIDGE_RUNTIME_STATE_SCHEMA_VERSION)) {
     throw new Error('Bridge runtime schema floor is invalid');
   }
-  const expected = runtimeSchemaFloor(statePath, hostId);
+  const expected = runtimeSchemaFloor(statePath, hostId, value.minSchemaVersion as 4 | 5);
   if (value.statePath !== expected.statePath || value.spoolPath !== expected.spoolPath) {
     throw new Error('Bridge runtime schema floor path binding is invalid');
   }
@@ -1779,7 +2420,7 @@ function parseMigrationIntent(value: unknown, statePath: string): RuntimeMigrati
     'stateSourceHash', 'spoolSourceHash', 'floorSourceHash', 'stateTargetHash', 'spoolTargetHash', 'floorTargetHash',
     'stateTarget', 'spoolTarget', 'floorTarget', 'createdAt',
   ]) || value.version !== MIGRATION_INTENT_VERSION || value.fromSchemaVersion !== PRIOR_RUNTIME_STATE_SCHEMA_VERSION
-    || value.toSchemaVersion !== BRIDGE_RUNTIME_STATE_SCHEMA_VERSION || !isNonEmptyString(value.hostId)
+    || value.toSchemaVersion !== PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION || !isNonEmptyString(value.hostId)
     || !isAbsoluteResolvedPath(value.statePath) || !isAbsoluteResolvedPath(value.spoolPath)
     || !isAbsoluteResolvedPath(value.floorPath) || !isAbsoluteResolvedPath(value.intentPath)
     || !isRuntimeHash(value.stateSourceHash) || !isRuntimeHash(value.spoolSourceHash) || !isRuntimeHash(value.floorSourceHash)
@@ -1799,15 +2440,57 @@ function parseMigrationIntent(value: unknown, statePath: string): RuntimeMigrati
 }
 
 function assertMigrationIntentTargets(intent: RuntimeMigrationIntentV1): void {
+  if (!isPriorStateRecordV4(intent.stateTarget, intent.hostId)) throw new Error('Bridge runtime migration intent target is invalid');
+  const spool = parsePriorV4SpoolRecord(
+    intent.spoolTarget as unknown as Record<string, unknown>, intent.hostId, intent.stateTarget.runtimeResetEpoch,
+  );
+  const floor = parseRuntimeSchemaFloor(intent.floorTarget as unknown as Record<string, unknown>, intent.statePath, intent.hostId);
+  if (floor.minSchemaVersion !== PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION) throw new Error('Bridge runtime migration intent target is invalid');
+  assertCurrentRuntimeRelationships(intent.stateTarget as unknown as PersistedBridgeState, spool, intent.hostId);
+  if (hashBytes(serializeSecureJson(intent.stateTarget)) !== intent.stateTargetHash
+    || hashBytes(serializeSecureJson(intent.spoolTarget)) !== intent.spoolTargetHash
+    || hashBytes(serializeSecureJson(floor)) !== intent.floorTargetHash || intent.floorSourceHash !== ABSENT_HASH) {
+    throw new Error('Bridge runtime migration intent target hash is invalid');
+  }
+}
+
+function parseMigrationIntentV2(value: unknown, statePath: string): RuntimeMigrationIntentV2 {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    'version', 'fromSchemaVersion', 'toSchemaVersion', 'hostId', 'statePath', 'spoolPath', 'floorPath', 'intentPath',
+    'stateSourceHash', 'spoolSourceHash', 'floorSourceHash', 'stateTargetHash', 'spoolTargetHash', 'floorTargetHash',
+    'stateTarget', 'spoolTarget', 'floorTarget', 'createdAt',
+  ]) || value.version !== MIGRATION_INTENT_V2_VERSION
+    || value.fromSchemaVersion !== PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION
+    || value.toSchemaVersion !== BRIDGE_RUNTIME_STATE_SCHEMA_VERSION || !isNonEmptyString(value.hostId)
+    || !isAbsoluteResolvedPath(value.statePath) || !isAbsoluteResolvedPath(value.spoolPath)
+    || !isAbsoluteResolvedPath(value.floorPath) || !isAbsoluteResolvedPath(value.intentPath)
+    || !isRuntimeHash(value.stateSourceHash) || !isRuntimeHash(value.spoolSourceHash) || !isRuntimeHash(value.floorSourceHash)
+    || !isRuntimeHash(value.stateTargetHash) || !isRuntimeHash(value.spoolTargetHash) || !isRuntimeHash(value.floorTargetHash)
+    || !isNonEmptyString(value.createdAt) || !isCanonicalTimestamp(value.createdAt)) {
+    throw new Error('Bridge runtime migration intent is invalid');
+  }
+  const intent = value as unknown as RuntimeMigrationIntentV2;
+  const expectedStatePath = resolve(statePath);
+  if (intent.statePath !== expectedStatePath || intent.spoolPath !== resolve(spoolPathForState(expectedStatePath))
+    || intent.floorPath !== resolve(runtimeSchemaFloorPathForState(expectedStatePath))
+    || intent.intentPath !== resolve(runtimeMigrationIntentPathForState(expectedStatePath))) {
+    throw new Error('Bridge runtime migration intent path binding is invalid');
+  }
+  assertMigrationIntentV2Targets(intent);
+  return intent;
+}
+
+function assertMigrationIntentV2Targets(intent: RuntimeMigrationIntentV2): void {
   const state = parseCurrentState(intent.stateTarget, intent.hostId);
   const spool = parseCurrentSpoolRecord(
     intent.spoolTarget as unknown as Record<string, unknown>, intent.hostId, state.runtimeResetEpoch,
   );
   const floor = parseRuntimeSchemaFloor(intent.floorTarget as unknown as Record<string, unknown>, intent.statePath, intent.hostId);
+  if (floor.minSchemaVersion !== BRIDGE_RUNTIME_STATE_SCHEMA_VERSION) throw new Error('Bridge runtime migration intent target is invalid');
   assertCurrentRuntimeRelationships(state, spool, intent.hostId);
   if (hashBytes(serializeSecureJson(intent.stateTarget)) !== intent.stateTargetHash
     || hashBytes(serializeSecureJson(intent.spoolTarget)) !== intent.spoolTargetHash
-    || hashBytes(serializeSecureJson(floor)) !== intent.floorTargetHash || intent.floorSourceHash !== ABSENT_HASH) {
+    || hashBytes(serializeSecureJson(floor)) !== intent.floorTargetHash) {
     throw new Error('Bridge runtime migration intent target hash is invalid');
   }
 }

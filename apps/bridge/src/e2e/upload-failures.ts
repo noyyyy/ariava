@@ -5,7 +5,7 @@ import { RelayClientError } from '../relay-client';
  * public event-failure hook surface. Values are stable contract strings; no
  * error text, ciphertext, or secrets ever appear here.
  */
-export type UploadFailureCategory = 'network' | 'http' | 'recipient-set' | 'session-revision' | 'event-content';
+export type UploadFailureCategory = 'network' | 'http' | 'recipient-set' | 'session-revision' | 'event-content' | 'local-validation' | 'local-spool-record';
 
 /** Category alias used by the Event upload decision and failure surfaces. */
 export type EncryptedEventFailureCategory = UploadFailureCategory;

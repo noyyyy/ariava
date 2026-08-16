@@ -24,7 +24,7 @@ import { probeHostPlatform } from './host-platform';
 import { loadUserConfig, resolveAriavaConfig, resolvePersistedAriavaConfig } from './host-manager/config';
 import { ensureAriavaSecureDirectories, pathHasFilesystemEvidence, readSecureJson, redactSensitive } from './host-manager/secure-files';
 import { createHostEncryptionBinding, createRuntimeHostEncryptionIdentityStore, HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostEncryptionIdentity, type HostEncryptionIdentityStore, type HostIdentity, type HostIdentityStore } from './identity';
-import { RelayClient, RelayClientError } from './relay-client';
+import { RelayClient, RelayClientError, RelayTransportError } from './relay-client';
 import { BridgeStateStore } from './state-store';
 import { assertProductionNodeRuntime } from './runtime/node-runtime';
 import { assertNodeCryptoSelfTest } from './e2e/node-crypto-self-test';
@@ -175,6 +175,65 @@ export class EncryptedEventFailureLogger {
   }
 }
 
+/**
+ * §6.2 Session publication outcome taxonomy (spec §6.2). `published`/`unchanged`
+ * allow the normal Event drain; `locally-blocked` allows Event drain only under
+ * the §6.2 conditions (stable accepted recipient version + no unconverged Session
+ * inflight); `deferred`/`fail-closed` keep the existing stop semantics.
+ */
+type SessionPublicationOutcome =
+  | { type: 'published' | 'unchanged' }
+  | { type: 'locally-blocked'; reason: 'content'; blockedSessionCount: number; recipientSetVersion: number }
+  | { type: 'deferred'; reason: 'network' | 'recipient-set' }
+  | { type: 'fail-closed' };
+
+/**
+ * §6.3 in-memory rate-limited Session publication block/recovery logger.
+ * Deliberately NOT the persisted `RuntimeHealthLogger` (which only accepts
+ * `driver | relay_presence` and writes `bridge_runtime_health`), and never
+ * touches the persisted `BridgeRuntimeHealth` exact schema. Fields are limited
+ * to the §6.3 allow-list; sessionId / byte counts / exception text / excerpts /
+ * ciphertext / keys / driver names are never written. `recovered` is emitted
+ * exactly once after a full publication success and clears the suppression
+ * state; after a restart the logger re-observes from scratch (no persistence).
+ */
+export class SessionPublicationBlockLogger {
+  private lastLogAt = Number.NEGATIVE_INFINITY;
+  private suppressed = 0;
+  private active = false;
+
+  constructor(
+    private readonly write: (line: string) => void = (line) => { process.stderr.write(line); },
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  blocked(blockedSessionCount: number): void {
+    const timestamp = this.now();
+    if (!this.active) this.active = true;
+    if (timestamp - this.lastLogAt < 30_000) {
+      this.suppressed += 1;
+      return;
+    }
+    const suppressed = this.suppressed;
+    this.suppressed = 0;
+    this.lastLogAt = timestamp;
+    this.write(`${JSON.stringify({
+      component: 'session_publication', outcome: 'blocked', code: 'protected_content_invalid',
+      blockedSessionCount, suppressed,
+    })}\n`);
+  }
+
+  recovered(): void {
+    if (!this.active) return;
+    this.active = false;
+    this.suppressed = 0;
+    this.lastLogAt = 0;
+    this.write(`${JSON.stringify({
+      component: 'session_publication', outcome: 'recovered', code: 'protected_content_invalid',
+    })}\n`);
+  }
+}
+
 export class BridgeDaemon {
   private relayClient?: RelayClient;
   private readonly stateStore: BridgeStateStore;
@@ -198,6 +257,7 @@ export class BridgeDaemon {
   private currentSessionsSnapshotFailureCount = 0;
   private lastCurrentSessionsSnapshotFailureLogAt = 0;
   private readonly encryptedEventFailureLogger = new EncryptedEventFailureLogger();
+  private readonly sessionPublicationBlockLogger = new SessionPublicationBlockLogger();
   private readonly runtimeHealthLogger = new RuntimeHealthLogger();
   private pollWaitTimer?: unknown;
   private pollWaitResolve?: () => void;
@@ -462,57 +522,99 @@ export class BridgeDaemon {
     // complete persisted set. Build the Host snapshot only from that reconciled store.
     const nextSessions = this.stateStore.listSessions();
     const activeSessions = nextSessions;
-    let encryptedPublishingReady = true;
+    let sessionPublicationOutcome: SessionPublicationOutcome = { type: 'deferred', reason: 'network' };
     if (authoritativeSetComplete && !offline) {
-      try { encryptedPublishingReady = await this.flushCurrentSessionsSnapshot(activeSessions); }
+      try {
+        sessionPublicationOutcome = await this.flushCurrentSessionsSnapshot(activeSessions);
+        if (sessionPublicationOutcome.type === 'deferred' && sessionPublicationOutcome.reason === 'network') offline = true;
+      }
       catch (error) {
         if (snapshotError(error, 'session_snapshot_conflict')) throw new Error('Relay rejected the persisted E2E lifecycle revision as conflicting', { cause: error });
-        const recovery = await this.handleCurrentSessionsSnapshotFailure(error, activeSessions);
-        offline = !recovery.online;
-        encryptedPublishingReady = recovery.encryptedPublishingReady;
+        if (!(error instanceof RelayClientError) && !(error instanceof RelayTransportError)) {
+          // Storage/canonicalization/keyring/crypto/Relay-response-shape faults are
+          // local fail-closed conditions, not evidence that the Host is offline.
+          // Keep unrelated handles/commands alive while Session/Event publication
+          // remains stopped for this pass.
+          this.logCurrentSessionsSnapshotFailure(error, activeSessions);
+          this.scheduleRegistryReconciliation();
+          sessionPublicationOutcome = { type: 'fail-closed' };
+        } else {
+          const recovery = await this.handleCurrentSessionsSnapshotFailure(error, activeSessions);
+          offline = !recovery.online;
+          sessionPublicationOutcome = recovery.outcome;
+        }
       }
     }
-    const flushedEvents = offline || !encryptedPublishingReady ? 0 : await this.flushPendingEvents();
+    if (sessionPublicationOutcome.type === 'published' || sessionPublicationOutcome.type === 'unchanged') {
+      this.sessionPublicationBlockLogger.recovered();
+    } else if (sessionPublicationOutcome.type === 'locally-blocked') {
+      this.sessionPublicationBlockLogger.blocked(sessionPublicationOutcome.blockedSessionCount);
+    }
+    const eventsMayDrain = !offline && this.eventsMayDrain(sessionPublicationOutcome);
+    const flushedEvents = !eventsMayDrain ? 0 : await this.flushPendingEvents();
     const flushedReads = offline ? 0 : await this.flushPendingHandles();
     const handledCommands = offline ? [] : await this.pullAndHandleCommands();
     return { host: this.stateStore.getHost(), sessions: nextSessions, emittedEvents: newEvents, flushedEvents, flushedReads, handledCommands, offline };
   }
 
+  /**
+   * §6.2: decides whether Event drain may proceed for the current Session
+   * publication outcome. `locally-blocked` drains only when the current recipient-
+   * set version equals the Bridge's last accepted version and there is no
+   * unconverged Session inflight evidence; `deferred`/`fail-closed` keep the
+   * existing stop semantics.
+   */
+  private eventsMayDrain(outcome: SessionPublicationOutcome): boolean {
+    if (outcome.type === 'published' || outcome.type === 'unchanged') return true;
+    if (outcome.type === 'locally-blocked') {
+      // §6.2: drain only when the recipient-set version used for the blocked pass
+      // matches the version proven by the last ACCEPTED manifest. The global
+      // recipientSetVersion is adopted at Session-ciphertext commit time (BEFORE
+      // the manifest is accepted), so it is not proof of accepted coverage.
+      const accepted = this.stateStore.getCurrentSessionsSnapshotState();
+      return accepted.lastAcceptedRecipientSetVersion === outcome.recipientSetVersion
+        && this.stateStore.listInflightSessionIds().length === 0;
+    }
+    return false;
+  }
+
   private resetCurrentSessionsSnapshotFailures(): void { this.currentSessionsSnapshotFailureCount = 0; }
 
-  private async handleCurrentSessionsSnapshotFailure(error: unknown, activeSessions: CanonicalSessionState[]): Promise<{ online: boolean; encryptedPublishingReady: boolean }> {
+  private async handleCurrentSessionsSnapshotFailure(error: unknown, activeSessions: CanonicalSessionState[]): Promise<{ online: boolean; outcome: SessionPublicationOutcome }> {
     this.currentSessionsSnapshotFailureCount += 1;
     this.logCurrentSessionsSnapshotFailure(error, activeSessions);
     this.scheduleRegistryReconciliation();
-    if (this.currentSessionsSnapshotFailureCount < 2) return { online: false, encryptedPublishingReady: false };
+    if (this.currentSessionsSnapshotFailureCount < 2) return { online: false, outcome: { type: 'deferred', reason: 'network' } };
     try {
       await this.recoverCurrentSessionsSnapshotPipeline(activeSessions);
       const recoveredAfter = this.currentSessionsSnapshotFailureCount;
-      const encryptedPublishingReady = await this.flushCurrentSessionsSnapshot(activeSessions);
+      const outcome = await this.flushCurrentSessionsSnapshot(activeSessions);
       this.resetCurrentSessionsSnapshotFailures();
-      if (!encryptedPublishingReady) {
+      if (outcome.type === 'deferred') {
         if (this.reconciliationTimer !== undefined) {
           this.reconciliationScheduler.cancel(this.reconciliationTimer);
           this.reconciliationTimer = undefined;
         }
-        return { online: true, encryptedPublishingReady: false };
+        return { online: true, outcome };
       }
       process.stderr.write(`Ariava recovered current-session snapshot publication after ${recoveredAfter} failure(s).\n`);
-      return { online: true, encryptedPublishingReady: true };
+      return { online: true, outcome };
     } catch (recoveryError) {
       this.logCurrentSessionsSnapshotFailure(recoveryError, activeSessions, 'recovery');
       this.scheduleRegistryReconciliation();
-      return { online: false, encryptedPublishingReady: false };
+      return { online: false, outcome: { type: 'deferred', reason: 'network' } };
     }
   }
 
-  private async recoverCurrentSessionsSnapshotPipeline(activeSessions: CanonicalSessionState[]): Promise<void> {
+  private async recoverCurrentSessionsSnapshotPipeline(_activeSessions: CanonicalSessionState[]): Promise<void> {
     if (this.encryptionStore) {
       this.keyring = new LocalLinkKeyring(
         `${this.config.identityPath}.e2e-keyring.json`, this.encryptionStore, this.keyringMigrationContext,
       );
     }
-    this.stateStore.clearInflightSessionUploads(activeSessions.map((session) => session.sessionId));
+    // `flushCurrentSessionsSnapshot()` performs the exact all-inflight reconcile
+    // after immutable full-set preflight. Keeping one owner avoids reconciling and
+    // then losing the fact that a replacement manifest must be forced.
   }
 
   private logCurrentSessionsSnapshotFailure(error: unknown, activeSessions: CanonicalSessionState[], phase = 'publish'): void {
@@ -642,7 +744,10 @@ export class BridgeDaemon {
     this.resetCurrentSessionsSnapshotFailures();
   }
 
-  private async flushCurrentSessionsSnapshot(currentSessions: CanonicalSessionState[]): Promise<boolean> {
+  private async flushCurrentSessionsSnapshot(currentSessions: CanonicalSessionState[]): Promise<SessionPublicationOutcome> {
+    // §6.1/§4.4: `currentSessions` is the single immutable snapshot for preflight,
+    // revision allocation, encryption, and the manifest — the orchestrator never
+    // re-reads the mutable store mid-pass (no split snapshot / TOCTOU).
     for (let attempt = 0; attempt < 4; attempt += 1) {
       let recipientSnapshot: Awaited<ReturnType<RelayClient['recipientSnapshot']>>;
       try {
@@ -650,20 +755,53 @@ export class BridgeDaemon {
       } catch (error) {
         if (snapshotError(error, 'e2e_recipient_not_ready')) {
           this.resetCurrentSessionsSnapshotFailures();
-          return false;
+          return { type: 'deferred', reason: 'recipient-set' };
         }
         throw error;
       }
       if (!this.keyring || !this.encryptionIdentity) throw new Error('E2E lifecycle encryption is unavailable');
       const recipients = this.keyring.reconcileRecipients(recipientSnapshot);
+
+      // §6.1: full-set content preflight BEFORE createCurrentSessionsPublication so a
+      // content block never allocates a publication revision, never creates/replaces
+      // inflight, and never sends a manifest. The Relay keeps its last accepted
+      // membership; the local Sessions keep receiving heartbeats/content updates.
+      const blockedSessionCount = this.uploadOrchestrator().preflightAuthoritativeSessionSet(currentSessions);
+      if (blockedSessionCount > 0) {
+        // §4.4: a content block must NOT strand committed Session inflight evidence;
+        // converge it (revision + inflight removal) before returning locally-blocked.
+        // Uncommitted/unknown evidence stays byte-preserved; malformed/cross-bound
+        // evidence fails closed (recovery-required).
+        const reconciled = await this.uploadOrchestrator().reconcileSessionInflights(currentSessions);
+        if (reconciled.deferred) return { type: 'fail-closed' };
+        return { type: 'locally-blocked', reason: 'content', blockedSessionCount, recipientSetVersion: recipientSnapshot.recipientSetVersion };
+      }
+
+      // Even when the canonical content digest is unchanged, a lost Session upload
+      // response may leave a committed revision represented only by inflight evidence.
+      // Reconcile every active/orphan V2 or legacy record before deciding `unchanged`.
+      const hadSessionInflights = this.stateStore.listInflightSessionIds().length > 0;
+      const reconciled = await this.uploadOrchestrator().reconcileSessionInflights(currentSessions);
+      if (reconciled.deferred) return { type: 'fail-closed' };
+      const minimumRevision = hadSessionInflights
+        ? this.stateStore.getCurrentSessionsSnapshotState().lastAcceptedRevision + 1
+        : 0;
       let publication = await this.stateStore.createCurrentSessionsPublication(
-        this.config.hostId, currentSessions, recipientSnapshot.recipientSetVersion, isoNow(),
+        this.config.hostId, currentSessions, recipientSnapshot.recipientSetVersion, isoNow(), minimumRevision,
       );
-      if (!publication) return true;
-      const committed = await this.uploadOrchestrator().publishAuthoritativeSnapshots(
-        recipientSnapshot, recipients, currentSessions.map((session) => session.sessionId),
+      if (!publication) return { type: 'unchanged' };
+      const outcome = await this.uploadOrchestrator().publishAuthoritativeSnapshots(
+        recipientSnapshot, recipients, currentSessions,
       );
-      if (!committed) throw new Error('authoritative encrypted Session snapshot publication failed');
+      if (outcome.type !== 'published') {
+        // Preserve the explicit publication taxonomy. Deterministic fail-closed and
+        // recipient-set deferrals must not be reclassified as offline network faults.
+        if (outcome.type === 'locally-blocked') {
+          return { type: 'locally-blocked', reason: 'content', blockedSessionCount: 1, recipientSetVersion: recipientSnapshot.recipientSetVersion };
+        }
+        return outcome;
+      }
+      const committed = outcome;
       if (committed.recipientSetVersion !== publication.request.recipientSetVersion) {
         publication = await this.stateStore.createCurrentSessionsPublication(
           this.config.hostId, currentSessions, committed.recipientSetVersion, isoNow(),
@@ -677,11 +815,11 @@ export class BridgeDaemon {
       const finalized = { request, contentDigest: publication.contentDigest, digest: await canonicalE2ECurrentSessionsDigestV1(request) };
       try {
         await this.sendCurrentSessionsPublication(finalized);
-        return true;
+        return { type: 'published' };
       } catch (error) {
         if (snapshotError(error, 'e2e_recipient_not_ready')) {
           this.resetCurrentSessionsSnapshotFailures();
-          return false;
+          return { type: 'deferred', reason: 'recipient-set' };
         }
         const stale = snapshotError(error, 'session_snapshot_stale');
         const recipientsChanged = snapshotError(error, 'e2e_recipient_set_changed');

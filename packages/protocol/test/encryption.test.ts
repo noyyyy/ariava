@@ -26,6 +26,15 @@ function corrupt(value: string): string {
   bytes[Math.floor(bytes.length / 2)]! ^= 1;
   return base64UrlEncode(bytes);
 }
+
+function captureError(fn: () => unknown): unknown {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  throw new Error('expected function to throw');
+}
 import {
   COMMAND_TYPES,
   E2E_EPOCH_STATES,
@@ -48,6 +57,7 @@ import {
   buildWrapAAD,
   isEpochOperationAllowed,
   pairRootInfo,
+  ProtectedContentValidationError,
   validateEncryptedContentV1,
   validateEncryptionKeyBindingV1,
   validateNotificationPreviewEnvelopeV2,
@@ -307,29 +317,35 @@ describe('E2E runtime protocol v3 and key ceremony v1', () => {
 
 
   test('enforces limits on emitted canonical bytes and rejects descriptor bypasses', () => {
-    const eventOverhead = buildProtectedEventContentBytes({ version: 3, agentText: '' }).byteLength;
+    const eventOverhead = buildProtectedEventContentBytes({ version: 3, agentText: 'x' }).byteLength - 1;
     const maximumEvent = buildProtectedEventContentBytes({
       version: 3, agentText: 'x'.repeat(E2E_LIMITS.eventPlaintextBytes - eventOverhead),
     });
     expect(maximumEvent.byteLength).toBe(E2E_LIMITS.eventPlaintextBytes);
-    expect(() => buildProtectedEventContentBytes({
+    const oversizeEventError = captureError(() => buildProtectedEventContentBytes({
       version: 3, agentText: 'x'.repeat(E2E_LIMITS.eventPlaintextBytes - eventOverhead + 1),
-    })).toThrow();
+    }));
+    expect(oversizeEventError).toBeInstanceOf(ProtectedContentValidationError);
+    expect((oversizeEventError as ProtectedContentValidationError).code).toBe('protected-event-invalid');
 
-    const sessionOverhead = buildProtectedSessionContentBytes({ version: 3, projectName: '', nameText: '' }).byteLength;
+    const sessionOverhead = buildProtectedSessionContentBytes({ version: 3, projectName: 'x', nameText: 'x' }).byteLength - 1;
     const maximumSession = buildProtectedSessionContentBytes({
-      version: 3, projectName: '', nameText: 'x'.repeat(E2E_LIMITS.sessionPlaintextBytes - sessionOverhead),
+      version: 3, projectName: 'x', nameText: 'x'.repeat(E2E_LIMITS.sessionPlaintextBytes - sessionOverhead),
     });
     expect(maximumSession.byteLength).toBe(E2E_LIMITS.sessionPlaintextBytes);
-    expect(() => buildProtectedSessionContentBytes({
-      version: 3, projectName: '', nameText: 'x'.repeat(E2E_LIMITS.sessionPlaintextBytes - sessionOverhead + 1),
-    })).toThrow();
+    const oversizeSessionError = captureError(() => buildProtectedSessionContentBytes({
+      version: 3, projectName: 'x', nameText: 'x'.repeat(E2E_LIMITS.sessionPlaintextBytes - sessionOverhead + 1),
+    }));
+    expect(oversizeSessionError).toBeInstanceOf(ProtectedContentValidationError);
+    expect((oversizeSessionError as ProtectedContentValidationError).code).toBe('protected-session-invalid');
 
     let getterCalls = 0;
     const accessorEvent = Object.defineProperty({ version: 3 }, 'agentText', {
       enumerable: true, get: () => { getterCalls += 1; return 'hidden'; },
     });
-    expect(() => buildProtectedEventContentBytes(accessorEvent as never)).toThrow();
+    const accessorError = captureError(() => buildProtectedEventContentBytes(accessorEvent as never));
+    expect(accessorError).toBeInstanceOf(ProtectedContentValidationError);
+    expect((accessorError as ProtectedContentValidationError).code).toBe('protected-event-invalid');
     expect(getterCalls).toBe(0);
 
     const hiddenSession = { version: 3, projectName: 'ariava', nameText: 'session' };
@@ -340,6 +356,56 @@ describe('E2E runtime protocol v3 and key ceremony v1', () => {
     disguisedOversizeEvent.agentText = 'x'.repeat(E2E_LIMITS.eventPlaintextBytes);
     expect(JSON.stringify(disguisedOversizeEvent).length).toBeLessThan(E2E_LIMITS.eventPlaintextBytes);
     expect(() => buildProtectedEventContentBytes(disguisedOversizeEvent)).toThrow();
+  });
+
+  test('rejects empty protected strings in Event and Session content (Watch-consistent bounded text)', () => {
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: '' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: 'ok', humanText: '' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: 'ok', projectName: '' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: '', nameText: 'ok' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: 'ok', nameText: '' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: 'ok', nameText: 'ok', openingText: '' } as never)).toThrow(ProtectedContentValidationError);
+    // Every required string must stay non-empty.
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: 'ok' })).not.toThrow();
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: 'ok', nameText: 'ok' })).not.toThrow();
+  });
+
+  test('rejects lone surrogates in protected Event and Session text fields (well-formed Unicode)', () => {
+    // Lone high surrogate in required event text.
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: '\ud800' } as never)).toThrow(ProtectedContentValidationError);
+    // Lone low surrogate in optional event text fields.
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: 'ok', humanText: '\udc00' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: 'ok', projectName: 'a\ud800b' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: 'ok', workingDirectory: '\udc00' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: 'ok', harnessProvider: '\ud800' } as never)).toThrow(ProtectedContentValidationError);
+    // Session text fields.
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: '\ud800', nameText: 'ok' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: 'ok', nameText: '\udc00' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: 'ok', nameText: 'ok', openingText: '\ud800' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: 'ok', nameText: 'ok', latestActivityText: '\udc00' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: 'ok', nameText: 'ok', workingDirectory: '\ud800' } as never)).toThrow(ProtectedContentValidationError);
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: 'ok', nameText: 'ok', harnessProvider: '\udc00' } as never)).toThrow(ProtectedContentValidationError);
+    // Valid astral pairs (well-formed surrogate pairs) must still pass.
+    expect(() => buildProtectedEventContentBytes({ version: 3, agentText: '\u{1F600}' })).not.toThrow();
+    expect(() => buildProtectedSessionContentBytes({ version: 3, projectName: '\u{1F600}', nameText: 'ok' })).not.toThrow();
+  });
+
+  test('derives ciphertext bounds as plaintext + 16 for session and event and keeps reply/preview unchanged', () => {
+    expect(E2E_LIMITS.sessionPlaintextBytes).toBe(64 * 1024);
+    expect(E2E_LIMITS.eventPlaintextBytes).toBe(64 * 1024);
+    expect(E2E_LIMITS.replyPlaintextBytes).toBe(4_000);
+    expect(E2E_LIMITS.notificationPreviewPlaintextBytes).toBe(4_000);
+
+    const eventCipher = {
+      version: 1, suite: E2E_SUITE_V1, contentId: fixed.event.contentId, payloadKind: 'event-content-v3' as const,
+      nonce: fixed.event.contentNonce, ciphertext: fixed.event.ciphertext,
+    } as const;
+    const sessionCipher = { ...eventCipher, payloadKind: 'session-content-v3' as const } as const;
+
+    expect(validateEncryptedContentV1({ ...eventCipher, ciphertext: base64UrlEncode(new Uint8Array(E2E_LIMITS.eventPlaintextBytes + E2E_LIMITS.authenticationTagBytes)) })).toBe(true);
+    expect(validateEncryptedContentV1({ ...eventCipher, ciphertext: base64UrlEncode(new Uint8Array(E2E_LIMITS.eventPlaintextBytes + E2E_LIMITS.authenticationTagBytes + 1)) })).toBe(false);
+    expect(validateEncryptedContentV1({ ...sessionCipher, ciphertext: base64UrlEncode(new Uint8Array(E2E_LIMITS.sessionPlaintextBytes + E2E_LIMITS.authenticationTagBytes)) })).toBe(true);
+    expect(validateEncryptedContentV1({ ...sessionCipher, ciphertext: base64UrlEncode(new Uint8Array(E2E_LIMITS.sessionPlaintextBytes + E2E_LIMITS.authenticationTagBytes + 1)) })).toBe(false);
   });
 
   test('changes canonical bytes when generation, epoch, or direction changes', () => {
@@ -380,7 +446,7 @@ describe('E2E runtime protocol v3 and key ceremony v1', () => {
     expect(validateEncryptedContentV1(content)).toBe(true);
     expect(validateEncryptedContentV1({ ...content, payloadKind: 'event-content-v1' })).toBe(false);
     expect(validateEncryptedContentV1({ ...content, nonce: base64UrlEncode(new Uint8Array(11)) })).toBe(false);
-    expect(validateEncryptedContentV1({ ...content, ciphertext: base64UrlEncode(new Uint8Array(32 * 1024 + 17)) })).toBe(false);
+    expect(validateEncryptedContentV1({ ...content, ciphertext: base64UrlEncode(new Uint8Array(E2E_LIMITS.eventPlaintextBytes + E2E_LIMITS.authenticationTagBytes + 1)) })).toBe(false);
     const wrap = { version: 1, suite: E2E_SUITE_V1, contentId: fixed.event.contentId, linkId: fixed.link.linkId, linkGeneration: 7, epoch: 3, senderEncryptionKeyId: 'ekey_host_vector', recipientEncryptionKeyId: 'ekey_watch_vector', nonce: fixed.event.wrapNonce, ciphertext: fixed.event.wrappedDek } as const;
     expect(validateRecipientKeyWrapV1(wrap)).toBe(true);
     expect(validateRecipientKeyWrapV1({ ...wrap, ciphertext: base64UrlEncode(new Uint8Array(47)) })).toBe(false);

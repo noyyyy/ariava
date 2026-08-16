@@ -6,7 +6,7 @@ import {
   type EncryptedCommandEnvelopeV1,
   type SignedRequestHeaders,
 } from '@ariava/protocol';
-import { RelayClient } from '../src/relay-client';
+import { RelayClient, RelayTransportError } from '../src/relay-client';
 import type { HostRequestSigner } from '../src/identity';
 
 const emptySignature = 'A'.repeat(86);
@@ -123,10 +123,6 @@ describe('RelayClient signed v2 requests', () => {
         content: { ...structuredClone(encryptedCommand.payload.content), payloadKind: 'reply-content-v1' } } } as unknown as EncryptedCommandEnvelopeV1;
     const valid = [encryptedCommand, reply];
     const sparse = [encryptedCommand, reply]; delete sparse[1];
-    const customArrayPrototype = [encryptedCommand]; Object.setPrototypeOf(customArrayPrototype, Object.create(Array.prototype));
-    const extraArrayProperty = [encryptedCommand] as EncryptedCommandEnvelopeV1[] & { extra?: boolean }; extraArrayProperty.extra = true;
-    const symbolArrayProperty = [encryptedCommand]; Object.defineProperty(symbolArrayProperty, Symbol('extra'), { value: true, enumerable: true });
-    const customItem = Object.create({ inherited: true }); Object.assign(customItem, encryptedCommand);
     const topLevelNullPrototype = Object.assign(Object.create(null), { commands: valid });
     const malformed = [
       null, [], {}, { commands: [], extra: true }, { commands: 'not-an-array' },
@@ -140,23 +136,15 @@ describe('RelayClient signed v2 requests', () => {
       { commands: [{ commandId: 'legacy-interrupt', hostId, sessionId, type: 'interrupt', payload: {},
         issuedAt: encryptedCommand.issuedAt, expiresAt: encryptedCommand.expiresAt, nonce: 'legacy', watchDeviceId: watchId }] },
       { commands: [encryptedCommand, { ...encryptedCommand, payload: {} }] },
-      { commands: customArrayPrototype }, { commands: sparse }, { commands: extraArrayProperty },
-      { commands: symbolArrayProperty }, { commands: [customItem] },
+      { commands: sparse },
     ];
     const pull = async (body: unknown) => new RelayClient({
       baseUrl: 'https://relay.example', signer: new RecordingSigner(),
-      fetch: async () => ({ ok: true, status: 200, json: async () => body } as Response),
+      fetch: async () => Response.json(body),
     }).pullCommands(hostId, 20);
     expect(await pull({ commands: valid })).toEqual(valid);
     expect(await pull(topLevelNullPrototype)).toEqual(valid);
     for (const candidate of malformed) await expect(pull(candidate)).rejects.toThrow('command pull response is invalid');
-    const changingBatch: Record<string, unknown> = {}; let reads = 0;
-    Object.defineProperty(changingBatch, 'commands', { enumerable: true, get: () => { reads += 1; return valid; } });
-    await expect(new RelayClient({ baseUrl: 'https://relay.example', signer: new RecordingSigner(),
-      fetch: async () => ({ ok: true, status: 200, json: async () => changingBatch } as Response),
-    }).pullCommands(hostId, 20)).rejects.toThrow('command pull response is invalid');
-    expect(reads).toBe(0);
-    await expect(pull({ commands: [encryptedCommand, customItem] })).rejects.toThrow('command pull response is invalid');
     await expect(pull({ commands: valid })).resolves.toHaveLength(2);
   });
 
@@ -256,5 +244,29 @@ describe('RelayClient signed v2 requests', () => {
     expect(() => client.removeWatch('../watch', 1)).toThrow();
     expect(() => client.removeWatch(watchId, 0)).toThrow('positive safe integer');
     expect(() => client.markSessionRead('session%2Fbad', { latestReadEventId: 'evt', readAt: new Date().toISOString(), source: 'bridge_recovery' })).toThrow();
+  });
+
+  test.each([200, 503])('classifies status %d response-body stream failures as transport errors', async (status) => {
+    const client = new RelayClient({
+      baseUrl: 'https://relay.example', signer: new RecordingSigner(),
+      fetch: async () => new Response(new ReadableStream({
+        start(controller) { controller.error(new TypeError('socket interrupted')); },
+      }), { status }),
+    });
+    await expect(client.updateHost(metadata)).rejects.toBeInstanceOf(RelayTransportError);
+  });
+
+  test('keeps malformed Relay JSON outside the transport-error taxonomy', async () => {
+    const client = new RelayClient({
+      baseUrl: 'https://relay.example', signer: new RecordingSigner(),
+      fetch: async () => new Response('{not-json', { status: 200 }),
+    });
+    try {
+      await client.updateHost(metadata);
+      throw new Error('expected malformed JSON failure');
+    } catch (error) {
+      expect(error).not.toBeInstanceOf(RelayTransportError);
+      expect(error).toBeInstanceOf(SyntaxError);
+    }
   });
 });

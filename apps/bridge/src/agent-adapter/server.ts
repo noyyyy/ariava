@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import {
   AGENT_ADAPTER_PROTOCOL_HEADER,
   AGENT_ADAPTER_PROTOCOL_VERSION,
+  ProtectedContentValidationError,
   SESSION_STATUSES,
   type SessionStatus,
 } from '@ariava/protocol';
@@ -12,6 +13,7 @@ import {
   type AgentAdapterRegistry,
   type RegisterSessionInput,
 } from './registry';
+import { AGENT_ADAPTER_LIMITS, isBoundedAgentAdapterIdentifier } from './registry-types';
 import type { BridgeRuntimeHealth } from '../types';
 import { parseAgentAdapterCommandResult, type AgentAdapterCommandResult } from './result';
 
@@ -19,6 +21,13 @@ export class AgentAdapterClientInputError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = 'AgentAdapterClientInputError';
+  }
+}
+
+export class AgentAdapterRequestBodyTooLargeError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'AgentAdapterRequestBodyTooLargeError';
   }
 }
 
@@ -178,7 +187,13 @@ export class AgentAdapterServer {
         this.writeJson(response, 409, { error: message, code: error.code });
         return;
       }
-      if (error instanceof AgentAdapterClientInputError || error instanceof AgentAdapterRequestValidationError) {
+      if (error instanceof AgentAdapterRequestBodyTooLargeError) {
+        this.writeJson(response, 413, { error: message });
+        return;
+      }
+      if (error instanceof ProtectedContentValidationError
+        || error instanceof AgentAdapterClientInputError
+        || error instanceof AgentAdapterRequestValidationError) {
         this.writeJson(response, 400, { error: message });
         return;
       }
@@ -186,17 +201,72 @@ export class AgentAdapterServer {
     }
   }
 
-  private async readJson(request: IncomingMessage): Promise<unknown> {
-    const chunks: Buffer[] = [];
-    for await (const chunk of request) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    }
-    if (chunks.length === 0) return {};
-    try {
-      return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
-    } catch (error) {
-      throw new AgentAdapterClientInputError('Request body must contain valid JSON', { cause: error });
-    }
+  private readJson(request: IncomingMessage): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      let settled = false;
+      const release = (): void => {
+        // §3.4: drop every listener and the accumulated buffer once the promise is
+        // settled so a slow/never-ending request cannot retain ~256 KiB per
+        // connection after an overflow reject.
+        request.removeListener('data', onData);
+        request.removeListener('end', onEnd);
+        request.removeListener('error', onError);
+        chunks.length = 0;
+      };
+      const onData = (chunk: Buffer): void => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        totalBytes += buffer.byteLength;
+        if (totalBytes > AGENT_ADAPTER_LIMITS.requestBodyBytes) {
+          // §3.4: exceeding the cap stops accumulation and parsing IMMEDIATELY.
+          // Keep a temporary error sink while draining: removing every `error`
+          // listener before `resume()` can turn a client abort into a process-level
+          // unhandled EventEmitter error after the 413 has already been returned.
+          settled = true;
+          release();
+          const absorbDrainError = (): void => {};
+          const cleanupDrain = (): void => {
+            request.removeListener('error', absorbDrainError);
+            request.removeListener('end', cleanupDrain);
+            request.removeListener('close', cleanupDrain);
+          };
+          request.on('error', absorbDrainError);
+          request.once('end', cleanupDrain);
+          request.once('close', cleanupDrain);
+          request.resume();
+          reject(new AgentAdapterRequestBodyTooLargeError('Request body exceeds the Agent Adapter byte limit'));
+          return;
+        }
+        chunks.push(buffer);
+      };
+      const onEnd = (): void => {
+        if (settled) return;
+        settled = true;
+        if (chunks.length === 0) { release(); resolve({}); return; }
+        let text: string;
+        try {
+          // §3.4: a fatal UTF-8 decoder rejects malformed byte sequences instead of
+          // lossily replacing them with U+FFFD — wire garbage must be a 400, never
+          // silently accepted as content.
+          text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
+        } catch (error) {
+          release();
+          reject(new AgentAdapterClientInputError('Request body must contain valid UTF-8', { cause: error }));
+          return;
+        }
+        release();
+        try {
+          resolve(JSON.parse(text) as unknown);
+        } catch (error) {
+          reject(new AgentAdapterClientInputError('Request body must contain valid JSON', { cause: error }));
+        }
+      };
+      const onError = (error: Error): void => { if (!settled) { settled = true; release(); reject(error); } };
+      request.on('data', onData);
+      request.on('end', onEnd);
+      request.on('error', onError);
+    });
   }
 
   private writeJson(response: ServerResponse, status: number, body: unknown): void {
@@ -208,8 +278,16 @@ export class AgentAdapterServer {
 
 function decodePathIdentity(value: string, label: 'sessionId' | 'commandId'): string {
   try {
-    return decodeURIComponent(value);
+    const decoded = decodeURIComponent(value);
+    if (/%2f/iu.test(value) || /%2f/iu.test(decoded) || decoded.includes('/')) {
+      throw new AgentAdapterClientInputError(`${label} path segment must not contain an encoded slash`);
+    }
+    if (!isBoundedAgentAdapterIdentifier(decoded)) {
+      throw new AgentAdapterClientInputError(`${label} path segment is invalid`);
+    }
+    return decoded;
   } catch (error) {
+    if (error instanceof AgentAdapterClientInputError) throw error;
     throw new AgentAdapterClientInputError(`${label} path segment contains malformed percent encoding`, { cause: error });
   }
 }
@@ -226,14 +304,14 @@ function parseRegisterInput(value: unknown): RegisterSessionInput {
     'register Session',
   );
   return {
-    sessionId: requireString(obj, 'sessionId'),
-    provider: requireString(obj, 'provider'),
+    sessionId: requireIdentifier(obj, 'sessionId'),
+    provider: requireIdentifier(obj, 'provider'),
     projectName: requireString(obj, 'projectName'),
     cwd: requireString(obj, 'cwd'),
     nameText: requireString(obj, 'nameText'),
     openingText: optionalString(obj, 'openingText'),
     latestActivityText: optionalString(obj, 'latestActivityText'),
-    harnessProvider: optionalString(obj, 'harnessProvider'),
+    harnessProvider: optionalIdentifier(obj, 'harnessProvider'),
     pid: optionalNumber(obj, 'pid'),
     status: optionalStatus(obj, 'status'),
   };
@@ -255,7 +333,7 @@ function parseHandleInput(value: unknown): import('@ariava/protocol').HandleSess
     throw new AgentAdapterClientInputError('handle.action is invalid');
   }
   return {
-    handledThroughEventId: requireString(obj, 'handledThroughEventId'),
+    handledThroughEventId: requireIdentifier(obj, 'handledThroughEventId'),
     handledThroughEventCreatedAt: optionalString(obj, 'handledThroughEventCreatedAt'),
     handledAt: optionalString(obj, 'handledAt'),
     action,
@@ -326,6 +404,14 @@ function parseResultInput(value: unknown, expectedCommandId: string): AgentAdapt
   return result;
 }
 
+function requireIdentifier(obj: Record<string, unknown>, key: string): string {
+  const value = obj[key];
+  if (!isBoundedAgentAdapterIdentifier(value)) {
+    throw new AgentAdapterClientInputError(`Missing or invalid field: ${key}`);
+  }
+  return value;
+}
+
 function requireString(obj: Record<string, unknown>, key: string): string {
   const value = obj[key];
   if (typeof value !== 'string') {
@@ -342,6 +428,15 @@ function optionalNullableString(obj: Record<string, unknown>, key: string): stri
   const value = obj[key];
   if (value === undefined || value === null) return value;
   if (typeof value !== 'string') {
+    throw new AgentAdapterClientInputError(`Invalid field: ${key}`);
+  }
+  return value;
+}
+
+function optionalIdentifier(obj: Record<string, unknown>, key: string): string | undefined {
+  const value = obj[key];
+  if (value === undefined) return undefined;
+  if (!isBoundedAgentAdapterIdentifier(value)) {
     throw new AgentAdapterClientInputError(`Invalid field: ${key}`);
   }
   return value;

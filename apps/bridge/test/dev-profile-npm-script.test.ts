@@ -433,6 +433,7 @@ const SAFE_DEV_LIFECYCLE_MODULES = [
   'e2e/upload-failures.ts',
   'e2e/upload-inputs.ts',
   'e2e/upload-orchestrator.ts',
+  'e2e/upload-preflight.ts',
   'host-manager/config.ts',
   'host-manager/dev-profile.ts',
   'host-manager/output.ts',

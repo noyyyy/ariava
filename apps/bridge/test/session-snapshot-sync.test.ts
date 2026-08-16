@@ -169,8 +169,8 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
       if (path === '/v2/bridge/e2e/sessions/current') { manifests += 1; return Response.json({ ok: true }); }
       if (path === '/v2/bridge/commands/pull') return Response.json({ commands: [] }); return Response.json({ ok: true });
     }, [activeSession('session-a')]); hostId = fx.identity.hostId;
-    expect((await fx.daemon.syncOnce()).offline).toBe(true);
-    expect({ recipientReads, uploads, reconciles, manifests }).toEqual({ recipientReads: 3, uploads: 1, reconciles: 1, manifests: 0 });
+    expect((await fx.daemon.syncOnce()).offline).toBe(false);
+    expect({ recipientReads, uploads, reconciles, manifests }).toEqual({ recipientReads: 4, uploads: 1, reconciles: 1, manifests: 0 });
   });
 
   test('invalid finalized references rebuild all active Sessions under a higher Host revision', async () => {

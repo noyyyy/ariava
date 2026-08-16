@@ -198,6 +198,7 @@ export class LocalEncryptedSpool {
     private readonly runtimeStateSchemaVersion = 2,
     private readonly runtimeResetEpoch = 'standalone',
     private readonly assertAccess: () => void = () => {},
+    private readonly writeHooks: SecureFileWriteHooks = {},
   ) {
     this.assertAccess();
     const loaded = this.load();
@@ -328,10 +329,24 @@ export class LocalEncryptedSpool {
   private persist(items: LocalEncryptedPendingPayloadV1[]): void {
     this.assertAccess();
     if (!this.keyId) throw new LocalSpoolRecoveryRequiredError('local spool key identity is unavailable; recovery is required');
-    writeSecureJson(this.path, {
-      version: 2, runtimeStateSchemaVersion: this.runtimeStateSchemaVersion, runtimeResetEpoch: this.runtimeResetEpoch,
+    const target = {
+      version: 2 as const, runtimeStateSchemaVersion: this.runtimeStateSchemaVersion, runtimeResetEpoch: this.runtimeResetEpoch,
       hostId: this.hostId, keyId: this.keyId, items,
-    } satisfies LocalSpoolFileV2);
+    } satisfies LocalSpoolFileV2;
+    try {
+      writeSecureJson(this.path, target, undefined, this.writeHooks);
+    } catch (error) {
+      // An atomic rename may have installed the exact target before a later
+      // directory-sync error was reported. Re-open the secure file and treat that
+      // exact target as committed so callers never retain stale in-memory source/
+      // inflight evidence while disk already contains its replacement. If the old
+      // or any unknown state remains, preserve the original failure and fail closed.
+      try {
+        const persisted = this.load();
+        if (persisted.keyId === target.keyId && JSON.stringify(persisted.items) === JSON.stringify(items)) return;
+      } catch {}
+      throw error;
+    }
   }
 }
 

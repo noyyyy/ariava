@@ -82,8 +82,12 @@ Ariava uses one encrypted, versioned Session/Event model across Pi and the local
 - Normal completion atomically produces one `done` Event and an `idle` Session. A question, blocker, or exhausted runtime error produces one `need_human` Event and a `need_human` Session.
 - Clients derive Event labels and Session display state from canonical type, status, and protected context; neither is stored in the canonical runtime contract.
 - Driver failures are Bridge health/log/retry concerns, not canonical Event types. Host availability is a Relay-presence concern, not a Session status.
-- Protected envelopes use `event-content-v2`, `session-content-v2`, and `notification-preview-v2`; notification routing uses only `agent.done` and `agent.need_human`.
-- This is an intentional breaking cutover. There is no compatibility decoder, negotiation, dual read/write, or fallback for the active model. The Bridge recognizes valid prior schema 2 runtime only to atomically reset it to empty schema 3 state; obsolete Sessions and Events are not replayed.
+- Protected envelopes use `event-content-v3`, `session-content-v3`, and `notification-preview-v2`; Agent Adapter protocol v3, Bridge runtime state schema v5, and Relay runtime epoch 3 form the coordinated authority. Notification routing uses only `agent.done` and `agent.need_human`.
+- This is an intentional breaking cutover. There is no compatibility decoder, negotiation, dual read/write, or fallback for the active model. Verified schema 4 state migrates crash-safely to schema 5 with inflight evidence preserved for exact reconciliation.
+
+### 64 KiB compatibility release note
+
+The minimum compatible pair for 64 KiB Session/Event protected content is **Ariava Watch 1.0 build 18** and **Ariava Bridge/pi extension 0.4.0**. Install the Watch build first, then upgrade Bridge and pi together. Watch builds through 1.0 (17) use the former 16 KiB Session / 32 KiB Event limits and are unsupported with Bridge 0.4.0; larger encrypted items may prevent those Watches from syncing.
 
 ## Encrypted commands and identity recovery
 

@@ -2,6 +2,14 @@ import type { E2EEventAndSessionUploadV3 } from '@ariava/protocol';
 import { encryptNotificationPreviews, type ActiveRecipientMaterial } from './envelope';
 import { buildNotificationPreview } from './notification-preview';
 
+export class PendingUploadBindingError extends Error {
+  readonly code = 'event-session-binding-invalid' as const;
+  constructor(message = 'Event upload requires its corresponding terminal Session snapshot') {
+    super(message);
+    this.name = 'PendingUploadBindingError';
+  }
+}
+
 export type EncryptedEventAndSession = E2EEventAndSessionUploadV3;
 
 /** Canonical encryption input builder for a terminal Event and its terminal Session snapshot. */
@@ -66,6 +74,6 @@ export function assertEventSessionBinding(
 ): void {
   if (event.hostId !== session.hostId || event.sessionId !== session.sessionId || event.provider !== session.provider
     || event.status !== session.status || session.lastEventId !== event.eventId) {
-    throw new TypeError('Event upload requires its corresponding terminal Session snapshot');
+    throw new PendingUploadBindingError('Event upload requires its corresponding terminal Session snapshot');
   }
 }

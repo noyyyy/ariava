@@ -27,6 +27,13 @@ function fixture() {
   return store;
 }
 
+function rawSpoolBytes(store: InstanceType<typeof BridgeStateStore>, spoolItemId: string): Uint8Array {
+  const spool = (store as any).spool;
+  const item = spool.get(spoolItemId);
+  if (!item) throw new Error(`missing spool item: ${spoolItemId}`);
+  return spool.open(item);
+}
+
 function terminalSession(overrides: Partial<CanonicalSessionState> = {}): CanonicalSessionState {
   return {
     sessionId: 'session-test', hostId: 'host-test', provider: 'pi', projectName: 'secret-project', nameText: 'Session',
@@ -304,9 +311,9 @@ describe('EncryptedUploadOrchestrator recipient-change no-progress fail-closed (
     const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any, {
       eventFailure: (failure) => failures.push(failure),
     });
-    const result = await orchestrator.publishAuthoritativeSnapshots(snapshot, [], ['session-test']);
-    expect(result?.recipientSetVersion).toBe(1);
-    expect(result?.revisions.get('session-test')).toBe(2);
+    const result = await orchestrator.publishAuthoritativeSnapshots(snapshot, [], [terminal]);
+    expect(result).toMatchObject({ type: 'published', recipientSetVersion: 1 });
+    expect(result?.type === 'published' && result.revisions.get('session-test')).toBe(2);
     expect({ publishes, reconciles, recipientReads }).toEqual({ publishes: 2, reconciles: 1, recipientReads: 1 });
     expect(store.currentSessionRevision('session-test')).toBe(2);
     expect(store.getInflightSessionUpload('session-test')).toBeUndefined();
@@ -340,7 +347,8 @@ describe('EncryptedUploadOrchestrator recipient-change no-progress fail-closed (
 
   test('repeated authoritative same-version reconcile-committed conflict fails closed after one revision advance', async () => {
     const store = fixture();
-    store.replaceDriverSessions('pi', [terminalSession()]);
+    const terminal = terminalSession();
+    store.replaceDriverSessions('pi', [terminal]);
     let publishes = 0; let reconciles = 0; let recipientReads = 0;
     const snapshot = { version: 1 as const, hostId: 'host-test', recipientSetVersion: 1, recipients: [] };
     const client = {
@@ -353,7 +361,7 @@ describe('EncryptedUploadOrchestrator recipient-change no-progress fail-closed (
     };
     const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
 
-    expect(await orchestrator.publishAuthoritativeSnapshots(snapshot, [], ['session-test'])).toBeUndefined();
+    expect(await orchestrator.publishAuthoritativeSnapshots(snapshot, [], [terminal])).toEqual({ type: 'fail-closed' });
     expect({ publishes, reconciles, recipientReads }).toEqual({ publishes: 2, reconciles: 2, recipientReads: 2 });
     expect(store.currentSessionRevision('session-test')).toBe(1);
     expect((store.getInflightSessionUpload('session-test') as any)?.revision).toBe(2);
@@ -439,6 +447,7 @@ describe('EncryptedUploadOrchestrator permanent Event conflict quarantine', () =
   test('permanent conflict quarantines the Event with the exact category and preserves restart safety', async () => {
     const store = fixture(); const terminal = terminalSession();
     store.replaceDriverSessions('pi', [terminal]); store.queuePendingEvent(doneEvent(), terminal); store.setRecipientSetVersion(1);
+    const sourceBefore = rawSpoolBytes(store, 'event-test');
     const failures: any[] = [];
     const client = {
       recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
@@ -450,8 +459,13 @@ describe('EncryptedUploadOrchestrator permanent Event conflict quarantine', () =
     });
     expect(await orchestrator.flushPendingEvents()).toBe(0);
     const record = store.getQuarantinedEventRecord('event-test') as any;
-    expect(record).toBeDefined();
-    expect(record).toMatchObject({ version: 1, eventId: 'event-test', sessionId: 'session-test', reason: 'session_revision_stale' });
+    expect(record).toMatchObject({
+      version: 2, eventId: 'event-test', sessionId: 'session-test', reasonCode: 'relay-permanent-conflict',
+      sourceArchive: { encoding: 'base64url' }, inflightArchive: { encoding: 'base64url' },
+    });
+    expect(base64UrlDecode(record.sourceArchive.bytes, undefined, 'source archive')).toEqual(sourceBefore);
+    expect(JSON.parse(new TextDecoder().decode(base64UrlDecode(record.inflightArchive.bytes, undefined, 'inflight archive'))))
+      .toMatchObject({ version: 2, upload: { event: { eventId: 'event-test' }, session: { sessionId: 'session-test' } } });
     expect(failures).toEqual([{ eventId: 'event-test', sessionId: 'session-test', outcome: 'quarantined', status: 409, category: 'session-revision' }]);
     expect(store.peekPendingUploads()).toEqual([]);
     expect(store.getInflightEventUpload('event-test')).toBeUndefined();
@@ -468,7 +482,7 @@ describe('EncryptedUploadOrchestrator permanent Event conflict quarantine', () =
       reconcileEncryptedEvent: async () => ({ committed: false }),
     };
     const throwingQuarantine = new (class extends BridgeStateStore {
-      quarantinePendingEvent(eventId: string, sessionId: string, reason: string, quarantinedAt?: string): boolean {
+      quarantinePendingEventRaw(_descriptor: any, _reason: any, _inflight?: Uint8Array): boolean {
         quarantineAttempts += 1;
         throw new Error('injected quarantine write failure');
       }
@@ -480,7 +494,7 @@ describe('EncryptedUploadOrchestrator permanent Event conflict quarantine', () =
     });
     expect(await orchestrator.flushPendingEvents()).toBe(0);
     expect(quarantineAttempts).toBe(1);
-    expect(failures).toEqual([{ eventId: 'event-test', sessionId: 'session-test', outcome: 'retry-deferred', status: 409, category: 'session-revision' }]);
+    expect(failures).toEqual([{ eventId: 'event-test', sessionId: 'session-test', outcome: 'retry-deferred', status: 409, category: 'local-spool-record' }]);
     // Source and inflight evidence remain retryable: restart succeeds once the failure clears.
     throwingQuarantine.dispose();
     const restarted = new BridgeStateStore(statePath);
@@ -492,5 +506,65 @@ describe('EncryptedUploadOrchestrator permanent Event conflict quarantine', () =
     expect(await new EncryptedUploadOrchestrator(restarted, okClient as any, { reconcileRecipients: () => [] } as any).flushPendingEvents()).toBe(1);
     expect(restarted.currentSessionRevision('session-test')).toBe(1);
     expect(restarted.getQuarantinedEventRecord('event-test')).toBeUndefined();
+  });
+
+  test('reconcile network error on a permanent conflict defers and preserves all evidence (never quarantines unknown state)', async () => {
+    const store = fixture(); const terminal = terminalSession();
+    store.replaceDriverSessions('pi', [terminal]); store.queuePendingEvent(doneEvent(), terminal); store.setRecipientSetVersion(1);
+    const failures: any[] = [];
+    const client = {
+      recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
+      publishEncryptedEvent: async () => { throw new RelayClientError(409, 'stale', { reason: 'session_revision_stale' }); },
+      reconcileEncryptedEvent: async () => { throw new Error('relay unreachable'); },
+    };
+    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any, {
+      eventFailure: (failure) => failures.push(failure),
+    });
+    expect(await orchestrator.flushPendingEvents()).toBe(0);
+    // The Relay may have committed the Event; nothing may be deleted or dead-lettered.
+    expect(store.getQuarantinedEventRecord('event-test')).toBeUndefined();
+    expect(store.getInflightEventUpload('event-test')).toBeDefined();
+    expect(store.peekPendingUploads().map((p) => p.event.eventId)).toEqual(['event-test']);
+    expect(failures.some((f) => f.outcome === 'retry-deferred')).toBe(true);
+  });
+
+  test('refresh-retry permanent conflict reconciles exactly before quarantining', async () => {
+    const store = fixture(); const terminal = terminalSession();
+    store.replaceDriverSessions('pi', [terminal]); store.queuePendingEvent(doneEvent(), terminal); store.setRecipientSetVersion(1);
+    let publishes = 0; let reconciles = 0;
+    const client = {
+      recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
+      publishEncryptedEvent: async () => {
+        publishes += 1;
+        if (publishes === 1) throw new RelayClientError(409, 'recipient changed', { reason: 'e2e_recipient_set_changed' });
+        throw new RelayClientError(409, 'stale', { reason: 'session_revision_stale' });
+      },
+      reconcileEncryptedEvent: async () => { reconciles += 1; return { committed: false }; },
+    };
+    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
+    expect(await orchestrator.flushPendingEvents()).toBe(0);
+    // Quarantine only after an exact reconcile proved uncommitted on BOTH conflicts.
+    expect(reconciles).toBe(2);
+    expect(store.getQuarantinedEventRecord('event-test')).toBeDefined();
+  });
+
+  test('refresh-retry reconcile error defers instead of quarantining', async () => {
+    const store = fixture(); const terminal = terminalSession();
+    store.replaceDriverSessions('pi', [terminal]); store.queuePendingEvent(doneEvent(), terminal); store.setRecipientSetVersion(1);
+    let publishes = 0; let reconciles = 0;
+    const client = {
+      recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
+      publishEncryptedEvent: async () => {
+        publishes += 1;
+        if (publishes === 1) throw new RelayClientError(409, 'recipient changed', { reason: 'e2e_recipient_set_changed' });
+        throw new RelayClientError(409, 'stale', { reason: 'session_revision_stale' });
+      },
+      reconcileEncryptedEvent: async () => { reconciles += 1; if (reconciles === 1) return { committed: false }; throw new Error('relay unreachable'); },
+    };
+    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
+    expect(await orchestrator.flushPendingEvents()).toBe(0);
+    expect(reconciles).toBe(2);
+    expect(store.getQuarantinedEventRecord('event-test')).toBeUndefined();
+    expect(store.getInflightEventUpload('event-test')).toBeDefined();
   });
 });

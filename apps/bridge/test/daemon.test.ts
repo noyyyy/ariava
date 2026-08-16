@@ -775,7 +775,7 @@ describe('BridgeDaemon', () => {
     const { daemon } = createCommandHarness();
     (daemon as any).startupValidated = true;
     (daemon as any).ensureHostPresence = async () => {};
-    (daemon as any).flushCurrentSessionsSnapshot = async () => true;
+    (daemon as any).flushCurrentSessionsSnapshot = async () => ({ type: 'published' });
     let pulls = 0; let release!: () => void;
     const blocked = new Promise<void>((resolve) => { release = resolve; });
     (daemon as any).relayClient = {
@@ -1262,7 +1262,7 @@ describe('BridgeDaemon', () => {
       (daemon as any).config.hostId, (daemon as any).config.identityPath, 'linux',
       { loadOrCreate: () => new Uint8Array(32).fill(7) },
     );
-    registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/' });
+    registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/', nameText: 'Handle' });
     stateStore.appendRecentEvent({
       eventId: 'evt-handle', hostId: (daemon as any).config.hostId, sessionId: 'sess-handle', provider: 'pi',
       type: 'done', status: 'idle', agentText: 'Done', createdAt: '2026-08-07T00:00:00.000Z',
@@ -1309,7 +1309,7 @@ describe('BridgeDaemon', () => {
       daemonInternals.config.hostId, daemonInternals.config.identityPath, 'linux',
       { loadOrCreate: () => new Uint8Array(32).fill(7) },
     );
-    registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/' });
+    registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/', nameText: 'Handle' });
     stateStore.appendRecentEvent({
       eventId: 'evt-handle', hostId: daemonInternals.config.hostId, sessionId: 'sess-handle', provider: 'pi',
       type: 'done', status: 'idle', agentText: 'Done', createdAt: '2026-08-07T00:00:00.000Z',

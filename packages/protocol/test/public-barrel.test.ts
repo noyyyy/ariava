@@ -24,6 +24,7 @@ const INTENDED_RUNTIME_EXPORTS = [
   'NEED_HUMAN_REASONS',
   'PAIRING_CODE_ALPHABET',
   'PAIRING_CODE_LIMITS',
+  'ProtectedContentValidationError',
   'REQUEST_SIGNATURE_DOMAIN',
   'RequestCanonicalizationError',
   'SESSION_HANDLE_ACTIONS',

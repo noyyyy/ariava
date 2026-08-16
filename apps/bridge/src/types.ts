@@ -176,7 +176,7 @@ export interface CommandReceiptOutboxInputV1 {
 }
 
 export interface PersistedBridgeState {
-  schemaVersion: 4;
+  schemaVersion: 5;
   runtimeResetEpoch: string;
   host: HostProjection | null;
   sessions: Record<string, CanonicalSessionState>;

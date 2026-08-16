@@ -261,8 +261,8 @@ describe('AgentAdapterServer', () => {
   });
 
   test('decodes exact native session and command path identities once across all routes', async () => {
-    const sessionId = ' /native% id?# ';
-    const commandId = ' /command% id?# ';
+    const sessionId = ' native% id?# ';
+    const commandId = ' command% id?# ';
     const encodedSessionId = encodeURIComponent(sessionId);
     const encodedCommandId = encodeURIComponent(commandId);
     const register = await fetch(url('/v1/agent/sessions'), {
@@ -457,6 +457,28 @@ describe('AgentAdapterServer', () => {
     const session = registry.listSessions()[0];
     expect(session?.openingText).toBeUndefined();
     expect(session?.latestActivityText).toBeUndefined();
+  });
+
+  test('register with an oversized Session returns 400 before any mutation', async () => {
+    const response = await fetch(url('/v1/agent/sessions'), {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ sessionId: 'big', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'n', openingText: 'a'.repeat(65_500) }),
+    });
+    expect(response.status).toBe(400);
+    expect(store.listSessions().some((s) => s.sessionId === 'big')).toBe(false);
+    expect(registry.listSessions().some((s) => s.sessionId === 'big')).toBe(false);
+  });
+
+  test('heartbeat with an oversized Session returns 400 and leaves the Session unchanged', async () => {
+    registry.register({ sessionId: 'sess-1', provider: 'pi', projectName: 'p', nameText: 'p', cwd: '/' });
+    const response = await fetch(url('/v1/agent/sessions/sess-1/heartbeat'), {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ status: 'working', latestActivityText: 'a'.repeat(65_500) }),
+    });
+    expect(response.status).toBe(400);
+    expect(registry.listSessions()[0]?.status).toBe('idle');
   });
 
   test('returns enqueued command during short poll', async () => {

@@ -29,6 +29,8 @@ export interface AgentAdapterClientOptions {
 }
 
 const DEFAULT_CONFIG_PATH = `${homedir()}/.config/ariava/agent-adapter.json`;
+export const AGENT_ADAPTER_REQUEST_BODY_BYTES = 256 * 1024;
+const adapterTextEncoder = new TextEncoder();
 
 export function resolveAgentAdapterConfigPath(explicitConfigPath?: string): string {
   if (explicitConfigPath !== undefined) return explicitConfigPath;
@@ -229,7 +231,11 @@ export class AgentAdapterClient implements AgentAdapter {
       },
     };
     if (body !== undefined) {
-      init.body = JSON.stringify(body);
+      const serialized = JSON.stringify(body);
+      if (adapterTextEncoder.encode(serialized).byteLength > AGENT_ADAPTER_REQUEST_BODY_BYTES) {
+        throw new Error('Agent Adapter request body exceeds the 256 KiB byte limit');
+      }
+      init.body = serialized;
     }
 
     return this.withRetry(() => fetch(url, init), `${method} ${path}`);
