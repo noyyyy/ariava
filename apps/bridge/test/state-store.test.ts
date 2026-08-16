@@ -1205,6 +1205,42 @@ describe('write-failure in-memory semantics (§3.3 inventory)', () => {
     restarted.dispose();
   });
 
+  test('Event completion uses the replacement spool after reentrant initialization', () => {
+    const { statePath, store } = failingStore('completion-reentrant-spool', { withSpool: true });
+    const event = makeEvent({ eventId: 'evt-reentrant' });
+    const session = makeSession({ lastEventId: event.eventId });
+    const keyStore = { loadOrCreate: () => new Uint8Array(32).fill(7) };
+    store.queuePendingEvent(event, session);
+    store.persistInflightEventUpload(event.eventId, session.sessionId, { marker: 'inflight' });
+    store.beginEventUploadCompletion({
+      version: 1, eventId: event.eventId, sessionId: session.sessionId, revision: 1,
+      eventContentId: 'event-content', sessionContentId: 'session-content', committedAt: LEGACY_AT,
+    });
+    let reinitialized = false;
+    expect(() => store.completeEventUpload(event.eventId, (phase) => {
+      if (phase !== 'revision-committed' || reinitialized) return;
+      reinitialized = true;
+      store.initializeEncryptedSpool('host-1', join(statePath, '..', 'identity.json'), 'linux', keyStore);
+    })).toThrow('event completion journal is missing');
+    expect(reinitialized).toBe(true);
+    expect(store.peekPendingUploads()).toEqual([]);
+    expect(store.getInflightEventUpload(event.eventId)).toBeUndefined();
+    expect(store.currentSessionRevision(session.sessionId)).toBe(1);
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).eventUploadCompletions).toBeUndefined();
+    const durableSpool = JSON.parse(readFileSync(spoolPathForState(statePath), 'utf8'));
+    const durableItemIds = durableSpool.items.map((item: { spoolItemId: string }) => item.spoolItemId);
+    expect(durableItemIds).not.toContain(event.eventId);
+    expect(durableItemIds).not.toContain(`inflight:event:${event.eventId}`);
+    store.dispose();
+
+    const restarted = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    restarted.initializeEncryptedSpool('host-1', join(statePath, '..', 'identity.json'), 'linux', keyStore);
+    expect(restarted.peekPendingUploads()).toEqual([]);
+    expect(restarted.getInflightEventUpload(event.eventId)).toBeUndefined();
+    expect(restarted.currentSessionRevision(session.sessionId)).toBe(1);
+    restarted.dispose();
+  });
+
   test('spool-dependent workflows fail closed without state mutation', () => {
     const { statePath, store, fail } = failingStore('spool-failure', { withSpool: true });
     const evt = makeEvent();
