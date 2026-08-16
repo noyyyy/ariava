@@ -896,3 +896,359 @@ describe('BridgeStateStore', () => {
     expect(() => new BridgeStateStore(statePath)).toThrow('Bridge state file is invalid or insecure');
   });
 });
+
+describe('write-failure in-memory semantics (§3.3 inventory)', () => {
+  function failingStore(label: string, options: { withSpool?: boolean } = {}): { statePath: string; store: BridgeStateStore; fail: { on: boolean } } {
+    const root = join(tmpdir(), `bridge-store-write-failure-${label}-${crypto.randomUUID()}`);
+    paths.push(root);
+    const statePath = join(root, 'state.json');
+    const fail = { on: false };
+    const store = new BridgeStateStore(statePath, (_path, value) => {
+      if (fail.on) throw new Error('injected state write failure');
+      writeFileSync(statePath, JSON.stringify(value), { mode: 0o600 });
+    });
+    if (options.withSpool) {
+      store.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux',
+        { loadOrCreate: () => new Uint8Array(32).fill(7) });
+    }
+    return { statePath, store, fail };
+  }
+
+  function makeSession(overrides: Partial<CanonicalSessionState> = {}): CanonicalSessionState {
+    return { sessionId: 'sess-1', hostId: 'host-1', provider: 'pi', projectName: 'project', nameText: 'Task',
+      status: 'idle', updatedAt: LEGACY_AT, ...overrides };
+  }
+  function makeEvent(overrides: Partial<CanonicalEvent> = {}): CanonicalEvent {
+    return { eventId: 'evt-1', hostId: 'host-1', sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
+      agentText: 'Done', createdAt: LEGACY_AT, ...overrides };
+  }
+
+  test('mutate-first operations preserve unrelated getter references', async () => {
+    const { store } = failingStore('getter-reference');
+    const firstSession = makeSession();
+    const secondSession = makeSession({ sessionId: 'sess-2', nameText: 'Second' });
+    const persistedHost: HostProjection = { hostId: 'host-1', hostName: 'Host', platform: 'linux', bridgeVersion: '1',
+      registeredAt: LEGACY_AT, lastSeenAt: LEGACY_AT, bridgeStatus: 'online' };
+    store.setHost(persistedHost);
+    store.replaceDriverSessions('pi', [firstSession, secondSession]);
+    const hostReference = store.getHost();
+    const firstSessionReference = store.getSession('sess-1');
+    const secondSessionReference = store.getSession('sess-2');
+    store.setRecipientSetVersion(1);
+    store.commitSessionRevision('sess-1', 1);
+    store.noteCurrentSessionsSnapshotRevisionLowerBound(1);
+    const publication = (await store.createCurrentSessionsPublication(
+      'host-1', store.listSessions(), 1, LEGACY_AT,
+    ))!;
+    store.acceptCurrentSessionsPublication(publication.request, 'digest', publication.contentDigest);
+    const updated = store.updateSession('sess-1', { nameText: 'Renamed' });
+    expect(updated).toBe(store.getSession('sess-1'));
+    expect(updated).not.toBe(firstSessionReference);
+    expect(store.getSession('sess-2')).toBe(secondSessionReference);
+    expect(store.getHost()).toBe(hostReference);
+    store.setHost({ ...persistedHost, hostName: 'Renamed Host' });
+    expect(store.getSession('sess-1')).toBe(updated);
+    expect(store.getSession('sess-2')).toBe(secondSessionReference);
+    store.dispose();
+  });
+
+  test('setHost mutates the in-memory Host before a failing persist while restart retains the old Host', () => {
+    const { statePath, store, fail } = failingStore('set-host');
+    const hostA: HostProjection = { hostId: 'host-1', hostName: 'A', platform: 'linux', bridgeVersion: '1',
+      registeredAt: LEGACY_AT, lastSeenAt: LEGACY_AT, bridgeStatus: 'online' };
+    const hostB: HostProjection = { ...hostA, hostName: 'B' };
+    store.setHost(hostA);
+    fail.on = true;
+    expect(() => store.setHost(hostB)).toThrow('injected state write failure');
+    expect(store.getHost()).toEqual(hostB);
+    store.dispose();
+    const restarted = new BridgeStateStore(statePath);
+    expect(restarted.getHost()).toEqual(hostA);
+    restarted.dispose();
+  });
+
+  test('clone-first health mutations leave the live state unchanged after a failing commit', () => {
+    const { store, fail } = failingStore('health');
+    fail.on = true;
+    expect(() => store.recordDriverReconciliationFailure('pi', LEGACY_AT, LEGACY_AT)).toThrow('injected state write failure');
+    expect(store.getRuntimeHealth()).toEqual({ status: 'healthy', drivers: [] });
+    fail.on = false;
+    store.recordDriverReconciliationFailure('pi', LEGACY_AT, LEGACY_AT);
+    fail.on = true;
+    expect(() => store.recordDriverReconciliationSuccess('pi')).toThrow('injected state write failure');
+    expect(store.getRuntimeHealth()).toMatchObject({ status: 'degraded', drivers: [{ driver: 'pi' }] });
+    expect(() => store.recordRelayPresenceFailure(LEGACY_AT, LEGACY_AT)).toThrow('injected state write failure');
+    expect(store.getRuntimeHealth().relayPresence).toBeUndefined();
+    fail.on = false;
+    store.recordRelayPresenceFailure(LEGACY_AT, LEGACY_AT);
+    fail.on = true;
+    expect(() => store.recordRelayPresenceSuccess()).toThrow('injected state write failure');
+    expect(store.getRuntimeHealth()).toMatchObject({ status: 'degraded',
+      relayPresence: { code: 'relay_presence_refresh_failed' } });
+    store.dispose();
+  });
+
+  test('clone-first session mutations leave the live state unchanged after a failing commit', () => {
+    const { statePath, store, fail } = failingStore('session');
+    fail.on = true;
+    expect(() => store.replaceDriverSessions('pi', [makeSession()])).toThrow('injected state write failure');
+    expect(store.listSessions()).toEqual([]);
+    fail.on = false;
+    store.replaceDriverSessions('pi', [makeSession()]);
+    fail.on = true;
+    expect(() => store.setSessionDriver('sess-1', 'other', makeSession({ provider: 'other' }))).toThrow('injected state write failure');
+    expect(store.getDriverNameForSession('sess-1')).toBe('pi');
+    expect(() => store.removeSession('sess-1')).toThrow('injected state write failure');
+    expect(store.listSessions()).toHaveLength(1);
+    expect(() => store.removeSessionDriver('sess-1')).toThrow('injected state write failure');
+    expect(store.getDriverNameForSession('sess-1')).toBe('pi');
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).sessions['sess-1'].provider).toBe('pi');
+    store.dispose();
+  });
+
+  test('updateSession mutates the live Session before a failing persist while restart retains the old Session', () => {
+    const { statePath, store, fail } = failingStore('update-session');
+    store.replaceDriverSessions('pi', [makeSession()]);
+    fail.on = true;
+    expect(() => store.updateSession('sess-1', { nameText: 'Renamed' })).toThrow('injected state write failure');
+    expect(store.getSession('sess-1')?.nameText).toBe('Renamed');
+    store.dispose();
+    const restarted = new BridgeStateStore(statePath);
+    expect(restarted.getSession('sess-1')?.nameText).toBe('Task');
+    restarted.dispose();
+  });
+
+  test('mutate-first publication failures retain only the previous durable snapshot on restart', async () => {
+    const allocation = failingStore('publication-allocation');
+    allocation.fail.on = true;
+    await expect(allocation.store.createCurrentSessionsPublication('host-1', [makeSession()], 1, LEGACY_AT))
+      .rejects.toThrow('injected state write failure');
+    expect(allocation.store.getCurrentSessionsSnapshotState().lastAllocatedRevision).toBe(1);
+    allocation.store.dispose();
+    const allocationRestarted = new BridgeStateStore(allocation.statePath);
+    expect(allocationRestarted.getCurrentSessionsSnapshotState().lastAllocatedRevision).toBe(0);
+    allocationRestarted.dispose();
+
+    const acceptance = failingStore('publication-acceptance');
+    const publication = (await acceptance.store.createCurrentSessionsPublication(
+      'host-1', [makeSession()], 1, LEGACY_AT,
+    ))!;
+    acceptance.store.setRecipientSetVersion(1);
+    acceptance.fail.on = true;
+    expect(() => acceptance.store.acceptCurrentSessionsPublication(
+      publication.request, 'digest-1', publication.contentDigest,
+    )).toThrow('injected state write failure');
+    expect(acceptance.store.getCurrentSessionsSnapshotState().lastAcceptedRevision).toBe(1);
+    acceptance.store.dispose();
+    const acceptanceRestarted = new BridgeStateStore(acceptance.statePath);
+    expect(acceptanceRestarted.getCurrentSessionsSnapshotState().lastAcceptedRevision).toBe(0);
+    acceptanceRestarted.dispose();
+
+    const lowerBound = failingStore('publication-lower-bound');
+    lowerBound.store.noteCurrentSessionsSnapshotRevisionLowerBound(8);
+    lowerBound.fail.on = true;
+    expect(() => lowerBound.store.noteCurrentSessionsSnapshotRevisionLowerBound(9))
+      .toThrow('injected state write failure');
+    expect(lowerBound.store.getCurrentSessionsSnapshotState().lastAllocatedRevision).toBe(9);
+    lowerBound.store.dispose();
+    const lowerBoundRestarted = new BridgeStateStore(lowerBound.statePath);
+    expect(lowerBoundRestarted.getCurrentSessionsSnapshotState().lastAllocatedRevision).toBe(8);
+    lowerBoundRestarted.dispose();
+  });
+
+  test('mutate-first revision methods keep the live value while restart retains old durable revisions', () => {
+    const { statePath, store, fail } = failingStore('revision');
+    fail.on = true;
+    expect(() => store.setRecipientSetVersion(1)).toThrow('injected state write failure');
+    expect(store.getRecipientSetVersion()).toBe(1);
+    expect(() => store.commitSessionRevision('sess-1', 1)).toThrow('injected state write failure');
+    expect(store.currentSessionRevision('sess-1')).toBe(1);
+    store.dispose();
+    const restarted = new BridgeStateStore(statePath);
+    expect(restarted.getRecipientSetVersion()).toBeUndefined();
+    expect(restarted.currentSessionRevision('sess-1')).toBe(0);
+    restarted.dispose();
+  });
+
+  test('clone-first producer reservation leaves the live state unchanged after a failing commit', () => {
+    const { store, fail } = failingStore('reservation');
+    const reservation = { version: 1 as const, eventId: 'evt-1', sessionId: 'sess-1', fingerprint: 'fp', createdAt: LEGACY_AT };
+    fail.on = true;
+    expect(() => store.reserveProducerEvent(reservation)).toThrow('injected state write failure');
+    expect(store.getProducerEventReservation('sess-1', 'fp')).toBeUndefined();
+    store.dispose();
+  });
+
+  test('clone-first event append failure leaves the live state unchanged and blocks dependent handles', () => {
+    const { store, fail } = failingStore('append-event');
+    fail.on = true;
+    expect(() => store.appendRecentEvent(makeEvent())).toThrow('injected state write failure');
+    fail.on = false;
+    expect(() => store.queuePendingSessionHandle({ hostId: 'host-1', sessionId: 'sess-1',
+      handledThroughEventId: 'evt-1', handledAt: LEGACY_AT, action: 'pi_input', updatedAt: LEGACY_AT }))
+      .toThrow(/durable Event/u);
+    store.dispose();
+  });
+
+  test('clone-first handle mutations leave the live state unchanged after a failing commit', () => {
+    const { store, fail } = failingStore('handle');
+    store.replaceDriverSessions('pi', [makeSession()]);
+    store.appendRecentEvent(makeEvent());
+    const handle = { hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: 'evt-1',
+      handledAt: LEGACY_AT, action: 'pi_input' as const, updatedAt: LEGACY_AT };
+    store.queuePendingSessionHandle(handle);
+    fail.on = true;
+    expect(() => store.removePendingSessionHandle('host-1', 'sess-1', 'evt-1')).toThrow('injected state write failure');
+    expect(store.peekPendingSessionHandles()).toHaveLength(1);
+    const newerHandle = { ...handle, handledAt: '2026-08-08T00:00:01.000Z', updatedAt: '2026-08-08T00:00:01.000Z' };
+    expect(() => store.queuePendingSessionHandle(newerHandle)).toThrow('injected state write failure');
+    expect(store.peekPendingSessionHandles()).toHaveLength(1);
+    expect(store.peekPendingSessionHandles()[0]?.handledThroughEventId).toBe('evt-1');
+    store.dispose();
+  });
+
+  test('clone-first command transitions leave the live execution unchanged after a failing commit', async () => {
+    const { store, fail } = failingStore('command');
+    const digest = await commandDigest(encryptedCommand);
+    const claim = { originalEncryptedCommand: encryptedCommand, commandDigest: digest, pinReference, claimedAt };
+    store.claimCommandExecution(claim);
+    fail.on = true;
+    expect(() => store.markCommandDispatchStarted(encryptedCommand.commandId, '2026-08-07T00:00:01.500Z'))
+      .toThrow('injected state write failure');
+    expect(store.getCommandExecution(encryptedCommand.commandId)?.state).toBe('claimed');
+    expect(() => store.recoverOrphanedCommandExecutions()).toThrow('injected state write failure');
+    expect(store.getCommandExecution(encryptedCommand.commandId)?.state).toBe('claimed');
+    expect(() => store.markCommandOutcomeUnknown(encryptedCommand.commandId)).toThrow('injected state write failure');
+    expect(store.getCommandExecution(encryptedCommand.commandId)?.state).toBe('claimed');
+    expect(() => store.persistTerminalReceiptBlocked(encryptedCommand.commandId, terminalResult))
+      .toThrow('injected state write failure');
+    expect(store.getCommandExecution(encryptedCommand.commandId)?.state).toBe('claimed');
+    const fresh = { ...encryptedCommand, commandId: 'command-claim-fail', nonce: 'nonce-claim-fail' };
+    const freshDigest = await commandDigest(fresh);
+    expect(() => store.claimCommandExecution({ originalEncryptedCommand: fresh, commandDigest: freshDigest,
+      pinReference, claimedAt })).toThrow('injected state write failure');
+    expect(store.getCommandExecution(fresh.commandId)).toBeUndefined();
+    store.dispose();
+  });
+
+  test('clone-first terminal receipt transitions leave the live execution unchanged after a failing commit', async () => {
+    const { store, fail } = failingStore('receipt');
+    const digest = await commandDigest(encryptedCommand);
+    const claim = { originalEncryptedCommand: encryptedCommand, commandDigest: digest, pinReference, claimedAt };
+    store.claimCommandExecution(claim);
+    store.persistTerminalReceiptBlocked(encryptedCommand.commandId, terminalResult);
+    const envelope = receipt(digest);
+    const canonicalBody = JSON.stringify(envelope);
+    const receiptDigest = await contentSha256((await import('@ariava/protocol')).buildCommandReceiptEnvelopeBindingBytes(envelope));
+    store.persistTerminalCommandReceipt(encryptedCommand.commandId, terminalResult,
+      { receipt: envelope, canonicalBody, receiptDigest });
+    fail.on = true;
+    expect(() => store.markCommandReceiptOutbox(encryptedCommand.commandId, 'acknowledged'))
+      .toThrow('injected state write failure');
+    expect(store.getCommandExecution(encryptedCommand.commandId)?.receiptOutbox?.state).toBe('pending');
+    const fresh = { ...encryptedCommand, commandId: 'command-receipt-fail', nonce: 'nonce-receipt-fail' };
+    const freshDigest = await commandDigest(fresh);
+    fail.on = false;
+    store.claimCommandExecution({ originalEncryptedCommand: fresh, commandDigest: freshDigest, pinReference, claimedAt });
+    const freshReceipt = { ...receipt(freshDigest), commandId: fresh.commandId, commandDigest: freshDigest };
+    const freshBody = JSON.stringify(freshReceipt);
+    const freshReceiptDigest = await contentSha256((await import('@ariava/protocol')).buildCommandReceiptEnvelopeBindingBytes(freshReceipt));
+    fail.on = true;
+    expect(() => store.persistTerminalCommandReceipt(fresh.commandId, { ...terminalResult, commandId: fresh.commandId },
+      { receipt: freshReceipt, canonicalBody: freshBody, receiptDigest: freshReceiptDigest }))
+      .toThrow('injected state write failure');
+    expect(store.getCommandExecution(fresh.commandId)?.state).toBe('claimed');
+    store.dispose();
+  });
+
+  test('clone-first prune leaves eligible executions in place after a failing commit', async () => {
+    const { store, fail } = failingStore('prune');
+    const digest = await commandDigest(encryptedCommand);
+    store.claimCommandExecution({ originalEncryptedCommand: encryptedCommand, commandDigest: digest,
+      pinReference, claimedAt });
+    fail.on = true;
+    const boundary = new Date(Date.parse(encryptedCommand.expiresAt) + 300_001).toISOString();
+    expect(() => store.pruneEligibleCommandExecutions(boundary)).toThrow('injected state write failure');
+    expect(store.getCommandExecution(encryptedCommand.commandId)).toBeDefined();
+    store.dispose();
+  });
+
+  test('mutate-first completion journal keeps the live value after a failing persist', () => {
+    const { store, fail } = failingStore('completion');
+    const completion = { version: 1 as const, eventId: 'evt-1', sessionId: 'sess-1', revision: 1,
+      eventContentId: 'event-content', sessionContentId: 'session-content', committedAt: LEGACY_AT };
+    fail.on = true;
+    expect(() => store.beginEventUploadCompletion(completion)).toThrow('injected state write failure');
+    fail.on = false;
+    const phases: string[] = [];
+    store.completeEventUpload('evt-1', (phase) => phases.push(phase));
+    expect(phases[0]).toBe('revision-committed');
+    expect(store.currentSessionRevision('sess-1')).toBe(1);
+    store.dispose();
+  });
+
+  test('partial Event completion resumes after a failed persist and restart preflight', () => {
+    const { statePath, store, fail } = failingStore('completion-partial', { withSpool: true });
+    const completion = { version: 1 as const, eventId: 'evt-2', sessionId: 'sess-1', revision: 1,
+      eventContentId: 'event-content', sessionContentId: 'session-content', committedAt: LEGACY_AT };
+    store.beginEventUploadCompletion(completion);
+    fail.on = true;
+    expect(() => store.completeEventUpload('evt-2')).toThrow('injected state write failure');
+    expect(store.currentSessionRevision('sess-1')).toBe(1);
+    store.dispose();
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).sessionRevisions['sess-1']).toBeUndefined();
+    const restarted = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    restarted.initializeEncryptedSpool('host-1', join(statePath, '..', 'identity.json'), 'linux',
+      { loadOrCreate: () => new Uint8Array(32).fill(7) });
+    expect(restarted.currentSessionRevision('sess-1')).toBe(1);
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).eventUploadCompletions).toBeUndefined();
+    restarted.dispose();
+  });
+
+  test('spool-dependent workflows fail closed without state mutation', () => {
+    const { statePath, store, fail } = failingStore('spool-failure', { withSpool: true });
+    const evt = makeEvent();
+    const sess = makeSession({ lastEventId: evt.eventId });
+    store.queuePendingEvent(evt, sess, 'fp');
+    fail.on = true;
+    expect(() => store.removePendingEvent(evt.eventId)).toThrow('injected state write failure');
+    expect(store.peekPendingUploads()).toEqual([]);
+    fail.on = false;
+    store.queuePendingEvent(evt, sess, 'fp');
+    fail.on = true;
+    expect(() => store.quarantinePendingEvent(evt.eventId, sess.sessionId, 'boom')).toThrow('injected state write failure');
+    expect(store.getQuarantinedEventRecord(evt.eventId)).toBeDefined();
+    // Replace the spool metadata file with an empty directory so the spool fails closed on new writes.
+    const spoolPath = spoolPathForState(statePath);
+    rmSync(spoolPath, { recursive: true, force: true });
+    mkdirSync(spoolPath, { mode: 0o700 });
+    const tupleEvt = makeEvent({ eventId: 'evt-tuple' });
+    expect(() => store.reserveProducerEventTuple(tupleEvt, makeSession({ lastEventId: 'evt-tuple' }), 'fp-tuple')).toThrow();
+    expect(store.getProducerEventReservation('sess-1', 'fp-tuple')).toBeUndefined();
+    store.dispose();
+  });
+
+  test('terminal-cancellation journal recovers after a failed state commit and restart preflight', () => {
+    const { statePath, store, fail } = failingStore('cancel-terminal', { withSpool: true });
+    const event = makeEvent();
+    const session = makeSession({ lastEventId: event.eventId });
+    const reservation = { version: 1 as const, eventId: event.eventId, sessionId: session.sessionId,
+      fingerprint: 'fp', createdAt: LEGACY_AT };
+    store.reserveProducerEventTuple(event, session, 'fp');
+    store.reserveProducerEvent(reservation);
+    fail.on = true;
+    expect(() => store.cancelTerminalEvent({ eventId: event.eventId, sessionId: session.sessionId, fingerprint: 'fp' }))
+      .toThrow('injected state write failure');
+    expect(store.getProducerEventReservation(session.sessionId, 'fp')).toEqual(reservation);
+    store.dispose();
+    const restarted = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
+    restarted.initializeEncryptedSpool('host-1', join(statePath, '..', 'identity.json'), 'linux',
+      { loadOrCreate: () => new Uint8Array(32).fill(7) });
+    expect(restarted.getProducerEventReservation(session.sessionId, 'fp')).toBeUndefined();
+    expect(restarted.getProducerEventTuple(event.eventId, 'fp')).toBeUndefined();
+    const durable = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(durable.producerEventReservations).toBeUndefined();
+    expect(durable.terminalCancellations).toBeUndefined();
+    restarted.dispose();
+  });
+});

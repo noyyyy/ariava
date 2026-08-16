@@ -467,6 +467,14 @@ const SAFE_DEV_LIFECYCLE_MODULES = [
   'runtime/node-runtime.ts',
   'runtime-lock.ts',
   'state-store.ts',
+  'state-store/state-codec.ts',
+  'state-store/command-transitions.ts',
+  'state-store/host-health-transitions.ts',
+  'state-store/session-transitions.ts',
+  'state-store/current-sessions-transitions.ts',
+  'state-store/event-transitions.ts',
+  'state-store/runtime-lifecycle.ts',
+  'state-store/state-transitions.ts',
   'ui/onboarding-renderer.ts',
 ] as const;
 

@@ -1,12 +1,59 @@
-import type { E2EEventAndSessionUploadV3, E2ERecipientSnapshotV1, EncryptedSessionSnapshotUploadV3 } from '@ariava/protocol';
+import type {
+  CanonicalEvent,
+  CanonicalSessionState,
+  E2EEventAndSessionUploadV3,
+  E2ERecipientSnapshotV1,
+  EncryptedSessionSnapshotUploadV3,
+} from '@ariava/protocol';
 import type { RelayClient } from '../relay-client';
-import { type BridgeStateStore, type EventDeadLetterReasonCode, type LoadedEventInflight, type PendingEventDescriptor } from '../state-store';
+import type { EventUploadCompletionV1 } from '../types';
+import type {
+  EventDeadLetterReasonCode,
+  LoadPendingEventPartsResult,
+  LoadedEventInflight,
+  PendingEventDescriptor,
+  SessionInflightLookup,
+  SessionInflightRecordV2,
+} from '../state-store';
 import { encryptEventUpload, encryptSessionSnapshot, type ActiveRecipientMaterial } from './envelope';
 import type { LocalLinkKeyring } from './link-keyring';
 import { RECIPIENT_SET_CHANGED_REASON, decideEventUpload, decideSessionUpload, type EventUploadDecision, type SessionUploadDecision } from './upload-decisions';
 import { isPermanentEventConflict, isRelayConflict, relayErrorStatus, relayFailureCategory, type UploadFailureCategory } from './upload-failures';
 import { attachNotificationPreviews, eventEncryptionInput, sessionEncryptionInput, type EncryptedEventAndSession } from './upload-inputs';
 import { digestsEqual, eventSourceDigest, preflightEventSource, preflightSessionSource, sessionSourceDigest } from './upload-preflight';
+
+/** Consumer-owned State Store capability port for encrypted uploads. */
+export interface UploadOrchestratorStateStore {
+  getSession(sessionId: string): CanonicalSessionState | undefined;
+  listSessions(): CanonicalSessionState[];
+  listPendingEventDescriptors(): PendingEventDescriptor[];
+  listEventInflightRecords(): Array<{ eventId: string; sessionId: string; kind: 'v2' | 'legacy' | 'malformed' }>;
+  loadPendingEventParts(descriptor: PendingEventDescriptor): LoadPendingEventPartsResult;
+  hasEventUploadCompletion(eventId: string): boolean;
+  openInflightEventRaw(eventId: string): Uint8Array | undefined;
+  getInflightEventUpload(eventId: string): unknown | undefined;
+  persistInflightEventUpload(eventId: string, sessionId: string, upload: unknown, sourceDigest?: string): void;
+  replaceInflightEventUpload(eventId: string, sessionId: string, upload: unknown, sourceDigest?: string): void;
+  listInflightSessionIds(): string[];
+  getInflightSessionUpload(sessionId: string): unknown | undefined;
+  getSessionInflightLookup(sessionId: string): SessionInflightLookup;
+  getSessionInflightRecordV2(sessionId: string): SessionInflightRecordV2 | undefined;
+  persistInflightSessionUpload(sessionId: string, upload: unknown, sourceDigest?: string): void;
+  replaceInflightSessionUpload(sessionId: string, upload: unknown, sourceDigest?: string): void;
+  removeInflightSessionUpload(sessionId: string): void;
+  nextSessionRevision(sessionId: string): number;
+  commitSessionRevision(sessionId: string, revision: number): void;
+  getRecipientSetVersion(): number | undefined;
+  setRecipientSetVersion(version: number): void;
+  beginEventUploadCompletion(completion: EventUploadCompletionV1): void;
+  completeEventUpload(eventId: string, step?: (phase: 'revision-committed' | 'inflight-removed' | 'source-removed' | 'journal-removed') => void): void;
+  quarantinePendingEventRaw(
+    descriptor: PendingEventDescriptor,
+    reasonCode: EventDeadLetterReasonCode,
+    provenUncommittedInflight?: Uint8Array,
+    quarantinedAt?: string,
+  ): boolean;
+}
 
 export interface EncryptedEventFailure {
   eventId: string;
@@ -35,7 +82,7 @@ export type AuthoritativeSnapshotOutcome =
   | { type: 'fail-closed' };
 
 export class EncryptedUploadOrchestrator {
-  constructor(private readonly stateStore: BridgeStateStore, private readonly client: RelayClient,
+  constructor(private readonly stateStore: UploadOrchestratorStateStore, private readonly client: RelayClient,
     private readonly keyring: LocalLinkKeyring,
     private readonly hooks?: EncryptedUploadHooks) {}
 

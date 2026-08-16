@@ -1,5 +1,5 @@
 import type { CommandResult } from '@ariava/protocol';
-import type { BridgeStateStore } from '../state-store';
+import type { CommandWorkflowStateStore } from './command-workflow-store';
 import type { CommandReceiptOutboxInputV1, PersistedCommandExecutionV4 } from '../types';
 import { buildCommandReceipt, type CommandReceiptExecution } from './command-receipt';
 import type { LocalLinkKeyring } from './link-keyring';
@@ -17,7 +17,7 @@ export interface CommandReceiptConstructionDependencies {
 }
 
 export async function persistTerminalCommandResult(
-  stateStore: BridgeStateStore,
+  stateStore: CommandWorkflowStateStore,
   keyring: LocalLinkKeyring,
   commandId: string,
   terminalResult: CommandResult,
@@ -44,7 +44,7 @@ export async function persistTerminalCommandResult(
 }
 
 export async function recoverBlockedCommandReceipts(
-  stateStore: BridgeStateStore,
+  stateStore: CommandWorkflowStateStore,
   keyring: LocalLinkKeyring,
   dependencies: CommandReceiptConstructionDependencies = {},
 ): Promise<number> {
@@ -77,7 +77,7 @@ export interface CommandReceiptDrainHooks {
 }
 
 export async function drainPendingCommandReceipts(
-  stateStore: BridgeStateStore,
+  stateStore: CommandWorkflowStateStore,
   keyring: LocalLinkKeyring,
   relayClient: PendingCommandReceiptRelayClient,
   hooks: CommandReceiptDrainHooks = {},

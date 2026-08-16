@@ -15,10 +15,9 @@ import type {
   EncryptedSessionSnapshotUploadV3, HostProjection, ReplaceE2ECurrentSessionsRequestV1,
 } from '@ariava/protocol';
 import {
-  SIGNED_REQUEST_LIMITS,
-  base64UrlDecode, base64UrlEncode, buildCommandReceiptEnvelopeBindingBytes, buildEncryptedCommandEnvelopeBindingBytes,
-  e2eCurrentSessionsSemanticDigestV1, isCanonicalTimestamp, validateCanonicalEventInvariant, validateCommandReceiptEnvelopeV1, validateCommandResult,
-  validateEncryptedCommandEnvelopeV1, validateEncryptedContentV1, validateNotificationPreviewEnvelopeV2, validateRecipientKeyWrapV1,
+  base64UrlDecode, base64UrlEncode, e2eCurrentSessionsSemanticDigestV1, isCanonicalTimestamp,
+  validateCanonicalEventInvariant, validateEncryptedContentV1, validateNotificationPreviewEnvelopeV2,
+  validateRecipientKeyWrapV1,
 } from '@ariava/protocol';
 import type {
   BridgeRuntimeHealth,
@@ -48,11 +47,65 @@ import {
   assertRuntimeWriterAllowed,
   type RuntimeCoordinator,
 } from './runtime-lock';
+import {
+  acceptCurrentSessionsPublicationTransition,
+  createCurrentSessionsPublicationTransition,
+  noteCurrentSessionsSnapshotRevisionLowerBoundTransition,
+  setRecipientSetVersionTransition,
+} from './state-store/current-sessions-transitions';
+import {
+  claimCommandExecutionTransition,
+  collectEncryptedUploadPinReferences,
+  markCommandDispatchStartedTransition,
+  markCommandOutcomeUnknownTransition,
+  markCommandReceiptOutboxTransition,
+  persistTerminalCommandReceiptTransition,
+  persistTerminalReceiptBlockedTransition,
+  pruneEligibleCommandExecutionsTransition,
+  readCommandExecutionPinRetentionReferences,
+  recoverOrphanedCommandExecutionsTransition,
+  validateCommandExecutionPinsState,
+  type CommandExecutionPinResolver,
+} from './state-store/command-transitions';
+import { appendRecentEventTransition, reserveProducerEventTransition } from './state-store/event-transitions';
+import {
+  readRuntimeHealth,
+  recordDriverReconciliationFailureTransition,
+  recordDriverReconciliationSuccessTransition,
+  recordRelayPresenceFailureTransition,
+  recordRelayPresenceSuccessTransition,
+  setHostTransition,
+} from './state-store/host-health-transitions';
+import {
+  commitSessionRevisionTransition,
+  queuePendingSessionHandleTransition,
+  readCurrentSessionRevision,
+  readNextSessionRevision,
+  removePendingSessionHandleTransition,
+  removeSessionDriverTransition,
+  removeSessionTransition,
+  replaceDriverSessionsTransition,
+  setSessionDriverTransition,
+  updateSessionTransition,
+} from './state-store/session-transitions';
+import { commitState, type StateTransition } from './state-store/state-transitions';
+import {
+  BRIDGE_RUNTIME_STATE_SCHEMA_VERSION,
+  assertCommandExecution,
+  emptyState,
+  isNonEmptyString,
+  isPositiveSafeInteger,
+  isRecord,
+  isVerifier,
+  producerReservationKey,
+} from './state-store/state-codec';
+import { loadCurrentOrFresh as loadFreshState } from './state-store/runtime-lifecycle';
 
-export const BRIDGE_RUNTIME_STATE_SCHEMA_VERSION = 5 as const;
+export { BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, emptyState };
+export { COMMAND_RECEIPT_RETENTION_DAYS, COMMAND_RECEIPT_RETENTION_MS } from './state-store/command-transitions';
+export type { CommandExecutionPinResolver };
+
 export const PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION = 4 as const;
-export const COMMAND_RECEIPT_RETENTION_DAYS = 30 as const;
-export const COMMAND_RECEIPT_RETENTION_MS = COMMAND_RECEIPT_RETENTION_DAYS * 24 * 60 * 60 * 1_000;
 const PRIOR_RUNTIME_STATE_SCHEMA_VERSION = 3 as const;
 const OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION = 2 as const;
 const LEGACY_RUNTIME_STATE_SCHEMA_VERSION = 1 as const;
@@ -65,17 +118,6 @@ const PRIOR_V2_SPOOL_KINDS = new Set([
   'event-upload-v2', 'session-upload-v2', 'terminal-cancellation-v2',
 ]);
 const MAX_RECENT_EVENTS = 200;
-const EMPTY_SNAPSHOT: PersistedCurrentSessionsSnapshotState = {
-  version: 1, lastAllocatedRevision: 0, lastAcceptedRevision: 0,
-};
-
-function emptyState(runtimeResetEpoch: string = randomUUID()): PersistedBridgeState {
-  return {
-    schemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, runtimeResetEpoch, host: null, sessions: {}, sessionDrivers: {},
-    reconciledDrivers: {}, recentEvents: [], sessionRevisions: {}, pendingHandles: {}, commandExecutions: {},
-    currentSessionsSnapshot: structuredClone(EMPTY_SNAPSHOT), runtimeHealth: { status: 'healthy', drivers: [] },
-  };
-}
 
 interface RuntimeResetIntentV1 {
   version: 1;
@@ -159,9 +201,6 @@ export interface RuntimeResetHooks {
   write?: SecureFileWriteHooks;
   remove?: SecureFileRemoveHooks;
   recoveryStep?: (phase: RuntimeRecoveryPhase) => void;
-}
-export interface CommandExecutionPinResolver {
-  resolvePinReference(linkId: string, linkGeneration: number, epoch: number): PersistedCommandPinReferenceV1 | undefined;
 }
 
 /** Minimal descriptor for one pending Event source item (§5.1); no payload decode. */
@@ -445,7 +484,8 @@ export class BridgeStateStore {
   }
 
   private loadCurrentOrFresh(): PersistedBridgeState {
-    if (!this.filePath || !pathHasFilesystemEvidence(this.filePath)) return emptyState();
+    if (!this.filePath) return loadFreshState(this.filePath);
+    if (!pathHasFilesystemEvidence(this.filePath)) return emptyState(randomUUID());
     try {
       return parseCurrentState(readSecureJson<unknown>(this.filePath));
     } catch (error) {
@@ -811,158 +851,79 @@ export class BridgeStateStore {
     if (this.filePath) this.writeState(this.filePath, nextState);
     this.state = nextState;
   }
-  setHost(host: HostProjection): void { this.state.host = sanitizePersistedHost(host); this.persist(); }
+  private commitTransition<Result>(
+    transition: (state: PersistedBridgeState) => StateTransition<Result>,
+  ): Result {
+    return commitState(
+      { state: this.state, commit: (nextState) => this.commit(nextState) },
+      transition,
+    );
+  }
+
+  private applyTransition<Result>(transition: StateTransition<Result>): Result {
+    if (transition.state !== this.state) {
+      this.state = transition.state;
+      this.persist();
+    }
+    return transition.result;
+  }
+
+  setHost(host: HostProjection): void { this.applyTransition(setHostTransition(this.state, host)); }
   getHost(): HostProjection | null { return this.state.host; }
 
-  getRuntimeHealth(): BridgeRuntimeHealth {
-    const health = this.state.runtimeHealth ?? { status: 'healthy' as const, drivers: [] };
-    return structuredClone({
-      ...health,
-      drivers: [...health.drivers].sort((left, right) => left.driver.localeCompare(right.driver)),
-    });
-  }
+  getRuntimeHealth(): BridgeRuntimeHealth { return readRuntimeHealth(this.state); }
   recordDriverReconciliationFailure(driver: string, seenAt: string, nextRetryAt: string): DriverRuntimeHealth {
-    const nextState = structuredClone(this.state);
-    const health = nextState.runtimeHealth ?? { status: 'healthy' as const, drivers: [] };
-    const existing = health.drivers.find((item) => item.driver === driver);
-    const degradation: DriverRuntimeHealth = existing
-      ? { ...existing, count: existing.count + 1, lastSeenAt: seenAt, nextRetryAt }
-      : { driver, code: 'driver_reconciliation_failed', count: 1, firstSeenAt: seenAt, lastSeenAt: seenAt, nextRetryAt };
-    health.drivers = [...health.drivers.filter((item) => item.driver !== driver), degradation]
-      .sort((left, right) => left.driver.localeCompare(right.driver));
-    health.status = 'degraded';
-    nextState.runtimeHealth = health;
-    this.commit(nextState);
-    return structuredClone(degradation);
+    return this.commitTransition((state) => recordDriverReconciliationFailureTransition(state, driver, seenAt, nextRetryAt));
   }
   recordDriverReconciliationSuccess(driver: string): { count: number } | undefined {
-    const nextState = structuredClone(this.state);
-    const health = nextState.runtimeHealth ?? { status: 'healthy' as const, drivers: [] };
-    const recovered = health.drivers.find((item) => item.driver === driver);
-    if (!recovered) return undefined;
-    health.drivers = health.drivers.filter((item) => item.driver !== driver);
-    health.status = health.drivers.length > 0 || health.relayPresence ? 'degraded' : 'healthy';
-    nextState.runtimeHealth = health;
-    this.commit(nextState);
-    return { count: recovered.count };
+    return this.commitTransition((state) => recordDriverReconciliationSuccessTransition(state, driver));
   }
   recordRelayPresenceFailure(seenAt: string, nextRetryAt: string): void {
-    const nextState = structuredClone(this.state);
-    const health = nextState.runtimeHealth ?? { status: 'healthy' as const, drivers: [] };
-    const existing = health.relayPresence;
-    health.relayPresence = existing
-      ? { ...existing, count: existing.count + 1, lastSeenAt: seenAt, nextRetryAt }
-      : { code: 'relay_presence_refresh_failed', count: 1, firstSeenAt: seenAt, lastSeenAt: seenAt, nextRetryAt };
-    health.status = 'degraded';
-    nextState.runtimeHealth = health;
-    this.commit(nextState);
+    this.commitTransition((state) => recordRelayPresenceFailureTransition(state, seenAt, nextRetryAt));
   }
   recordRelayPresenceSuccess(): { count: number } | undefined {
-    const nextState = structuredClone(this.state);
-    const health = nextState.runtimeHealth ?? { status: 'healthy' as const, drivers: [] };
-    const recovered = health.relayPresence;
-    if (!recovered) return undefined;
-    delete health.relayPresence;
-    health.status = health.drivers.length > 0 ? 'degraded' : 'healthy';
-    nextState.runtimeHealth = health;
-    this.commit(nextState);
-    return { count: recovered.count };
+    return this.commitTransition((state) => recordRelayPresenceSuccessTransition(state));
   }
 
   replaceDriverSessions(driverName: string, sessions: CanonicalSessionState[]): void {
-    const nextState = structuredClone(this.state);
-    const nextIds = new Set(sessions.map((session) => session.sessionId));
-    for (const [sessionId, registeredDriver] of Object.entries(nextState.sessionDrivers)) if (registeredDriver === driverName && !nextIds.has(sessionId)) {
-      delete nextState.sessionDrivers[sessionId]; delete nextState.sessions[sessionId];
-    }
-
-    for (const session of sessions) { nextState.sessions[session.sessionId] = session; nextState.sessionDrivers[session.sessionId] = driverName; }
-    nextState.reconciledDrivers[driverName] = true;
-    this.commit(nextState);
+    this.commitTransition((state) => replaceDriverSessionsTransition(state, driverName, sessions));
   }
   listSessions(): CanonicalSessionState[] { return Object.values(this.state.sessions).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); }
   hasReconciledDriver(driverName: string): boolean { return this.state.reconciledDrivers[driverName] === true; }
   getSession(sessionId: string): CanonicalSessionState | undefined { return this.state.sessions[sessionId]; }
   getDriverNameForSession(sessionId: string): string | undefined { return this.state.sessionDrivers[sessionId]; }
   setSessionDriver(sessionId: string, driverName: string, session?: CanonicalSessionState): void {
-    const nextState = structuredClone(this.state);
-    const boundSession = session ?? nextState.sessions[sessionId];
-    if (!boundSession || boundSession.sessionId !== sessionId || boundSession.provider !== driverName) {
-      throw new TypeError('Session driver requires its canonical Session');
-    }
-    nextState.sessions[sessionId] = boundSession;
-    nextState.sessionDrivers[sessionId] = driverName;
-    this.commit(nextState);
+    this.commitTransition((state) => setSessionDriverTransition(state, sessionId, driverName, session));
   }
   removeSession(sessionId: string, expectedDriverName?: string): boolean {
-    const driverName = this.state.sessionDrivers[sessionId];
-    if (expectedDriverName !== undefined && driverName !== expectedDriverName) return false;
-    const existed = sessionId in this.state.sessions || driverName !== undefined;
-    if (!existed) return false;
-    const nextState = structuredClone(this.state);
-    delete nextState.sessions[sessionId]; delete nextState.sessionDrivers[sessionId];
-    this.commit(nextState);
-    return true;
+    return this.commitTransition((state) => removeSessionTransition(state, sessionId, expectedDriverName));
   }
   removeSessionDriver(sessionId: string): void {
-    if (!(sessionId in this.state.sessionDrivers)) return;
-    const nextState = structuredClone(this.state);
-    delete nextState.sessionDrivers[sessionId];
-    this.commit(nextState);
+    this.commitTransition((state) => removeSessionDriverTransition(state, sessionId));
   }
   updateSession(sessionId: string, patch: Partial<CanonicalSessionState>): CanonicalSessionState | undefined {
-    const current = this.getSession(sessionId); if (!current) return undefined;
-    const next = { ...current, ...patch }; this.state.sessions[sessionId] = next; this.persist(); return next;
+    return this.applyTransition(updateSessionTransition(this.state, sessionId, patch));
   }
 
   async createCurrentSessionsPublication(hostId: string, sessions: CanonicalSessionState[], recipientSetVersion: number, observedAt: string, minimumRevision = 0): Promise<{ request: ReplaceE2ECurrentSessionsRequestV1; contentDigest: string } | undefined> {
     const contentDigest = await e2eCurrentSessionsSemanticDigestV1(hostId, sessions);
-    const current = this.state.currentSessionsSnapshot;
-    if (current.lastAcceptedContentDigest === contentDigest
-      && current.lastAcceptedRecipientSetVersion === recipientSetVersion && current.lastAcceptedRevision >= minimumRevision) return undefined;
-    const revision = Math.max(current.lastAllocatedRevision + 1, current.lastAcceptedRevision + 1, minimumRevision);
-    const request: ReplaceE2ECurrentSessionsRequestV1 = { hostId, revision, observedAt, recipientSetVersion, sessions: [] };
-    this.state.currentSessionsSnapshot = { ...current, version: 1, lastAllocatedRevision: revision };
-    this.persist();
-    return { request, contentDigest };
+    return this.applyTransition(createCurrentSessionsPublicationTransition(this.state, {
+      hostId, contentDigest, recipientSetVersion, observedAt, minimumRevision,
+    }));
   }
   getCurrentSessionsSnapshotState(): PersistedCurrentSessionsSnapshotState { return structuredClone(this.state.currentSessionsSnapshot); }
   acceptCurrentSessionsPublication(request: ReplaceE2ECurrentSessionsRequestV1, digest: string, contentDigest: string): boolean {
-    const current = this.state.currentSessionsSnapshot;
-    if (this.state.recipientSetVersion !== request.recipientSetVersion) {
-      throw new TypeError('current Sessions publication recipient set is not locally committed');
-    }
-    if (request.revision < current.lastAcceptedRevision) return false;
-    this.state.currentSessionsSnapshot = { version: 1, lastAllocatedRevision: Math.max(current.lastAllocatedRevision, request.revision),
-      lastAcceptedRevision: Math.max(current.lastAcceptedRevision, request.revision), lastAcceptedDigest: digest,
-      lastAcceptedContentDigest: contentDigest, lastAcceptedRecipientSetVersion: request.recipientSetVersion };
-    this.persist(); return true;
+    return this.applyTransition(acceptCurrentSessionsPublicationTransition(this.state, request, digest, contentDigest));
   }
   noteCurrentSessionsSnapshotRevisionLowerBound(revision: number): void {
-    const current = this.state.currentSessionsSnapshot;
-    const nextAllocated = Math.max(current.lastAllocatedRevision, revision);
-    if (nextAllocated === current.lastAllocatedRevision) return;
-    this.state.currentSessionsSnapshot = { ...current, lastAllocatedRevision: nextAllocated };
-    this.persist();
+    this.applyTransition(noteCurrentSessionsSnapshotRevisionLowerBoundTransition(this.state, revision));
   }
   getProducerEventReservation(sessionId: string, fingerprint: string): PersistedProducerEventReservationV1 | undefined {
     const reservation = this.state.producerEventReservations?.[producerReservationKey(sessionId, fingerprint)];
     return reservation && structuredClone(reservation);
   }
   reserveProducerEvent(reservation: PersistedProducerEventReservationV1): void {
-    const key = producerReservationKey(reservation.sessionId, reservation.fingerprint);
-    const existing = this.state.producerEventReservations?.[key];
-    if (existing) {
-      if (existing.eventId !== reservation.eventId || existing.createdAt !== reservation.createdAt) {
-        throw new TypeError('producer Event reservation conflict');
-      }
-      return;
-    }
-    const nextState = structuredClone(this.state);
-    const reservations = { ...(nextState.producerEventReservations ?? {}), [key]: structuredClone(reservation) };
-    const retained = Object.entries(reservations).slice(-200);
-    nextState.producerEventReservations = Object.fromEntries(retained);
-    this.commit(nextState);
+    this.commitTransition((state) => reserveProducerEventTransition(state, reservation));
   }
   getProducerEventTuple(eventId: string, fingerprint: string): { event: CanonicalEvent; session: CanonicalSessionState } | undefined {
     return this.openProducerTuple('event-reservation-v3', eventId, fingerprint)
@@ -1105,9 +1066,7 @@ export class BridgeStateStore {
   }
 
   appendRecentEvent(event: CanonicalEvent): void {
-    const nextState = structuredClone(this.state);
-    nextState.recentEvents = retainRecentEvents([event, ...nextState.recentEvents], nextState.pendingHandles);
-    this.commit(nextState);
+    this.commitTransition((state) => appendRecentEventTransition(state, event));
   }
   queuePendingEvent(event: CanonicalEvent, terminalSession: CanonicalSessionState, producerFingerprint?: string): void {
     assertEventSessionBinding(event, terminalSession);
@@ -1572,13 +1531,10 @@ export class BridgeStateStore {
     return true;
   }
   getQuarantinedEventRecord(eventId: string): unknown | undefined { return this.openSpoolJson(`dead-letter:event:${eventId}`); }
-  currentSessionRevision(sessionId: string): number { return this.state.sessionRevisions[sessionId] ?? 0; }
-  nextSessionRevision(sessionId: string): number { return this.currentSessionRevision(sessionId) + 1; }
+  currentSessionRevision(sessionId: string): number { return readCurrentSessionRevision(this.state, sessionId); }
+  nextSessionRevision(sessionId: string): number { return readNextSessionRevision(this.state, sessionId); }
   commitSessionRevision(sessionId: string, revision: number): void {
-    const current = this.currentSessionRevision(sessionId);
-    if (revision === current) return;
-    if (revision !== current + 1) throw new TypeError('session revision must advance monotonically');
-    this.state.sessionRevisions[sessionId] = revision; this.persist();
+    this.applyTransition(commitSessionRevisionTransition(this.state, sessionId, revision));
   }
   beginEventUploadCompletion(completion: EventUploadCompletionV1): void {
     const existing = this.state.eventUploadCompletions?.[completion.eventId];
@@ -1618,35 +1574,14 @@ export class BridgeStateStore {
   }
   getRecipientSetVersion(): number | undefined { return this.state.recipientSetVersion; }
   setRecipientSetVersion(version: number): void {
-    if (!Number.isSafeInteger(version) || version < 1 || (this.state.recipientSetVersion !== undefined && version < this.state.recipientSetVersion)) throw new TypeError('recipient set version rollback rejected');
-    this.state.recipientSetVersion = version; this.persist();
+    this.applyTransition(setRecipientSetVersionTransition(this.state, version));
   }
   queuePendingSessionHandle(handle: PendingSessionHandle): void {
-    const event = this.state.recentEvents.find((candidate) => candidate.eventId === handle.handledThroughEventId);
-    if (!event || event.hostId !== handle.hostId || event.sessionId !== handle.sessionId) {
-      throw new TypeError('handledThroughEventId must reference a durable Event for the same Host and Session');
-    }
-    if (handle.handledThroughEventCreatedAt !== undefined && handle.handledThroughEventCreatedAt !== event.createdAt) {
-      throw new TypeError('handledThroughEventCreatedAt does not match the durable Event');
-    }
-    const boundHandle = { ...handle, handledThroughEventCreatedAt: event.createdAt };
-    const key = sessionHandleKey(boundHandle.hostId, boundHandle.sessionId);
-    const current = this.state.pendingHandles[key];
-    if (current && comparePendingHandles(boundHandle, current) < 0) {
-      throw new TypeError('handledThroughEventId is older than the pending durable cursor');
-    }
-    const nextState = structuredClone(this.state);
-    nextState.pendingHandles[key] = boundHandle;
-    nextState.recentEvents = retainRecentEvents(nextState.recentEvents, nextState.pendingHandles);
-    this.commit(nextState);
+    this.commitTransition((state) => queuePendingSessionHandleTransition(state, handle));
   }
   peekPendingSessionHandles(): PendingSessionHandle[] { return Object.values(this.state.pendingHandles); }
   removePendingSessionHandle(hostId: string, sessionId: string, handledThroughEventId?: string): void {
-    const key = sessionHandleKey(hostId, sessionId); const current = this.state.pendingHandles[key]; if (!current) return;
-    if (handledThroughEventId && current.handledThroughEventId !== handledThroughEventId) return;
-    const nextState = structuredClone(this.state);
-    delete nextState.pendingHandles[key];
-    this.commit(nextState);
+    this.commitTransition((state) => removePendingSessionHandleTransition(state, hostId, sessionId, handledThroughEventId));
   }
   getCommandExecution(commandId: string): PersistedCommandExecutionV4 | undefined {
     const execution = this.state.commandExecutions[commandId];
@@ -1656,16 +1591,7 @@ export class BridgeStateStore {
     return Object.values(this.state.commandExecutions).map((execution) => structuredClone(execution));
   }
   commandExecutionPinRetentionReferences(): import('./e2e/link-keyring').PinRetentionReferences {
-    const references: import('./e2e/link-keyring').PinRetentionReferences = {};
-    for (const execution of Object.values(this.state.commandExecutions)) {
-      const key = `${execution.pinReference.linkId}:${execution.pinReference.linkGeneration}:${execution.pinReference.epoch}`;
-      const category = commandExecutionRetentionCategory(execution);
-      const retainThrough = commandExecutionRetainedThrough(execution);
-      const values = references[category] ?? {};
-      values[key] = laterCanonicalTimestamp(values[key], retainThrough);
-      references[category] = values;
-    }
-    return references;
+    return readCommandExecutionPinRetentionReferences(this.state);
   }
   durableContentPinRetentionReferences(retainThrough: string): import('./e2e/link-keyring').PinRetentionReferences {
     if (!isCanonicalTimestamp(retainThrough)) throw new TypeError('content retention cutoff is invalid');
@@ -1684,28 +1610,13 @@ export class BridgeStateStore {
     return Object.keys(contentRetainedThrough).length === 0 ? {} : { contentRetainedThrough };
   }
   pruneEligibleCommandExecutions(now: string): PersistedCommandExecutionV4[] {
-    if (!isCanonicalTimestamp(now)) throw new TypeError('command execution prune clock is invalid');
-    const eligible = Object.entries(this.state.commandExecutions)
-      .filter(([, execution]) => commandExecutionRetainedThrough(execution) < now);
-    if (eligible.length === 0) return [];
-    const nextState = structuredClone(this.state);
-    for (const [commandId] of eligible) delete nextState.commandExecutions[commandId];
-    this.commit(nextState);
-    return eligible.map(([, execution]) => structuredClone(execution));
+    return this.commitTransition((state) => pruneEligibleCommandExecutionsTransition(state, now));
   }
   validateCommandExecutionPins(
     resolver: CommandExecutionPinResolver,
     options: { allowUnavailableForTerminal?: boolean } = {},
   ): void {
-    for (const execution of Object.values(this.state.commandExecutions)) {
-      const expected = execution.pinReference;
-      const actual = resolver.resolvePinReference(expected.linkId, expected.linkGeneration, expected.epoch);
-      if (!actual && options.allowUnavailableForTerminal
-        && (execution.state === 'terminal_receipt_blocked' || execution.state === 'terminal')) continue;
-      if (!actual || JSON.stringify(actual) !== JSON.stringify(expected)) {
-        throw new Error('Bridge runtime command execution pin reference is unavailable or inconsistent');
-      }
-    }
+    validateCommandExecutionPinsState(this.state, resolver, options);
     this.commandExecutionPinsReady = true;
   }
   claimCommandExecution(input: {
@@ -1713,93 +1624,33 @@ export class BridgeStateStore {
     pinReference: PersistedCommandPinReferenceV1; claimedAt: string;
   }): { status: 'claimed' | 'duplicate'; execution: PersistedCommandExecutionV4 } | { status: 'conflict' } {
     this.assertCommandExecutionPinsReady();
-    const candidate: PersistedCommandExecutionV4 = {
-      version: 1, originalEncryptedCommand: structuredClone(input.originalEncryptedCommand),
-      commandDigest: input.commandDigest, pinReference: structuredClone(input.pinReference),
-      watchDeviceId: input.originalEncryptedCommand.watchDeviceId, nonce: input.originalEncryptedCommand.nonce,
-      expiresAt: input.originalEncryptedCommand.expiresAt, state: 'claimed', claimedAt: input.claimedAt,
-    };
-    assertCommandExecution(candidate);
-    const existing = this.state.commandExecutions[input.originalEncryptedCommand.commandId];
-    if (existing) return sameCommandClaim(existing, candidate)
-      ? { status: 'duplicate', execution: structuredClone(existing) } : { status: 'conflict' };
-    if (Object.values(this.state.commandExecutions).some((execution) =>
-      execution.watchDeviceId === candidate.watchDeviceId && execution.nonce === candidate.nonce)) return { status: 'conflict' };
-    const nextState = structuredClone(this.state);
-    nextState.commandExecutions[input.originalEncryptedCommand.commandId] = candidate;
-    this.commit(nextState);
-    return { status: 'claimed', execution: structuredClone(candidate) };
+    return this.commitTransition((state) => claimCommandExecutionTransition(state, input));
   }
   markCommandDispatchStarted(commandId: string, dispatchStartedAt: string): PersistedCommandExecutionV4 {
-    const current = this.requireCommandExecution(commandId);
-    if (current.state !== 'claimed') throw new TypeError('command execution cannot start dispatch from its current state');
-    return this.replaceCommandExecution(commandId, { ...current, state: 'dispatch_started', dispatchStartedAt });
+    this.assertCommandExecutionPinsReady();
+    return this.commitTransition((state) => markCommandDispatchStartedTransition(state, commandId, dispatchStartedAt));
   }
   recoverOrphanedCommandExecutions(): number {
     this.assertCommandExecutionPinsReady();
-    const orphanIds = Object.entries(this.state.commandExecutions)
-      .filter(([, execution]) => execution.state === 'claimed' || execution.state === 'dispatch_started')
-      .map(([commandId]) => commandId);
-    if (orphanIds.length === 0) return 0;
-    const nextState = structuredClone(this.state);
-    for (const commandId of orphanIds) nextState.commandExecutions[commandId] = {
-      ...nextState.commandExecutions[commandId]!, state: 'outcome_unknown',
-    };
-    this.commit(nextState);
-    return orphanIds.length;
+    return this.commitTransition((state) => recoverOrphanedCommandExecutionsTransition(state));
   }
   markCommandOutcomeUnknown(commandId: string): PersistedCommandExecutionV4 {
-    const current = this.requireCommandExecution(commandId);
-    if (current.state !== 'claimed' && current.state !== 'dispatch_started') {
-      throw new TypeError('command execution cannot become outcome-unknown from its current state');
-    }
-    return this.replaceCommandExecution(commandId, { ...current, state: 'outcome_unknown' });
+    this.assertCommandExecutionPinsReady();
+    return this.commitTransition((state) => markCommandOutcomeUnknownTransition(state, commandId));
   }
   persistTerminalReceiptBlocked(commandId: string, terminalResult: CommandResult): PersistedCommandExecutionV4 {
-    const current = this.requireCommandExecution(commandId);
-    if (current.state !== 'claimed' && current.state !== 'dispatch_started') {
-      throw new TypeError('command execution cannot persist a terminal result from its current state');
-    }
-    return this.replaceCommandExecution(commandId, {
-      ...current, state: 'terminal_receipt_blocked', terminalResult: structuredClone(terminalResult),
-    });
+    this.assertCommandExecutionPinsReady();
+    return this.commitTransition((state) => persistTerminalReceiptBlockedTransition(state, commandId, terminalResult));
   }
   persistTerminalCommandReceipt(
     commandId: string, terminalResult: CommandResult, outbox: CommandReceiptOutboxInputV1,
   ): PersistedCommandExecutionV4 {
-    const current = this.requireCommandExecution(commandId);
-    if (current.state !== 'claimed' && current.state !== 'dispatch_started' && current.state !== 'terminal_receipt_blocked') {
-      throw new TypeError('command execution cannot become terminal from its current state');
-    }
-    if (current.state === 'terminal_receipt_blocked' && JSON.stringify(current.terminalResult) !== JSON.stringify(terminalResult)) {
-      throw new TypeError('terminal result is immutable');
-    }
-    assertReceiptOutboxForExecution(current, terminalResult, outbox);
-    return this.replaceCommandExecution(commandId, {
-      ...current, state: 'terminal', terminalResult: structuredClone(terminalResult),
-      receiptOutbox: { version: 1, state: 'pending', canonicalBody: outbox.canonicalBody, receiptDigest: outbox.receiptDigest },
-    });
+    this.assertCommandExecutionPinsReady();
+    return this.commitTransition((state) => persistTerminalCommandReceiptTransition(state, commandId, terminalResult, outbox));
   }
   markCommandReceiptOutbox(commandId: string, state: 'acknowledged' | 'undeliverable'): PersistedCommandExecutionV4 {
-    const current = this.requireCommandExecution(commandId);
-    if (current.state !== 'terminal' || !current.receiptOutbox || current.receiptOutbox.state !== 'pending') {
-      throw new TypeError('command receipt outbox cannot transition from its current state');
-    }
-    return this.replaceCommandExecution(commandId, { ...current, receiptOutbox: { ...current.receiptOutbox, state } });
-  }
-  private requireCommandExecution(commandId: string): PersistedCommandExecutionV4 {
     this.assertCommandExecutionPinsReady();
-    const execution = this.state.commandExecutions[commandId];
-    if (!execution) throw new TypeError('command execution is not claimed');
-    return structuredClone(execution);
-  }
-  private replaceCommandExecution(commandId: string, execution: PersistedCommandExecutionV4): PersistedCommandExecutionV4 {
-    assertCommandExecution(execution);
-    if (execution.originalEncryptedCommand.commandId !== commandId) throw new TypeError('command execution ID binding is invalid');
-    const nextState = structuredClone(this.state);
-    nextState.commandExecutions[commandId] = execution;
-    this.commit(nextState);
-    return structuredClone(execution);
+    return this.commitTransition((current) => markCommandReceiptOutboxTransition(current, commandId, state));
   }
   private assertCommandExecutionPinsReady(): void {
     if (!this.commandExecutionPinsReady) {
@@ -1808,54 +1659,6 @@ export class BridgeStateStore {
   }
 }
 
-function commandExecutionRetainedThrough(execution: PersistedCommandExecutionV4): string {
-  if (execution.state === 'claimed' || execution.state === 'dispatch_started' || execution.state === 'outcome_unknown') {
-    return addMilliseconds(execution.expiresAt, SIGNED_REQUEST_LIMITS.clockSkewMs, 'command execution expiry');
-  }
-  if (!execution.terminalResult) throw new TypeError('terminal command execution retention is noncanonical');
-  return addMilliseconds(execution.terminalResult.updatedAt, COMMAND_RECEIPT_RETENTION_MS, 'command receipt retention');
-}
-
-function addMilliseconds(timestamp: string, durationMs: number, label: string): string {
-  if (!isCanonicalTimestamp(timestamp)) throw new TypeError(`${label} timestamp is invalid`);
-  const value = Date.parse(timestamp) + durationMs;
-  if (!Number.isFinite(value)) throw new TypeError(`${label} timestamp is invalid`);
-  return new Date(value).toISOString();
-}
-
-function laterCanonicalTimestamp(left: string | undefined, right: string): string {
-  return left && left > right ? left : right;
-}
-
-function collectEncryptedUploadPinReferences(
-  value: unknown, references: Record<string, string>, retainThrough: string,
- ): void {
-  if (!isRecord(value)) return;
-  for (const nested of Object.values(value)) {
-    if (Array.isArray(nested)) {
-      for (const item of nested) collectEncryptedUploadPinReferences(item, references, retainThrough);
-      continue;
-    }
-    if (!isRecord(nested)) continue;
-    if (isNonEmptyString(nested.linkId) && isPositiveSafeInteger(nested.linkGeneration) && isPositiveSafeInteger(nested.epoch)) {
-      const key = `${nested.linkId}:${nested.linkGeneration}:${nested.epoch}`;
-      references[key] = laterCanonicalTimestamp(references[key], retainThrough);
-    }
-    collectEncryptedUploadPinReferences(nested, references, retainThrough);
-  }
-}
-
-function commandExecutionRetentionCategory(
-  execution: PersistedCommandExecutionV4,
-): keyof import('./e2e/link-keyring').PinRetentionReferences {
-  if (execution.state === 'claimed' || execution.state === 'dispatch_started' || execution.state === 'outcome_unknown') {
-    return 'executionRetainedThrough';
-  }
-  if (execution.state === 'terminal_receipt_blocked') return 'terminalReceiptRetainedThrough';
-  if (execution.receiptOutbox?.state === 'pending') return 'pendingOutboxRetainedThrough';
-  if (execution.receiptOutbox?.state === 'undeliverable') return 'undeliverableOutboxRetainedThrough';
-  return 'terminalReceiptRetainedThrough';
-}
 
 function retainRecentEvents(
   events: CanonicalEvent[], pendingHandles: Record<string, PendingSessionHandle>,
@@ -1873,49 +1676,12 @@ function comparePendingHandles(left: PendingSessionHandle, right: PendingSession
   if (cursorCompare !== 0) return cursorCompare; const eventCompare = left.handledThroughEventId.localeCompare(right.handledThroughEventId);
   return eventCompare !== 0 ? eventCompare : left.updatedAt.localeCompare(right.updatedAt);
 }
-function producerReservationKey(sessionId: string, fingerprint: string): string { return `${sessionId}\n${fingerprint}`; }
 function terminalCancellationItemId(eventId: string): string { return `cancel:terminal:${eventId}`; }
 function sanitizePersistedHost(host: HostProjection | null): HostProjection | null {
   if (!host) return null;
   const value = { ...host } as HostProjection & Record<string, unknown>;
   delete value.claimCode; delete value.claimCodeExpiresAt; delete value.ownerUserId;
   return value;
-}
-function sameCommandClaim(left: PersistedCommandExecutionV4, right: PersistedCommandExecutionV4): boolean {
-  return left.commandDigest === right.commandDigest
-    && JSON.stringify(left.originalEncryptedCommand) === JSON.stringify(right.originalEncryptedCommand)
-    && JSON.stringify(left.pinReference) === JSON.stringify(right.pinReference);
-}
-
-function assertReceiptOutboxForExecution(
-  execution: PersistedCommandExecutionV4, terminalResult: CommandResult, outbox: CommandReceiptOutboxInputV1,
- ): void {
-  if (!validateCommandResult(terminalResult) || !validateCommandReceiptEnvelopeV1(outbox.receipt)
-    || JSON.stringify(outbox.receipt) !== outbox.canonicalBody
-    || hashBytes(buildCommandReceiptEnvelopeBindingBytes(outbox.receipt)) !== outbox.receiptDigest) {
-    throw new TypeError('command receipt outbox input is invalid');
-  }
-  const receipt = outbox.receipt;
-  const command = execution.originalEncryptedCommand;
-  if (terminalResult.commandId !== command.commandId || terminalResult.hostId !== command.hostId
-    || terminalResult.sessionId !== command.sessionId || receipt.hostId !== command.hostId
-    || receipt.watchDeviceId !== command.watchDeviceId || receipt.sessionId !== command.sessionId
-    || receipt.commandId !== command.commandId || receipt.commandType !== command.type
-    || receipt.commandDigest !== execution.commandDigest || receipt.completedAt !== terminalResult.updatedAt
-    || receipt.linkId !== execution.pinReference.linkId
-    || receipt.linkGeneration !== execution.pinReference.linkGeneration || receipt.epoch !== execution.pinReference.epoch
-    || receipt.keyWrap.senderEncryptionKeyId !== execution.pinReference.hostEncryptionKeyId
-    || receipt.keyWrap.recipientEncryptionKeyId !== execution.pinReference.watchEncryptionKeyId) {
-    throw new TypeError('command receipt does not match its execution');
-  }
-}
-
-function assertPersistedReceiptMatchesExecution(execution: PersistedCommandExecutionV4): void {
-  const outbox = execution.receiptOutbox!;
-  const receipt = JSON.parse(outbox.canonicalBody);
-  assertReceiptOutboxForExecution(execution, execution.terminalResult!, {
-    canonicalBody: outbox.canonicalBody, receiptDigest: outbox.receiptDigest, receipt,
-  });
 }
 
 function sameEventCompletion(left: EventUploadCompletionV1, right: EventUploadCompletionV1): boolean {
@@ -2515,17 +2281,9 @@ function isRuntimeHash(value: unknown): boolean {
 function isAbsoluteResolvedPath(value: unknown): value is string {
   return typeof value === 'string' && value.startsWith('/') && resolve(value) === value;
 }
-function isVerifier(value: unknown): value is string {
-  return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/u.test(value);
-}
 function isRuntimeEpoch(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
 }
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-function isNonEmptyString(value: unknown): value is string { return typeof value === 'string' && value.length > 0; }
-function isPositiveSafeInteger(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) > 0; }
 function isNonNegativeSafeInteger(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) >= 0; }
 function isValueMap(value: unknown, predicate: (item: unknown) => boolean): boolean {
   return isRecord(value) && Object.values(value).every(predicate);
@@ -2630,80 +2388,6 @@ function isCurrentCommandExecution(value: unknown): boolean {
   try { assertCommandExecution(value); return true; } catch { return false; }
 }
 
-function assertCommandExecution(value: unknown): asserts value is PersistedCommandExecutionV4 {
-  if (!isRecord(value) || !hasExactOptionalKeys(value, [
-    'version', 'originalEncryptedCommand', 'commandDigest', 'pinReference', 'watchDeviceId', 'nonce', 'expiresAt',
-    'state', 'claimedAt',
-  ], ['dispatchStartedAt', 'terminalResult', 'receiptOutbox']) || value.version !== 1
-    || !validateEncryptedCommandEnvelopeV1(value.originalEncryptedCommand)
-    || !isVerifier(value.commandDigest) || !isPersistedCommandPinReference(value.pinReference)
-    || value.watchDeviceId !== value.originalEncryptedCommand.watchDeviceId
-    || value.nonce !== value.originalEncryptedCommand.nonce || value.expiresAt !== value.originalEncryptedCommand.expiresAt
-    || !isCanonicalTimestamp(value.claimedAt)
-    || !['claimed', 'dispatch_started', 'outcome_unknown', 'terminal_receipt_blocked', 'terminal'].includes(value.state as string)) {
-    throw new TypeError('command execution is invalid');
-  }
-  const execution = value as unknown as PersistedCommandExecutionV4;
-  const recomputedDigest = hashBytes(buildEncryptedCommandEnvelopeBindingBytes(execution.originalEncryptedCommand));
-  if (execution.commandDigest !== recomputedDigest
-    || execution.pinReference.linkId !== execution.originalEncryptedCommand.linkId
-    || execution.pinReference.linkGeneration !== execution.originalEncryptedCommand.linkGeneration
-    || execution.pinReference.epoch !== execution.originalEncryptedCommand.epoch
-    || execution.pinReference.hostEncryptionKeyId !== execution.originalEncryptedCommand.payload.keyWrap.recipientEncryptionKeyId
-    || execution.pinReference.watchEncryptionKeyId !== execution.originalEncryptedCommand.payload.keyWrap.senderEncryptionKeyId) {
-    throw new TypeError('command execution binding is invalid');
-  }
-  if (execution.dispatchStartedAt !== undefined && !isCanonicalTimestamp(execution.dispatchStartedAt)) {
-    throw new TypeError('command dispatch timestamp is invalid');
-  }
-  if (execution.terminalResult !== undefined && (!validateCommandResult(execution.terminalResult)
-    || execution.terminalResult.commandId !== execution.originalEncryptedCommand.commandId
-    || execution.terminalResult.hostId !== execution.originalEncryptedCommand.hostId
-    || execution.terminalResult.sessionId !== execution.originalEncryptedCommand.sessionId)) {
-    throw new TypeError('command terminal result binding is invalid');
-  }
-  if (execution.receiptOutbox !== undefined && !isPersistedReceiptOutbox(execution.receiptOutbox)) {
-    throw new TypeError('command receipt outbox is invalid');
-  }
-  switch (execution.state) {
-    case 'claimed':
-      if (execution.dispatchStartedAt || execution.terminalResult || execution.receiptOutbox) throw new TypeError('claimed command shape is invalid');
-      break;
-    case 'dispatch_started':
-      if (!execution.dispatchStartedAt || execution.terminalResult || execution.receiptOutbox) throw new TypeError('dispatch-started command shape is invalid');
-      break;
-    case 'outcome_unknown':
-      if (execution.terminalResult || execution.receiptOutbox) throw new TypeError('outcome-unknown command shape is invalid');
-      break;
-    case 'terminal_receipt_blocked':
-      if (!execution.terminalResult || execution.receiptOutbox) throw new TypeError('receipt-blocked command shape is invalid');
-      break;
-    case 'terminal':
-      if (!execution.terminalResult || !execution.receiptOutbox) throw new TypeError('terminal command shape is invalid');
-      assertPersistedReceiptMatchesExecution(execution);
-      break;
-  }
-}
-
-function isPersistedCommandPinReference(value: unknown): value is PersistedCommandPinReferenceV1 {
-  return isRecord(value) && hasExactKeys(value, [
-    'version', 'linkId', 'linkGeneration', 'epoch', 'transcriptDigest', 'hostEncryptionKeyId', 'watchEncryptionKeyId',
-  ]) && value.version === 1 && isNonEmptyString(value.linkId) && isPositiveSafeInteger(value.linkGeneration)
-    && isPositiveSafeInteger(value.epoch) && isVerifier(value.transcriptDigest)
-    && typeof value.hostEncryptionKeyId === 'string' && /^ekey_[A-Za-z0-9_-]{43}$/u.test(value.hostEncryptionKeyId)
-    && typeof value.watchEncryptionKeyId === 'string' && /^ekey_[A-Za-z0-9_-]{43}$/u.test(value.watchEncryptionKeyId);
-}
-
-function isPersistedReceiptOutbox(value: unknown): boolean {
-  if (!isRecord(value) || !hasExactKeys(value, ['version', 'state', 'canonicalBody', 'receiptDigest'])
-    || value.version !== 1 || !['pending', 'acknowledged', 'undeliverable'].includes(value.state as string)
-    || !isNonEmptyString(value.canonicalBody) || !isVerifier(value.receiptDigest)) return false;
-  try {
-    const receipt = JSON.parse(value.canonicalBody);
-    return validateCommandReceiptEnvelopeV1(receipt) && JSON.stringify(receipt) === value.canonicalBody
-      && hashBytes(buildCommandReceiptEnvelopeBindingBytes(receipt)) === value.receiptDigest;
-  } catch { return false; }
-}
 function isCurrentEventCompletion(value: unknown): boolean {
   return isRecord(value) && hasExactOptionalKeys(value,
     ['version', 'eventId', 'sessionId', 'revision', 'eventContentId', 'sessionContentId', 'committedAt'],

@@ -1,11 +1,29 @@
-import { isCommandExpired, validateCommandResult, type CommandEnvelope, type CommandResult } from '@ariava/protocol';
+import {
+  isCommandExpired,
+  validateCommandResult,
+  type CanonicalSessionState,
+  type CommandEnvelope,
+  type CommandResult,
+} from '@ariava/protocol';
 import { isoNow } from '@ariava/shared-utils';
-import { BridgeStateStore } from './state-store';
 import type { AgentDriver, CommandHandlingOutcome } from './types';
+
+/**
+ * Narrow capability port for command routing (spec §7.2).
+ *
+ * Consumer-owned contract: `CommandRouter` depends only on the session lookup
+ * and driver binding it actually uses, not the full `BridgeStateStore`.
+ * `BridgeStateStore` structurally satisfies this interface; state-store does
+ * not export consumer ports.
+ */
+export interface CommandRouterStateStore {
+  getSession(sessionId: string): CanonicalSessionState | undefined;
+  getDriverNameForSession(sessionId: string): string | undefined;
+}
 
 export class CommandRouter {
   constructor(
-    private readonly stateStore: BridgeStateStore,
+    private readonly stateStore: CommandRouterStateStore,
     private readonly drivers: Map<string, AgentDriver>,
     private readonly hostId: string,
   ) {}
