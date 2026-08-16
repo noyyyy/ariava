@@ -1,57 +1,41 @@
-import { createHash } from 'node:crypto';
 import type {
-  CanonicalEvent,
   CanonicalSessionState,
   CommandEnvelope,
   CommandResult,
   HandleSessionRequest,
   SessionStatus,
 } from '@ariava/protocol';
-import {
-  base64UrlEncode,
-  buildProtectedEventContentBytes,
-  encodeLengthPrefixedFields,
-  isCanonicalTimestamp,
-  validateCanonicalEventInvariant,
-} from '@ariava/protocol';
 import { createId, isoNow } from '@ariava/shared-utils';
-import type { BridgeStateStore } from '../state-store';
 import { asCommandResult, parseAgentAdapterCommandResult } from './result';
+import {
+  assertProducerContextMatchesSession,
+  immutableCopy,
+  normalizeHandledAt,
+  parseCanonicalProducerEvent,
+  producerEventFingerprint,
+  semanticFingerprint,
+} from './registry-codec';
+import { authorizeRegistration, reduceHeartbeat, reduceRegistration } from './session-transitions';
+import { planTerminalEvent, toCanonicalSessionState } from './terminal-event-plan';
+import { SESSION_TTL_MS, TERMINAL_RETRY_DELAYS_MS } from './registry-types';
+import type {
+  PendingTerminal,
+  RegisteredSession,
+  RegisterSessionInput,
+  RegistryMutationCallback,
+  RegistryMutationReason,
+  RegistryRetryScheduler,
+  RegistryStateStore,
+} from './registry-types';
 
-export type AgentAdapterEventInput = CanonicalEvent extends infer Event
-  ? Event extends CanonicalEvent ? Omit<Event, 'eventId' | 'hostId'> : never
-  : never;
-
-export interface RegisteredSession {
-  sessionId: string;
-  provider: string;
-  projectName: string;
-  cwd: string;
-  nameText: string;
-  openingText?: string;
-  latestActivityText?: string;
-  harnessProvider?: string;
-  pid?: number;
-  hostId: string;
-  registeredAt: string;
-  lastHeartbeatAt: string;
-  status: SessionStatus;
-  semanticUpdatedAt: string;
-  lastEventId?: string;
-}
-
-export interface RegisterSessionInput {
-  sessionId: string;
-  provider: string;
-  projectName: string;
-  cwd: string;
-  nameText: string;
-  openingText?: string;
-  latestActivityText?: string;
-  harnessProvider?: string;
-  pid?: number;
-  status?: SessionStatus;
-}
+export type {
+  AgentAdapterEventInput,
+  RegisteredSession,
+  RegisterSessionInput,
+  RegistryMutationCallback,
+  RegistryMutationReason,
+  RegistryRetryScheduler,
+} from './registry-types';
 
 export class AgentAdapterRequestValidationError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -69,24 +53,6 @@ export class SessionIdCollisionError extends Error {
   }
 }
 
-const SESSION_TTL_MS = 45_000;
-const TERMINAL_RETRY_DELAYS_MS = [100, 500, 2_000, 5_000] as const;
-const EVENT_KEYS = [
-  'sessionId', 'provider', 'type', 'status', 'agentText', 'humanText', 'projectName',
-  'workingDirectory', 'harnessProvider', 'createdAt', 'needHuman',
-] as const;
-const EVENT_REQUIRED_KEYS = [
-  'sessionId', 'provider', 'type', 'status', 'agentText', 'projectName', 'workingDirectory',
-  'harnessProvider', 'createdAt',
-] as const;
-
-type PendingTerminal = { event: CanonicalEvent; session: CanonicalSessionState };
-export type RegistryMutationReason = 'register' | 'semantic' | 'handle' | 'unregister' | 'ttl';
-export type RegistryMutationCallback = (reason: RegistryMutationReason) => void;
-export interface RegistryRetryScheduler {
-  schedule(callback: () => void, delayMs: number): unknown;
-  cancel(handle: unknown): void;
-}
 const DEFAULT_RETRY_SCHEDULER: RegistryRetryScheduler = {
   schedule: (callback, delayMs) => {
     const timer = setTimeout(callback, delayMs);
@@ -117,7 +83,7 @@ export class AgentAdapterRegistry {
 
   constructor(
     private readonly hostId: string,
-    private readonly stateStore: BridgeStateStore,
+    private readonly stateStore: RegistryStateStore,
     private readonly onMutation: RegistryMutationCallback = () => {},
     private readonly now: () => Date = () => new Date(),
     private readonly retryScheduler: RegistryRetryScheduler = DEFAULT_RETRY_SCHEDULER,
@@ -129,37 +95,26 @@ export class AgentAdapterRegistry {
   register(input: RegisterSessionInput): RegisteredSession {
     const previous = this.sessions.get(input.sessionId);
     const persistedSession = this.stateStore.getSession(input.sessionId);
-    const requestedOwner = normalizedOwner(input);
-    const liveOwner = previous ? normalizedOwner(previous) : undefined;
-    const persistedOwner = persistedSession ? normalizedOwner(persistedSession) : undefined;
-    if ((liveOwner && !sameOwner(liveOwner, requestedOwner))
-      || (persistedOwner && !sameOwner(persistedOwner, requestedOwner))) {
-      throw new SessionIdCollisionError(input.sessionId);
-    }
+    const authorization = authorizeRegistration({ previousLive: previous, persistedSession }, input);
+    if (authorization.kind === 'collision') throw new SessionIdCollisionError(authorization.sessionId);
 
     const now = this.nowIso();
-    const projectName = input.projectName;
-    const nameText = input.nameText;
-    const session: RegisteredSession = {
-      sessionId: input.sessionId, provider: input.provider, projectName, cwd: input.cwd, nameText,
-      openingText: input.openingText, latestActivityText: input.latestActivityText,
-      harnessProvider: input.harnessProvider, pid: input.pid,
-      hostId: this.hostId, registeredAt: previous?.registeredAt ?? now, lastHeartbeatAt: now,
-      status: input.status ?? 'idle', semanticUpdatedAt: previous?.semanticUpdatedAt ?? now,
-      lastEventId: previous?.lastEventId,
-    };
-    const changed = !previous || semanticFingerprint(previous) !== semanticFingerprint(session);
-    if (changed && previous) session.semanticUpdatedAt = now;
-    const contextChanged = previous && producerContextFingerprint(previous) !== producerContextFingerprint(session);
-    const persistedContextChanged = !previous && persistedSession
-      && canonicalProducerContextFingerprint(persistedSession) !== producerContextFingerprint(session);
     const persistedCancellation = this.stateStore.getTerminalEventCancellation(input.sessionId);
-    if (contextChanged || (persistedContextChanged && persistedCancellation)) {
-      this.cancelTerminalRetry(input.sessionId, { nextDriverName: input.provider, persistedCancellation });
-    } else this.stateStore.setSessionDriver(input.sessionId, input.provider, this.toCanonicalSession(session));
-    this.sessions.set(input.sessionId, session);
-    if (changed) this.onMutation('register');
-    return session;
+    const transition = reduceRegistration(
+      { previousLive: previous, persistedSession, terminalCancellation: persistedCancellation },
+      input, this.hostId, now,
+    );
+    if (transition.persistence.kind === 'durable-set-session-driver') {
+      this.stateStore.setSessionDriver(input.sessionId, input.provider, toCanonicalSessionState(transition.nextSession));
+    } else {
+      this.cancelTerminalRetry(input.sessionId, {
+        nextDriverName: transition.persistence.nextDriverName,
+        persistedCancellation: transition.persistence.persistedCancellation,
+      });
+    }
+    this.sessions.set(input.sessionId, transition.nextSession);
+    if (transition.semanticChanged) this.onMutation('register');
+    return transition.nextSession;
   }
 
   unregister(sessionId: string, reason: 'unregister' | 'ttl' = 'unregister'): boolean {
@@ -213,23 +168,19 @@ export class AgentAdapterRegistry {
     metadata: { openingText?: string | null; projectName?: string; nameText?: string } = {},
   ): RegisteredSession | undefined {
     const session = this.sessions.get(sessionId); if (!session) return undefined;
-    const before = semanticFingerprint(session); const contextBefore = producerContextFingerprint(session); const now = this.nowIso();
-    const next = { ...session, lastHeartbeatAt: now, status };
-    if (latestActivityText !== undefined) next.latestActivityText = latestActivityText ?? undefined;
-    if (metadata.openingText !== undefined) next.openingText = metadata.openingText ?? undefined;
-    if (metadata.projectName !== undefined) next.projectName = metadata.projectName;
-    if (metadata.nameText !== undefined) next.nameText = metadata.nameText;
-    if (producerContextFingerprint(next) !== contextBefore) this.cancelTerminalRetry(sessionId);
-    if (semanticFingerprint(next) !== before) { next.semanticUpdatedAt = now; this.onMutation('semantic'); }
-    this.sessions.set(sessionId, next);
-    return next;
+    const now = this.nowIso();
+    const transition = reduceHeartbeat(session, { status, latestActivityText, metadata }, now);
+    if (transition.contextChanged) this.cancelTerminalRetry(sessionId);
+    if (transition.semanticChanged) this.onMutation('semantic');
+    this.sessions.set(sessionId, transition.nextSession);
+    return transition.nextSession;
   }
 
   listSessions(): CanonicalSessionState[] {
     const now = this.now().getTime(); const active: CanonicalSessionState[] = [];
     for (const session of this.sessions.values()) {
       if (now - new Date(session.lastHeartbeatAt).getTime() > SESSION_TTL_MS) { this.unregister(session.sessionId, 'ttl'); continue; }
-      active.push(this.toCanonicalSession(session));
+      active.push(toCanonicalSessionState(session));
     }
     return active.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
@@ -242,7 +193,7 @@ export class AgentAdapterRegistry {
   pushEvent(sessionId: string, value: unknown): string {
     const session = this.sessions.get(sessionId);
     if (!session) throw new AgentAdapterRequestValidationError(`Session ${sessionId} is not registered`);
-    let input: AgentAdapterEventInput;
+    let input: import('./registry-types').AgentAdapterEventInput;
     try {
       input = parseCanonicalProducerEvent(value);
       if (input.sessionId !== sessionId) throw new TypeError('canonical Event sessionId does not match the request path');
@@ -255,41 +206,54 @@ export class AgentAdapterRegistry {
 
     const fingerprint = producerEventFingerprint(input);
     const existing = this.delayedTerminalEvents.get(sessionId);
-    if (existing && producerEventFingerprint(existing.event) === fingerprint) {
-      if (!this.hasPendingCommandWork(sessionId)) {
-        try { this.commitPendingTerminal(sessionId, existing, fingerprint); }
-        catch (error) { this.scheduleTerminalRetry(sessionId); throw error; }
+    const isLiveDuplicate = existing !== undefined && producerEventFingerprint(existing.event) === fingerprint;
+    const persistedReservation = isLiveDuplicate ? undefined : this.stateStore.getProducerEventReservation(sessionId, fingerprint);
+    const persistedTuple = persistedReservation
+      ? this.stateStore.getProducerEventTuple(persistedReservation.eventId, fingerprint)
+      : undefined;
+    const eventId = isLiveDuplicate
+      ? existing.event.eventId
+      : persistedReservation?.eventId ?? createId('evt');
+    const plan = planTerminalEvent({
+      session, livePending: existing, persistedReservation, persistedTuple,
+      hasPendingCommandWork: this.hasPendingCommandWork(sessionId), input, eventId,
+    });
+    switch (plan.type) {
+      case 'reject':
+        throw plan.error;
+      case 'return-live-duplicate': {
+        const duplicate = existing!;
+        if (plan.promoteNow) this.promotePendingTerminal(sessionId, duplicate, fingerprint);
+        return duplicate.event.eventId;
       }
-      return existing.event.eventId;
-    }
-    const persisted = this.stateStore.getProducerEventReservation(sessionId, fingerprint);
-    if (persisted) {
-      const tuple = this.stateStore.getProducerEventTuple(persisted.eventId, fingerprint);
-      if (!tuple) return persisted.eventId;
-      const pending = Object.freeze({ event: immutableCopy(tuple.event), session: immutableCopy(tuple.session) });
-      this.delayedTerminalEvents.set(sessionId, pending);
-      if (!this.hasPendingCommandWork(sessionId)) {
-        try { this.commitPendingTerminal(sessionId, pending, fingerprint); }
-        catch (error) { this.scheduleTerminalRetry(sessionId); throw error; }
+      case 'return-reservation-without-tuple':
+        return plan.eventId;
+      case 'stage-reserved-tuple': {
+        const pending = Object.freeze({ event: immutableCopy(plan.tuple.event), session: immutableCopy(plan.tuple.session) });
+        this.delayedTerminalEvents.set(sessionId, pending);
+        if (plan.promoteNow) this.promotePendingTerminal(sessionId, pending, fingerprint);
+        return persistedReservation!.eventId;
       }
-      return persisted.eventId;
+      case 'cancel-older-and-reserve':
+      case 'reserve-new-tuple': {
+        if (plan.type === 'cancel-older-and-reserve') this.cancelTerminalRetry(sessionId);
+        this.stateStore.reserveProducerEventTuple(plan.tuple.event, plan.tuple.session, fingerprint);
+        this.delayedTerminalEvents.set(sessionId, plan.tuple);
+        this.stateStore.reserveProducerEvent(plan.reservation);
+        if (plan.promoteNow) this.promotePendingTerminal(sessionId, plan.tuple, fingerprint);
+        return plan.tuple.event.eventId;
+      }
     }
-    if (existing) this.cancelTerminalRetry(sessionId);
+  }
 
-    const eventId = createId('evt');
-    const event = immutableCopy({ ...input, eventId, hostId: session.hostId } as CanonicalEvent);
-    const terminalRegistered = { ...session, status: event.status, latestActivityText: event.agentText,
-      lastEventId: eventId, semanticUpdatedAt: event.createdAt };
-    const terminalSession = immutableCopy(this.toCanonicalSession(terminalRegistered));
-    const pending = Object.freeze({ event, session: terminalSession });
-    this.stateStore.reserveProducerEventTuple(event, terminalSession, fingerprint);
-    this.delayedTerminalEvents.set(sessionId, pending);
-    this.stateStore.reserveProducerEvent({ version: 1, eventId, sessionId, fingerprint, createdAt: event.createdAt });
-    if (!this.hasPendingCommandWork(sessionId)) {
-      try { this.commitPendingTerminal(sessionId, pending, fingerprint); }
-      catch (error) { this.scheduleTerminalRetry(sessionId); throw error; }
+  /** Commit a staged terminal Event now, or arrange a retry when the durable write fails. */
+  private promotePendingTerminal(sessionId: string, pending: PendingTerminal, fingerprint: string): void {
+    try {
+      this.commitPendingTerminal(sessionId, pending, fingerprint);
+    } catch (error) {
+      this.scheduleTerminalRetry(sessionId);
+      throw error;
     }
-    return eventId;
   }
 
   handleSession(sessionId: string, request: HandleSessionRequest): { ok: true; hostId: string; sessionId: string; handledThroughEventId: string } {
@@ -478,12 +442,6 @@ export class AgentAdapterRegistry {
     const current = this.inFlightCommands.get(sessionId); if (!current) { this.flushDelayedTerminalEvent(sessionId); return; }
     current.delete(commandId); if (!current.size) this.inFlightCommands.delete(sessionId); this.flushDelayedTerminalEvent(sessionId);
   }
-  private toCanonicalSession(session: RegisteredSession): CanonicalSessionState {
-    return { sessionId: session.sessionId, hostId: session.hostId, provider: session.provider, projectName: session.projectName,
-      nameText: session.nameText, openingText: session.openingText, latestActivityText: session.latestActivityText,
-      workingDirectory: session.cwd, harnessProvider: session.harnessProvider,
-      status: session.status, updatedAt: session.semanticUpdatedAt, lastEventId: session.lastEventId };
-  }
   private nowIso(): string { return this.now().toISOString(); }
   private removeCommandWaiter(sessionId: string, resolver: (command: CommandEnvelope | null) => void): void {
     const waiters = this.commandWaiters.get(sessionId); if (!waiters) return; const index = waiters.indexOf(resolver);
@@ -498,118 +456,4 @@ export class AgentAdapterRegistry {
     for (const waiter of waiters) waiter(result);
     this.resultWaiters.delete(commandId);
   }
-}
-
-function parseCanonicalProducerEvent(value: unknown): AgentAdapterEventInput {
-  const event = exactRecord(value, EVENT_KEYS, EVENT_REQUIRED_KEYS, 'canonical Event');
-  for (const key of ['sessionId', 'provider', 'agentText', 'projectName', 'workingDirectory', 'harnessProvider', 'createdAt'] as const) requireString(event, key);
-  optionalString(event, 'humanText');
-  if (!isCanonicalTimestamp(event.createdAt)) throw new TypeError('canonical Event createdAt is invalid');
-  const invariant = validateCanonicalEventInvariant({ type: event.type, status: event.status, ...(Object.hasOwn(event, 'needHuman') ? { needHuman: event.needHuman } : {}) });
-  if (!invariant.success) throw new TypeError(`canonical Event invariant is invalid: ${invariant.issues.join(', ')}`);
-  buildProtectedEventContentBytes({
-    version: 3,
-    agentText: event.agentText as string,
-    ...(event.humanText !== undefined ? { humanText: event.humanText as string } : {}),
-    projectName: event.projectName as string,
-    workingDirectory: event.workingDirectory as string,
-    harnessProvider: event.harnessProvider as string,
-    ...(event.needHuman !== undefined ? { needHuman: event.needHuman as never } : {}),
-  });
-  return event as unknown as AgentAdapterEventInput;
-}
-
-function exactRecord(value: unknown, allowedKeys: readonly string[], requiredKeys: readonly string[], label: string): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object`);
-  const allowed = new Set(allowedKeys);
-  for (const key of Reflect.ownKeys(value)) {
-    if (typeof key !== 'string' || !allowed.has(key)) throw new TypeError(`${label} contains unsupported fields`);
-    const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
-    if (!descriptor.enumerable || !('value' in descriptor)) throw new TypeError(`${label}.${key} is invalid`);
-  }
-  for (const key of requiredKeys) if (!Object.hasOwn(value, key)) throw new TypeError(`${label}.${key} is required`);
-  return value as Record<string, unknown>;
-}
-function immutableCopy<Value>(value: Value): Value {
-  const copy = structuredClone(value);
-  return deepFreeze(copy);
-}
-
-function deepFreeze<Value>(value: Value): Value {
-  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
-  for (const nested of Object.values(value)) deepFreeze(nested);
-  return Object.freeze(value);
-}
-
-function requireString(value: Record<string, unknown>, key: string): void { if (typeof value[key] !== 'string') throw new TypeError(`canonical Event.${key} is invalid`); }
-function optionalString(value: Record<string, unknown>, key: string): void { if (value[key] !== undefined && typeof value[key] !== 'string') throw new TypeError(`canonical Event.${key} is invalid`); }
-function normalizeHandledAt(value: string | undefined, fallback: string): string { if (!value) return fallback; return Number.isFinite(new Date(value).getTime()) ? value : fallback; }
-
-function assertProducerContextMatchesSession(event: AgentAdapterEventInput, session: RegisteredSession): void {
-  const expected = {
-    projectName: session.projectName,
-    workingDirectory: session.cwd,
-    harnessProvider: session.harnessProvider ?? session.provider,
-  };
-  for (const [key, value] of Object.entries(expected)) {
-    if ((event as unknown as Record<string, unknown>)[key] !== value) {
-      throw new TypeError(`canonical Event ${key} does not match the registered Session`);
-    }
-  }
-}
-
-function producerEventFingerprint(event: AgentAdapterEventInput | CanonicalEvent): string {
-  const producer = event as CanonicalEvent;
-  const protectedContent = buildProtectedEventContentBytes({
-    version: 3,
-    agentText: producer.agentText,
-    ...(producer.humanText === undefined ? {} : { humanText: producer.humanText }),
-    ...(producer.projectName === undefined ? {} : { projectName: producer.projectName }),
-    ...(producer.workingDirectory === undefined ? {} : { workingDirectory: producer.workingDirectory }),
-    ...(producer.harnessProvider === undefined ? {} : { harnessProvider: producer.harnessProvider }),
-    ...(producer.needHuman === undefined ? {} : { needHuman: producer.needHuman }),
-  });
-  const publicMetadata = JSON.stringify({
-    sessionId: producer.sessionId,
-    provider: producer.provider,
-    type: producer.type,
-    status: producer.status,
-    createdAt: producer.createdAt,
-  });
-  const canonical = encodeLengthPrefixedFields([
-    'ariava-producer-event-fingerprint-v1',
-    publicMetadata,
-    base64UrlEncode(protectedContent),
-  ]);
-  return createHash('sha256').update(canonical).digest('base64url');
-}
-function producerContextFingerprint(session: Pick<RegisteredSession, 'projectName' | 'cwd' | 'harnessProvider' | 'provider'>): string {
-  return JSON.stringify({
-    projectName: session.projectName,
-    workingDirectory: session.cwd,
-    harnessProvider: session.harnessProvider ?? session.provider,
-  });
-}
-
-function canonicalProducerContextFingerprint(session: CanonicalSessionState): string {
-  return JSON.stringify({
-    projectName: session.projectName,
-    workingDirectory: session.workingDirectory ?? '',
-    harnessProvider: session.harnessProvider ?? session.provider,
-  });
-}
-
-function normalizedOwner(session: Pick<RegisterSessionInput, 'provider' | 'harnessProvider'>): readonly [string, string] {
-  return [session.provider, session.harnessProvider ?? session.provider] as const;
-}
-
-function sameOwner(left: readonly [string, string], right: readonly [string, string]): boolean {
-  return left[0] === right[0] && left[1] === right[1];
-}
-
-function semanticFingerprint(session: RegisteredSession): string {
-  return JSON.stringify({ sessionId: session.sessionId, provider: session.provider, projectName: session.projectName, cwd: session.cwd,
-    nameText: session.nameText, openingText: session.openingText, latestActivityText: session.latestActivityText,
-    harnessProvider: session.harnessProvider, pid: session.pid,
-    hostId: session.hostId, status: session.status, lastEventId: session.lastEventId });
 }

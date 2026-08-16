@@ -933,4 +933,65 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     } finally { cleanup(); }
   });
 
+  test('heartbeat context-change cancel write failure preserves the live Session and mutation ordering', () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const mutations: string[] = [];
+      const registry = new AgentAdapterRegistry('host-1', store, (reason) => mutations.push(reason));
+      register(registry);
+      const command = makeCommand('sess-1');
+      registry.enqueueCommand(command);
+      registry.pushEvent('sess-1', doneEvent({ createdAt: '2026-08-07T00:00:10.000Z' }));
+      mutations.length = 0;
+      const original = store.cancelTerminalEvent.bind(store);
+      store.cancelTerminalEvent = (() => { throw new Error('cancel write failed'); }) as typeof store.cancelTerminalEvent;
+      expect(() => registry.heartbeat('sess-1', 'working', undefined, { projectName: 'other' }))
+        .toThrow('cancel write failed');
+      store.cancelTerminalEvent = original;
+      expect(registry.listSessions()[0]).toMatchObject({ projectName: 'project' });
+      expect(mutations).toEqual([]);
+      expect((registry as any).delayedTerminalEvents.size).toBe(1);
+    } finally { cleanup(); }
+  });
+
+  test('restart with a persisted reservation but no spool tuple returns the existing Event ID', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-reservation-no-tuple-'));
+    try {
+      const statePath = join(dir, 'state.json');
+      const store = initializedStore(dir);
+      const registry = new AgentAdapterRegistry('host-1', store);
+      register(registry);
+      registry.enqueueCommand(makeCommand('sess-1'));
+      const producer = doneEvent({ createdAt: '2026-08-07T00:00:11.000Z' });
+      const eventId = registry.pushEvent('sess-1', producer);
+      const spoolPath = spoolPathForState(statePath);
+      const spool = JSON.parse(readFileSync(spoolPath, 'utf8')) as { items: Array<{ eventId?: string }> };
+      spool.items = spool.items.filter((item) => item.eventId !== eventId);
+      writeFileSync(spoolPath, `${JSON.stringify(spool, null, 2)}\n`, { mode: 0o600 });
+      store.dispose();
+      const restarted = initializedStore(dir);
+      const reg2 = new AgentAdapterRegistry('host-1', restarted);
+      register(reg2);
+      expect(reg2.pushEvent('sess-1', producer)).toBe(eventId);
+      expect(restarted.peekPendingEvents()).toEqual([]);
+      restarted.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('abandoning an in-flight command releases the command-gated terminal Event', async () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const registry = new AgentAdapterRegistry('host-1', store);
+      register(registry);
+      const command = makeCommand('sess-1');
+      registry.enqueueCommand(command);
+      const eventId = registry.pushEvent('sess-1', doneEvent({ createdAt: '2026-08-07T00:00:12.000Z' }));
+      await registry.dequeueCommand('sess-1', 0);
+      expect(store.peekPendingEvents()).toEqual([]);
+      registry.abandonCommand(command.commandId);
+      expect(registry.hasPendingCommandWork('sess-1')).toBe(false);
+      expect(store.peekPendingEvents()).toEqual([expect.objectContaining({ eventId })]);
+    } finally { cleanup(); }
+  });
+
 });
