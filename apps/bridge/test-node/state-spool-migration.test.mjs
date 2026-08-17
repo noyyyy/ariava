@@ -1178,8 +1178,8 @@ test('recognized reset repopulates only live v2 Agent Adapter Sessions through p
     const state = daemon.stateStore;
     state.initializeEncryptedSpool(HOST_ID, fixture.identityPath, 'linux');
     const registry = daemon.adapterRegistry;
-    registry.register({ sessionId: 'live-1', provider: 'pi', projectName: 'live-project', cwd: '/live', nameText: 'Live one' });
-    registry.register({ sessionId: 'live-2', provider: 'pi', projectName: 'live-project', cwd: '/live', nameText: 'Live two' });
+    registry.register({ sessionId: 'live-1', provider: 'pi', projectName: 'live-project', cwd: '/live', nameText: 'Live one', driverInstanceId: 'AAAAAAAAAAAAAAAAAAAAAA' });
+    registry.register({ sessionId: 'live-2', provider: 'pi', projectName: 'live-project', cwd: '/live', nameText: 'Live two', driverInstanceId: 'AAAAAAAAAAAAAAAAAAAAAA' });
     const live = registry.listSessions(); state.replaceDriverSessions('pi', live);
     const published = [];
     const orchestrator = createEncryptedUploadActions({
