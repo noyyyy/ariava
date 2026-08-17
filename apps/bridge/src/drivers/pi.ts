@@ -2,8 +2,8 @@ import type { CanonicalSessionState, CommandResult } from '@ariava/protocol';
 import type { AgentAdapterClient } from '../agent-adapter/client';
 import type { AgentDriver, DriverCommandContext } from '../types';
 
-export class PaiDriver implements AgentDriver {
-  readonly name = 'pi';
+export class AgentAdapterDriver implements AgentDriver {
+  readonly name = 'agent-adapter';
 
   constructor(
     private readonly adapter: AgentAdapterClient,

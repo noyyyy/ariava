@@ -26,6 +26,7 @@ import type {
   PersistedCommandPinReferenceV1,
   PersistedCurrentSessionsSnapshotState,
   PersistedProducerEventReservationV1,
+  ProducerEventSourceCheckpointV1,
 } from './types';
 import {
   LocalEncryptedSpool,
@@ -56,7 +57,10 @@ import {
   validateCommandExecutionPinsState,
   type CommandExecutionPinResolver,
 } from './state-store/command-transitions';
-import { appendRecentEventTransition } from './state-store/event-transitions';
+import {
+  appendRecentEventTransition,
+  reserveProducerEventWithCheckpointTransition,
+} from './state-store/event-transitions';
 import {
   readRuntimeHealth,
   recordDriverReconciliationFailureTransition,
@@ -627,6 +631,21 @@ export class BridgeStateStore {
   reserveProducerEvent(reservation: PersistedProducerEventReservationV1): void {
     spoolTransactions.reserveProducerEvent(this.transactionShell(), reservation);
   }
+
+  /** Durable source tuple + fingerprint + reservation + accepted checkpoint in one state commit (§8 Event). */
+  acceptProducerEventSource(input: {
+    reservation: PersistedProducerEventReservationV1;
+    checkpoint: ProducerEventSourceCheckpointV1;
+  }): void {
+    this.commitTransition((state) =>
+      reserveProducerEventWithCheckpointTransition(state, input.reservation, input.checkpoint),
+    );
+  }
+
+  getProducerEventCheckpoint(sessionId: string): ProducerEventSourceCheckpointV1 | undefined {
+    const checkpoint = this.state.producerEventCheckpoints?.[sessionId];
+    return checkpoint && structuredClone(checkpoint);
+  }
   getProducerEventTuple(eventId: string, fingerprint: string): { event: CanonicalEvent; session: CanonicalSessionState } | undefined {
     return this.openProducerTuple('event-reservation-v3', eventId, fingerprint)
       ?? this.openProducerTuple('event-source-v3', eventId, fingerprint);
@@ -1081,6 +1100,16 @@ export class BridgeStateStore {
   markCommandOutcomeUnknown(commandId: string): PersistedCommandExecutionV4 {
     this.assertCommandExecutionPinsReady();
     return this.commitTransition((state) => markCommandOutcomeUnknownTransition(state, commandId));
+  }
+
+  /** Agent Adapter owner-loss hook: durable outcome_unknown only when the execution journal entry exists. */
+  markCommandOutcomeUnknownIfPresent(commandId: string): boolean {
+    try {
+      this.markCommandOutcomeUnknown(commandId);
+      return true;
+    } catch {
+      return false;
+    }
   }
   persistTerminalReceiptBlocked(commandId: string, terminalResult: CommandResult): PersistedCommandExecutionV4 {
     this.assertCommandExecutionPinsReady();

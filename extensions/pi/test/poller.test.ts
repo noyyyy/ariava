@@ -3,7 +3,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CommandEnvelope } from '@ariava/protocol';
-import type { AgentAdapter, AgentAdapterCommandResult } from '../src/adapter-interface';
+import type {
+  AgentAdapter,
+  AgentAdapterCommandResult,
+  CommandExecutionOutcome,
+} from '../src/adapter-interface';
 import { startCommandPoller } from '../src/poller';
 
 const originalLogPath = process.env.ARIAVA_PI_LOG_PATH;
@@ -17,16 +21,20 @@ afterEach(() => {
 
 function makeCommand(overrides: Partial<CommandEnvelope> = {}): CommandEnvelope {
   return {
-    commandId: 'cmd-1',
-    hostId: 'host-1',
-    sessionId: 'session-1',
-    type: 'reply',
-    payload: { text: 'Continue' },
-    issuedAt: '2026-08-12T00:00:00.000Z',
-    expiresAt: '2026-08-12T00:01:00.000Z',
-    nonce: 'n',
-    watchDeviceId: 'watch-1',
-    ...overrides,
+    commandId: 'cmd-1', hostId: 'host-1', sessionId: 'session-1', type: 'reply', payload: { text: 'Continue' },
+    issuedAt: '2026-08-12T00:00:00.000Z', expiresAt: '2026-08-12T00:01:00.000Z',
+    nonce: 'n', watchDeviceId: 'watch-1', ...overrides,
+  };
+}
+
+function rejected(command = makeCommand()): AgentAdapterCommandResult {
+  return {
+    commandId: command.commandId,
+    hostId: command.hostId,
+    sessionId: command.sessionId,
+    accepted: false,
+    status: 'rejected',
+    updatedAt: '2026-08-12T00:00:01.000Z',
   };
 }
 
@@ -39,6 +47,10 @@ function executed(command = makeCommand()): AgentAdapterCommandResult {
     status: 'executed',
     updatedAt: '2026-08-12T00:00:01.000Z',
   };
+}
+
+function terminal(command = makeCommand()): CommandExecutionOutcome {
+  return { kind: 'terminal', result: rejected(command) };
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -58,243 +70,155 @@ function captureLog(): string {
 }
 
 describe('startCommandPoller', () => {
-  test('dispatches and submits the exact terminal result', async () => {
+  test('submits only an exact deterministic pre-call rejection', async () => {
     const command = makeCommand();
     const submitted: AgentAdapterCommandResult[] = [];
-    let callCount = 0;
+    let polls = 0;
     const adapter = {
-      pollCommands: async () => (++callCount === 1 ? command : null),
-      submitResult: async (_commandId: string, result: AgentAdapterCommandResult) => {
-        submitted.push(result);
-      },
+      pollCommands: async () => (++polls === 1 ? command : null),
+      submitResult: async (_commandId: string, result: AgentAdapterCommandResult) => { submitted.push(result); },
     } as unknown as AgentAdapter;
-    const dispatched: CommandEnvelope[] = [];
     const poller = startCommandPoller({
       sessionId: command.sessionId,
       client: adapter,
-      onCommand: async (polled) => {
-        dispatched.push(polled);
-        return executed(polled);
-      },
+      onCommand: async () => terminal(command),
     }, 10);
-
     await waitFor(() => submitted.length === 1);
     poller.stop();
-
-    expect(dispatched).toEqual([command]);
-    expect(submitted).toEqual([executed(command)]);
-    expect(Object.keys(submitted[0]!).sort()).toEqual([
-      'accepted', 'commandId', 'hostId', 'sessionId', 'status', 'updatedAt',
-    ]);
+    expect(submitted).toEqual([rejected(command)]);
   });
 
-  test('waits after an empty poll and uses immediate server checks', async () => {
+  test('submits an executed result exactly once', async () => {
     const command = makeCommand();
-    const intervals: number[] = [];
-    const timeouts: number[] = [];
-    let callCount = 0;
-    let submitted = false;
+    const submitted: AgentAdapterCommandResult[] = [];
+    let polls = 0;
     const adapter = {
-      pollCommands: async (_sessionId: string, timeoutMs: number) => {
-        timeouts.push(timeoutMs);
-        intervals.push(Date.now());
-        callCount += 1;
-        if (callCount === 1) return null;
-        return callCount === 2 ? command : null;
-      },
-      submitResult: async () => { submitted = true; },
+      pollCommands: async () => (++polls === 1 ? command : null),
+      submitResult: async (_commandId: string, result: AgentAdapterCommandResult) => { submitted.push(result); },
     } as unknown as AgentAdapter;
     const poller = startCommandPoller({
       sessionId: command.sessionId,
       client: adapter,
-      onCommand: async () => executed(command),
-    }, 20);
-
-    await waitFor(() => submitted);
-    poller.stop();
-
-    expect(timeouts.length).toBeGreaterThanOrEqual(2);
-    expect(timeouts.every((timeout) => timeout === 0)).toBe(true);
-    expect(intervals.length).toBeGreaterThanOrEqual(2);
-    expect(intervals[1]! - intervals[0]!).toBeGreaterThanOrEqual(15);
-  });
-
-  test('invalid dequeued commands are not dispatched and log no untrusted command fields', async () => {
-    const logPath = captureLog();
-    const invalid = {
-      ...makeCommand(),
-      commandId: 'plaintext-shaped-untrusted-id',
-      payload: { text: 'invalid command plaintext' },
-      extra: 'ciphertext_private_marker',
-    } as unknown as CommandEnvelope;
-    let polls = 0;
-    let dispatched = false;
-    const adapter = {
-      pollCommands: async () => (++polls === 1 ? invalid : null),
-      submitResult: async () => undefined,
-    } as unknown as AgentAdapter;
-    const poller = startCommandPoller({
-      sessionId: 'session-1',
-      client: adapter,
-      onCommand: async () => {
-        dispatched = true;
-        return executed();
-      },
+      onCommand: async () => ({ kind: 'terminal', result: executed(command) }),
     }, 10);
-
-    await waitFor(() => existsSync(logPath));
+    await waitFor(() => submitted.length === 1);
+    await Bun.sleep(30);
     poller.stop();
-
-    expect(dispatched).toBe(false);
-    expect(JSON.parse(readFileSync(logPath, 'utf8'))).toEqual({ event: 'command_dispatch_failed' });
+    expect(submitted).toEqual([executed(command)]);
   });
 
-  test('throw after dequeue never submits a fabricated failed result and logs no private text', async () => {
-    const logPath = captureLog();
-    const command = makeCommand({ payload: { text: 'command plaintext marker' } });
+  test('outcome_unknown submits no wire result and releases local dequeue state', async () => {
+    const command = makeCommand();
     let polls = 0;
     let submissions = 0;
+    const abandoned: string[] = [];
     const adapter = {
       pollCommands: async () => (++polls === 1 ? command : null),
       submitResult: async () => { submissions += 1; },
+      abandonCommand: (commandId: string) => abandoned.push(commandId),
     } as unknown as AgentAdapter;
     const poller = startCommandPoller({
       sessionId: command.sessionId,
       client: adapter,
-      onCommand: async () => { throw new Error('private driver error marker'); },
+      onCommand: async () => ({ kind: 'outcome_unknown' }),
     }, 10);
+    await waitFor(() => abandoned.length === 1);
+    poller.stop();
+    expect(submissions).toBe(0);
+    expect(abandoned).toEqual([command.commandId]);
+  });
 
+  test('handler throw after dequeue never fabricates or retries a result', async () => {
+    const logPath = captureLog();
+    const command = makeCommand({ payload: { text: 'private text' } });
+    let polls = 0;
+    let submissions = 0;
+    const abandoned: string[] = [];
+    const adapter = {
+      pollCommands: async () => (++polls === 1 ? command : null),
+      submitResult: async () => { submissions += 1; },
+      abandonCommand: (commandId: string) => abandoned.push(commandId),
+    } as unknown as AgentAdapter;
+    const poller = startCommandPoller({
+      sessionId: command.sessionId,
+      client: adapter,
+      onCommand: async () => { throw new Error('private driver error'); },
+    }, 10);
     await waitFor(() => existsSync(logPath));
     poller.stop();
-
     expect(submissions).toBe(0);
+    expect(abandoned).toEqual([command.commandId]);
     const capture = readFileSync(logPath, 'utf8');
     expect(capture).toContain('command_dispatch_failed');
-    expect(capture).toContain(command.commandId);
-    expect(capture).not.toContain('command plaintext marker');
-    expect(capture).not.toContain('private driver error marker');
+    expect(capture).not.toContain('private text');
+    expect(capture).not.toContain('private driver error');
   });
 
   test.each([
-    ['diagnostic field', { ...executed(), message: 'private result text' }],
-    ['queued status', { ...executed(), status: 'queued' }],
-    ['delivered status', { ...executed(), status: 'delivered' }],
-    ['unknown status', { ...executed(), status: 'unknown' }],
-    ['correlation field', { ...executed(), correlationId: 'correlation-1' }],
-  ])('rejects %s returned by a command handler without submitting', async (_label, invalid) => {
+    ['failed', { kind: 'terminal', result: { ...rejected(), status: 'failed' } }],
+    ['unknown wire status', { kind: 'terminal', result: { ...rejected(), status: 'outcome_unknown' } }],
+    ['diagnostic field', { kind: 'terminal', result: { ...rejected(), message: 'private result' } }],
+  ])('does not submit forbidden %s outcomes', async (_label, invalid) => {
     const logPath = captureLog();
     let polls = 0;
     let submissions = 0;
     const adapter = {
       pollCommands: async () => (++polls === 1 ? makeCommand() : null),
       submitResult: async () => { submissions += 1; },
+      abandonCommand: () => undefined,
     } as unknown as AgentAdapter;
     const poller = startCommandPoller({
       sessionId: 'session-1',
       client: adapter,
-      onCommand: async () => invalid as AgentAdapterCommandResult,
+      onCommand: async () => invalid as unknown as CommandExecutionOutcome,
     }, 10);
-
     await waitFor(() => existsSync(logPath));
     poller.stop();
-
     expect(submissions).toBe(0);
-    const capture = readFileSync(logPath, 'utf8');
-    expect(capture).toContain('command_result_invalid');
-    expect(capture).not.toContain('private result text');
+    expect(readFileSync(logPath, 'utf8')).toContain('command_result_invalid');
+    expect(readFileSync(logPath, 'utf8')).not.toContain('private result');
   });
 
-  test('late result submission rejection logs only the event code and opaque command ID', async () => {
+  test('result submission is attempted once and never replayed after rejection', async () => {
     const logPath = captureLog();
-    const command = makeCommand({ payload: { text: 'late command plaintext' } });
     let polls = 0;
-    let submitAttempted = false;
+    let submitAttempts = 0;
     const adapter = {
-      pollCommands: async () => (++polls === 1 ? command : null),
-      submitResult: async () => {
-        submitAttempted = true;
-        throw new Error('late result private server detail');
-      },
+      pollCommands: async () => (++polls === 1 ? makeCommand() : null),
+      submitResult: async () => { submitAttempts += 1; throw new Error('late unknown'); },
     } as unknown as AgentAdapter;
     const poller = startCommandPoller({
-      sessionId: command.sessionId,
-      client: adapter,
-      onCommand: async () => executed(command),
+      sessionId: 'session-1', client: adapter, onCommand: async () => terminal(),
     }, 10);
-
-    await waitFor(() => submitAttempted && existsSync(logPath));
+    await waitFor(() => existsSync(logPath));
+    await Bun.sleep(30);
     poller.stop();
-
-    const entry = JSON.parse(readFileSync(logPath, 'utf8')) as Record<string, unknown>;
-    expect(entry).toEqual({
-      event: 'command_result_submit_failed',
-      commandId: command.commandId,
-    });
-    const capture = JSON.stringify(entry);
-    expect(capture).not.toContain('late command plaintext');
-    expect(capture).not.toContain('late result private server detail');
+    expect(submitAttempts).toBe(1);
+    expect(readFileSync(logPath, 'utf8')).toContain('command_result_submit_failed');
   });
 
-  test('stop during an in-flight poll prevents late command dispatch', async () => {
-    let resolvePoll!: (command: CommandEnvelope) => void;
-    const pendingPoll = new Promise<CommandEnvelope>((resolve) => { resolvePoll = resolve; });
-    let dispatched = false;
-    let submitted = false;
-    const adapter = {
-      pollCommands: async () => pendingPoll,
-      submitResult: async () => { submitted = true; },
-    } as unknown as AgentAdapter;
-    const poller = startCommandPoller({
-      sessionId: 'session-1',
-      client: adapter,
-      onCommand: async () => {
-        dispatched = true;
-        return executed();
-      },
-    }, 10);
-
-    poller.stop();
-    resolvePoll(makeCommand());
-    await Bun.sleep(20);
-
-    expect(dispatched).toBe(false);
-    expect(submitted).toBe(false);
-  });
-
-  test.each(['resolve', 'throw'] as const)('stop during executing side effect suppresses late handler %s', async (outcome) => {
-    const logPath = captureLog();
-    const command = makeCommand({ payload: { text: 'canceled command plaintext' } });
+  test('stop during a possible side effect suppresses result submission', async () => {
+    const command = makeCommand();
     let polls = 0;
-    let handlerStarted = false;
-    let releaseHandler!: () => void;
-    const handlerGate = new Promise<void>((resolve) => { releaseHandler = resolve; });
+    let started = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
     let submissions = 0;
+    const abandoned: string[] = [];
     const adapter = {
       pollCommands: async () => (++polls === 1 ? command : null),
       submitResult: async () => { submissions += 1; },
+      abandonCommand: (commandId: string) => abandoned.push(commandId),
     } as unknown as AgentAdapter;
     const poller = startCommandPoller({
       sessionId: command.sessionId,
       client: adapter,
-      onCommand: async () => {
-        handlerStarted = true;
-        await handlerGate;
-        if (outcome === 'throw') throw new Error('late private handler error');
-        return executed(command);
-      },
+      onCommand: async () => { started = true; await gate; return terminal(command); },
     }, 10);
-
-    await waitFor(() => handlerStarted);
+    await waitFor(() => started);
     poller.stop();
-    releaseHandler();
-    await waitFor(() => existsSync(logPath));
-    await Bun.sleep(10);
-
+    release();
+    await waitFor(() => abandoned.length === 1);
     expect(submissions).toBe(0);
-    const entry = JSON.parse(readFileSync(logPath, 'utf8')) as Record<string, unknown>;
-    expect(entry).toEqual({ event: 'command_dispatch_canceled', commandId: command.commandId });
-    const capture = JSON.stringify(entry);
-    expect(capture).not.toContain('canceled command plaintext');
-    expect(capture).not.toContain('late private handler error');
   });
 });

@@ -151,7 +151,9 @@ export function sameOwner(left: readonly [string, string], right: readonly [stri
   return left[0] === right[0] && left[1] === right[1];
 }
 
-export function semanticFingerprint(session: RegisteredSession): string {
+export function semanticFingerprint(
+  session: Omit<RegisteredSession, 'driverInstanceId' | 'ownerLease' | 'lastOwnerLeaseMonotonic'>,
+): string {
   return JSON.stringify({ sessionId: session.sessionId, provider: session.provider, projectName: session.projectName, cwd: session.cwd,
     nameText: session.nameText, openingText: session.openingText, latestActivityText: session.latestActivityText,
     harnessProvider: session.harnessProvider, pid: session.pid,

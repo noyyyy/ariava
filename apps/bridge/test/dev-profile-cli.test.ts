@@ -388,6 +388,7 @@ describe('source dev profile commands', () => {
           url: `http://127.0.0.1:${config.agentAdapter.port}`,
           secret: 'dev-secret',
           protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+          provider: 'pi', profileId: 'dev', hostId: 'host-dev',
         });
       },
       runForever: () => new Promise<void>((resolveRun) => { finishBridge = resolveRun; }),
@@ -541,6 +542,7 @@ describe('source dev profile commands', () => {
       url: 'http://127.0.0.1:7273',
       secret: 'secret',
       protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+      provider: 'pi', profileId: 'dev', hostId: 'host-dev',
     });
     harness.deps.sourcePiExtensionPath = join(harness.root, 'missing-index.ts');
     expect(await runDevProfileCommand(['pi'], harness.deps)).toBe(1);
@@ -554,6 +556,7 @@ describe('source dev profile commands', () => {
       url: 'http://127.0.0.1:7273',
       secret: 'secret',
       protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+      provider: 'pi', profileId: 'dev', hostId: 'host-dev',
     });
     const extensionPath = join(harness.root, 'index.ts');
     writeFileSync(extensionPath, 'export default {}', { mode: 0o600 });
@@ -594,6 +597,7 @@ describe('source dev profile commands', () => {
       url: 'http://127.0.0.1:7273',
       secret: 'must-not-appear',
       protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+      provider: 'pi', profileId: 'dev', hostId: 'host-dev',
     });
     const offset = harness.output().length;
     expect(await runDevProfileCommand(['status'], harness.deps)).toBe(0);
@@ -618,6 +622,7 @@ describe('source dev profile commands', () => {
       url: 'http://127.0.0.1:7273',
       secret: 'source-only-secret',
       protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+      provider: 'pi', profileId: 'dev', hostId: 'host-dev',
     });
     mkdirSync(join(harness.deps.paths.statePath, '..'), { recursive: true, mode: 0o700 });
     writeFileSync(harness.deps.paths.statePath, '{}', { mode: 0o600 });
@@ -680,6 +685,7 @@ describe('source dev profile commands', () => {
       url: 'http://127.0.0.1:7272',
       secret: 'dev-wrong-port-secret',
       protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+      provider: 'pi', profileId: 'dev', hostId: 'host-dev',
     });
     mkdirSync(join(harness.deps.paths.statePath, '..'), { recursive: true, mode: 0o700 });
     writeFileSync(harness.deps.paths.statePath, '{}', { mode: 0o600 });

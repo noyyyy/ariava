@@ -125,6 +125,7 @@ export function cancelTerminalEvent(shell: SpoolTransactionShell, input: {
   if (input.removeSession) {
     delete nextState.sessions[input.sessionId];
     delete nextState.sessionDrivers[input.sessionId];
+    delete nextState.producerEventCheckpoints?.[input.sessionId];
   } else if (input.nextDriverName !== undefined) {
     nextState.sessionDrivers[input.sessionId] = input.nextDriverName;
   }

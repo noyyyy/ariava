@@ -4,6 +4,7 @@ import type {
   EventUploadCompletionV1,
   PersistedBridgeState,
   PersistedProducerEventReservationV1,
+  ProducerEventSourceCheckpointV1,
 } from '../types';
 import type { StateTransition } from './state-transitions';
 import { producerReservationKey } from './state-codec';
@@ -58,6 +59,36 @@ export function reserveProducerEventTransition(
   const reservations = { ...(nextState.producerEventReservations ?? {}), [key]: structuredClone(reservation) };
   const retained = Object.entries(reservations).slice(-200);
   nextState.producerEventReservations = Object.fromEntries(retained);
+  return { state: nextState, result: undefined };
+}
+
+/**
+ * Clone-first bounded producer Event reservation + accepted source checkpoint in one
+ * state transition (spec §8 Event: source tuple, fingerprint, event reservation and
+ * accepted checkpoint must be durable together).
+ */
+export function reserveProducerEventWithCheckpointTransition(
+  state: PersistedBridgeState,
+  reservation: PersistedProducerEventReservationV1,
+  checkpoint: ProducerEventSourceCheckpointV1,
+): StateTransition<void> {
+  if (checkpoint.sessionId !== reservation.sessionId) {
+    throw new TypeError('producer Event checkpoint session mismatch');
+  }
+  const key = producerReservationKey(reservation.sessionId, reservation.fingerprint);
+  const existing = state.producerEventReservations?.[key];
+  if (existing) {
+    if (existing.eventId !== reservation.eventId || existing.createdAt !== reservation.createdAt) {
+      throw new TypeError('producer Event reservation conflict');
+    }
+  }
+  const nextState = structuredClone(state);
+  if (!existing) {
+    const reservations = { ...(nextState.producerEventReservations ?? {}), [key]: structuredClone(reservation) };
+    const retained = Object.entries(reservations).slice(-200);
+    nextState.producerEventReservations = Object.fromEntries(retained);
+  }
+  (nextState.producerEventCheckpoints ??= {})[checkpoint.sessionId] = structuredClone(checkpoint);
   return { state: nextState, result: undefined };
 }
 

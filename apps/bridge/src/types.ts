@@ -90,6 +90,16 @@ export interface PersistedProducerEventReservationV1 {
   createdAt: string;
 }
 
+export interface ProducerEventSourceCheckpointV1 {
+  version: 1;
+  sessionId: string;
+  producerEventId: string;
+  producerEventOrder: string;
+  eventId: string;
+  fingerprint: string;
+  createdAt: string;
+}
+
 export interface PersistedTerminalCancellationV1 {
   version: 1;
   sessionId: string;
@@ -187,6 +197,7 @@ export interface PersistedBridgeState {
   recipientSetVersion?: number;
   eventUploadCompletions?: Record<string, EventUploadCompletionV1>;
   producerEventReservations?: Record<string, PersistedProducerEventReservationV1>;
+  producerEventCheckpoints?: Record<string, ProducerEventSourceCheckpointV1>;
   terminalCancellations?: Record<string, PersistedTerminalCancellationV1>;
   pendingHandles: Record<string, PendingSessionHandle>;
   commandExecutions: Record<string, PersistedCommandExecutionV4>;

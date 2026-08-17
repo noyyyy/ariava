@@ -82,7 +82,9 @@ export function planTerminalEvent(snapshot: TerminalEventPlanInput): TerminalEve
   return { type: 'reserve-new-tuple', tuple, reservation, promoteNow: !hasPendingCommandWork };
 }
 
-export function toCanonicalSessionState(session: RegisteredSession): CanonicalSessionState {
+export function toCanonicalSessionState(
+  session: Omit<RegisteredSession, 'driverInstanceId' | 'ownerLease' | 'lastOwnerLeaseMonotonic'>,
+): CanonicalSessionState {
   return { sessionId: session.sessionId, hostId: session.hostId, provider: session.provider, projectName: session.projectName,
     nameText: session.nameText, openingText: session.openingText, latestActivityText: session.latestActivityText,
     workingDirectory: session.cwd, harnessProvider: session.harnessProvider,

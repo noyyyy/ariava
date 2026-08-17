@@ -29,7 +29,6 @@ const REGISTRATION_WARNING_MESSAGE =
   'Ariava bridge did not register this pi session within 5s. Check that the selected local bridge profile is running and its Agent Adapter discovery file is available.';
 const REGISTRATION_RETRY_MS = 1_000;
 const TERMINAL_ALERT_QUIET_WINDOW_MS = 1_500;
-const TERMINAL_DELIVERY_RETRY_DELAYS_MS = [250, 1_000, 4_000, 8_000] as const;
 
 type LatestAgentEndResult = {
   assistantFound: boolean;
@@ -74,7 +73,6 @@ type PiReducerState = {
   pendingHandleCandidate?: PendingHandleCandidate;
   quietTimer?: ReturnType<typeof setTimeout>;
   terminalDeliveryInFlight?: boolean;
-  terminalDeliveryAttempts?: number;
   lastInputAt?: number;
   inputCursor: number;
   activeLeafId?: string;
@@ -126,7 +124,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
           handledThroughEventId: candidate.eventId,
           handledThroughEventCreatedAt: candidate.eventCreatedAt,
           handledAt: new Date(loopState.lastInputAt ?? Date.now()).toISOString(),
-          action: 'pi_input',
+          action: 'local_input',
         });
         if (state?.pendingHandleCandidate === candidate) {
           state.pendingHandleCandidate = undefined;
@@ -193,6 +191,29 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       .trim();
     return text || undefined;
   }
+  async function settleTerminalLocally(
+    loopState: PiReducerState,
+    alert: PendingTerminalAlert,
+    terminalSession: NonNullable<typeof session>,
+    sessionStatus: 'idle' | 'need_human',
+  ): Promise<void> {
+    if (alert.fingerprint) markFingerprintEmitted(alert.fingerprint);
+    session = terminalSession;
+    heartbeatContext.status = sessionStatus;
+    heartbeatContext.latestActivityText = terminalSession.latestActivityText;
+    loopState.terminalEmittedForCurrentLoop = true;
+    loopState.latestPendingAlert = undefined;
+    loopState.terminalDeliveryInFlight = false;
+    loopState.pendingHandleCandidate = undefined;
+    try {
+      await adapter.heartbeat(
+        terminalSession.sessionId, sessionStatus, terminalSession.latestActivityText ?? null, terminalSession,
+      );
+    } catch {
+      logExtensionEvent('heartbeat_failed');
+    }
+  }
+
   async function emitTerminalAlert(alert: PendingTerminalAlert) {
     if (
       !session ||
@@ -207,6 +228,11 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     const normalizedAgentText = normalizeAssistantTextForEvent(eventType, session, alert.agentText);
     const sessionStatus = alert.type === 'done' ? 'idle' : 'need_human';
     const terminalSession = withSessionStatus(session, sessionStatus, normalizedAgentText);
+    if (adapter.eventPublicationEnabled === false) {
+      await settleTerminalLocally(state, alert, terminalSession, sessionStatus);
+      return;
+    }
+
     const event = alert.type === 'done'
       ? buildDoneEvent(terminalSession, normalizedAgentText, alert.humanText, alert.createdAt)
       : buildNeedHumanEvent(terminalSession, alert.reason === 'error'
@@ -266,7 +292,6 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       heartbeatContext.latestActivityText = terminalSession.latestActivityText;
       currentState.terminalEmittedForCurrentLoop = true;
       currentState.latestPendingAlert = undefined;
-      currentState.terminalDeliveryAttempts = 0;
       currentState.pendingHandleCandidate = candidate;
     } catch (error) {
       const currentState = state;
@@ -279,8 +304,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
         currentState.flowRevision === deliveredFlowRevision &&
         currentState.settledRunGeneration === deliveredRunGeneration
       ) {
-        currentState.terminalDeliveryAttempts = (currentState.terminalDeliveryAttempts ?? 0) + 1;
-        scheduleTerminalDeliveryRetry(currentState, alert);
+        await settleTerminalLocally(currentState, alert, terminalSession, sessionStatus);
       }
       logExtensionEvent('terminal_event_push_failed');
     } finally {
@@ -294,25 +318,11 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     loopState.quietTimer = undefined;
   }
 
-  function scheduleTerminalDeliveryRetry(loopState: PiReducerState, alert: PendingTerminalAlert): void {
-    clearQuietTimer(loopState);
-    const attempt = loopState.terminalDeliveryAttempts ?? 1;
-    const delayMs = TERMINAL_DELIVERY_RETRY_DELAYS_MS[Math.min(
-      attempt - 1,
-      TERMINAL_DELIVERY_RETRY_DELAYS_MS.length - 1,
-    )];
-    loopState.quietTimer = setTimeout(() => {
-      if (state !== loopState || loopState.latestPendingAlert !== alert) return;
-      void emitTerminalAlert(alert);
-    }, delayMs);
-    loopState.quietTimer.unref?.();
-  }
 
   function invalidatePendingTerminal(loopState: PiReducerState): void {
     clearQuietTimer(loopState);
     loopState.latestPendingAlert = undefined;
     loopState.terminalDeliveryInFlight = false;
-    loopState.terminalDeliveryAttempts = 0;
   }
 
   function schedulePendingTerminal(ctx: ExtensionContext) {
@@ -499,7 +509,6 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       sessionId,
       client: adapter,
       onCommand: (command) => handleCommand(pi, ctx, command),
-      getSession: () => session,
     });
     registerSessionInBackground(ctx, sessionId);
   });

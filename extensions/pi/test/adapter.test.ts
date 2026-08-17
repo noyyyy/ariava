@@ -1,520 +1,363 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AGENT_ADAPTER_PROTOCOL_VERSION, type CommandEnvelope, type CommandResult } from '@ariava/protocol';
-import type { AgentAdapterRegistry } from '../../../apps/bridge/src/agent-adapter/registry';
-import { AGENT_ADAPTER_REQUEST_BODY_BYTES, AgentAdapterClient, resolveAgentAdapterConfigPath } from '../src/adapter';
+import {
+  AGENT_ADAPTER_PROTOCOL_HEADER,
+  AGENT_ADAPTER_PROTOCOL_VERSION,
+  isAgentAdapterProducerEventId,
+  isAgentAdapterProducerEventOrder,
+  producerEventOrderAsBigInt,
+  type CommandEnvelope,
+} from '@ariava/protocol';
+import {
+  AGENT_ADAPTER_OWNER_HEADERS,
+  AGENT_ADAPTER_REQUEST_BODY_BYTES,
+  AgentAdapterClient,
+  resolveAgentAdapterConfigPath,
+} from '../src/adapter';
 import type { PiSessionInfo } from '../src/session';
 
-mock.module('../../../apps/bridge/src/e2e/node-crypto', () => ({
-  ChaChaPolyAuthenticationError: class ChaChaPolyAuthenticationError extends Error {},
-  chachaPolySeal: (_key: Uint8Array, plaintext: Uint8Array) => ({
-    nonce: new Uint8Array(12).fill(1), ciphertext: new Uint8Array([...plaintext, ...new Uint8Array(16)]),
-  }),
-  chachaPolyOpen: (_key: Uint8Array, _nonce: Uint8Array, ciphertext: Uint8Array) => ciphertext.slice(0, -16),
-}));
+const originalFetch = globalThis.fetch;
+const originalDiscoveryPath = process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
+const temporaryDirectories: string[] = [];
 
-function makeSequencingSession(sessionId: string): PiSessionInfo {
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  if (originalDiscoveryPath === undefined) delete process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
+  else process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = originalDiscoveryPath;
+  for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+function makeSession(sessionId = 'session-1'): PiSessionInfo {
   return {
     sessionId, provider: 'pi', projectName: 'demo', cwd: '/tmp/demo', nameText: 'Demo session',
     openingText: 'Start task', latestActivityText: 'Working', status: 'idle', pid: 1234,
   };
 }
 
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((promiseResolve) => { resolve = promiseResolve; });
-  return { promise, resolve };
+function makeCommand(sessionId = 'session-1', commandId = 'command-1'): CommandEnvelope {
+  return {
+    commandId, hostId: 'host-1', sessionId, type: 'reply', payload: { text: 'Continue' },
+    issuedAt: '2026-08-12T00:00:00.000Z', expiresAt: '2026-08-12T00:01:00.000Z',
+    nonce: 'nonce-1', watchDeviceId: 'watch-1',
+  };
 }
 
-describe('AgentAdapterClient sequencing', () => {
-  const originalFetch = globalThis.fetch;
+function discovery(secret = 'secret') {
+  return {
+    url: 'http://127.0.0.1:7272',
+    secret,
+    protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+    provider: 'pi' as const,
+    profileId: 'profile-1',
+    hostId: 'host-1',
+  };
+}
 
-  afterEach(() => { globalThis.fetch = originalFetch; });
+const OWNER_LEASE_A = Buffer.alloc(32, 1).toString('base64url');
+const OWNER_LEASE_B = Buffer.alloc(32, 2).toString('base64url');
 
-  function response(status: number, body: unknown = {}): Response {
-    return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
-  }
-
-  test('orders an in-flight old register before newer heartbeat semantics', async () => {
-    const blocked = deferred<Response>();
-    const requests: Array<{ method: string; path: string; body?: any }> = [];
-    globalThis.fetch = (async (input, init) => {
-      const request = { method: init?.method ?? 'GET', path: new URL(String(input)).pathname,
-        body: init?.body ? JSON.parse(String(init.body)) : undefined };
-      requests.push(request);
-      if (requests.length === 1) return blocked.promise;
-      return response(200, {});
-    }) as typeof fetch;
-    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
-    const oldSession = makeSequencingSession('ordered-session');
-    const oldRegister = sequenced.registerSession(oldSession);
-    const newest = { ...oldSession, status: 'working' as const, latestActivityText: 'Newest semantics' };
-    const heartbeat = sequenced.heartbeat(newest.sessionId, newest.status, newest.latestActivityText, newest);
-    await Bun.sleep(10);
-    expect(requests).toHaveLength(1);
-    blocked.resolve(response(201, { sessionId: oldSession.sessionId, registeredAt: 'now' }));
-    await Promise.all([oldRegister, heartbeat]);
-    expect(requests.map(({ path }) => path)).toEqual([
-      '/v1/agent/sessions', '/v1/agent/sessions/ordered-session/heartbeat',
-    ]);
-    expect(requests[1]?.body).toMatchObject({ status: 'working', latestActivityText: 'Newest semantics' });
+function registerResponse(sessionId = 'session-1', ownerLease = OWNER_LEASE_A): Response {
+  return jsonResponse(201, {
+    sessionId,
+    registeredAt: '2026-08-12T00:00:00.000Z',
+    ownership: 'owned',
+    ownerLease,
   });
+}
 
-  test('orders shutdown unregister after an in-flight register', async () => {
-    const blocked = deferred<Response>();
-    const methods: string[] = [];
-    globalThis.fetch = (async (_input, init) => {
-      methods.push(init?.method ?? 'GET');
-      if (methods.length === 1) return blocked.promise;
-      return response(200);
-    }) as typeof fetch;
-    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
-    const registration = sequenced.registerSession(makeSequencingSession('shutdown-order'));
-    const unregister = sequenced.unregisterSession('shutdown-order');
-    await Bun.sleep(10);
-    expect(methods).toEqual(['POST']);
-    blocked.resolve(response(201, { sessionId: 'shutdown-order', registeredAt: 'now' }));
-    await Promise.all([registration, unregister]);
-    expect(methods).toEqual(['POST', 'DELETE']);
-  });
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
 
-  test('heartbeat 404 recovery completes without reentrant queue deadlock', async () => {
-    const paths: string[] = [];
-    globalThis.fetch = (async (input, init) => {
-      paths.push(`${init?.method} ${new URL(String(input)).pathname}`);
-      if (paths.length === 1) return response(404, { error: 'Session not found' });
-      if (paths.length === 2) return response(201, { sessionId: 'recover', registeredAt: 'now' });
-      return response(200);
-    }) as typeof fetch;
-    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
-    const session = makeSequencingSession('recover');
-    await expect(Promise.race([
-      sequenced.heartbeat(session.sessionId, 'working', 'Recovered', session).then(() => 'done'),
-      Bun.sleep(250).then(() => 'timeout'),
-    ])).resolves.toBe('done');
-    expect(paths).toEqual([
-      'POST /v1/agent/sessions/recover/heartbeat',
-      'POST /v1/agent/sessions',
-      'POST /v1/agent/sessions/recover/heartbeat',
-    ]);
-  });
+type CapturedRequest = {
+  method: string;
+  path: string;
+  headers: Headers;
+  body?: unknown;
+};
 
-  test('late poll 404 cannot resurrect a session after unregister completes', async () => {
-    const blockedPoll = deferred<Response>();
-    const requests: string[] = [];
-    globalThis.fetch = (async (input, init) => {
-      const request = `${init?.method} ${new URL(String(input)).pathname}`;
-      requests.push(request);
-      if (request.startsWith('GET ')) return blockedPoll.promise;
-      return response(200);
-    }) as typeof fetch;
-    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
-    const session = makeSequencingSession('shutdown-race');
+function captureRequests(responder: (request: CapturedRequest, index: number) => Response | Promise<Response>) {
+  const requests: CapturedRequest[] = [];
+  globalThis.fetch = (async (input, init) => {
+    const request: CapturedRequest = {
+      method: init?.method ?? 'GET',
+      path: `${new URL(String(input)).pathname}${new URL(String(input)).search}`,
+      headers: new Headers(init?.headers),
+      body: init?.body === undefined ? undefined : JSON.parse(String(init.body)),
+    };
+    requests.push(request);
+    return responder(request, requests.length - 1);
+  }) as typeof fetch;
+  return requests;
+}
 
-    const poll = sequenced.pollCommands(session.sessionId, 30_000, session);
-    await Bun.sleep(0);
-    await sequenced.unregisterSession(session.sessionId);
-    blockedPoll.resolve(response(404, { error: 'Session not found' }));
+function expectOwnerHeaders(request: CapturedRequest, expectedLease: string, expectedInstance?: string): string {
+  expect(request.headers.get(AGENT_ADAPTER_PROTOCOL_HEADER)).toBe('4');
+  expect(request.headers.get(AGENT_ADAPTER_OWNER_HEADERS.ownerLease)).toBe(expectedLease);
+  const instance = request.headers.get(AGENT_ADAPTER_OWNER_HEADERS.driverInstance);
+  expect(instance).toMatch(/^[A-Za-z0-9_-]{22}$/);
+  if (expectedInstance !== undefined) expect(instance).toBe(expectedInstance);
+  return instance!;
+}
 
-    await expect(poll).resolves.toBeNull();
-    expect(requests).toEqual([
-      'GET /v1/agent/sessions/shutdown-race/commands',
-      'DELETE /v1/agent/sessions/shutdown-race',
-    ]);
-  });
-
-  test.each(['heartbeat', 'register'] as const)('%s invalidates stale poll recovery', async (newerOperation) => {
-    const blockedPoll = deferred<Response>();
-    const requests: string[] = [];
-    globalThis.fetch = (async (input, init) => {
-      const request = `${init?.method} ${new URL(String(input)).pathname}`;
-      requests.push(request);
-      if (request.startsWith('GET ') && requests.length === 1) return blockedPoll.promise;
-      return response(request === 'POST /v1/agent/sessions' ? 201 : 200, {
-        sessionId: 'newer-lifecycle', registeredAt: 'now',
+describe('AgentAdapterClient protocol-4 transport', () => {
+  test('uses only /v2 and binds every owner route to one stable driver instance and lease', async () => {
+    const lease = OWNER_LEASE_A;
+    const command = makeCommand();
+    const requests = captureRequests((_request, index) => {
+      if (index === 0) return registerResponse(command.sessionId, lease);
+      if (index === 1) return jsonResponse(200, { ok: true });
+      if (index === 2) return jsonResponse(200, {
+        ok: true, hostId: command.hostId, sessionId: command.sessionId, handledThroughEventId: 'event-1',
       });
-    }) as typeof fetch;
-    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
-    const session = makeSequencingSession('newer-lifecycle');
+      if (index === 3) return jsonResponse(200, { command });
+      if (index === 4) return jsonResponse(200, { ok: true });
+      return jsonResponse(200, { ok: true });
+    });
+    const client = new AgentAdapterClient({ baseUrl: discovery().url, secret: discovery().secret });
+    await client.registerSession(makeSession());
+    await client.heartbeat(command.sessionId, 'working', 'Busy');
+    await client.handleSession(command.sessionId, { handledThroughEventId: 'event-1' });
+    await client.pollCommands(command.sessionId, 0);
+    await client.submitResult(command.commandId, {
+      commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId,
+      accepted: false, status: 'rejected', updatedAt: '2026-08-12T00:00:01.000Z',
+    });
+    await client.unregisterSession(command.sessionId);
 
-    const poll = sequenced.pollCommands(session.sessionId, 30_000, session);
-    await Bun.sleep(0);
-    if (newerOperation === 'heartbeat') await sequenced.heartbeat(session.sessionId, 'working');
-    else await sequenced.registerSession({ ...session, latestActivityText: 'newest' });
-    blockedPoll.resolve(response(404, { error: 'Session not found' }));
-
-    await expect(poll).resolves.toBeNull();
-    expect(requests.filter((request) => request === 'POST /v1/agent/sessions')).toHaveLength(
-      newerOperation === 'register' ? 1 : 0,
-    );
+    expect(requests.map((request) => request.path)).toEqual([
+      '/v2/agent/sessions',
+      '/v2/agent/sessions/session-1/heartbeat',
+      '/v2/agent/sessions/session-1/handle',
+      '/v2/agent/sessions/session-1/commands?timeout=0',
+      '/v2/agent/sessions/session-1/commands/command-1/result',
+      '/v2/agent/sessions/session-1',
+    ]);
+    expect(requests.every((request) => !request.path.includes('/v1/'))).toBe(true);
+    expect((requests[0]!.body as Record<string, unknown>).driverInstanceId).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    expect(requests[0]!.headers.has(AGENT_ADAPTER_OWNER_HEADERS.ownerLease)).toBe(false);
+    const instance = expectOwnerHeaders(requests[1]!, lease);
+    for (const request of requests.slice(2)) expectOwnerHeaders(request, lease, instance);
+    expect(requests[2]!.body).toEqual({ handledThroughEventId: 'event-1', action: 'local_input' });
   });
 
-  test('sequential poll 404 still re-registers and retries', async () => {
-    const requests: string[] = [];
-    globalThis.fetch = (async (input, init) => {
-      const request = `${init?.method} ${new URL(String(input)).pathname}`;
-      requests.push(request);
-      if (requests.length === 1) return response(404, { error: 'Session not found' });
-      if (requests.length === 2) return response(201, { sessionId: 'poll-recover', registeredAt: 'now' });
-      return new Response(null, { status: 204 });
-    }) as typeof fetch;
-    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
-    const session = makeSequencingSession('poll-recover');
+  test('re-register and heartbeat recovery reuse the same driver instance and adopt the successor lease', async () => {
+    const firstLease = OWNER_LEASE_A;
+    const secondLease = OWNER_LEASE_B;
+    const requests = captureRequests((_request, index) => {
+      if (index === 0) return registerResponse('session-1', firstLease);
+      if (index === 1) return jsonResponse(409, { error: { code: 'STALE_OWNER', retryable: false } });
+      if (index === 2) return registerResponse('session-1', secondLease);
+      return jsonResponse(200, { ok: true });
+    });
+    const client = new AgentAdapterClient({ baseUrl: discovery().url, secret: discovery().secret });
+    const session = makeSession();
+    await client.registerSession(session);
+    await client.heartbeat(session.sessionId, 'working', 'Recovered', session);
 
-    await expect(sequenced.pollCommands(session.sessionId, 0, session)).resolves.toBeNull();
-    expect(requests).toEqual([
-      'GET /v1/agent/sessions/poll-recover/commands',
-      'POST /v1/agent/sessions',
-      'GET /v1/agent/sessions/poll-recover/commands',
+    const firstInstance = (requests[0]!.body as Record<string, string>).driverInstanceId;
+    expect((requests[2]!.body as Record<string, string>).driverInstanceId).toBe(firstInstance);
+    expectOwnerHeaders(requests[1]!, firstLease, firstInstance);
+    expectOwnerHeaders(requests[3]!, secondLease, firstInstance);
+  });
+
+  test('poll never reacquires or replays after SESSION_NOT_FOUND', async () => {
+    const requests = captureRequests((_request, index) => index === 0
+      ? registerResponse()
+      : jsonResponse(404, { error: { code: 'SESSION_NOT_FOUND', retryable: false } }));
+    const client = new AgentAdapterClient({ baseUrl: discovery().url, secret: discovery().secret });
+    await client.registerSession(makeSession());
+    await expect(client.pollCommands('session-1', 0)).rejects.toThrow('failed: 404');
+    expect(requests).toHaveLength(2);
+    expect(requests.filter((request) => request.path === '/v2/agent/sessions')).toHaveLength(1);
+  });
+
+  test.each([
+    ['poll', async (client: AgentAdapterClient) => client.pollCommands('session-1', 0)],
+    ['handle', async (client: AgentAdapterClient) => client.handleSession('session-1', { handledThroughEventId: 'event-1' })],
+    ['unregister', async (client: AgentAdapterClient) => client.unregisterSession('session-1')],
+  ])('%s transport failure is attempted exactly once', async (_label, operation) => {
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      if (attempts === 1) return registerResponse();
+      throw new Error('transport uncertain');
+    }) as typeof fetch;
+    const client = new AgentAdapterClient({ baseUrl: discovery().url, secret: discovery().secret });
+    await client.registerSession(makeSession());
+    await expect(operation(client)).rejects.toThrow('transport uncertain');
+    expect(attempts).toBe(2);
+  });
+
+  test('a dequeued command result never switches to a successor lease', async () => {
+    const oldLease = OWNER_LEASE_A;
+    const newLease = OWNER_LEASE_B;
+    const command = makeCommand();
+    const requests = captureRequests((_request, index) => {
+      if (index === 0) return registerResponse(command.sessionId, oldLease);
+      if (index === 1) return jsonResponse(200, { command });
+      if (index === 2) return registerResponse(command.sessionId, newLease);
+      return jsonResponse(409, { error: { code: 'COMMAND_OUTCOME_UNKNOWN', retryable: false } });
+    });
+    const client = new AgentAdapterClient({ baseUrl: discovery().url, secret: discovery().secret });
+    const session = makeSession();
+    await client.registerSession(session);
+    await client.pollCommands(session.sessionId, 0);
+    await client.registerSession(session);
+    await expect(client.submitResult(command.commandId, {
+      commandId: command.commandId, hostId: command.hostId, sessionId: command.sessionId,
+      accepted: false, status: 'rejected', updatedAt: '2026-08-12T00:00:01.000Z',
+    })).resolves.toBeUndefined();
+    expectOwnerHeaders(requests[3]!, oldLease);
+    expect(requests).toHaveLength(4);
+  });
+
+  test('Event publication sends owner-bound v2 bodies once with valid increasing in-memory order', async () => {
+    const requests = captureRequests((request, index) => {
+      if (index === 0) return registerResponse();
+      const body = request.body as { producerEventId: string; producerEventOrder: string };
+      return jsonResponse(200, {
+        eventId: `event-${index}`,
+        producerEventId: body.producerEventId,
+        producerEventOrder: body.producerEventOrder,
+        disposition: 'committed',
+      });
+    });
+    const client = new AgentAdapterClient({ baseUrl: discovery().url, secret: discovery().secret });
+    await client.registerSession(makeSession());
+    expect(client.eventPublicationEnabled).toBe(true);
+    const event = {
+      sessionId: 'session-1', provider: 'pi' as const, type: 'done' as const, status: 'idle' as const,
+      agentText: 'Done', createdAt: '2026-08-12T00:00:00.000Z',
+    };
+    await expect(client.pushEvent(event)).resolves.toEqual({ eventId: 'event-1' });
+    await expect(client.pushEvent({ ...event, createdAt: '2026-08-12T00:00:01.000Z' }))
+      .resolves.toEqual({ eventId: 'event-2' });
+
+    expect(requests.map((request) => request.path)).toEqual([
+      '/v2/agent/sessions',
+      '/v2/agent/sessions/session-1/events',
+      '/v2/agent/sessions/session-1/events',
     ]);
+    const instance = expectOwnerHeaders(requests[1]!, OWNER_LEASE_A);
+    expectOwnerHeaders(requests[2]!, OWNER_LEASE_A, instance);
+    const first = requests[1]!.body as { producerEventId: string; producerEventOrder: string; event: unknown };
+    const second = requests[2]!.body as { producerEventId: string; producerEventOrder: string; event: unknown };
+    expect(isAgentAdapterProducerEventId(first.producerEventId)).toBe(true);
+    expect(isAgentAdapterProducerEventId(second.producerEventId)).toBe(true);
+    expect(isAgentAdapterProducerEventOrder(first.producerEventOrder)).toBe(true);
+    expect(isAgentAdapterProducerEventOrder(second.producerEventOrder)).toBe(true);
+    expect(producerEventOrderAsBigInt(first.producerEventOrder)! >= (1n << 127n)).toBe(true);
+    expect(producerEventOrderAsBigInt(second.producerEventOrder)! > producerEventOrderAsBigInt(first.producerEventOrder)!).toBe(true);
+    expect(first.event).toEqual(event);
+  });
+
+  test.each([
+    ['transport uncertainty', () => { throw new Error('transport uncertain'); }, 'transport uncertain'],
+    ['ORDER_CONFLICT', () => jsonResponse(409, { error: { code: 'ORDER_CONFLICT', retryable: false } }), 'failed: 409'],
+  ])('Event %s is attempted once without retry', async (_label, failure, expectedError) => {
+    let requests = 0;
+    globalThis.fetch = (async () => {
+      requests += 1;
+      if (requests === 1) return registerResponse();
+      return failure();
+    }) as typeof fetch;
+    const client = new AgentAdapterClient({ baseUrl: discovery().url, secret: discovery().secret });
+    await client.registerSession(makeSession());
+    await expect(client.pushEvent({
+      sessionId: 'session-1', provider: 'pi', type: 'done', status: 'idle', agentText: 'Done',
+      createdAt: '2026-08-12T00:00:00.000Z',
+    })).rejects.toThrow(expectedError);
+    expect(requests).toBe(2);
   });
 
   test('producer preflight permits exact 256 KiB and rejects cap+1 before fetch', async () => {
-    let fetches = 0; let sentBytes = 0;
-    globalThis.fetch = (async (_input, init) => {
-      fetches += 1;
-      sentBytes = new TextEncoder().encode(String(init?.body)).byteLength;
-      return response(200);
-    }) as typeof fetch;
-    const sequenced = new AgentAdapterClient({ baseUrl: 'http://127.0.0.1:1', secret: 'secret' });
-    const discovery = { url: 'http://127.0.0.1:1', secret: 'secret', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION };
+    let fetches = 0;
+    globalThis.fetch = (async () => { fetches += 1; return jsonResponse(200, {}); }) as typeof fetch;
+    const client = new AgentAdapterClient({ baseUrl: discovery().url, secret: discovery().secret });
     const bodyAt = (bytes: number) => ({ value: 'x'.repeat(bytes - '{"value":""}'.length) });
-    await expect((sequenced as any).requestWithDiscovery(discovery, 'POST', '/test', bodyAt(AGENT_ADAPTER_REQUEST_BODY_BYTES)))
+    await expect((client as any).requestWithDiscovery(discovery(), 'POST', '/test', bodyAt(AGENT_ADAPTER_REQUEST_BODY_BYTES)))
       .resolves.toBeInstanceOf(Response);
-    expect(fetches).toBe(1);
-    expect(sentBytes).toBe(AGENT_ADAPTER_REQUEST_BODY_BYTES);
-    await expect((sequenced as any).requestWithDiscovery(discovery, 'POST', '/test', bodyAt(AGENT_ADAPTER_REQUEST_BODY_BYTES + 1)))
+    await expect((client as any).requestWithDiscovery(discovery(), 'POST', '/test', bodyAt(AGENT_ADAPTER_REQUEST_BODY_BYTES + 1)))
       .rejects.toThrow('256 KiB');
     expect(fetches).toBe(1);
   });
 });
 
-describe('AgentAdapterClient', () => {
-  let dir: string;
-  let secret: string;
-  let baseUrl: string;
-  let client: AgentAdapterClient;
-  let registry: AgentAdapterRegistry;
-  let stopServer: (() => void) | undefined;
+describe('AgentAdapterClient discovery', () => {
+  test('accepts exactly six Pi keys and rejects missing, unknown, wrong provider/version, and non-loopback files before network', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pi-discovery-'));
+    temporaryDirectories.push(directory);
+    const path = join(directory, 'agent-adapter.json');
+    let networkRequests = 0;
+    globalThis.fetch = (async () => { networkRequests += 1; return registerResponse(); }) as typeof fetch;
 
-  const originalDiscoveryPath = process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
-  beforeEach(async () => {
-    delete process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
-    dir = mkdtempSync(join(tmpdir(), 'pi-adapter-'));
-    secret = 'test-secret';
+    writeFileSync(path, JSON.stringify(discovery()));
+    await expect(new AgentAdapterClient({ configPath: path }).registerSession(makeSession())).resolves.toMatchObject({ sessionId: 'session-1' });
+    expect(networkRequests).toBe(1);
 
-    const { AgentAdapterRegistry: Registry } = await import('../../../apps/bridge/src/agent-adapter/registry');
-    const { AgentAdapterServer } = await import('../../../apps/bridge/src/agent-adapter/server');
-    const { BridgeStateStore } = await import('../../../apps/bridge/src/state-store');
-
-    const store = new BridgeStateStore(join(dir, 'state.json'));
-    store.initializeEncryptedSpool('host-1', join(dir, 'identity.json'), 'linux');
-    registry = new Registry('host-1', store);
-    const server = new AgentAdapterServer({ port: 0, secret, hostId: 'host-1' }, registry);
-    await server.start();
-    stopServer = () => server.stop();
-    baseUrl = server.url;
-
-    client = new AgentAdapterClient({ baseUrl, secret });
-  });
-
-  afterEach(() => {
-    stopServer?.();
-    stopServer = undefined;
-    rmSync(dir, { recursive: true, force: true });
-    if (originalDiscoveryPath === undefined) {
-      delete process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
-    } else {
-      process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = originalDiscoveryPath;
+    const invalid = [
+      { url: discovery().url, secret: 'secret', protocolVersion: 4, provider: 'pi', profileId: 'profile-1' },
+      { ...discovery(), extra: true },
+      { ...discovery(), provider: 'codex' },
+      { ...discovery(), protocolVersion: 3 },
+      { ...discovery(), url: 'http://example.com:7272' },
+    ];
+    for (const candidate of invalid) {
+      writeFileSync(path, JSON.stringify(candidate));
+      await expect(new AgentAdapterClient({ configPath: path }).registerSession(makeSession()))
+        .rejects.toThrow('Invalid agent adapter discovery file');
     }
+    expect(networkRequests).toBe(1);
   });
 
-  function makeSession(sessionId: string): PiSessionInfo {
-    return {
-      sessionId,
-      provider: 'pi',
-      projectName: 'demo',
-      cwd: '/tmp/demo',
-      nameText: 'Demo session',
-      openingText: 'Start task',
-      latestActivityText: 'Working',
-      status: 'idle',
-      pid: 1234,
-    };
-  }
-
-  test('preserves one exact native ID across every adapter/server route', async () => {
-    const sessionId = ' native% id?# ';
-    const commandId = ' command% id?# ';
-    const session = makeSession(sessionId);
-    expect((await client.registerSession(session)).sessionId).toBe(sessionId);
-    await client.heartbeat(sessionId, 'working', 'Exact native ID');
-    const event = await client.pushEvent({
-      sessionId, provider: 'pi', type: 'done', status: 'idle', agentText: 'Done',
-      projectName: session.projectName, workingDirectory: session.cwd, harnessProvider: 'pi',
-      createdAt: '2026-08-07T00:00:00.000Z',
+  test('401 heartbeat rereads discovery, re-registers with the same instance, then retries safely', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pi-discovery-rotate-'));
+    temporaryDirectories.push(directory);
+    const path = join(directory, 'agent-adapter.json');
+    writeFileSync(path, JSON.stringify(discovery('old-secret')));
+    const requests = captureRequests((_request, index) => {
+      if (index === 0) return registerResponse();
+      if (index === 1) {
+        writeFileSync(path, JSON.stringify(discovery('new-secret')));
+        return jsonResponse(401, { error: { code: 'UNAUTHORIZED', retryable: false } });
+      }
+      if (index === 2) return registerResponse('session-1', OWNER_LEASE_B);
+      return jsonResponse(200, { ok: true });
     });
-    expect((await client.handleSession(sessionId, { handledThroughEventId: event.eventId })).sessionId).toBe(sessionId);
-    registry.enqueueCommand({
-      commandId, hostId: 'host-1', sessionId, type: 'reply', payload: {},
-      issuedAt: '2026-06-30T09:59:00.000Z', expiresAt: '2026-06-30T10:05:00.000Z',
-      nonce: 'exact', watchDeviceId: 'watch-1',
-    });
-    expect(await client.pollCommands(sessionId, 0)).toMatchObject({ commandId, sessionId });
-    const result: CommandResult = {
-      commandId, hostId: 'host-1', sessionId, accepted: true, status: 'executed',
-      updatedAt: '2026-06-30T10:00:00.000Z',
-    };
-    await client.submitResult(commandId, result);
-    expect(await registry.waitForResult(commandId, { timeoutMs: 50 })).toEqual(result);
-    await client.unregisterSession(sessionId);
-    expect(registry.hasSession(sessionId)).toBe(false);
-  });
-
-  test('registerSession omits extension-only session fields', async () => {
-    const session = { ...makeSession('sess-1'), rawSessionName: 'Local Pi branch name' };
-    const result = await client.registerSession(session);
-    expect(result.sessionId).toBe('sess-1');
-    expect(typeof result.registeredAt).toBe('string');
-  });
-
-  test('unregisterSession', async () => {
-    await client.registerSession(makeSession('sess-1'));
-    await client.unregisterSession('sess-1');
-    expect(registry.listSessions()).toHaveLength(0);
-  });
-
-  test('pushEvent', async () => {
-    const session = makeSession('sess-1');
+    const client = new AgentAdapterClient({ configPath: path });
+    const session = makeSession();
     await client.registerSession(session);
-
-    const result = await client.pushEvent({
-      sessionId: session.sessionId,
-      provider: session.provider,
-      type: 'done',
-      status: 'idle',
-      agentText: 'Tests passed',
-      projectName: session.projectName,
-      workingDirectory: session.cwd,
-      harnessProvider: 'pi',
-      createdAt: '2026-08-07T00:00:00.000Z',
-    });
-
-    expect(typeof result.eventId).toBe('string');
+    await client.heartbeat(session.sessionId, 'working', 'Busy', session);
+    const instance = (requests[0]!.body as Record<string, string>).driverInstanceId;
+    expect((requests[2]!.body as Record<string, string>).driverInstanceId).toBe(instance);
+    expect(requests[0]!.headers.get('authorization')).toBe('Bearer old-secret');
+    expect(requests[2]!.headers.get('authorization')).toBe('Bearer new-secret');
+    expect(requests[3]!.headers.get('authorization')).toBe('Bearer new-secret');
   });
 
-  test('handleSession', async () => {
-    const session = makeSession('sess-1');
-    await client.registerSession(session);
-    const event = await client.pushEvent({
-      sessionId: session.sessionId, provider: session.provider, type: 'done', status: 'idle',
-      agentText: 'Done', projectName: session.projectName, workingDirectory: session.cwd,
-      harnessProvider: 'pi', createdAt: '2026-07-16T00:00:00.000Z',
-    });
-    const result = await client.handleSession(session.sessionId, {
-      handledThroughEventId: event.eventId, handledAt: '2026-07-16T00:00:00Z', action: 'pi_input',
-    });
-    expect(result).toMatchObject({ ok: true, hostId: 'host-1', sessionId: 'sess-1', handledThroughEventId: event.eventId });
-  });
-
-  test('heartbeat updates an idle session to working', async () => {
-    const session = makeSession('sess-1');
-    await client.registerSession(session);
-    expect(registry.listSessions()[0]?.status).toBe('idle');
-
-    await expect(client.heartbeat(session.sessionId, 'working', 'Busy')).resolves.toBeUndefined();
-    expect(registry.listSessions()[0]).toMatchObject({ status: 'working', latestActivityText: 'Busy' });
-  });
-
-  test('heartbeat full semantic snapshot explicitly clears optional branch text', async () => {
-    const session = makeSession('sess-clear');
-    await client.registerSession(session);
-    await client.heartbeat(session.sessionId, 'idle', null, {
-      ...session,
-      openingText: undefined,
-      latestActivityText: undefined,
-    });
-
-    expect(registry.listSessions()[0]).toMatchObject({ status: 'idle' });
-    expect(registry.listSessions()[0]?.openingText).toBeUndefined();
-    expect(registry.listSessions()[0]?.latestActivityText).toBeUndefined();
-  });
-
-  test('heartbeat re-registers and retries semantic update after a Bridge registry restart', async () => {
-    const session = makeSession('sess-restart');
-    await client.registerSession(session);
-    registry.unregister(session.sessionId);
-
-    await expect(client.heartbeat(session.sessionId, 'working', 'Recovered activity', {
-      ...session,
-      status: 'working',
-      latestActivityText: 'Recovered activity',
-    })).resolves.toBeUndefined();
-
-    expect(registry.listSessions()[0]).toMatchObject({
-      sessionId: session.sessionId, status: 'working', latestActivityText: 'Recovered activity',
-    });
-  });
-
-  test('command polling re-registers after a Bridge registry restart', async () => {
-    const session = makeSession('sess-poll-restart');
-    await client.registerSession(session);
-    registry.unregister(session.sessionId);
-
-    await expect(client.pollCommands(session.sessionId, 0, session)).resolves.toBeNull();
-    expect(registry.listSessions()[0]).toMatchObject({ sessionId: session.sessionId, status: 'idle' });
-  });
-
-  test('pollCommands returns enqueued command', async () => {
-    const { AgentAdapterClient: BridgeClient } = await import('../../../apps/bridge/src/agent-adapter/client');
-    const bridgeClient = new BridgeClient(registry);
-
-    const command: CommandEnvelope = {
-      commandId: 'cmd-1',
-      hostId: 'host-1',
-      sessionId: 'sess-1',
-      type: 'reply',
-      payload: { text: 'Continue' },
-      issuedAt: '2026-06-30T10:00:00.000Z',
-      expiresAt: '2026-06-30T10:05:00.000Z',
-      nonce: 'n1',
-      watchDeviceId: 'watch-1',
-    };
-
-    await client.registerSession(makeSession('sess-1'));
-
-    const poll = client.pollCommands('sess-1', 500);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    bridgeClient.enqueueCommand(command);
-
-    const resolved = await poll;
-    expect(resolved?.commandId).toBe('cmd-1');
-  });
-
-  test('submitResult', async () => {
-    await client.registerSession(makeSession('sess-1'));
-
-    const result: CommandResult = {
-      commandId: 'cmd-1',
-      hostId: 'host-1',
-      sessionId: 'sess-1',
-      accepted: true,
-      status: 'executed',
-      updatedAt: '2026-06-30T10:00:00.000Z',
-    };
-
-    const command: CommandEnvelope = {
-      commandId: result.commandId, hostId: result.hostId, sessionId: result.sessionId, type: 'reply', payload: {},
-      issuedAt: '2026-06-30T09:59:00Z', expiresAt: '2026-06-30T10:05:00Z', nonce: 'result-nonce', watchDeviceId: 'watch-1',
-    };
-    registry.enqueueCommand(command);
-    await client.submitResult('cmd-1', result);
-    const resolved = await registry.waitForResult('cmd-1', { timeoutMs: 100 });
-    expect(resolved).toEqual(result);
-  });
-
-  test.each([
-    ['message', { message: 'private result text' }],
-    ['reason', { reason: 'private reason' }],
-    ['queued', { accepted: true, status: 'queued' }],
-    ['delivered', { accepted: true, status: 'delivered' }],
-    ['unknown', { accepted: true, status: 'unknown' }],
-    ['expired', { accepted: false, status: 'expired' }],
-    ['correlationId', { correlationId: 'correlation-1' }],
-    ['non-canonical timestamp', { updatedAt: '2026-06-30T10:00:00Z' }],
-  ])('submitResult rejects non-exact result field or status: %s', async (_label, override) => {
-    const result = {
-      commandId: 'cmd-invalid', hostId: 'host-1', sessionId: 'sess-1',
-      accepted: true, status: 'executed', updatedAt: '2026-06-30T10:00:00.000Z', ...override,
-    };
-    await expect(client.submitResult('cmd-invalid', result as CommandResult)).rejects.toThrow(
-      'Agent Adapter command result is invalid',
-    );
-  });
-
-  const discovery = (value: string) => ({
-    url: baseUrl, secret: value, protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
-  });
-
-  test('reads discovery file', async () => {
-    const configPath = join(dir, 'agent-adapter.json');
-    writeFileSync(configPath, JSON.stringify(discovery(secret)));
-
-    const fileClient = new AgentAdapterClient({ configPath });
-    const result = await fileClient.registerSession(makeSession('sess-2'));
-    expect(result.sessionId).toBe('sess-2');
-  });
-
-  test('explicit discovery path takes precedence over environment selection', async () => {
-    const explicitConfigPath = join(dir, 'explicit-agent-adapter.json');
-    writeFileSync(explicitConfigPath, JSON.stringify(discovery(secret)));
-    process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = join(dir, 'missing-environment-discovery.json');
-
-    const fileClient = new AgentAdapterClient({ configPath: explicitConfigPath });
-    const result = await fileClient.registerSession(makeSession('sess-explicit'));
-
-    expect(result.sessionId).toBe('sess-explicit');
-  });
-
-  test('reads discovery path selected from the process environment', async () => {
-    const environmentConfigPath = join(dir, 'environment-agent-adapter.json');
-    writeFileSync(environmentConfigPath, JSON.stringify(discovery(secret)));
-    process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = environmentConfigPath;
-
-    const fileClient = new AgentAdapterClient();
-    const result = await fileClient.registerSession(makeSession('sess-environment'));
-
-    expect(result.sessionId).toBe('sess-environment');
-  });
-
-  test('rejects discovery files without the exact v3 protocol version', async () => {
-    const configPath = join(dir, 'legacy-agent-adapter.json');
-    writeFileSync(configPath, JSON.stringify({ url: baseUrl, secret }));
-    await expect(new AgentAdapterClient({ configPath }).registerSession(makeSession('legacy'))).rejects.toThrow(
-      'Invalid agent adapter discovery file',
-    );
-    writeFileSync(configPath, JSON.stringify({ ...discovery(secret), protocolVersion: 2 }));
-    await expect(new AgentAdapterClient({ configPath }).registerSession(makeSession('wrong-version'))).rejects.toThrow(
-      'Invalid agent adapter discovery file',
-    );
-  });
-
-  test('uses the production discovery path when the environment selection is absent or empty', () => {
-    delete process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH;
-    const defaultPath = join(homedir(), '.config', 'ariava', 'agent-adapter.json');
-    expect(resolveAgentAdapterConfigPath()).toBe(defaultPath);
-
+  test('resolves explicit, environment, and default discovery paths', () => {
+    const explicit = '/tmp/explicit-agent-adapter.json';
+    process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = '/tmp/environment-agent-adapter.json';
+    expect(resolveAgentAdapterConfigPath(explicit)).toBe(explicit);
+    expect(resolveAgentAdapterConfigPath()).toBe('/tmp/environment-agent-adapter.json');
     process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = '   ';
-    expect(resolveAgentAdapterConfigPath()).toBe(defaultPath);
+    expect(resolveAgentAdapterConfigPath()).toBe(join(homedir(), '.config', 'ariava', 'agent-adapter.json'));
   });
 
-  test('reloads discovery file after adapter auth is rejected', async () => {
-    const configPath = join(dir, 'agent-adapter.json');
-    writeFileSync(configPath, JSON.stringify(discovery('stale-secret')));
-
-    const fileClient = new AgentAdapterClient({ configPath });
-    await expect(fileClient.heartbeat('sess-1', 'working', 'Busy')).rejects.toThrow('Unauthorized');
-
-    await client.registerSession(makeSession('sess-1'));
-    writeFileSync(configPath, JSON.stringify(discovery(secret)));
-
-    await expect(fileClient.heartbeat('sess-1', 'working', 'Busy')).resolves.toBeUndefined();
-  });
-
-  test('reloads the same environment-selected discovery file after a 401', async () => {
-    const environmentConfigPath = join(dir, 'dev-agent-adapter.json');
-    writeFileSync(environmentConfigPath, JSON.stringify(discovery('stale-secret')));
-    process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = environmentConfigPath;
-
-    const fileClient = new AgentAdapterClient();
-    await expect(fileClient.heartbeat('sess-1', 'working', 'Busy')).rejects.toThrow('Unauthorized');
-
-    await client.registerSession(makeSession('sess-1'));
-    writeFileSync(environmentConfigPath, JSON.stringify(discovery(secret)));
-    process.env.ARIAVA_AGENT_ADAPTER_CONFIG_PATH = join(dir, 'production-agent-adapter.json');
-
-    await expect(fileClient.heartbeat('sess-1', 'working', 'Busy')).resolves.toBeUndefined();
+  test('lease remains in memory and is absent from discovery and register body', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pi-discovery-memory-'));
+    temporaryDirectories.push(directory);
+    const path = join(directory, 'agent-adapter.json');
+    writeFileSync(path, JSON.stringify(discovery()));
+    const requests = captureRequests(() => registerResponse());
+    const client = new AgentAdapterClient({ configPath: path });
+    await client.registerSession(makeSession());
+    expect(readFileSync(path, 'utf8')).toBe(JSON.stringify(discovery()));
+    expect(requests[0]!.body).not.toHaveProperty('ownerLease');
+    expect(requests[0]!.body).not.toHaveProperty('profileId');
+    expect(requests[0]!.body).not.toHaveProperty('hostId');
   });
 });

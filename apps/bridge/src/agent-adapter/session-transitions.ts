@@ -46,7 +46,7 @@ export type RegistrationPersistence =
   | { readonly kind: 'no-op'; readonly nextDriverName: string; readonly persistedCancellation: undefined };
 
 export type RegistrationTransition = {
-  readonly nextSession: RegisteredSession;
+  readonly nextSession: Omit<RegisteredSession, 'driverInstanceId' | 'ownerLease' | 'lastOwnerLeaseMonotonic'>;
   readonly semanticChanged: boolean;
   readonly contextChanged: boolean;
   readonly persistence: RegistrationPersistence;
@@ -59,7 +59,7 @@ export function reduceRegistration(
   now: string,
 ): RegistrationTransition {
   const previous = evidence.previousLive;
-  const nextSession: RegisteredSession = {
+  const nextSession: Omit<RegisteredSession, 'driverInstanceId' | 'ownerLease' | 'lastOwnerLeaseMonotonic'> = {
     sessionId: input.sessionId, provider: input.provider, projectName: input.projectName, cwd: input.cwd, nameText: input.nameText,
     openingText: input.openingText, latestActivityText: input.latestActivityText,
     harnessProvider: input.harnessProvider, pid: input.pid,

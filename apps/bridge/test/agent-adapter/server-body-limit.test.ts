@@ -19,6 +19,8 @@ mock.module('../../src/e2e/node-crypto', () => ({
 
 const CAP = AGENT_ADAPTER_LIMITS.requestBodyBytes;
 
+/** 16 zero bytes as unpadded base64url: a valid protocol-4 driver instance id. */
+const DRIVER_INSTANCE_ID = 'AAAAAAAAAAAAAAAAAAAAAA';
 /** JSON whose raw UTF-8 byte length is exactly `byteLength` bytes. */
 function jsonBodyOfExactBytes(byteLength: number): string {
   const prefix = '{"sessionId":"';
@@ -30,7 +32,7 @@ function jsonBodyOfExactBytes(byteLength: number): string {
 
 function validRegisterBody(sessionId = 'sess-1'): string {
   return JSON.stringify({
-    sessionId, provider: 'pi', projectName: 'project', cwd: '/project', nameText: 'Task', status: 'working',
+    sessionId, provider: 'pi', projectName: 'project', cwd: '/project', nameText: 'Task', status: 'working', driverInstanceId: DRIVER_INSTANCE_ID,
   });
 }
 
@@ -72,7 +74,7 @@ describe('AgentAdapterServer request body cap (§3.4)', () => {
 
   function rawPost(body: Buffer, overrides: Record<string, string> = {}): Promise<{ status: number; body: string }> {
     return new Promise((resolve, reject) => {
-      const req = httpRequest(url('/v1/agent/sessions'), {
+      const req = httpRequest(url('/v2/agent/sessions'), {
         method: 'POST',
         headers: { ...headers(), ...overrides },
       }, (res) => {
@@ -89,7 +91,7 @@ describe('AgentAdapterServer request body cap (§3.4)', () => {
   test('reads a request body at exactly the 256 KiB cap (validation proceeds)', async () => {
     const body = jsonBodyOfExactBytes(CAP);
     expect(Buffer.byteLength(body)).toBe(CAP);
-    const response = await fetch(url('/v1/agent/sessions'), { method: 'POST', headers: headers(), body });
+    const response = await fetch(url('/v2/agent/sessions'), { method: 'POST', headers: headers(), body });
     // Read and parsed successfully; route-level validation then fails on missing keys -> 400, not 413.
     expect(response.status).toBe(400);
     expect(await response.text()).not.toContain('exceeds');
@@ -97,7 +99,7 @@ describe('AgentAdapterServer request body cap (§3.4)', () => {
 
   test('rejects one byte over the cap with 413 before any mutation', async () => {
     const body = jsonBodyOfExactBytes(CAP + 1);
-    const response = await fetch(url('/v1/agent/sessions'), { method: 'POST', headers: headers(), body });
+    const response = await fetch(url('/v2/agent/sessions'), { method: 'POST', headers: headers(), body });
     expect(response.status).toBe(413);
     expect(registry.listSessions()).toEqual([]);
     expect(store.peekPendingUploads()).toEqual([]);
@@ -107,7 +109,7 @@ describe('AgentAdapterServer request body cap (§3.4)', () => {
     const chunk = Buffer.alloc(CAP / 2, 'a');
     const overflow = Buffer.from('b');
     const response = await new Promise<{ status: number; body: string }>((resolve, reject) => {
-      const req = httpRequest(url('/v1/agent/sessions'), {
+      const req = httpRequest(url('/v2/agent/sessions'), {
         method: 'POST',
         headers: { ...headers(), 'transfer-encoding': 'chunked' },
       }, (res) => {
@@ -134,23 +136,28 @@ describe('AgentAdapterServer request body cap (§3.4)', () => {
 
   test('stays healthy and stops accumulating/parsing after an overflow', async () => {
     const oversized = jsonBodyOfExactBytes(CAP + 1);
-    const rejected = await fetch(url('/v1/agent/sessions'), { method: 'POST', headers: headers(), body: oversized });
+    const rejected = await fetch(url('/v2/agent/sessions'), { method: 'POST', headers: headers(), body: oversized });
     expect(rejected.status).toBe(413);
-    const accepted = await fetch(url('/v1/agent/sessions'), { method: 'POST', headers: headers(), body: validRegisterBody() });
+    const accepted = await fetch(url('/v2/agent/sessions'), { method: 'POST', headers: headers(), body: validRegisterBody() });
     expect(accepted.status).toBe(201);
   });
 
   test('maps oversized canonical Event content to 400 (not 500) before any spool mutation', async () => {
-    const registered = await fetch(url('/v1/agent/sessions'), { method: 'POST', headers: headers(), body: validRegisterBody() });
+    const registered = await fetch(url('/v2/agent/sessions'), { method: 'POST', headers: headers(), body: validRegisterBody() });
     expect(registered.status).toBe(201);
+    const { ownerLease } = await registered.json() as { ownerLease: string };
     const oversizedEvent = JSON.stringify({
       sessionId: 'sess-1', provider: 'pi', type: 'done', status: 'idle',
       agentText: 'a'.repeat(64 * 1024),
       projectName: 'project', workingDirectory: '/project', harnessProvider: 'pi',
       createdAt: '2026-08-07T00:00:01.000Z',
     });
-    const response = await fetch(url('/v1/agent/sessions/sess-1/events'), {
-      method: 'POST', headers: headers(), body: oversizedEvent,
+    const response = await fetch(url('/v2/agent/sessions/sess-1/events'), {
+      method: 'POST', headers: { ...headers(),
+        'x-ariava-driver-instance': DRIVER_INSTANCE_ID, 'x-ariava-owner-lease': ownerLease },
+      body: JSON.stringify({
+        producerEventId: 'AAAAAAAAAAAAAAAAAAAAAA', producerEventOrder: '00000000000000000000000000000001', event: JSON.parse(oversizedEvent),
+      }),
     });
     expect(response.status).toBe(400);
     expect(store.peekPendingUploads()).toEqual([]);
@@ -167,7 +174,7 @@ describe('AgentAdapterServer request body cap (§3.4)', () => {
     ]);
     const response = await rawPost(malformed);
     expect(response.status).toBe(400);
-    expect(response.body).toContain('UTF-8');
+    expect(JSON.parse(response.body)).toEqual({ error: { code: 'INVALID_REQUEST', retryable: false } });
     expect(registry.listSessions()).toEqual([]);
     expect(store.peekPendingUploads()).toEqual([]);
   });
@@ -177,7 +184,7 @@ describe('AgentAdapterServer request body cap (§3.4)', () => {
     const overflow = Buffer.from('b');
     let request: import('node:http').ClientRequest | undefined;
     const responsePromise = new Promise<{ status: number; body: string }>((resolve, reject) => {
-      request = httpRequest(url('/v1/agent/sessions'), {
+      request = httpRequest(url('/v2/agent/sessions'), {
         method: 'POST', headers: { ...headers(), 'transfer-encoding': 'chunked' },
       }, (res) => {
         let data = '';
@@ -201,22 +208,22 @@ describe('AgentAdapterServer request body cap (§3.4)', () => {
 
   test('enforces well-formed ≤256 UTF-8-byte identifiers in bodies and paths before mutation', async () => {
     const exactMultibyte = 'é'.repeat(128);
-    const accepted = await fetch(url('/v1/agent/sessions'), { method: 'POST', headers: headers(), body: validRegisterBody(exactMultibyte) });
+    const accepted = await fetch(url('/v2/agent/sessions'), { method: 'POST', headers: headers(), body: validRegisterBody(exactMultibyte) });
     expect(accepted.status).toBe(201);
     expect(registry.hasSession(exactMultibyte)).toBe(true);
 
     const overMultibyte = 'é'.repeat(129);
-    const oversizedBody = await fetch(url('/v1/agent/sessions'), { method: 'POST', headers: headers(), body: validRegisterBody(overMultibyte) });
+    const oversizedBody = await fetch(url('/v2/agent/sessions'), { method: 'POST', headers: headers(), body: validRegisterBody(overMultibyte) });
     expect(oversizedBody.status).toBe(400);
     expect(registry.hasSession(overMultibyte)).toBe(false);
 
-    const loneSurrogateBody = await fetch(url('/v1/agent/sessions'), {
+    const loneSurrogateBody = await fetch(url('/v2/agent/sessions'), {
       method: 'POST', headers: headers(), body: validRegisterBody('\ud800'),
     });
     expect(loneSurrogateBody.status).toBe(400);
     expect(registry.listSessions()).toHaveLength(1);
 
-    const oversizedPath = await fetch(url(`/v1/agent/sessions/${'x'.repeat(257)}/heartbeat`), {
+    const oversizedPath = await fetch(url(`/v2/agent/sessions/${'x'.repeat(257)}/heartbeat`), {
       method: 'POST', headers: headers(), body: JSON.stringify({ status: 'working' }),
     });
     expect(oversizedPath.status).toBe(400);
@@ -226,9 +233,9 @@ describe('AgentAdapterServer request body cap (§3.4)', () => {
 
   test('rejects encoded, double-encoded, and malformed slash path identities before mutation', async () => {
     const nativeId = 'a/b';
-    expect((await fetch(url('/v1/agent/sessions'), { method: 'POST', headers: headers(), body: validRegisterBody(nativeId) })).status).toBe(201);
+    expect((await fetch(url('/v2/agent/sessions'), { method: 'POST', headers: headers(), body: validRegisterBody(nativeId) })).status).toBe(201);
     for (const pathId of ['a%2Fb', 'a%2fb', 'a%252Fb', 'a%ZZb']) {
-      const response = await fetch(url(`/v1/agent/sessions/${pathId}`), { method: 'DELETE', headers: headers() });
+      const response = await fetch(url(`/v2/agent/sessions/${pathId}`), { method: 'DELETE', headers: headers() });
       expect(response.status).toBe(400);
       expect(registry.hasSession(nativeId)).toBe(true);
     }

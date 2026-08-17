@@ -1,11 +1,11 @@
-import { AGENT_ADAPTER_PROTOCOL_VERSION } from '@ariava/protocol';
+import {
+  type AgentAdapterDiscovery,
+  validateAgentAdapterDiscovery as validateProtocolAgentAdapterDiscovery,
+} from '@ariava/protocol';
 import { pathHasFilesystemEvidence, readSecureJson, writeSecureJson } from '../host-manager/secure-files';
 
-export interface AgentAdapterDiscoveryFile {
-  url: string;
-  secret: string;
-  protocolVersion: typeof AGENT_ADAPTER_PROTOCOL_VERSION;
-}
+/** Exact six-key discovery evidence shared with the producer (spec 08-16 §6). */
+export type AgentAdapterDiscoveryFile = AgentAdapterDiscovery;
 
 export function readAgentAdapterConfig(path: string, expectedPort?: number): AgentAdapterDiscoveryFile | null {
   if (!pathHasFilesystemEvidence(path)) {
@@ -24,40 +24,18 @@ export function validateAgentAdapterDiscovery(
   value: unknown,
   expectedPort?: number,
 ): AgentAdapterDiscoveryFile {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  const result = validateProtocolAgentAdapterDiscovery(value);
+  if (!result.success) {
     throw new Error('Agent Adapter discovery file is invalid');
   }
-  const record = value as Record<string, unknown>;
-  const keys = Object.keys(record);
-  const hasExpectedKeys = keys.length === 3
-    && keys.includes('url') && keys.includes('secret') && keys.includes('protocolVersion');
-  if (!hasExpectedKeys
-    || typeof record.url !== 'string'
-    || typeof record.secret !== 'string'
-    || record.secret.trim().length === 0
-    || record.protocolVersion !== AGENT_ADAPTER_PROTOCOL_VERSION) {
-    throw new Error('Agent Adapter discovery file is invalid');
-  }
+  const discovery = result.value!;
 
-  let url: URL;
-  try {
-    url = new URL(record.url);
-  } catch {
-    throw new Error('Agent Adapter discovery URL is invalid');
+  if (expectedPort !== undefined) {
+    // discovery.url is already a canonical loopback origin; only the port can disagree.
+    const url = new URL(discovery.url);
+    if (Number(url.port) !== expectedPort) {
+      throw new Error('Agent Adapter discovery URL port is invalid');
+    }
   }
-  if (url.protocol !== 'http:' || url.username || url.password || url.search || url.hash
-    || (url.pathname !== '/' && url.pathname !== '') || !isLoopbackHostname(url.hostname)) {
-    throw new Error('Agent Adapter discovery URL must be an unauthenticated loopback HTTP origin');
-  }
-  const port = Number(url.port);
-  if (!url.port || port < 1 || port > 65_535
-    || (expectedPort !== undefined && port !== expectedPort)) {
-    throw new Error('Agent Adapter discovery URL port is invalid');
-  }
-  return { url: url.origin, secret: record.secret, protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION };
-}
-
-export function isLoopbackHostname(hostname: string): boolean {
-  const normalized = hostname.toLowerCase();
-  return normalized === '127.0.0.1' || normalized === '[::1]' || normalized === '::1';
+  return discovery;
 }

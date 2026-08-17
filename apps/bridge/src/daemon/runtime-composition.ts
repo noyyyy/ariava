@@ -8,7 +8,7 @@ import { createDefaultProfile } from '../cli/profiles/default';
 import { createDevProfile } from '../cli/profiles/dev';
 import { assertHostDomainResetRuntimeStartAllowed } from '../cli/operations/host-domain-reset-journal';
 import { CommandRouter } from '../command-router';
-import { PaiDriver } from '../drivers/pi';
+import { AgentAdapterDriver } from '../drivers/pi';
 import { LocalLinkKeyring } from '../e2e/link-keyring';
 import { assertNodeCryptoSelfTest } from '../e2e/node-crypto-self-test';
 import { DEFAULT_ENCRYPTED_UPLOAD_CRYPTO, createEncryptedUploadActions, type EncryptedEventFailure, type EncryptedUploadActions } from '../e2e/upload-actions';
@@ -80,7 +80,7 @@ export interface BridgeDaemonShellOwnership {
   readonly adapterServer: 'owned';
   /** Constructed here; the daemon owns its lifetime (no disposal surface). */
   readonly router: 'owned';
-  /** Injected drivers are borrowed and never disposed; the default-constructed PaiDriver is owned. */
+  /** Injected drivers are borrowed and never disposed; the default-constructed AgentAdapterDriver is owned. */
   readonly drivers: 'owned' | 'borrowed';
 }
 
@@ -108,7 +108,7 @@ export interface BridgeDaemonShellHooks {
 
 export interface BridgeDaemonShellOptions {
   readonly config: BridgeConfig;
-  /** Borrowed; when omitted the shell constructs the default PaiDriver (owned). */
+  /** Borrowed; when omitted the shell constructs the default AgentAdapterDriver (owned). */
   readonly drivers?: AgentDriver[];
   /** Borrowed registry clock; passed through to the registry unchanged. */
   readonly registryNow?: () => Date;
@@ -141,7 +141,7 @@ export function createBridgeDaemonShell(options: BridgeDaemonShellOptions): Brid
       adapterRegistry,
       () => store.getRuntimeHealth(),
     );
-    const drivers = options.drivers ?? [new PaiDriver(adapterClient, options.config.hostId)];
+    const drivers = options.drivers ?? [new AgentAdapterDriver(adapterClient, options.config.hostId)];
     const router = new CommandRouter(
       store,
       new Map(drivers.map((driver) => [driver.name, driver])),
@@ -340,6 +340,9 @@ export async function activateBridgeDaemonServer(options: BridgeDaemonServerActi
     url: options.adapterServer.url,
     secret: options.config.agentAdapter.secret,
     protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+    provider: 'pi',
+    profileId: configPathMatchesProfile(options.config.configPath, 'dev') ? 'dev' : 'default',
+    hostId: options.config.hostId,
   });
 }
 

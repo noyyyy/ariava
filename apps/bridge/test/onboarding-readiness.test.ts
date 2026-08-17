@@ -131,6 +131,7 @@ function fixture(overrides: Partial<StrictReadinessInput> = {}, depOverrides: Pa
   const deps: Partial<StrictReadinessDependencies> = {
     clock: clock(), readDiscovery: () => ({
       url: 'http://127.0.0.1:7272', secret: 'secret-value', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+      provider: 'pi', profileId: 'default', hostId: 'host-1',
     }),
     serviceStatus: () => ({ backend: 'systemd-user', support: { platform: 'linux', backend: 'systemd-user', supported: true, isWsl: false, reason: 'supported' }, installed: true, enabled: true, loaded: true, processRunning: true, runtimePath: '/usr/bin/node', ariavaBinPath: '/prefix/bin/ariava', runtimePathMatchesCurrent: true, ariavaBinPathMatchesCurrent: true, logBackend: 'journald' }),
     fetch: async (request) => {
@@ -151,6 +152,7 @@ describe('strict onboarding readiness', () => {
       url: 'http://127.0.0.1:7272',
       secret: 's',
       protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+      provider: 'pi', profileId: 'default', hostId: 'host-1',
     };
     expect(validateAgentAdapterDiscovery(currentDiscovery, 7272)).toEqual(currentDiscovery);
     expect(validateAgentAdapterDiscovery({ ...currentDiscovery, url: 'http://[::1]:7272' }, 7272).url).toBe('http://[::1]:7272');
@@ -179,6 +181,7 @@ describe('strict onboarding readiness', () => {
     await expect(pollForDiscoveryAndHealth(input, deps)).resolves.toEqual({
       discovery: {
         url: 'http://127.0.0.1:7272', secret: 'secret-value', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+        provider: 'pi', profileId: 'default', hostId: 'host-1',
       },
       health: { status: 'healthy', drivers: [] },
     });
@@ -223,7 +226,7 @@ describe('strict onboarding readiness', () => {
 
   test('dev discovery cannot satisfy production strict readiness', async () => {
     const candidate = fixture({}, {
-      readDiscovery: () => ({ url: 'http://127.0.0.1:7273', secret: 'dev-secret', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION }),
+      readDiscovery: () => ({ url: 'http://127.0.0.1:7273', secret: 'dev-secret', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION, provider: 'pi', profileId: 'dev', hostId: 'host-1' }),
     });
 
     const result = await checkStrictOnboardingReadiness(candidate.input, candidate.deps);
@@ -332,7 +335,7 @@ describe('strict onboarding readiness', () => {
     // Omit nonce so defaultDependencies.nonce (base64url of 16 random bytes) is used.
     const depsWithoutNonce: Partial<StrictReadinessDependencies> = {
       clock: clock(),
-      readDiscovery: () => ({ url: 'http://127.0.0.1:7272', secret: 'secret-value', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION }),
+      readDiscovery: () => ({ url: 'http://127.0.0.1:7272', secret: 'secret-value', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION, provider: 'pi', profileId: 'default', hostId: 'host-1' }),
       serviceStatus: () => ({
         backend: 'systemd-user',
         support: { platform: 'linux', backend: 'systemd-user', supported: true, isWsl: false, reason: 'supported' },
@@ -417,7 +420,7 @@ describe('strict onboarding readiness', () => {
 
   test('adapter discovery failures preserve concrete message on both related checks', async () => {
     const candidate = fixture({}, {
-      readDiscovery: () => ({ url: 'http://10.0.0.1:7272', secret: 'secret-value', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION }),
+      readDiscovery: () => ({ url: 'http://10.0.0.1:7272', secret: 'secret-value', protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION, provider: 'pi', profileId: 'default', hostId: 'host-1' }),
     });
     const failed = await checkStrictOnboardingReadiness(candidate.input, candidate.deps);
     expect(failed.ready).toBe(false);

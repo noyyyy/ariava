@@ -588,6 +588,37 @@ describe('ariavaPiExtension settled lifecycle', () => {
   });
 });
 
+  test('Event-disabled producer settles terminal status locally without push or handle retry loops', async () => {
+    let pushCalls = 0;
+    let handleCalls = 0;
+    const harness = createHarness({
+      adapter: {
+        eventPublicationEnabled: false,
+        pushEvent: async () => { pushCalls += 1; throw new Error('must not publish'); },
+        handleSession: async (sessionId, request) => {
+          handleCalls += 1;
+          return { ok: true, hostId: 'host-1', sessionId, handledThroughEventId: request.handledThroughEventId };
+        },
+      },
+    });
+    await harness.start();
+    await end(harness, { stopReason: 'stop', text: 'Settled without Event publication.' });
+    await settleAndWait(harness);
+    await Bun.sleep(300);
+
+    expect(pushCalls).toBe(0);
+    expect(handleCalls).toBe(0);
+    expect(harness.terminalEvents()).toEqual([]);
+    expect(harness.heartbeats.at(-1)).toMatchObject({
+      sessionId: 'sess-1', status: 'idle', latestActivityText: 'Settled without Event publication.',
+    });
+
+    await harness.emit('input');
+    await Bun.sleep(20);
+    expect(handleCalls).toBe(0);
+    await harness.shutdown();
+  });
+
 describe('unchanged extension integration behavior', () => {
   test('reads the exact native ID once per session lifecycle', async () => {
     let reads = 0;
@@ -679,7 +710,7 @@ describe('unchanged extension integration behavior', () => {
         registerSession: async () => {
           attempts += 1;
           if (attempts < 2) {
-            throw new Error('Agent Adapter POST /v1/agent/sessions failed: 401 {"error":"Unauthorized"}');
+            throw new Error('Agent Adapter POST /v2/agent/sessions failed: 401');
           }
           return { sessionId: 'sess-1', registeredAt: '2026-07-08T00:00:00Z' };
         },
@@ -777,21 +808,18 @@ describe('unchanged extension integration behavior', () => {
     await harness.emit('input');
     await Bun.sleep(20);
 
-    expect(handled).toEqual([{ sessionId: 'sess-1', eventId: 'event-1', action: 'pi_input' }]);
+    expect(handled).toEqual([{ sessionId: 'sess-1', eventId: 'event-1', action: 'local_input' }]);
     await harness.shutdown();
   });
 
-  test('retries one immutable terminal Event after a non-2xx failure and commits only after ACK', async () => {
+  test('drops a failed terminal Event after one attempt and settles local terminal state', async () => {
     const attempts: PushedEvent[] = [];
     const handled: string[] = [];
     const harness = createHarness({
       adapter: {
         pushEvent: async (event) => {
           attempts.push(structuredClone(event));
-          if (attempts.length === 1) {
-            throw new Error('Agent Adapter POST /events failed: 503 unavailable');
-          }
-          return { eventId: 'durable-event' };
+          throw new Error('Agent Adapter POST /events failed: 503 unavailable');
         },
         handleSession: async (sessionId, request) => {
           handled.push(request.handledThroughEventId);
@@ -800,16 +828,18 @@ describe('unchanged extension integration behavior', () => {
       },
     });
     await harness.start();
-    await end(harness, { stopReason: 'stop', text: 'Durably delivered once.' });
+    await end(harness, { stopReason: 'stop', text: 'Best effort delivery failed.' });
     await harness.emit('agent_settled');
     await Bun.sleep(QUIET_WAIT_MS + 400);
 
-    expect(attempts).toHaveLength(2);
-    expect(attempts[1]).toEqual(attempts[0]);
-    expect(attempts[0]).toMatchObject({ type: 'done', status: 'idle', agentText: 'Durably delivered once.' });
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toMatchObject({ type: 'done', status: 'idle', agentText: 'Best effort delivery failed.' });
+    expect(harness.heartbeats.at(-1)).toMatchObject({
+      sessionId: 'sess-1', status: 'idle', latestActivityText: 'Best effort delivery failed.',
+    });
     await harness.emit('input');
     await Bun.sleep(20);
-    expect(handled).toEqual(['durable-event']);
+    expect(handled).toEqual([]);
     await harness.shutdown();
   });
 

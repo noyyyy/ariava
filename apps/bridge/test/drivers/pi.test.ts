@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { CanonicalSessionState, CommandEnvelope, CommandResult } from '@ariava/protocol';
 import type { AgentAdapterClient } from '../../src/agent-adapter/client';
-import { CommandDispatchOutcomeUnknownError, PaiDriver } from '../../src/drivers/pi';
+import { CommandDispatchOutcomeUnknownError, AgentAdapterDriver } from '../../src/drivers/pi';
 import type { DriverCommandContext } from '../../src/types';
 
 function buildCommand(overrides: Partial<CommandEnvelope> = {}): CommandEnvelope {
@@ -32,7 +32,7 @@ function buildSession(): CanonicalSessionState {
   };
 }
 
-describe('PaiDriver', () => {
+describe('AgentAdapterDriver', () => {
   test('listSessions returns adapter sessions', async () => {
     const sessions: CanonicalSessionState[] = [buildSession()];
     const adapter: AgentAdapterClient = {
@@ -41,7 +41,7 @@ describe('PaiDriver', () => {
       waitForResult: async () => undefined,
     } as unknown as AgentAdapterClient;
 
-    const driver = new PaiDriver(adapter, 'host-1');
+    const driver = new AgentAdapterDriver(adapter, 'host-1');
     expect(await driver.listSessions('host-1')).toEqual(sessions);
   });
 
@@ -66,7 +66,7 @@ describe('PaiDriver', () => {
       waitForResult: async () => resolved,
     } as unknown as AgentAdapterClient;
 
-    const driver = new PaiDriver(adapter, 'host-1');
+    const driver = new AgentAdapterDriver(adapter, 'host-1');
     const ctx: DriverCommandContext = { command, session: buildSession() };
     driver.preflightCommandDispatch(ctx);
     driver.releaseCommandDispatch(ctx);
@@ -87,7 +87,7 @@ describe('PaiDriver', () => {
       waitForResult: async () => undefined,
       abandonCommand: (commandId) => { abandoned = commandId; },
     } as unknown as AgentAdapterClient;
-    const driver = new PaiDriver(adapter, 'host-1');
+    const driver = new AgentAdapterDriver(adapter, 'host-1');
     const ctx: DriverCommandContext = { command, session: buildSession() };
     driver.preflightCommandDispatch(ctx);
     driver.releaseCommandDispatch(ctx);
@@ -106,7 +106,7 @@ describe('PaiDriver', () => {
         waitForResult: async () => { throw failure; },
         abandonCommand: (commandId: string) => { abandoned = commandId; },
       } as unknown as AgentAdapterClient;
-      const driver = new PaiDriver(adapter, 'host-1');
+      const driver = new AgentAdapterDriver(adapter, 'host-1');
       const ctx: DriverCommandContext = { command, session: buildSession() };
       driver.preflightCommandDispatch(ctx);
       driver.releaseCommandDispatch(ctx);

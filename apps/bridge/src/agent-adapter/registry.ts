@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import type {
   CanonicalSessionState,
   CommandEnvelope,
@@ -5,7 +6,13 @@ import type {
   HandleSessionRequest,
   SessionStatus,
 } from '@ariava/protocol';
-import { ProtectedContentValidationError } from '@ariava/protocol';
+import {
+  AGENT_ADAPTER_LIMITS,
+  ProtectedContentValidationError,
+  type AgentAdapterEventResponse,
+  producerEventOrderAsBigInt,
+  validateAgentAdapterEventRequest,
+} from '@ariava/protocol';
 import { createId, isoNow } from '@ariava/shared-utils';
 import { asCommandResult, parseAgentAdapterCommandResult } from './result';
 import {
@@ -19,7 +26,7 @@ import {
 } from './registry-codec';
 import { authorizeRegistration, reduceHeartbeat, reduceRegistration } from './session-transitions';
 import { planTerminalEvent, toCanonicalSessionState } from './terminal-event-plan';
-import { SESSION_TTL_MS, TERMINAL_RETRY_DELAYS_MS } from './registry-types';
+import { OWNER_LEASE_TTL_MS, SESSION_TTL_MS, TERMINAL_RETRY_DELAYS_MS } from './registry-types';
 import type {
   PendingTerminal,
   RegisteredSession,
@@ -39,6 +46,42 @@ export type {
   RegistryRetryScheduler,
 } from './registry-types';
 
+export class AgentAdapterOwnerConflictError extends Error {
+  readonly code = 'owner_conflict' as const;
+
+  constructor(sessionId: string) {
+    super(`Session ID ${sessionId} is owned by a different live driver instance`);
+    this.name = 'AgentAdapterOwnerConflictError';
+  }
+}
+
+export class AgentAdapterStaleOwnerError extends Error {
+  readonly code = 'stale_owner' as const;
+
+  constructor(sessionId: string) {
+    super(`Session ID ${sessionId} is not owned by this driver instance and lease`);
+    this.name = 'AgentAdapterStaleOwnerError';
+  }
+}
+
+export class AgentAdapterSessionNotFoundError extends Error {
+  readonly code = 'session_not_found' as const;
+
+  constructor(sessionId: string) {
+    super(`Session ID ${sessionId} is not registered`);
+    this.name = 'AgentAdapterSessionNotFoundError';
+  }
+}
+
+export class AgentAdapterOrderConflictError extends Error {
+  readonly code = 'order_conflict' as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'AgentAdapterOrderConflictError';
+  }
+}
+
 export class AgentAdapterRequestValidationError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -57,8 +100,8 @@ export class SessionIdCollisionError extends Error {
 
 const DEFAULT_RETRY_SCHEDULER: RegistryRetryScheduler = {
   schedule: (callback, delayMs) => {
-    const timer = setTimeout(callback, delayMs);
-    timer.unref();
+    const timer: ReturnType<typeof setTimeout> = setTimeout(callback, delayMs);
+    timer.unref?.();
     return timer;
   },
   cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -67,6 +110,9 @@ const DEFAULT_RESULT_WAITER_SCHEDULER: RegistryRetryScheduler = {
   schedule: (callback, delayMs) => setTimeout(callback, delayMs),
   cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
+function createOwnerLease(): string {
+  return randomBytes(AGENT_ADAPTER_LIMITS.ownerLeaseBytes).toString('base64url');
+}
 
 export class AgentAdapterRegistry {
   private readonly recoveryDeadlineMs: number;
@@ -76,11 +122,13 @@ export class AgentAdapterRegistry {
   private results = new Map<string, CommandResult>();
   private resultWaiters = new Map<string, Array<(result: CommandResult | undefined) => void>>();
   private resultWaiterTimers = new Map<(result: CommandResult | undefined) => void, unknown>();
-  private commandSessions = new Map<string, { hostId: string; sessionId: string; provider: string }>();
+  private commandSessions = new Map<string, { hostId: string; sessionId: string; provider: string; ownerLease?: string }>();
   private inFlightCommands = new Map<string, Set<string>>();
   private delayedTerminalEvents = new Map<string, PendingTerminal>();
   private terminalRetryAttempts = new Map<string, number>();
   private terminalRetryTimers = new Map<string, unknown>();
+  /** commandIds whose live in-flight binding was cleared by owner loss (durable outcome_unknown). */
+  private orphanedCommandIds = new Set<string>();
   private disposed = false;
 
   constructor(
@@ -90,15 +138,28 @@ export class AgentAdapterRegistry {
     private readonly now: () => Date = () => new Date(),
     private readonly retryScheduler: RegistryRetryScheduler = DEFAULT_RETRY_SCHEDULER,
     private readonly resultWaiterScheduler: RegistryRetryScheduler = DEFAULT_RESULT_WAITER_SCHEDULER,
+    private readonly monotonicNow: () => number = () => performance.now(),
   ) {
     this.recoveryDeadlineMs = this.now().getTime() + SESSION_TTL_MS;
   }
 
   register(input: RegisterSessionInput): RegisteredSession {
+    if (typeof input.driverInstanceId !== 'string' || input.driverInstanceId.length === 0) {
+      throw new AgentAdapterRequestValidationError('driverInstanceId is required');
+    }
     const previous = this.sessions.get(input.sessionId);
     const persistedSession = this.stateStore.getSession(input.sessionId);
     const authorization = authorizeRegistration({ previousLive: previous, persistedSession }, input);
     if (authorization.kind === 'collision') throw new SessionIdCollisionError(authorization.sessionId);
+
+    const monotonicNow = this.monotonicNow();
+    // Lazy TTL expiry: a live lease that already expired is revoked before the
+    // same-provider/same-instance checks, so a contender may acquire after TTL.
+    if (previous && monotonicNow - previous.lastOwnerLeaseMonotonic > OWNER_LEASE_TTL_MS) {
+      this.loseOwnership(previous, 'ttl');
+    } else if (previous && previous.driverInstanceId !== input.driverInstanceId) {
+      throw new AgentAdapterOwnerConflictError(input.sessionId);
+    }
 
     const now = this.nowIso();
     const persistedCancellation = this.stateStore.getTerminalEventCancellation(input.sessionId);
@@ -115,39 +176,75 @@ export class AgentAdapterRegistry {
       throw error;
     }
     if (transition.persistence.kind === 'durable-set-session-driver') {
-      this.stateStore.setSessionDriver(input.sessionId, input.provider, toCanonicalSessionState(transition.nextSession));
+      this.stateStore.setSessionDriver(input.sessionId, 'agent-adapter', toCanonicalSessionState(transition.nextSession));
     } else {
       this.cancelTerminalRetry(input.sessionId, {
         nextDriverName: transition.persistence.nextDriverName,
         persistedCancellation: transition.persistence.persistedCancellation,
       });
     }
-    this.sessions.set(input.sessionId, transition.nextSession);
+    const sameInstance = previous?.driverInstanceId === input.driverInstanceId && this.sessions.has(input.sessionId);
+    const owned: RegisteredSession = {
+      ...transition.nextSession,
+      driverInstanceId: input.driverInstanceId,
+      ownerLease: sameInstance && previous ? previous.ownerLease : createOwnerLease(),
+      lastOwnerLeaseMonotonic: monotonicNow,
+    };
+    this.sessions.set(input.sessionId, owned);
     if (transition.semanticChanged) this.onMutation('register');
-    return transition.nextSession;
+    return owned;
   }
 
   unregister(sessionId: string, reason: 'unregister' | 'ttl' = 'unregister'): boolean {
     const session = this.sessions.get(sessionId);
-    const pending = this.delayedTerminalEvents.get(sessionId);
+    if (!session) return false;
+    this.loseOwnership(session, reason);
+    return true;
+  }
+
+  /**
+   * Revoke a Session's live ownership: durable outcome_unknown for any
+   * in-flight commands (when the execution journal entry exists), then clear
+   * all live orphans (queue, in-flight, poll/result waiters, terminal Event).
+   * No redispatch and no result/receipt is generated.
+   */
+  private loseOwnership(session: RegisteredSession, reason: 'unregister' | 'ttl'): void {
+    const sessionId = session.sessionId;
     const persistedCancellation = this.stateStore.getTerminalEventCancellation(sessionId);
-    let removedPersisted = false;
+    const pending = this.delayedTerminalEvents.get(sessionId);
     if (pending || persistedCancellation) {
       this.cancelTerminalRetry(sessionId, { removeSession: true, persistedCancellation });
-      removedPersisted = true;
     } else {
-      removedPersisted = this.stateStore.removeSession(sessionId, session?.provider);
+      this.stateStore.removeSession(sessionId, this.stateStore.getDriverNameForSession(sessionId));
     }
-    if (!session && !removedPersisted) return false;
-    this.cancelCommandPolls(sessionId);
     for (const [commandId, binding] of this.commandSessions) {
-      if (binding.sessionId === sessionId) this.settleResultWaiters(commandId, undefined);
-      if (binding.sessionId === sessionId) this.commandSessions.delete(commandId);
+      if (binding.sessionId !== sessionId) continue;
+      try { this.stateStore.markCommandOutcomeUnknownIfPresent?.(commandId); } catch { /* best-effort */ }
+      this.orphanedCommandIds.add(commandId);
+      this.settleResultWaiters(commandId, undefined);
+      this.commandSessions.delete(commandId);
     }
     this.commandQueues.delete(sessionId); this.inFlightCommands.delete(sessionId);
     this.sessions.delete(sessionId);
     this.onMutation(reason);
-    return true;
+  }
+
+  /** Verify the caller is the current live owner with a non-expired lease (owner routes). */
+  assertCurrentOwner(sessionId: string, driverInstanceId: string, ownerLease: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new AgentAdapterSessionNotFoundError(sessionId);
+    const monotonicNow = this.monotonicNow();
+    if (monotonicNow - session.lastOwnerLeaseMonotonic > OWNER_LEASE_TTL_MS) {
+      this.loseOwnership(session, 'ttl');
+      throw new AgentAdapterStaleOwnerError(sessionId);
+    }
+    if (session.driverInstanceId !== driverInstanceId || session.ownerLease !== ownerLease) {
+      throw new AgentAdapterStaleOwnerError(sessionId);
+    }
+  }
+
+  isCommandOutcomeUnknown(commandId: string): boolean {
+    return this.orphanedCommandIds.has(commandId);
   }
 
   hasSession(sessionId: string): boolean { return this.sessions.has(sessionId); }
@@ -172,6 +269,7 @@ export class AgentAdapterRegistry {
     this.inFlightCommands.clear();
     this.results.clear();
     this.commandSessions.clear();
+    this.orphanedCommandIds.clear();
   }
 
   heartbeat(sessionId: string, status: SessionStatus, latestActivityText?: string | null,
@@ -190,14 +288,15 @@ export class AgentAdapterRegistry {
     }
     if (transition.contextChanged) this.cancelTerminalRetry(sessionId);
     if (transition.semanticChanged) this.onMutation('semantic');
-    this.sessions.set(sessionId, transition.nextSession);
-    return transition.nextSession;
+    const nextSession = { ...transition.nextSession, lastOwnerLeaseMonotonic: this.monotonicNow() };
+    this.sessions.set(sessionId, nextSession);
+    return nextSession;
   }
 
   listSessions(): CanonicalSessionState[] {
-    const now = this.now().getTime(); const active: CanonicalSessionState[] = [];
+    const monotonicNow = this.monotonicNow(); const active: CanonicalSessionState[] = [];
     for (const session of this.sessions.values()) {
-      if (now - new Date(session.lastHeartbeatAt).getTime() > SESSION_TTL_MS) { this.unregister(session.sessionId, 'ttl'); continue; }
+      if (monotonicNow - session.lastOwnerLeaseMonotonic > OWNER_LEASE_TTL_MS) { this.unregister(session.sessionId, 'ttl'); continue; }
       active.push(toCanonicalSessionState(session));
     }
     return active.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
@@ -264,6 +363,109 @@ export class AgentAdapterRegistry {
         return plan.tuple.event.eventId;
       }
     }
+  }
+  /**
+   * Protocol-4 Event POST: exact `{producerEventId, producerEventOrder, event}` wire
+   * shape. The producer source tuple, content fingerprint, Event reservation and
+   * accepted source checkpoint are durable in one state commit (§8 Event).
+   * A duplicate source tuple returns the original eventId with disposition
+   * `duplicate`; a non-increasing order or same source with a different fingerprint
+   * fails closed with ORDER_CONFLICT before any mutation.
+   */
+  pushEventSource(sessionId: string, value: unknown): AgentAdapterEventResponse {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new AgentAdapterSessionNotFoundError(sessionId);
+    const validated = validateAgentAdapterEventRequest(value);
+    if (!validated.success) {
+      throw new AgentAdapterRequestValidationError(`invalid Event request: ${validated.issues.join(', ')}`);
+    }
+    const { producerEventId, producerEventOrder, event } = validated.value!;
+    let input: import('./registry-types').AgentAdapterEventInput;
+    try {
+      input = parseCanonicalProducerEvent(event);
+      if (input.sessionId !== sessionId) throw new TypeError('canonical Event sessionId does not match the request path');
+      if (input.provider !== session.provider) throw new TypeError('canonical Event provider does not match the registered Session');
+      assertProducerContextMatchesSession(input, session);
+    } catch (error) {
+      if (error instanceof ProtectedContentValidationError || error instanceof TypeError) {
+        throw new AgentAdapterRequestValidationError(error.message, { cause: error });
+      }
+      throw error;
+    }
+
+    const fingerprint = producerEventFingerprint(input);
+    const checkpoint = this.stateStore.getProducerEventCheckpoint(sessionId);
+    if (checkpoint) {
+      const previousOrder = producerEventOrderAsBigInt(checkpoint.producerEventOrder);
+      const currentOrder = producerEventOrderAsBigInt(producerEventOrder);
+      if (checkpoint.producerEventId === producerEventId && checkpoint.producerEventOrder === producerEventOrder) {
+        if (checkpoint.fingerprint !== fingerprint) {
+          throw new AgentAdapterOrderConflictError('same producer source tuple with a different content fingerprint');
+        }
+        return { eventId: checkpoint.eventId, producerEventId, producerEventOrder, disposition: 'duplicate' };
+      }
+      if (previousOrder === null || currentOrder === null || currentOrder <= previousOrder) {
+        throw new AgentAdapterOrderConflictError('producerEventOrder must be strictly increasing per Session');
+      }
+    }
+
+    const existing = this.delayedTerminalEvents.get(sessionId);
+    const isLiveDuplicate = existing !== undefined && producerEventFingerprint(existing.event) === fingerprint;
+    const persistedReservation = isLiveDuplicate ? undefined : this.stateStore.getProducerEventReservation(sessionId, fingerprint);
+    const persistedTuple = persistedReservation
+      ? this.stateStore.getProducerEventTuple(persistedReservation.eventId, fingerprint)
+      : undefined;
+    const eventId = isLiveDuplicate
+      ? existing!.event.eventId
+      : persistedReservation?.eventId ?? createId('evt');
+    const plan = planTerminalEvent({
+      session, livePending: existing, persistedReservation, persistedTuple,
+      hasPendingCommandWork: this.hasPendingCommandWork(sessionId), input, eventId,
+    });
+    const respond = (eventId: string, disposition: 'committed' | 'duplicate'): AgentAdapterEventResponse =>
+      ({ eventId, producerEventId, producerEventOrder, disposition });
+    switch (plan.type) {
+      case 'reject':
+        throw plan.error;
+      case 'return-live-duplicate': {
+        const duplicate = existing!;
+        if (plan.promoteNow) this.promotePendingTerminal(sessionId, duplicate, fingerprint);
+        return respond(duplicate.event.eventId, 'duplicate');
+      }
+      case 'return-reservation-without-tuple':
+        return respond(plan.eventId, 'duplicate');
+      case 'stage-reserved-tuple': {
+        const pending = Object.freeze({ event: immutableCopy(plan.tuple.event), session: immutableCopy(plan.tuple.session) });
+        this.delayedTerminalEvents.set(sessionId, pending);
+        this.commitProducerEventSource(sessionId, persistedReservation!, producerEventId, producerEventOrder, fingerprint);
+        if (plan.promoteNow) this.promotePendingTerminal(sessionId, pending, fingerprint);
+        return respond(persistedReservation!.eventId, 'committed');
+      }
+      case 'cancel-older-and-reserve':
+      case 'reserve-new-tuple': {
+        if (plan.type === 'cancel-older-and-reserve') this.cancelTerminalRetry(sessionId);
+        this.stateStore.reserveProducerEventTuple(plan.tuple.event, plan.tuple.session, fingerprint);
+        this.delayedTerminalEvents.set(sessionId, plan.tuple);
+        this.commitProducerEventSource(sessionId, plan.reservation, producerEventId, producerEventOrder, fingerprint);
+        if (plan.promoteNow) this.promotePendingTerminal(sessionId, plan.tuple, fingerprint);
+        return respond(plan.tuple.event.eventId, 'committed');
+      }
+    }
+  }
+
+  /** One durable commit: producer Event reservation + accepted source checkpoint together. */
+  private commitProducerEventSource(
+    sessionId: string,
+    reservation: import('../types').PersistedProducerEventReservationV1,
+    producerEventId: string,
+    producerEventOrder: string,
+    fingerprint: string,
+  ): void {
+    const checkpoint: import('../types').ProducerEventSourceCheckpointV1 = {
+      version: 1, sessionId, producerEventId, producerEventOrder, eventId: reservation.eventId, fingerprint,
+      createdAt: this.nowIso(),
+    };
+    this.stateStore.acceptProducerEventSource({ reservation, checkpoint });
   }
 
   /** Commit a staged terminal Event now, or arrange a retry when the durable write fails. */

@@ -63,7 +63,8 @@ export function setSessionDriverTransition(
 ): StateTransition<void> {
   const nextState = structuredClone(state);
   const boundSession = session ?? nextState.sessions[sessionId];
-  if (!boundSession || boundSession.sessionId !== sessionId || boundSession.provider !== driverName) {
+  if (!boundSession || boundSession.sessionId !== sessionId
+    || (boundSession.provider !== driverName && driverName !== 'agent-adapter')) {
     throw new TypeError('Session driver requires its canonical Session');
   }
   nextState.sessions[sessionId] = boundSession;
@@ -83,6 +84,7 @@ export function removeSessionTransition(
   const nextState = structuredClone(state);
   delete nextState.sessions[sessionId];
   delete nextState.sessionDrivers[sessionId];
+  delete nextState.producerEventCheckpoints?.[sessionId];
   return { state: nextState, result: true };
 }
 

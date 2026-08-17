@@ -169,6 +169,9 @@ describe('activateBridgeDaemonServer', () => {
       url: 'http://127.0.0.1:43210',
       secret: config.agentAdapter.secret,
       protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+      provider: 'pi',
+      profileId: 'default',
+      hostId: config.hostId,
     });
   });
 

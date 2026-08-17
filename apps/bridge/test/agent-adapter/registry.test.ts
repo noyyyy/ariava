@@ -80,10 +80,13 @@ function makeCommand(sessionId: string): CommandEnvelope {
   };
 }
 
+/** 16 zero bytes as unpadded base64url: a valid protocol-4 driver instance id. */
+const DRIVER_INSTANCE_ID = 'AAAAAAAAAAAAAAAAAAAAAA';
+
 function register(registry: AgentAdapterRegistry): void {
   registry.register({
     sessionId: 'sess-1', provider: 'pi', projectName: 'project', cwd: '/project', nameText: 'Task',
-    status: 'working', latestActivityText: 'Running',
+    status: 'working', latestActivityText: 'Running', driverInstanceId: DRIVER_INSTANCE_ID,
   });
 }
 
@@ -105,11 +108,11 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       failWrites = false;
       register(registry);
       expect(registry.hasSession('sess-1')).toBe(true);
-      expect(store.getDriverNameForSession('sess-1')).toBe('pi');
+      expect(store.getDriverNameForSession('sess-1')).toBe('agent-adapter');
       failWrites = true;
       expect(() => registry.unregister('sess-1')).toThrow('state persistence failed');
       expect(registry.hasSession('sess-1')).toBe(true);
-      expect(store.getDriverNameForSession('sess-1')).toBe('pi');
+      expect(store.getDriverNameForSession('sess-1')).toBe('agent-adapter');
       failWrites = false;
       expect(registry.unregister('sess-1')).toBe(true);
       store.dispose();
@@ -125,7 +128,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       const store = initializedStore(dir);
       const first = new AgentAdapterRegistry('host-1', store);
       first.register({
-        sessionId: 'owned-session', provider: 'adapter', harnessProvider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+        sessionId: 'owned-session', provider: 'adapter', harnessProvider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: DRIVER_INSTANCE_ID,
       });
       const beforeDrivers = store.getDriverNameForSession('owned-session');
       const beforeEvents = structuredClone(store.peekPendingEvents());
@@ -135,12 +138,12 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       const restartedStore = initializedStore(dir);
       const restarted = new AgentAdapterRegistry('host-1', restartedStore);
       expect(() => restarted.register({
-        sessionId: 'owned-session', provider: 'adapter', harnessProvider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+        sessionId: 'owned-session', provider: 'adapter', harnessProvider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: DRIVER_INSTANCE_ID,
       })).not.toThrow();
       const afterSameOwner = readFileSync(join(dir, 'state.json'), 'utf8');
       const sessionsAfterSameOwner = structuredClone(restartedStore.listSessions());
       expect(() => restarted.register({
-        sessionId: 'owned-session', provider: 'adapter', harnessProvider: 'codex', projectName: 'other', cwd: '/other', nameText: 'other',
+        sessionId: 'owned-session', provider: 'adapter', harnessProvider: 'codex', projectName: 'other', cwd: '/other', nameText: 'other', driverInstanceId: DRIVER_INSTANCE_ID,
       })).toThrow(expect.objectContaining({ code: 'session_id_collision' }));
       expect(readFileSync(join(dir, 'state.json'), 'utf8')).toBe(afterSameOwner);
       expect(restartedStore.listSessions()).toEqual(sessionsAfterSameOwner);
@@ -160,7 +163,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       const original = new AgentAdapterRegistry('host-1', schema4Store);
       original.register({
         sessionId: 'migrated-owner', provider: 'adapter', harnessProvider: 'pi',
-        projectName: 'project', cwd: '/project', nameText: 'Migrated owner',
+        projectName: 'project', cwd: '/project', nameText: 'Migrated owner', driverInstanceId: DRIVER_INSTANCE_ID,
       });
       schema4Store.dispose();
 
@@ -170,6 +173,14 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       delete schema3State.commandExecutions;
       schema3State.commandResults = {};
       schema3State.seenCommands = {};
+      // Historical schema 3 coupled sessionDrivers[id] to canonical provider.
+      // The live schema 4 persist writes 'agent-adapter'; rewrite the forged
+      // v3 source back to that coupling so isPriorStateRecordV3 can accept it.
+      schema3State.sessionDrivers = Object.fromEntries(
+        Object.entries(schema3State.sessions as Record<string, { provider: string }>).map(([sessionId, session]) => [
+          sessionId, session.provider,
+        ]),
+      );
       schema3Spool.runtimeStateSchemaVersion = 3;
       rmSync(runtimeSchemaFloorPathForState(statePath), { force: true });
       writeFileSync(statePath, `${JSON.stringify(schema3State)}\n`, { mode: 0o600 });
@@ -196,7 +207,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
 
       expect(() => restarted.register({
         sessionId: 'migrated-owner', provider: 'adapter', harnessProvider: 'codex',
-        projectName: 'other', cwd: '/other', nameText: 'Conflicting owner',
+        projectName: 'other', cwd: '/other', nameText: 'Conflicting owner', driverInstanceId: DRIVER_INSTANCE_ID,
       })).toThrow(expect.objectContaining({ code: 'session_id_collision' }));
       expect(readFileSync(statePath)).toEqual(stateBeforeCollision);
       expect(readFileSync(spoolPath)).toEqual(spoolBeforeCollision);
@@ -212,7 +223,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     const { store, cleanup } = makeStore();
     try {
       const persisted = new AgentAdapterRegistry('host-1', store);
-      persisted.register({ sessionId: 'masked-owner', provider: 'persisted', projectName: 'p', cwd: '/', nameText: 'p' });
+      persisted.register({ sessionId: 'masked-owner', provider: 'persisted', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: DRIVER_INSTANCE_ID });
       const registry = new AgentAdapterRegistry('host-1', store);
       (registry as any).sessions.set('masked-owner', {
         sessionId: 'masked-owner', provider: 'requested', projectName: 'live', cwd: '/live', nameText: 'live',
@@ -221,7 +232,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       });
       const beforeSessions = structuredClone(store.listSessions());
       expect(() => registry.register({
-        sessionId: 'masked-owner', provider: 'requested', projectName: 'new', cwd: '/new', nameText: 'new',
+        sessionId: 'masked-owner', provider: 'requested', projectName: 'new', cwd: '/new', nameText: 'new', driverInstanceId: DRIVER_INSTANCE_ID,
       })).toThrow(expect.objectContaining({ code: 'session_id_collision' }));
       expect(store.listSessions()).toEqual(beforeSessions);
       expect(store.peekPendingEvents()).toEqual([]);
@@ -733,7 +744,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       else (store as any).writeState = () => { throw new Error('state commit failed'); };
       expect(() => registry.unregister('sess-1')).toThrow(boundary === 'intent-write' ? 'intent write failed' : 'state commit failed');
       expect(registry.hasSession('sess-1')).toBe(true);
-      expect(store.getDriverNameForSession('sess-1')).toBe('pi');
+      expect(store.getDriverNameForSession('sess-1')).toBe('agent-adapter');
       expect(store.getTerminalEventCancellation('sess-1')?.eventId).toBe(eventId);
       spool.enqueue = originalEnqueue;
       (store as any).writeState = originalWriteState;
@@ -1002,7 +1013,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
         const before = store.listSessions();
         expect(() => registry.register({
           sessionId: 'big', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'n',
-          openingText: 'a'.repeat(65_500),
+          openingText: 'a'.repeat(65_500), driverInstanceId: DRIVER_INSTANCE_ID,
         })).toThrow(AgentAdapterRequestValidationError);
         expect(store.listSessions()).toEqual(before);
         expect(registry.listSessions().some((s) => s.sessionId === 'big')).toBe(false);
@@ -1027,10 +1038,137 @@ describe('AgentAdapterRegistry canonical ingest', () => {
         const registry = new AgentAdapterRegistry('host-1', store);
         const accepted = registry.register({
           sessionId: 'ok', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'n',
-          openingText: 'a'.repeat(64_000),
+          openingText: 'a'.repeat(64_000), driverInstanceId: DRIVER_INSTANCE_ID,
         });
         expect(accepted.sessionId).toBe('ok');
         expect(store.listSessions().some((s) => s.sessionId === 'ok')).toBe(true);
+      } finally { cleanup(); }
+    });
+  });
+
+  describe('owner lease, TTL, and producer source tuple semantics (Spec 08-16 §6)', () => {
+    const OTHER_INSTANCE = 'BBBBBBBBBBBBBBBBBBBBBB';
+    const TTL_MS = 45_000;
+
+    function newRegistry(store: BridgeStateStore, monotonicStart = 1_000_000): { registry: AgentAdapterRegistry; advance: (ms: number) => void } {
+      let clock = monotonicStart;
+      const advance = (ms: number): void => { clock += ms; };
+      const registry = new AgentAdapterRegistry('host-1', store, () => {}, () => new Date(),
+        undefined as never, undefined as never, () => clock);
+      return { registry, advance };
+    }
+
+    test('re-registering from the same live driver instance keeps the same owner lease', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const { registry } = newRegistry(store);
+        const first = registry.register({
+          sessionId: 'same-instance', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        const second = registry.register({
+          sessionId: 'same-instance', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        expect(second.ownerLease).toBe(first.ownerLease);
+      } finally { cleanup(); }
+    });
+
+    test('a different live driver instance is rejected with OWNER_CONFLICT while the lease is current', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const { registry } = newRegistry(store);
+        registry.register({
+          sessionId: 'owner-conflict', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        expect(() => registry.register({
+          sessionId: 'owner-conflict', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: OTHER_INSTANCE,
+        })).toThrow(expect.objectContaining({ code: 'owner_conflict' }));
+        expect(registry.listSessions().some((s) => s.sessionId === 'owner-conflict')).toBe(true);
+      } finally { cleanup(); }
+    });
+
+    test('after the TTL elapses without activity a contender may acquire: lazy revocation', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const { registry, advance } = newRegistry(store);
+        registry.register({
+          sessionId: 'ttl-takeover', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        advance(TTL_MS + 1);
+        const contender = registry.register({
+          sessionId: 'ttl-takeover', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: OTHER_INSTANCE,
+        });
+        expect(contender.ownerLease).not.toBe(DRIVER_INSTANCE_ID);
+        // Same-instance re-register across TTL also rotates the lease.
+        advance(TTL_MS + 1);
+        const rotated = registry.register({
+          sessionId: 'ttl-takeover', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: OTHER_INSTANCE,
+        });
+        expect(rotated.ownerLease).not.toBe(contender.ownerLease);
+      } finally { cleanup(); }
+    });
+
+    test('assertCurrentOwner fails closed on a stale lease: wrong instance, wrong lease, expired', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const { registry, advance } = newRegistry(store);
+        const owned = registry.register({
+          sessionId: 'stale-owner', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        // Wrong lease for the same instance.
+        expect(() => registry.assertCurrentOwner('stale-owner', DRIVER_INSTANCE_ID, 'not-the-lease'))
+          .toThrow(expect.objectContaining({ code: 'stale_owner' }));
+        // Unknown session is a distinct 404-class error, not stale.
+        expect(() => registry.assertCurrentOwner('missing', DRIVER_INSTANCE_ID, owned.ownerLease))
+          .toThrow(expect.objectContaining({ code: 'session_not_found' }));
+        // Correct lease before TTL passes.
+        expect(() => registry.assertCurrentOwner('stale-owner', DRIVER_INSTANCE_ID, owned.ownerLease)).not.toThrow();
+        // After the TTL elapses the live lease is revoked.
+        advance(TTL_MS + 1);
+        expect(() => registry.assertCurrentOwner('stale-owner', DRIVER_INSTANCE_ID, owned.ownerLease))
+          .toThrow(expect.objectContaining({ code: 'stale_owner' }));
+        expect(registry.hasSession('stale-owner')).toBe(false);
+      } finally { cleanup(); }
+    });
+
+    test('producer source tuple: duplicate replay returns the original eventId, order conflicts fail closed', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const { registry } = newRegistry(store);
+        registry.register({
+          sessionId: 'tuple-session', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        const canonical = {
+          sessionId: 'tuple-session', provider: 'pi', type: 'done', status: 'idle',
+          agentText: 'Done', projectName: 'p', workingDirectory: '/', harnessProvider: 'pi', createdAt: '2026-08-07T00:00:01.000Z',
+        };
+        const first = registry.pushEventSource('tuple-session', {
+          producerEventId: 'AAAAAAAAAAAAAAAAAAAAAA', producerEventOrder: '00000000000000000000000000000001', event: canonical,
+        });
+        expect(first.disposition).toBe('committed');
+        // Exact replay of the same tuple is a duplicate carrying the original eventId.
+        const replay = registry.pushEventSource('tuple-session', {
+          producerEventId: 'AAAAAAAAAAAAAAAAAAAAAA', producerEventOrder: '00000000000000000000000000000001', event: canonical,
+        });
+        expect(replay.disposition).toBe('duplicate');
+        expect(replay.eventId).toBe(first.eventId);
+        // Same tuple, different content fingerprint: order/fingerprint conflict, zero mutation.
+        const before = structuredClone(store.listSessions());
+        expect(() => registry.pushEventSource('tuple-session', {
+          producerEventId: 'AAAAAAAAAAAAAAAAAAAAAA', producerEventOrder: '00000000000000000000000000000001',
+          event: { ...canonical, agentText: 'Different' },
+        })).toThrow(expect.objectContaining({ code: 'order_conflict' }));
+        expect(store.listSessions()).toEqual(before);
+        // A non-strictly-increasing order is also an order conflict.
+        expect(() => registry.pushEventSource('tuple-session', {
+          producerEventId: 'AQEBAQEBAQEBAQEBAQEBAQ', producerEventOrder: '00000000000000000000000000000001', event: canonical,
+        })).toThrow(expect.objectContaining({ code: 'order_conflict' }));
+        // A strictly larger order with the same immutable content reuses the same
+        // content-addressed eventId while advancing the source checkpoint.
+        const next = registry.pushEventSource('tuple-session', {
+          producerEventId: 'AQEBAQEBAQEBAQEBAQEBAQ', producerEventOrder: '00000000000000000000000000000002', event: canonical,
+        });
+        expect(next.disposition).toBe('committed');
+        expect(next.eventId).toBe(first.eventId);
       } finally { cleanup(); }
     });
   });

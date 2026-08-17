@@ -2,12 +2,19 @@ import { describe, expect, test } from 'bun:test';
 import * as protocol from '../src';
 
 const INTENDED_RUNTIME_EXPORTS = [
+  'AGENT_ADAPTER_COMMAND_POLL_QUERY',
+  'AGENT_ADAPTER_DISCOVERY_KEYS',
+  'AGENT_ADAPTER_EVENT_DISPOSITIONS',
+  'AGENT_ADAPTER_HANDLE_ACTIONS',
+  'AGENT_ADAPTER_HEALTH_PATH',
+  'AGENT_ADAPTER_LIMITS',
   'AGENT_ADAPTER_PROTOCOL_HEADER',
   'AGENT_ADAPTER_PROTOCOL_VERSION',
+  'AGENT_ADAPTER_ROUTE_PREFIX',
   'BRIDGE_STATUSES',
   'COMMAND_LIMITS',
-  'COMMAND_TYPES',
   'COMMAND_RESULT_STATUSES',
+  'COMMAND_TYPES',
   'E2E_EPOCH_OPERATIONS',
   'E2E_EPOCH_STATES',
   'E2E_LIMITS',
@@ -24,6 +31,12 @@ const INTENDED_RUNTIME_EXPORTS = [
   'NEED_HUMAN_REASONS',
   'PAIRING_CODE_ALPHABET',
   'PAIRING_CODE_LIMITS',
+  'PRODUCER_EVENT_ORDER_MAX',
+  'PROTOCOL_4_ERROR_CODE_LIST',
+  'PROTOCOL_4_ERROR_GOLDEN',
+  'PROTOCOL_4_PRECEDENCE_GOLDEN',
+  'PROTOCOL_4_RAW_BODY_LIMIT_BYTES',
+  'PROTOCOL_4_RETRYABLE_CODES',
   'ProtectedContentValidationError',
   'REQUEST_SIGNATURE_DOMAIN',
   'RequestCanonicalizationError',
@@ -33,6 +46,8 @@ const INTENDED_RUNTIME_EXPORTS = [
   'SESSION_STATUSES',
   'SIGNED_REQUEST_HEADER_NAMES',
   'SIGNED_REQUEST_LIMITS',
+  'agentAdapterProtocol4ErrorRetryable',
+  'agentAdapterProtocol4ErrorStatus',
   'assertRestrictedDynamicValue',
   'base64UrlDecode',
   'base64UrlEncode',
@@ -62,6 +77,7 @@ const INTENDED_RUNTIME_EXPORTS = [
   'compareEventCursors',
   'contentSha256',
   'createSignedRequestHeaders',
+  'decodeAgentAdapterPathIdentifier',
   'deriveCommandReceiptDigest',
   'deriveEncryptedCommandDigest',
   'deriveEncryptionKeyId',
@@ -71,6 +87,14 @@ const INTENDED_RUNTIME_EXPORTS = [
   'encryptionKeyIdMatchesPublicKey',
   'eventCursorCovers',
   'formatPairingCode',
+  'isAgentAdapterCommandPollTimeout',
+  'isAgentAdapterDiscovery',
+  'isAgentAdapterDriverInstanceId',
+  'isAgentAdapterIdentifier',
+  'isAgentAdapterOwnerLease',
+  'isAgentAdapterProducerEventId',
+  'isAgentAdapterProducerEventOrder',
+  'isAgentAdapterProtocol4ErrorCode',
   'isBridgeStatus',
   'isCanonicalNeedHumanErrorMessage',
   'isCanonicalTimestamp',
@@ -81,11 +105,26 @@ const INTENDED_RUNTIME_EXPORTS = [
   'isIdentityStatus',
   'isKeyStatus',
   'isLinkRevokeReason',
+  'isProtocol4ErrorEnvelope',
   'isRestrictedDynamicValue',
   'isUserVisibleActionableAlert',
+  'nextProducerEventOrder',
   'normalizePairingCode',
-  'sha256',
   'pairRootInfo',
+  'parseAgentAdapterCommandPollTimeout',
+  'producerEventOrderAsBigInt',
+  'producerEventOrderFromBigInt',
+  'protocol4ErrorEnvelope',
+  'sha256',
+  'validateAgentAdapterDiscovery',
+  'validateAgentAdapterEventRequest',
+  'validateAgentAdapterEventResponse',
+  'validateAgentAdapterHandleRequest',
+  'validateAgentAdapterHandleResponse',
+  'validateAgentAdapterHeartbeatRequest',
+  'validateAgentAdapterOkResponse',
+  'validateAgentAdapterRegisterOwnedResponse',
+  'validateAgentAdapterRegisterRequest',
   'validateCanonicalEventInvariant',
   'validateCommandReceiptEnvelopeV1',
   'validateCommandResult',
@@ -117,7 +156,23 @@ describe('public protocol barrel', () => {
     expect(Object.keys(protocol).sort()).toEqual([...INTENDED_RUNTIME_EXPORTS].sort());
   });
 
-  test('requires Adapter protocol v3', () => {
-    expect(protocol.AGENT_ADAPTER_PROTOCOL_VERSION).toBe(3);
+  test('requires Adapter protocol v4', () => {
+    expect(protocol.AGENT_ADAPTER_PROTOCOL_VERSION).toBe(4);
+  });
+
+  test('does not export a protocol-3 Agent Adapter wire parser as production API', () => {
+    const runtime = protocol as Record<string, unknown>;
+    for (const legacyParser of [
+      'parseAgentAdapterEventInput',
+      'parseAgentAdapterHeartbeatInput',
+      'parseAgentAdapterRegisterInput',
+      'parseAgentAdapterHandleInput',
+      'parseAgentAdapterCommandResultV3',
+      'isProtocol3ErrorEnvelope',
+      'AGENT_ADAPTER_V3_SCHEMA',
+      'validateAgentAdapterEventV3',
+    ]) {
+      expect(runtime[legacyParser], legacyParser).toBeUndefined();
+    }
   });
 });

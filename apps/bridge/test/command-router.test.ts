@@ -7,10 +7,12 @@ import { BridgeStateStore } from '../src/state-store';
 import { CommandRouter } from '../src/command-router';
 import { AgentAdapterClient } from '../src/agent-adapter/client';
 import { AgentAdapterRegistry } from '../src/agent-adapter/registry';
-import { PaiDriver } from '../src/drivers/pi';
+import { AgentAdapterDriver } from '../src/drivers/pi';
 import type { AgentDriver, DriverCommandContext } from '../src/types';
 
 const paths: string[] = [];
+
+const DRIVER_INSTANCE_ID = 'AAAAAAAAAAAAAAAAAAAAAA'; // 16 zero bytes in base64url
 
 afterEach(() => {
   for (const path of paths.splice(0)) {
@@ -19,7 +21,7 @@ afterEach(() => {
 });
 
 class FakeDriver implements AgentDriver {
-  readonly name = 'pi';
+  readonly name = 'agent-adapter';
 
   async listSessions(): Promise<CanonicalSessionState[]> {
     return [];
@@ -42,7 +44,7 @@ describe('CommandRouter', () => {
     const root = join(tmpdir(), `bridge-router-${Date.now()}`);
     paths.push(root);
     const store = new BridgeStateStore(join(root, 'state.json'));
-    store.replaceDriverSessions('pi', [
+    store.replaceDriverSessions('agent-adapter', [
       {
         sessionId: 'pane-1',
         hostId: 'host-1',
@@ -56,7 +58,7 @@ describe('CommandRouter', () => {
       },
     ]);
 
-    const router = new CommandRouter(store, new Map([['pi', new FakeDriver()]]), 'host-1');
+    const router = new CommandRouter(store, new Map([['agent-adapter', new FakeDriver()]]), 'host-1');
     const outcome = await router.handle({
       commandId: 'cmd-1',
       hostId: 'host-1',
@@ -78,7 +80,7 @@ describe('CommandRouter', () => {
     const root = join(tmpdir(), `bridge-router-${Date.now()}`);
     paths.push(root);
     const store = new BridgeStateStore(join(root, 'state.json'));
-    store.replaceDriverSessions('pi', [
+    store.replaceDriverSessions('agent-adapter', [
       {
         sessionId: 'pane-1',
         hostId: 'host-1',
@@ -91,7 +93,7 @@ describe('CommandRouter', () => {
       },
     ]);
 
-    const router = new CommandRouter(store, new Map([['pi', new FakeDriver()]]), 'host-1');
+    const router = new CommandRouter(store, new Map([['agent-adapter', new FakeDriver()]]), 'host-1');
     const outcome = await router.handle({
       commandId: 'cmd-2',
       hostId: 'host-1',
@@ -123,13 +125,13 @@ describe('CommandRouter', () => {
   test('runs pure preflight before the durable marker and releases only after it succeeds', async () => {
     const root = join(tmpdir(), `bridge-router-order-${Date.now()}`); paths.push(root);
     const store = new BridgeStateStore(join(root, 'state.json'));
-    store.replaceDriverSessions('pi', [{
+    store.replaceDriverSessions('agent-adapter', [{
       sessionId: 'pane-1', hostId: 'host-1', provider: 'pi', projectName: 'proj', nameText: 'Task',
       status: 'idle', updatedAt: '2026-06-28T10:00:00Z',
     }]);
     const order: string[] = [];
     const driver: AgentDriver = {
-      name: 'pi',
+      name: 'agent-adapter',
       listSessions: async () => [],
       preflightCommandDispatch: () => { order.push('preflight'); },
       releaseCommandDispatch: () => { order.push('release'); },
@@ -139,7 +141,7 @@ describe('CommandRouter', () => {
           accepted: true, status: 'executed', updatedAt: '2026-06-28T12:00:00.000Z' };
       },
     };
-    const router = new CommandRouter(store, new Map([['pi', driver]]), 'host-1');
+    const router = new CommandRouter(store, new Map([['agent-adapter', driver]]), 'host-1');
     const command = {
       commandId: 'cmd-order', hostId: 'host-1', sessionId: 'pane-1', type: 'interrupt' as const, payload: {},
       issuedAt: '2099-06-28T10:00:00Z', expiresAt: '2099-06-28T10:10:00Z', nonce: 'n-order', watchDeviceId: 'watch-1',
@@ -157,14 +159,14 @@ describe('CommandRouter', () => {
   test('does not release an already-waiting Pi poll until the durable marker succeeds', async () => {
     const root = join(tmpdir(), `bridge-router-poll-order-${Date.now()}`); paths.push(root);
     const store = new BridgeStateStore(join(root, 'state.json'));
-    store.replaceDriverSessions('pi', [{
+    store.replaceDriverSessions('agent-adapter', [{
       sessionId: 'pane-1', hostId: 'host-1', provider: 'pi', projectName: 'proj', nameText: 'Task',
       status: 'idle', updatedAt: '2026-06-28T10:00:00Z',
     }]);
     const registry = new AgentAdapterRegistry('host-1', store);
-    registry.register({ sessionId: 'pane-1', provider: 'pi', projectName: 'proj', nameText: 'Task', cwd: '/' });
+    registry.register({ sessionId: 'pane-1', provider: 'pi', projectName: 'proj', nameText: 'Task', cwd: '/', driverInstanceId: DRIVER_INSTANCE_ID });
     const router = new CommandRouter(
-      store, new Map([['pi', new PaiDriver(new AgentAdapterClient(registry), 'host-1')]]), 'host-1',
+      store, new Map([['agent-adapter', new AgentAdapterDriver(new AgentAdapterClient(registry), 'host-1')]]), 'host-1',
     );
     const command = {
       commandId: 'cmd-poll-order', hostId: 'host-1', sessionId: 'pane-1', type: 'interrupt' as const, payload: {},

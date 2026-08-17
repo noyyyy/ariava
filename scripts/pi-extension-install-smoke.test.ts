@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { AGENT_ADAPTER_PROTOCOL_HEADER, AGENT_ADAPTER_PROTOCOL_VERSION } from '../packages/protocol/src/agent-adapter';
+import { AGENT_ADAPTER_OWNER_HEADERS } from '../extensions/pi/src/adapter';
 
 const repositoryRoot = join(import.meta.dir, '..');
 const installScript = join(repositoryRoot, 'scripts', 'install-pi-extension.sh');
@@ -65,6 +66,9 @@ const requests = [];
 const secret = 'temporary-loopback-secret';
 const agentAdapterProtocolHeader = ${JSON.stringify(AGENT_ADAPTER_PROTOCOL_HEADER)};
 const agentAdapterProtocolVersion = ${AGENT_ADAPTER_PROTOCOL_VERSION};
+const ownerLease = 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE';
+const driverInstanceHeader = ${JSON.stringify(AGENT_ADAPTER_OWNER_HEADERS.driverInstance)};
+const ownerLeaseHeader = ${JSON.stringify(AGENT_ADAPTER_OWNER_HEADERS.ownerLease)};
 const server = Bun.serve({
   hostname: '127.0.0.1',
   port: 0,
@@ -76,15 +80,21 @@ const server = Bun.serve({
       path: url.pathname,
       authorization: request.headers.get('authorization'),
       protocolVersion,
+      driverInstanceId: request.headers.get(driverInstanceHeader),
+      ownerLease: request.headers.get(ownerLeaseHeader),
     });
     if (request.headers.get('authorization') !== 'Bearer ' + secret) return new Response('Unauthorized', { status: 401 });
     if (protocolVersion !== String(agentAdapterProtocolVersion)) return new Response('Upgrade Required', { status: 426 });
-    if (request.method === 'POST' && url.pathname === '/v1/agent/sessions') {
+    if (request.method === 'POST' && url.pathname === '/v2/agent/sessions') {
       const session = await request.json();
-      return Response.json({ sessionId: session.sessionId, registeredAt: '2026-07-22T00:00:00Z' });
+      return Response.json({ hostId: 'host-smoke', sessionId: session.sessionId, ownerLease }, { status: 201 });
+    }
+    const ownerRoute = url.pathname.startsWith('/v2/agent/sessions/');
+    if (ownerRoute && (request.headers.get(driverInstanceHeader) === null || request.headers.get(ownerLeaseHeader) !== ownerLease)) {
+      return Response.json({ error: { code: 'STALE_OWNER', retryable: false } }, { status: 409 });
     }
     if (request.method === 'GET' && url.pathname.endsWith('/commands')) return new Response(null, { status: 204 });
-    if (request.method === 'DELETE' && url.pathname.startsWith('/v1/agent/sessions/')) return new Response(null, { status: 204 });
+    if (request.method === 'DELETE' && ownerRoute) return Response.json({ ok: true });
     return new Response('Not found', { status: 404 });
   },
 });
@@ -93,6 +103,9 @@ mkdirSync(new URL('.', pathToFileURL(discoveryPath)), { recursive: true, mode: 0
 writeFileSync(discoveryPath, JSON.stringify({
   url: server.url.toString().replace(/\/$/, ''),
   secret,
+  hostId: 'host-smoke',
+  profileId: 'production',
+  provider: 'pi',
   protocolVersion: agentAdapterProtocolVersion,
 }), { mode: 0o600 });
 chmodSync(discoveryPath, 0o600);
@@ -114,10 +127,10 @@ const context = {
 };
 extensionModule.default(pi);
 await handlers.get('session_start')({}, context);
-for (let attempt = 0; attempt < 100 && !requests.some((request) => request.method === 'POST' && request.path === '/v1/agent/sessions'); attempt += 1) {
+for (let attempt = 0; attempt < 100 && !requests.some((request) => request.method === 'POST' && request.path === '/v2/agent/sessions'); attempt += 1) {
   await Bun.sleep(20);
 }
-if (!requests.some((request) => request.method === 'POST' && request.path === '/v1/agent/sessions')) {
+if (!requests.some((request) => request.method === 'POST' && request.path === '/v2/agent/sessions')) {
   throw new Error('installed extension did not resolve discovery and register with the loopback adapter');
 }
 await handlers.get('session_shutdown')({ reason: 'quit' }, context);
@@ -181,9 +194,11 @@ describe('pi extension disposable-home install and discovery smoke', () => {
       expect(result).toMatchObject({ loaded: true, registered: true, discoveryPath });
       expect(result.requests).toContainEqual({
         method: 'POST',
-        path: '/v1/agent/sessions',
+        path: '/v2/agent/sessions',
         authorization: 'Bearer temporary-loopback-secret',
         protocolVersion: String(AGENT_ADAPTER_PROTOCOL_VERSION),
+        driverInstanceId: null,
+        ownerLease: null,
       });
       expect(discoveryPath).toStartWith(home);
       expect(installRoot).toStartWith(home);

@@ -3,8 +3,8 @@ import {
   validateAgentAdapterCommand,
   validateAgentAdapterCommandResult,
   type AgentAdapter,
+  type CommandExecutionOutcome,
 } from './adapter-interface';
-import type { PiSessionInfo } from './session';
 import { logExtensionEvent, logExtensionEventThrottled } from './logger';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
@@ -14,8 +14,7 @@ const POLL_ERROR_BACKOFF_MS = 1_000;
 export interface CommandPollerContext {
   sessionId: string;
   client: AgentAdapter;
-  onCommand: (command: CommandEnvelope) => Promise<import('./adapter-interface').AgentAdapterCommandResult>;
-  getSession?: () => PiSessionInfo | null;
+  onCommand: (command: CommandEnvelope) => Promise<CommandExecutionOutcome>;
 }
 
 export interface CommandPollerHandle {
@@ -28,7 +27,6 @@ export function startCommandPoller(
 ): CommandPollerHandle {
   const abort = new AbortController();
   let stopped = false;
-
   let generation = 0;
 
   const canceled = (commandGeneration: number) =>
@@ -37,7 +35,7 @@ export function startCommandPoller(
   const run = async () => {
     while (!stopped && !abort.signal.aborted) {
       try {
-        const command = await ctx.client.pollCommands(ctx.sessionId, IMMEDIATE_POLL_TIMEOUT_MS, ctx.getSession?.() ?? undefined);
+        const command = await ctx.client.pollCommands(ctx.sessionId, IMMEDIATE_POLL_TIMEOUT_MS);
         if (stopped || abort.signal.aborted) return;
         if (command) {
           if (!validateAgentAdapterCommand(command) || command.sessionId !== ctx.sessionId) {
@@ -47,15 +45,22 @@ export function startCommandPoller(
           }
           const commandGeneration = generation;
           try {
-            const result = await ctx.onCommand(structuredClone(command));
+            const outcome = await ctx.onCommand(structuredClone(command));
             if (canceled(commandGeneration)) {
+              ctx.client.abandonCommand?.(command.commandId);
               logExtensionEvent('command_dispatch_canceled', { commandId: command.commandId });
               return;
             }
+            if (outcome.kind === 'outcome_unknown') {
+              ctx.client.abandonCommand?.(command.commandId);
+              continue;
+            }
+            const result = outcome.result;
             if (!validateAgentAdapterCommandResult(result)
               || result.commandId !== command.commandId
               || result.hostId !== command.hostId
               || result.sessionId !== command.sessionId) {
+              ctx.client.abandonCommand?.(command.commandId);
               logExtensionEvent('command_result_invalid', { commandId: command.commandId });
               continue;
             }
@@ -65,6 +70,7 @@ export function startCommandPoller(
               logExtensionEvent('command_result_submit_failed', { commandId: command.commandId });
             }
           } catch {
+            ctx.client.abandonCommand?.(command.commandId);
             if (canceled(commandGeneration)) {
               logExtensionEvent('command_dispatch_canceled', { commandId: command.commandId });
               return;
@@ -92,7 +98,6 @@ export function startCommandPoller(
     },
   };
 }
-
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {

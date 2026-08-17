@@ -25,6 +25,7 @@ import type { HostEncryptionIdentity } from '../src/identity';
 import type { CommandReceiptOutboxInputV1, PersistedCommandExecutionV4 } from '../src/types';
 
 const roots: string[] = [];
+const DRIVER_INSTANCE_ID = 'AAAAAAAAAAAAAAAAAAAAAA'; // 16 zero bytes in base64url
 const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
 const decoder = new TextDecoder();
 const bunPath = process.execPath;
@@ -413,11 +414,11 @@ function instrumentConstructorRollbackDisposal(order: string[]): {
 }
 
 describe('BridgeDaemon', () => {
-  test('loads PaiDriver by default', () => {
+  test('loads AgentAdapterDriver by default', () => {
     const config = loadBridgeConfig();
     config.statePath = `${process.cwd()}/.state/ariava/test-bridge-state-${Date.now()}.json`;
     const daemon = new BridgeDaemon(config);
-    expect(daemon.driverNames).toEqual(['pi']);
+    expect(daemon.driverNames).toEqual(['agent-adapter']);
     daemon.stop();
   });
 
@@ -1348,7 +1349,7 @@ describe('BridgeDaemon', () => {
       (daemon as any).config.hostId, (daemon as any).config.identityPath, 'linux',
       { loadOrCreate: () => new Uint8Array(32).fill(7) },
     );
-    registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/', nameText: 'Handle' });
+    registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/', nameText: 'Handle', driverInstanceId: DRIVER_INSTANCE_ID });
     stateStore.appendRecentEvent({
       eventId: 'evt-handle', hostId: (daemon as any).config.hostId, sessionId: 'sess-handle', provider: 'pi',
       type: 'done', status: 'idle', agentText: 'Done', createdAt: '2026-08-07T00:00:00.000Z',
@@ -1395,7 +1396,7 @@ describe('BridgeDaemon', () => {
       daemonInternals.config.hostId, daemonInternals.config.identityPath, 'linux',
       { loadOrCreate: () => new Uint8Array(32).fill(7) },
     );
-    registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/', nameText: 'Handle' });
+    registry.register({ sessionId: 'sess-handle', provider: 'pi', projectName: 'project', cwd: '/', nameText: 'Handle', driverInstanceId: DRIVER_INSTANCE_ID });
     stateStore.appendRecentEvent({
       eventId: 'evt-handle', hostId: daemonInternals.config.hostId, sessionId: 'sess-handle', provider: 'pi',
       type: 'done', status: 'idle', agentText: 'Done', createdAt: '2026-08-07T00:00:00.000Z',

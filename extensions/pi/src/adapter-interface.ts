@@ -1,8 +1,9 @@
 import {
   isCanonicalTimestamp,
+  type AgentAdapterHandleRequest,
+  type AgentAdapterHandleResponse,
   type CanonicalEvent,
   type CommandEnvelope,
-  type HandleSessionRequest,
   type SessionStatus,
 } from '@ariava/protocol';
 import type { PiSessionInfo } from './session';
@@ -10,32 +11,31 @@ import type { PiSessionInfo } from './session';
 type WithoutBridgeIdentity<T> = T extends CanonicalEvent ? Omit<T, 'eventId' | 'hostId'> : never;
 export type AgentAdapterEvent = WithoutBridgeIdentity<CanonicalEvent>;
 
-export type AgentAdapterCommandResult =
-  | {
-      commandId: string;
-      hostId: string;
-      sessionId: string;
-      accepted: true;
-      status: 'executed';
-      updatedAt: string;
-    }
-  | {
-      commandId: string;
-      hostId: string;
-      sessionId: string;
-      accepted: false;
-      status: 'failed' | 'rejected';
-      updatedAt: string;
-    };
+/** Pi submits only terminal `executed` or deterministic pre-call `rejected` results. */
+export type AgentAdapterCommandResult = {
+  commandId: string;
+  hostId: string;
+  sessionId: string;
+  updatedAt: string;
+} & (
+  | { accepted: true; status: 'executed' }
+  | { accepted: false; status: 'rejected' }
+);
+
+export type CommandExecutionOutcome =
+  | { kind: 'terminal'; result: AgentAdapterCommandResult }
+  | { kind: 'outcome_unknown' };
 
 export interface AgentAdapter {
+  readonly eventPublicationEnabled?: boolean;
   registerSession(session: PiSessionInfo): Promise<{ sessionId: string; registeredAt: string }>;
   unregisterSession(sessionId: string): Promise<void>;
   pushEvent(event: AgentAdapterEvent): Promise<{ eventId: string }>;
-  handleSession(sessionId: string, request: HandleSessionRequest): Promise<{ ok: true; hostId: string; sessionId: string; handledThroughEventId: string }>;
+  handleSession(sessionId: string, request: AgentAdapterHandleRequest): Promise<AgentAdapterHandleResponse>;
   heartbeat(sessionId: string, status: SessionStatus, latestActivityText?: string | null, session?: PiSessionInfo): Promise<void>;
-  pollCommands(sessionId: string, timeoutMs: number, session?: PiSessionInfo): Promise<CommandEnvelope | null>;
+  pollCommands(sessionId: string, timeoutMs: number): Promise<CommandEnvelope | null>;
   submitResult(commandId: string, result: AgentAdapterCommandResult): Promise<void>;
+  abandonCommand?(commandId: string): void;
 }
 
 export function validateAgentAdapterCommand(value: unknown): value is CommandEnvelope {
@@ -66,8 +66,10 @@ export function validateAgentAdapterCommandResult(value: unknown): value is Agen
     && isIdentifier(value.hostId)
     && isIdentifier(value.sessionId)
     && isCanonicalTimestamp(value.updatedAt)
-    && ((value.accepted === true && value.status === 'executed')
-      || (value.accepted === false && (value.status === 'failed' || value.status === 'rejected')));
+    && (
+      (value.accepted === true && value.status === 'executed')
+      || (value.accepted === false && value.status === 'rejected')
+    );
 }
 
 function isExactRecord(

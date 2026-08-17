@@ -353,6 +353,14 @@ function isCurrentProducerReservation(value: unknown): boolean {
     && value.version === 1 && ['eventId', 'sessionId', 'fingerprint', 'createdAt'].every((key) => isNonEmptyString(value[key]));
 }
 
+function isCurrentProducerCheckpoint(value: unknown): boolean {
+  return isRecord(value) && hasExactKeys(
+    value,
+    ['version', 'sessionId', 'producerEventId', 'producerEventOrder', 'eventId', 'fingerprint', 'createdAt'],
+  ) && value.version === 1 && ['sessionId', 'producerEventId', 'producerEventOrder', 'eventId', 'fingerprint', 'createdAt']
+    .every((key) => isNonEmptyString(value[key]));
+}
+
 function isCurrentTerminalCancellation(value: unknown): boolean {
   return isRecord(value) && hasExactKeys(value, ['version', 'sessionId', 'eventId', 'fingerprint', 'removeSession', 'createdAt'])
     && value.version === 1 && ['sessionId', 'eventId', 'fingerprint', 'createdAt'].every((key) => isNonEmptyString(value[key]))
@@ -424,7 +432,7 @@ const PRIOR_V3_STATE_REQUIRED_KEYS = [
   'sessionRevisions', 'pendingHandles', 'commandResults', 'seenCommands', 'currentSessionsSnapshot',
 ] as const;
 const CURRENT_STATE_OPTIONAL_KEYS = [
-  'recipientSetVersion', 'eventUploadCompletions', 'producerEventReservations', 'terminalCancellations', 'runtimeHealth',
+  'recipientSetVersion', 'eventUploadCompletions', 'producerEventReservations', 'producerEventCheckpoints', 'terminalCancellations', 'runtimeHealth',
 ] as const;
 const PRIOR_STATE_KEYS = [
   'schemaVersion', 'host', 'sessions', 'sessionDrivers', 'reconciledDrivers', 'recentEvents', 'pendingEvents',
@@ -449,6 +457,7 @@ function isStateRecordOfShape(value: Record<string, unknown>, schemaVersion: num
   if (value.recipientSetVersion !== undefined && !isPositiveSafeInteger(value.recipientSetVersion)) return false;
   return (value.eventUploadCompletions === undefined || isValueMap(value.eventUploadCompletions, isCurrentEventCompletion))
     && (value.producerEventReservations === undefined || isValueMap(value.producerEventReservations, isCurrentProducerReservation))
+    && (value.producerEventCheckpoints === undefined || isValueMap(value.producerEventCheckpoints, isCurrentProducerCheckpoint))
     && (value.terminalCancellations === undefined || isValueMap(value.terminalCancellations, isCurrentTerminalCancellation))
     && (value.runtimeHealth === undefined || isCurrentRuntimeHealth(value.runtimeHealth));
 }
@@ -488,6 +497,7 @@ export function isPriorStateRecordV3(value: Record<string, unknown>, hostId: str
   if (value.recipientSetVersion !== undefined && !isPositiveSafeInteger(value.recipientSetVersion)) return false;
   if ((value.eventUploadCompletions !== undefined && !isValueMap(value.eventUploadCompletions, isCurrentEventCompletion))
     || (value.producerEventReservations !== undefined && !isValueMap(value.producerEventReservations, isCurrentProducerReservation))
+    || (value.producerEventCheckpoints !== undefined && !isValueMap(value.producerEventCheckpoints, isCurrentProducerCheckpoint))
     || (value.terminalCancellations !== undefined && !isValueMap(value.terminalCancellations, isCurrentTerminalCancellation))
     || (value.runtimeHealth !== undefined && !isCurrentRuntimeHealth(value.runtimeHealth))) return false;
   try { assertPriorStateV3Relationships(value, hostId); return true; } catch { return false; }
@@ -583,7 +593,13 @@ export function migrateStateV3ToV4(value: Record<string, unknown>, hostId: strin
   const snapshot = value.currentSessionsSnapshot as PersistedCurrentSessionsSnapshotState;
   const target = {
     schemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, runtimeResetEpoch: value.runtimeResetEpoch, host: structuredClone(value.host),
-    sessions, sessionDrivers: structuredClone(value.sessionDrivers), reconciledDrivers: structuredClone(value.reconciledDrivers),
+    sessions,
+    sessionDrivers: Object.fromEntries(
+      Object.entries(value.sessionDrivers as Record<string, string>).map(([sessionId, driver]) => [
+        sessionId, driver === 'pi' ? 'agent-adapter' : driver,
+      ]),
+    ),
+    reconciledDrivers: structuredClone(value.reconciledDrivers),
     recentEvents: [], sessionRevisions: structuredClone(value.sessionRevisions),
     ...(value.recipientSetVersion === undefined ? {} : { recipientSetVersion: value.recipientSetVersion }),
     pendingHandles: {}, commandExecutions: {},
@@ -654,6 +670,7 @@ export function isObsoleteStateRecord(value: Record<string, unknown>, hostId: st
   if (value.recipientSetVersion !== undefined && !isPositiveSafeInteger(value.recipientSetVersion)) return false;
   if ((value.eventUploadCompletions !== undefined && !isValueMap(value.eventUploadCompletions, isCurrentEventCompletion))
     || (value.producerEventReservations !== undefined && !isValueMap(value.producerEventReservations, isCurrentProducerReservation))
+    || (value.producerEventCheckpoints !== undefined && !isValueMap(value.producerEventCheckpoints, isCurrentProducerCheckpoint))
     || (value.terminalCancellations !== undefined && !isValueMap(value.terminalCancellations, isCurrentTerminalCancellation))
     || (value.runtimeHealth !== undefined && !isCurrentRuntimeHealth(value.runtimeHealth))) return false;
   try { assertPriorStateV3Relationships(value, hostId); return true; } catch { return false; }
@@ -716,7 +733,8 @@ export function assertCurrentStateRelationships(state: PersistedBridgeState, hos
   }
   for (const [sessionId, driver] of Object.entries(state.sessionDrivers)) {
     const session = state.sessions[sessionId];
-    if (!session || session.sessionId !== sessionId || session.provider !== driver) {
+    if (!session || session.sessionId !== sessionId
+      || (driver !== 'agent-adapter' && driver !== session.provider)) {
       throw new Error('Bridge runtime Session driver binding is invalid');
     }
   }
@@ -764,6 +782,13 @@ export function assertCurrentStateRelationships(state: PersistedBridgeState, hos
     if (key !== producerReservationKey(reservation.sessionId, reservation.fingerprint)
       || (event && (event.sessionId !== reservation.sessionId || event.createdAt !== reservation.createdAt))) {
       throw new Error('Bridge runtime producer fingerprint binding is invalid');
+    }
+  }
+  for (const [sessionId, checkpoint] of Object.entries(state.producerEventCheckpoints ?? {})) {
+    const event = events.get(checkpoint.eventId);
+    if (sessionId !== checkpoint.sessionId || !sessions.has(sessionId)
+      || (event && event.sessionId !== checkpoint.sessionId)) {
+      throw new Error('Bridge runtime producer Event checkpoint binding is invalid');
     }
   }
   for (const [eventId, cancellation] of Object.entries(state.terminalCancellations ?? {})) {

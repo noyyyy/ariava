@@ -151,7 +151,7 @@ describe('createBridgeDaemonShell', () => {
     expect(existsSync(statePath)).toBe(false);
     expect(existsSync(`${statePath}.spool.json`)).toBe(false);
     expect(existsSync(join(root, 'adapter.json'))).toBe(false);
-    // The default driver is shell-owned PaiDriver; injected drivers stay borrowed.
+    // The default driver is shell-owned AgentAdapterDriver; injected drivers stay borrowed.
     const defaulted = createBridgeDaemonShell({
       config: fixture('default-driver').config,
       onRegistryMutation: () => {},
@@ -159,6 +159,6 @@ describe('createBridgeDaemonShell', () => {
     shells.push(defaulted);
     expect(defaulted.ownership.drivers).toBe('owned');
     expect(defaulted.drivers).toHaveLength(1);
-    expect(defaulted.drivers[0]?.name).toBe('pi');
+    expect(defaulted.drivers[0]?.name).toBe('agent-adapter');
   });
 });
