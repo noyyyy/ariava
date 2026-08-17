@@ -83,14 +83,12 @@ import {
   LEGACY_RUNTIME_STATE_SCHEMA_VERSION,
   OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION,
   PRIOR_RUNTIME_STATE_SCHEMA_VERSION,
-  PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION,
   assertCurrentRuntimeRelationships,
   assertEventSessionBinding,
   emptyState,
   hasExactOptionalKeys,
   isCurrentStateRecord,
   isPriorStateRecordV3,
-  isPriorStateRecordV4,
   isRecognizedLegacyRuntime,
   isRecognizedObsoleteRuntime,
   isRecord,
@@ -115,7 +113,6 @@ import {
 } from './state-store/state-persistence';
 import {
   beginRuntimeMigration,
-  beginRuntimeMigrationV4ToV5,
   beginRuntimeReset,
   parseRuntimeSchemaFloor,
   resumeRuntimeMigration,
@@ -126,10 +123,8 @@ import {
   runtimeSchemaFloorPathForState,
   type RuntimeResetPhase,
 } from './state-store/runtime-reset';
-import type { PriorV4BridgeState } from './state-store/state-codec';
 
-export { BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, emptyState };
-export type { PriorV4BridgeState };
+export { BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, emptyState };
 export type { RuntimeResetHooks };
 export type { PendingEventDescriptor, PendingEventSource } from './state-store/spool-transactions';
 export { COMMAND_RECEIPT_RETENTION_DAYS, COMMAND_RECEIPT_RETENTION_MS } from './state-store/command-transitions';
@@ -432,13 +427,7 @@ export class BridgeStateStore {
       const migrationIntentPath = runtimeMigrationIntentPathForState(this.filePath);
       if (pathHasFilesystemEvidence(migrationIntentPath)) {
         const resumed = resumeRuntimeMigration({ filePath: this.filePath }, hostId, resetStep, resetWriteHooks, resetRemoveHooks);
-        if (resumed.schemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION) {
-          return parseCurrentState(resumed, hostId);
-        }
-        // A resumed v3→v4 intent converges to schema4; continue to the v4→v5
-        // migration (§4.5: v3→v4 completes strictly before the independent v4→v5
-        // intent is evaluated).
-        return this.preflightRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
+        return parseCurrentState(resumed, hostId);
       }
       const floorPath = runtimeSchemaFloorPathForState(this.filePath);
       const floorBytes = readOptionalSecureBytes(floorPath);
@@ -458,19 +447,6 @@ export class BridgeStateStore {
       const stateRecord = parseRawJson(stateBytes, 'Bridge runtime state');
       const spoolRecord = parseRawJson(spoolBytes, 'Bridge runtime spool');
       if (floor) {
-        if (floor.minSchemaVersion === PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION) {
-          // Established floor4: only an exact verified schema4 runtime may continue,
-          // and it must now migrate to schema5 (§4.5 allowed source: verified
-          // schema4/floor4). Everything else violates the established floor.
-          if (!stateRecord || !spoolRecord || !isPriorStateRecordV4(stateRecord, hostId)
-            || !isSpoolRecordForSchema(spoolRecord, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, hostId,
-              stateRecord.runtimeResetEpoch as string, 'current')) {
-            throw new Error('Bridge runtime artifacts violate the established schema floor');
-          }
-          return beginRuntimeMigrationV4ToV5(
-            { filePath: this.filePath }, hostId, stateRecord, spoolRecord, floorBytes, stateBytes!, spoolBytes!, resetStep, resetWriteHooks, resetRemoveHooks,
-          );
-        }
         if (!stateRecord || !spoolRecord || !isCurrentStateRecord(stateRecord)) {
           throw new Error('Bridge runtime artifacts violate the established schema floor');
         }
@@ -487,22 +463,13 @@ export class BridgeStateStore {
         writeSecureJson(floorPath, runtimeSchemaFloor(this.filePath, hostId, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION), undefined, resetWriteHooks);
         return state;
       }
-      if (stateRecord && spoolRecord && isPriorStateRecordV4(stateRecord, hostId)
-        && isSpoolRecordForSchema(spoolRecord, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, hostId,
-          stateRecord.runtimeResetEpoch as string, 'current')) {
-        // Schema4 runtime without an established floor (defensive): begin the
-        // independent v4→v5 intent with an absent floor source.
-        return beginRuntimeMigrationV4ToV5(
-          { filePath: this.filePath }, hostId, stateRecord, spoolRecord, undefined, stateBytes!, spoolBytes!, resetStep, resetWriteHooks, resetRemoveHooks,
-        );
-      }
       if (stateRecord && spoolRecord && isPriorStateRecordV3(stateRecord, hostId)
         && isSpoolRecordForSchema(spoolRecord, PRIOR_RUNTIME_STATE_SCHEMA_VERSION, hostId, stateRecord.runtimeResetEpoch as string, 'current')) {
         beginRuntimeMigration(
           { filePath: this.filePath }, hostId, stateRecord, spoolRecord, stateBytes!, spoolBytes!, resetStep, resetWriteHooks, resetRemoveHooks,
         );
-        // v3→v4 converges to schema4 + floor4; the chain continues with the
-        // independent v4→v5 migration. Never merge 3→5 into one un-reviewed step.
+        // v3→v4 converges to the current schema4 + floor4; the recursive preflight
+        // then opens it directly.
         return this.preflightRuntime(hostId, keyStore, resetStep, resetWriteHooks, resetRemoveHooks);
       }
       if (!stateRecord && !spoolRecord) {

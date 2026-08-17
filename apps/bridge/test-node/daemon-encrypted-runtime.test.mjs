@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import {
   E2E_SUITE_V1, base64UrlEncode, buildEncryptionBindingBytes, buildLinkTranscriptBytes, contentSha256,
 } from '../../../packages/protocol/dist/index.js';
-import { BridgeDaemon } from '../dist/daemon.js';
-import { EncryptedUploadOrchestrator } from '../dist/e2e/upload-orchestrator.js';
+import { BridgeDaemon, EncryptedEventFailureLogger } from '../dist/daemon.js';
+import { DEFAULT_ENCRYPTED_UPLOAD_CRYPTO, createEncryptedUploadActions } from '../dist/e2e/upload-actions.js';
 import { generateHostEncryptionIdentity } from '../dist/identity/host-encryption-key.js';
 import { RelayClientError } from '../dist/relay-client.js';
 import { LocalLinkKeyring } from '../dist/e2e/link-keyring.js';
@@ -79,7 +79,7 @@ async function fixture(handler, sessions = []) {
     reconcileEncryptedSession: (session) => invoke('/v2/bridge/e2e/sessions/reconcile', { session }).then((value) => value.committed),
   };
   const recipients = keyring.reconcileRecipients(snapshots(1));
-  const orchestrator = (stateStore = state, hooks) => new EncryptedUploadOrchestrator(stateStore, client, keyring, hooks);
+  const orchestrator = (stateStore = state, hooks) => createEncryptedUploadActions({ stateStore, relayClient: client, crypto: DEFAULT_ENCRYPTED_UPLOAD_CRYPTO, keyring, hooks });
   return { root, config, state, calls, snapshots, recipients, client, keyring, runtimeEncryptionIdentity, orchestrator, restore: () => {} };
 }
 
@@ -146,7 +146,7 @@ function createDurableCancellation(label) {
   return { statePath, identityPath, spoolPath, hostId, keyStore, store, sourceEvent, terminal };
 }
 
-test('BridgeDaemon delegates encrypted uploads to the production orchestrator', async () => {
+test('BridgeDaemon delegates encrypted uploads to a manually bound upload-actions instance', async () => {
   const f = await fixture(({ path, snapshots }) => {
     if (path === '/v2/bridge/e2e/recipients') return Response.json(snapshots(1));
     if (path === '/v2/bridge/e2e/sessions' || path === '/v2/bridge/e2e/events') return Response.json({ ok: true });
@@ -155,6 +155,18 @@ test('BridgeDaemon delegates encrypted uploads to the production orchestrator', 
   try {
     const daemon = Object.create(BridgeDaemon.prototype);
     daemon.stateStore = f.state; daemon.relayClient = f.client; daemon.encryptionIdentity = f.runtimeEncryptionIdentity; daemon.keyring = f.keyring; daemon.startupValidated = true;
+    // The constructor field initializer does not run on an Object.create shell, so attach
+    // a failure logger matching the production activation hook contract.
+    daemon.encryptedEventFailureLogger = new EncryptedEventFailureLogger();
+    // Bind one actions instance explicitly. Production activation binding is covered by
+    // runtime-activation.test.ts; this test covers only the daemon delegation path.
+    daemon.uploadActions = createEncryptedUploadActions({
+      stateStore: f.state,
+      relayClient: f.client,
+      crypto: DEFAULT_ENCRYPTED_UPLOAD_CRYPTO,
+      keyring: f.keyring,
+      hooks: { eventFailure: (failure) => daemon.encryptedEventFailureLogger.record(failure) },
+    });
     f.state.replaceDriverSessions('test', [session(f.config.hostId, 'delegate-session')]);
     await seedEvent(f, event(f.config.hostId, 'delegate-event', 'delegate-session'));
     assert.equal(await daemon.flushEncryptedUploadsForTest(), 1);

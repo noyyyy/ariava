@@ -13,7 +13,7 @@ mock.module('../src/e2e/node-crypto', () => ({
   hkdfSha256: () => new Uint8Array(32).fill(5),
 }));
 
-const { EncryptedUploadOrchestrator } = await import('../src/e2e/upload-orchestrator');
+const { DEFAULT_ENCRYPTED_UPLOAD_CRYPTO, createEncryptedUploadActions } = await import('../src/e2e/upload-actions');
 const { BridgeStateStore } = await import('../src/state-store');
 const { RelayClientError } = await import('../src/relay-client');
 const { BridgeDaemon, SessionPublicationBlockLogger, loadBridgeConfig } = await import('../src/daemon');
@@ -21,6 +21,16 @@ const { LinuxJsonHostIdentityStore, publicIdentityMetadata } = await import('../
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+
+/** Mirrors the removed compatibility facade's constructor shape; binds the single actions implementation. */
+function createOrchestrator(
+  stateStore: any,
+  relayClient: any,
+  keyring: any,
+  hooks?: Parameters<typeof createEncryptedUploadActions>[0]['hooks'],
+) {
+  return createEncryptedUploadActions({ stateStore, relayClient, crypto: DEFAULT_ENCRYPTED_UPLOAD_CRYPTO, keyring, hooks });
+}
 
 function fixture() {
   const root = join(tmpdir(), `bridge-publication-${Date.now()}-${roots.length}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
@@ -86,7 +96,7 @@ describe('Authoritative Session publication §6.1', () => {
       publishEncryptedSession: async () => { publishes += 1; return { ok: true as const }; },
       reconcileEncryptedSession: async () => { reconciles += 1; return true; },
     };
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
+    const orchestrator = createOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
 
     const result = await orchestrator.publishAuthoritativeSnapshots(snapshotV1, [], [invalid]);
 
@@ -105,7 +115,7 @@ describe('Authoritative Session publication §6.1', () => {
     const invalid = terminalSession({ openingText: 'a'.repeat(64 * 1024) });
     const valid = terminalSession({ sessionId: 'session-ok', lastEventId: undefined });
     store.replaceDriverSessions('pi', [invalid, valid]);
-    const orchestrator = new EncryptedUploadOrchestrator(store, {} as any, { reconcileRecipients: () => [] } as any);
+    const orchestrator = createOrchestrator(store, {} as any, { reconcileRecipients: () => [] } as any);
     expect(orchestrator.preflightAuthoritativeSessionSet([invalid, valid])).toBe(1);
     expect(store.currentSessionRevision('session-test')).toBe(0);
     expect(store.currentSessionRevision('session-ok')).toBe(0);
@@ -117,7 +127,7 @@ describe('Authoritative Session publication §6.1', () => {
     const invalid = terminalSession({ openingText: 'a'.repeat(64 * 1024) });
     store.replaceDriverSessions('pi', [invalid]);
     const client = { publishEncryptedSession: async () => { throw new Error('unexpected publish'); } };
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
+    const orchestrator = createOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
     // The immutable snapshot is authoritative: an internal source-access fault on
     // the supplied Session tuple propagates (fail-closed), never a content block.
     const faulty = terminalSession();
@@ -143,7 +153,7 @@ describe('Authoritative Session publication §6.1', () => {
       },
       reconcileEncryptedSession: async () => { reconciles += 1; return false; },
     };
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
+    const orchestrator = createOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
 
     const result = await orchestrator.publishAuthoritativeSnapshots(snapshotV1, [], [terminal]);
     expect(result).toMatchObject({ type: 'published', recipientSetVersion: 1 });
@@ -165,7 +175,7 @@ describe('Authoritative Session publication §6.1', () => {
       publishEncryptedSession: async () => { publishes += 1; return { ok: true as const }; },
       reconcileEncryptedSession: async () => { reconciles += 1; return true; },
     };
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
+    const orchestrator = createOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
 
     const result = await orchestrator.publishAuthoritativeSnapshots(snapshotV1, [], [terminal]);
 
@@ -189,7 +199,7 @@ describe('Authoritative Session publication §6.1', () => {
       publishEncryptedSession: async () => { publishes += 1; return { ok: true as const }; },
       reconcileEncryptedSession: async () => { reconciles += 1; return false; },
     };
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
+    const orchestrator = createOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
 
     const result = await orchestrator.publishAuthoritativeSnapshots(snapshotV1, [], [terminal]);
 
@@ -213,7 +223,7 @@ describe('Authoritative Session publication §6.1', () => {
       publishEncryptedSession: async () => { publishes += 1; return { ok: true as const }; },
       reconcileEncryptedSession: async () => { reconciles += 1; return false; },
     };
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
+    const orchestrator = createOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
 
     const result = await orchestrator.publishAuthoritativeSnapshots(snapshotV1, [], [terminalSession()]);
 
@@ -231,7 +241,7 @@ describe('Authoritative Session publication §6.1', () => {
     store.persistInflightSessionUpload('session-test', sessionUploadFixture(2), 'A'.repeat(43));
     store.persistInflightSessionUpload('session-orphan', sessionUploadFixture(7, 1, 'session-orphan'), 'B'.repeat(43));
     const seen: string[] = [];
-    const orchestrator = new EncryptedUploadOrchestrator(store, {
+    const orchestrator = createOrchestrator(store, {
       reconcileEncryptedSession: async (upload: any) => { seen.push(upload.sessionId); return true; },
     } as any, {} as any);
     expect(await orchestrator.reconcileSessionInflights([active])).toEqual({ deferred: false });
@@ -247,7 +257,7 @@ describe('Authoritative Session publication §6.1', () => {
     store.persistInflightSessionUpload('session-orphan', sessionUploadFixture(7, 1, 'session-orphan'), 'B'.repeat(43));
     const beforeActive = readSessionInflightRaw(store, 'session-test');
     const beforeOrphan = readSessionInflightRaw(store, 'session-orphan');
-    const orchestrator = new EncryptedUploadOrchestrator(store, { reconcileEncryptedSession: async () => false } as any, {} as any);
+    const orchestrator = createOrchestrator(store, { reconcileEncryptedSession: async () => false } as any, {} as any);
     expect(await orchestrator.reconcileSessionInflights([terminalSession()])).toEqual({ deferred: true });
     expect(readSessionInflightRaw(store, 'session-test')).toEqual(beforeActive);
     expect(readSessionInflightRaw(store, 'session-orphan')).toEqual(beforeOrphan);
@@ -262,7 +272,7 @@ describe('Authoritative Session publication §6.1', () => {
     const expectedMalformed = malformed.slice();
     replaceSessionInflightRaw(store, 'session-test', malformed);
     let reconciles = 0;
-    const orchestrator = new EncryptedUploadOrchestrator(store, { reconcileEncryptedSession: async () => { reconciles += 1; return true; } } as any, {} as any);
+    const orchestrator = createOrchestrator(store, { reconcileEncryptedSession: async () => { reconciles += 1; return true; } } as any, {} as any);
     expect(await orchestrator.reconcileSessionInflights([terminalSession()])).toEqual({ deferred: true });
     expect(reconciles).toBe(0);
     expect(readSessionInflightRaw(store, 'session-test')).toEqual(expectedMalformed);
@@ -405,6 +415,18 @@ describe('Bridge Event drain decoupling §6.2', () => {
     };
     (fx.daemon as any).keyring = { reconcileRecipients: () => [] };
     (fx.daemon as any).encryptionIdentity = {};
+    // This fixture bypasses activation, so bind exactly one EncryptedUploadActions
+    // instance from the same fake Relay/keyring/state-store dependencies,
+    // mirroring the production activation contract in `activateBridgeRuntime`
+    // (createEncryptedUploadActions with DEFAULT_ENCRYPTED_UPLOAD_CRYPTO and the
+    // daemon event-failure hook). No on-demand facade construction.
+    (fx.daemon as any).uploadActions = createEncryptedUploadActions({
+      stateStore: fx.store,
+      relayClient: (fx.daemon as any).relayClient,
+      crypto: DEFAULT_ENCRYPTED_UPLOAD_CRYPTO,
+      keyring: (fx.daemon as any).keyring,
+      hooks: { eventFailure: (failure) => (fx.daemon as any).encryptedEventFailureLogger.record(failure) },
+    });
     expect(await (fx.daemon as any).flushCurrentSessionsSnapshot([active])).toEqual({ type: 'published' });
     expect(publishedSessions).toHaveLength(1);
     expect(publishedSessions[0].revision).toBe(2);

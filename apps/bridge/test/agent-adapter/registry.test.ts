@@ -179,7 +179,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       migratedStore.initializeEncryptedSpool('host-1', join(dir, 'identity.json'), 'linux', {
         loadOrCreate: () => new Uint8Array(32).fill(7),
       });
-      expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject({ schemaVersion: 5 });
+      expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject({ schemaVersion: 4 });
       expect(migratedStore.listSessions()).toEqual([expect.objectContaining({
         sessionId: 'migrated-owner', provider: 'adapter', harnessProvider: 'pi',
       })]);

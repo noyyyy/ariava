@@ -30,8 +30,7 @@ import { isRecognizedLocalSpoolPayloadKind, type LocalSpoolFileV2 } from '../e2e
 import { sessionHandleKey } from './session-transitions';
 
 /** Current Bridge runtime state schema. */
-export const BRIDGE_RUNTIME_STATE_SCHEMA_VERSION = 5 as const;
-export const PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION = 4 as const;
+export const BRIDGE_RUNTIME_STATE_SCHEMA_VERSION = 4 as const;
 export const PRIOR_RUNTIME_STATE_SCHEMA_VERSION = 3 as const;
 export const OBSOLETE_RUNTIME_STATE_SCHEMA_VERSION = 2 as const;
 export const LEGACY_RUNTIME_STATE_SCHEMA_VERSION = 1 as const;
@@ -40,17 +39,13 @@ const PRIOR_V2_SPOOL_KINDS = new Set([
   'event-upload-v2', 'session-upload-v2', 'terminal-cancellation-v2',
 ]);
 
-/** Schema 4 Bridge runtime state: identical shape to schema 5, only the version literal differs. */
-export type PriorV4BridgeState = Omit<PersistedBridgeState, 'schemaVersion'> & { schemaVersion: 4 };
-
-
 const EMPTY_SNAPSHOT: PersistedCurrentSessionsSnapshotState = {
   version: 1,
   lastAllocatedRevision: 0,
   lastAcceptedRevision: 0,
 };
 
-/** Pure schema-v5 state constructor; entropy is supplied by the lifecycle shell. */
+/** Pure schema-v4 state constructor; entropy is supplied by the lifecycle shell. */
 export function emptyState(runtimeResetEpoch: string): PersistedBridgeState {
   return {
     schemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION,
@@ -462,15 +457,6 @@ export function isCurrentStateRecord(value: Record<string, unknown>): boolean {
   return isStateRecordOfShape(value, BRIDGE_RUNTIME_STATE_SCHEMA_VERSION);
 }
 
-/** Schema4 record: the exact current-state shape with the v4 version literal. */
-export function isPriorStateRecordV4(value: Record<string, unknown>, hostId: string): boolean {
-  if (!isStateRecordOfShape(value, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION)) return false;
-  try {
-    assertCurrentStateRelationships(value as unknown as PersistedBridgeState, hostId);
-    return true;
-  } catch { return false; }
-}
-
 export function parseCurrentState(value: unknown, hostId?: string): PersistedBridgeState {
   if (!isRecord(value) || !isCurrentStateRecord(value)) throw new Error('Bridge runtime state schema is invalid');
   const state = structuredClone(value) as unknown as PersistedBridgeState;
@@ -596,7 +582,7 @@ export function migrateStateV3ToV4(value: Record<string, unknown>, hostId: strin
   ]));
   const snapshot = value.currentSessionsSnapshot as PersistedCurrentSessionsSnapshotState;
   const target = {
-    schemaVersion: PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, runtimeResetEpoch: value.runtimeResetEpoch, host: structuredClone(value.host),
+    schemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, runtimeResetEpoch: value.runtimeResetEpoch, host: structuredClone(value.host),
     sessions, sessionDrivers: structuredClone(value.sessionDrivers), reconciledDrivers: structuredClone(value.reconciledDrivers),
     recentEvents: [], sessionRevisions: structuredClone(value.sessionRevisions),
     ...(value.recipientSetVersion === undefined ? {} : { recipientSetVersion: value.recipientSetVersion }),
@@ -605,31 +591,15 @@ export function migrateStateV3ToV4(value: Record<string, unknown>, hostId: strin
       lastAllocatedRevision: Math.max(snapshot.lastAllocatedRevision, snapshot.lastAcceptedRevision), lastAcceptedRevision: 0 },
     ...(value.runtimeHealth === undefined ? {} : { runtimeHealth: structuredClone(value.runtimeHealth) }),
   };
-  if (!isPriorStateRecordV4(target, hostId)) throw new Error('migrated Bridge runtime schema v4 is invalid');
-  return target as unknown as PriorV4BridgeState;
+  return parseCurrentState(target, hostId);
 }
 
 export function migrateSpoolV3ToV4(value: Record<string, unknown>, hostId: string, epoch: string): LocalSpoolFileV2 {
   if (!isSpoolRecordForSchema(value, PRIOR_RUNTIME_STATE_SCHEMA_VERSION, hostId, epoch, 'current')) {
     throw new Error('Bridge runtime spool schema v3 is invalid');
   }
-  return { ...(structuredClone(value) as unknown as LocalSpoolFileV2), runtimeStateSchemaVersion: 4, items: [] };
+  return { ...(structuredClone(value) as unknown as LocalSpoolFileV2), runtimeStateSchemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION, items: [] };
 }
-
-export function migrateStateV4ToV5(value: Record<string, unknown>, hostId: string): PersistedBridgeState {
-  if (!isPriorStateRecordV4(value, hostId)) throw new Error('Bridge runtime schema v4 is invalid');
-  const state = structuredClone(value) as Record<string, unknown>;
-  state.schemaVersion = BRIDGE_RUNTIME_STATE_SCHEMA_VERSION;
-  return parseCurrentState(state, hostId);
-}
-
-export function migrateSpoolV4ToV5(value: Record<string, unknown>, hostId: string, epoch: string): LocalSpoolFileV2 {
-  if (!isSpoolRecordForSchema(value, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, hostId, epoch, 'current')) {
-    throw new Error('Bridge runtime spool schema v4 is invalid');
-  }
-  return { ...(structuredClone(value) as unknown as LocalSpoolFileV2), runtimeStateSchemaVersion: BRIDGE_RUNTIME_STATE_SCHEMA_VERSION };
-}
-
 export function isRecognizedPriorStateRecord(value: Record<string, unknown> | undefined, hostId: string): boolean {
   if (!value || !hasOnlyKeys(value, PRIOR_STATE_KEYS)) return false;
   if (value.schemaVersion !== undefined && value.schemaVersion !== LEGACY_RUNTIME_STATE_SCHEMA_VERSION) return false;
@@ -695,20 +665,12 @@ export function parseCurrentSpoolRecord(value: Record<string, unknown>, hostId: 
   }
   return structuredClone(value) as unknown as LocalSpoolFileV2;
 }
-
-export function parsePriorV4SpoolRecord(value: Record<string, unknown>, hostId: string, epoch: string): LocalSpoolFileV2 {
-  if (!isSpoolRecordForSchema(value, PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION, hostId, epoch, 'current')) {
-    throw new Error('prior Bridge runtime spool schema is invalid');
-  }
-  return structuredClone(value) as unknown as LocalSpoolFileV2;
-}
-
 export function isSpoolRecordForSchema(
-  value: Record<string, unknown>, schemaVersion: 2 | 3 | 4 | 5, hostId: string, epoch: string, kind: 'current' | 'standalone-v2',
+  value: Record<string, unknown>, schemaVersion: 2 | 3 | 4, hostId: string, epoch: string, kind: 'current' | 'standalone-v2',
 ): boolean {
-  // Schema4 and schema5 spools both carry the current v3 payload kinds; only
-  // schemas 2/3 use the obsolete-v2 kinds.
-  const spoolKind = schemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION || schemaVersion === PRIOR_V4_RUNTIME_STATE_SCHEMA_VERSION ? 'current' : 'obsolete-v2';
+  // Only the current schema (4) carries the current v3 payload kinds; schemas
+  // 2/3 use the obsolete-v2 kinds.
+  const spoolKind = schemaVersion === BRIDGE_RUNTIME_STATE_SCHEMA_VERSION ? 'current' : 'obsolete-v2';
   return hasExactKeys(value, ['version', 'runtimeStateSchemaVersion', 'runtimeResetEpoch', 'hostId', 'keyId', 'items'])
     && value.version === 2 && value.runtimeStateSchemaVersion === schemaVersion
     && value.runtimeResetEpoch === epoch && value.hostId === hostId && isVerifier(value.keyId)

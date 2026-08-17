@@ -105,7 +105,7 @@ describe('Bridge E2E authoritative current-session reconciliation', () => {
     expect(manifests).toHaveLength(1);
     expect(manifests[0]).toEqual({ hostId, revision: 1, observedAt: expect.any(String), recipientSetVersion: 1, sessions: [] });
     expect(publishedState).toMatchObject({ version: 1, lastAllocatedRevision: 1, lastAcceptedRevision: 1 });
-    expect((fx.daemon as any).currentSessionsSnapshotFailureCount).toBe(0);
+    expect((fx.daemon as any).snapshotFailureState.count).toBe(0);
   });
 
   test('stale Host revision rebuilds only the Host revision domain', async () => {

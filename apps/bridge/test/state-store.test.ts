@@ -181,7 +181,7 @@ describe('BridgeStateStore', () => {
     expect(store.peekPendingEvents()).toEqual([]);
     expect(store.peekPendingSessionHandles()).toEqual([]);
     const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
-    expect(persisted.schemaVersion).toBe(5);
+    expect(persisted.schemaVersion).toBe(4);
     expect(persisted).not.toHaveProperty('pendingEvents');
     expect(persisted).not.toHaveProperty('pendingReads');
     expect(store.getRuntimeHealth()).toEqual({ status: 'healthy', drivers: [] });
@@ -200,16 +200,16 @@ describe('BridgeStateStore', () => {
     expect(migrated.peekPendingEvents()).toEqual([]);
     expect(migrated.listCommandExecutions()).toEqual([]);
     const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
-    expect(persisted).toMatchObject({ schemaVersion: 5, recentEvents: [], pendingHandles: {}, commandExecutions: {} });
+    expect(persisted).toMatchObject({ schemaVersion: 4, recentEvents: [], pendingHandles: {}, commandExecutions: {} });
     expect(persisted.sessions['sess-1']).not.toHaveProperty('lastEventId');
     expect(persisted).not.toHaveProperty('commandResults');
     expect(persisted).not.toHaveProperty('seenCommands');
     expect(JSON.parse(readFileSync(runtimeSchemaFloorPathForState(statePath), 'utf8'))).toEqual({
-      version: 1, hostId: 'host-1', minSchemaVersion: 5, statePath, spoolPath: spoolPathForState(statePath),
+      version: 1, hostId: 'host-1', minSchemaVersion: 4, statePath, spoolPath: spoolPathForState(statePath),
     });
   });
 
-  test.each(['intent', 'spool', 'state', 'floor', 'cleanup'] as const)('resumes v3 migration after a crash at %s', (boundary) => {
+  test.each(['intent', 'spool', 'state', 'floor', 'cleanup'] as const)('recovers v3 migration after an injected %s boundary failure', (boundary) => {
     const root = join(tmpdir(), `bridge-store-v3-crash-${boundary}-${Date.now()}`); paths.push(root);
     const statePath = join(root, 'state.json'); seedV3Runtime(statePath);
     const migration = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
@@ -231,16 +231,16 @@ describe('BridgeStateStore', () => {
       expect(JSON.parse(readFileSync(statePath, 'utf8')).schemaVersion).toBe(3);
       const retry = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
       retry.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
-      expect(JSON.parse(readFileSync(statePath, 'utf8')).schemaVersion).toBe(5);
+      expect(JSON.parse(readFileSync(statePath, 'utf8')).schemaVersion).toBe(4);
       return;
     }
     expect(pathHas(intentPath)).toBe(boundary !== 'cleanup');
     const resumed = new BridgeStateStore(statePath, undefined, { deferRuntimePreflight: true });
     resumed.initializeEncryptedSpool('host-1', join(root, 'identity.json'), 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
     expect(resumed.listCommandExecutions()).toEqual([]);
-    expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject({ schemaVersion: 5, commandExecutions: {} });
-    expect(JSON.parse(readFileSync(spoolPathForState(statePath), 'utf8')).runtimeStateSchemaVersion).toBe(5);
-    expect(JSON.parse(readFileSync(runtimeSchemaFloorPathForState(statePath), 'utf8')).minSchemaVersion).toBe(5);
+    expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject({ schemaVersion: 4, commandExecutions: {} });
+    expect(JSON.parse(readFileSync(spoolPathForState(statePath), 'utf8')).runtimeStateSchemaVersion).toBe(4);
+    expect(JSON.parse(readFileSync(runtimeSchemaFloorPathForState(statePath), 'utf8')).minSchemaVersion).toBe(4);
     expect(pathHas(intentPath)).toBe(false);
   });
 

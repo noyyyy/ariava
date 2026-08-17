@@ -5,44 +5,57 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
   BridgePairWatchResponse,
-  CanonicalEvent,
   CanonicalSessionState,
   ReplaceE2ECurrentSessionsRequestV1,
   HostEnrollmentRequest,
   HostProjection,
 } from '@ariava/protocol';
-import { AGENT_ADAPTER_PROTOCOL_VERSION, canonicalE2ECurrentSessionsDigestV1, validateCommandResult,
-  type CommandResult, type E2ERecipientSnapshotV1 } from '@ariava/protocol';
+import {
+  canonicalE2ECurrentSessionsDigestV1,
+  type CommandResult,
+  type E2ERecipientSnapshotV1,
+} from '@ariava/protocol';
 import { isoNow } from '@ariava/shared-utils';
-import { AgentAdapterClient } from './agent-adapter/client';
-import { writeAgentAdapterConfig } from './agent-adapter/config';
+import { writeAgentAdapterConfig, type AgentAdapterDiscoveryFile } from './agent-adapter/config';
 import { AgentAdapterRegistry } from './agent-adapter/registry';
 import { AgentAdapterServer } from './agent-adapter/server';
 import { CommandRouter } from './command-router';
-import { PaiDriver } from './drivers/pi';
 import { probeHostPlatform } from './host-platform';
 import { loadUserConfig, resolveAriavaConfig, resolvePersistedAriavaConfig } from './host-manager/config';
 import { ensureAriavaSecureDirectories, pathHasFilesystemEvidence, readSecureJson, redactSensitive } from './host-manager/secure-files';
-import { createHostEncryptionBinding, createRuntimeHostEncryptionIdentityStore, HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostEncryptionIdentity, type HostEncryptionIdentityStore, type HostIdentity, type HostIdentityStore } from './identity';
-import { RelayClient, RelayClientError, RelayTransportError } from './relay-client';
+import { createHostEncryptionBinding, HostIdentityError, LinuxJsonHostIdentityStore, MacOSKeychainHostIdentityStore, type HostEncryptionIdentity, type HostEncryptionIdentityStore, type HostIdentity, type HostIdentityStore } from './identity';
+import { RelayClientError, type RelayClient } from './relay-client';
 import { BridgeStateStore } from './state-store';
-import { assertProductionNodeRuntime } from './runtime/node-runtime';
-import { assertNodeCryptoSelfTest } from './e2e/node-crypto-self-test';
 import type { AgentDriver, BridgeConfig, BridgeSyncResult } from './types';
-import { LocalLinkKeyring, type PinRetentionReferences } from './e2e/link-keyring';
-import { prepareCommandForExecution } from './e2e/command-execution';
-import { EncryptedUploadOrchestrator } from './e2e/upload-orchestrator';
-import { acquireRuntimeCoordinator, type RuntimeCoordinator } from './runtime-lock';
-import { createDefaultProfile } from './cli/profiles/default';
-import { createDevProfile } from './cli/profiles/dev';
-import { assertHostDomainResetRuntimeStartAllowed } from './cli/operations/host-domain-reset-journal';
-import { resolveAriavaDevProfilePaths } from './host-manager/dev-profile';
+import { LocalLinkKeyring } from './e2e/link-keyring';
+import { DEFAULT_ENCRYPTED_UPLOAD_CRYPTO, createEncryptedUploadActions, type EncryptedEventFailure, type EncryptedUploadActions } from './e2e/upload-actions';
+import type { RuntimeCoordinator } from './runtime-lock';
+import type { CommandReceiptConstructionDependencies } from './e2e/command-receipt-recovery';
 import {
-  drainPendingCommandReceipts,
-  persistTerminalCommandResult,
-  recoverBlockedCommandReceipts,
-  type CommandReceiptConstructionDependencies,
-} from './e2e/command-receipt-recovery';
+  buildHostEnrollmentRequest,
+  buildHostMetadata,
+} from './daemon/daemon-inputs';
+import { isAbortError, snapshotError } from './daemon/daemon-errors';
+import { performHostPresenceRegistration } from './daemon/presence-workflow';
+import {
+  createInitialSnapshotFailureState,
+  decideSnapshotFailure,
+  decideSnapshotFailureLog,
+  resetSnapshotFailures,
+  summarizeSnapshotFailures,
+  type SnapshotFailureDecision,
+  type SnapshotFailureState,
+} from './daemon/snapshot-policy';
+import { activateBridgeDaemonServer, activateBridgeRuntime, assertHostDomainResetStartAllowed, createBridgeDaemonShell, type BridgeDaemonActiveRuntime } from './daemon/runtime-composition';
+import {
+  performCommandPullAndDispatch,
+  performReconciledReceiptDrain,
+  pruneCommandRuntime,
+  recoverStartupCommandPipeline,
+  refreshCommandAuthority,
+  type CommandWorkflowDependencies,
+} from './daemon/command-workflow';
+import { performBridgeSyncOnce, type SessionPublicationOutcome } from './daemon/sync-workflow';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const BRIDGE_VERSION = readPackageVersion();
@@ -156,7 +169,7 @@ export class EncryptedEventFailureLogger {
     private readonly now: () => number = () => Date.now(),
   ) {}
 
-  record(failure: import('./e2e/upload-orchestrator').EncryptedEventFailure): void {
+  record(failure: EncryptedEventFailure): void {
     const timestamp = this.now();
     if (timestamp - this.lastLogAt < 30_000) {
       this.suppressed += 1;
@@ -175,17 +188,6 @@ export class EncryptedEventFailureLogger {
   }
 }
 
-/**
- * §6.2 Session publication outcome taxonomy (spec §6.2). `published`/`unchanged`
- * allow the normal Event drain; `locally-blocked` allows Event drain only under
- * the §6.2 conditions (stable accepted recipient version + no unconverged Session
- * inflight); `deferred`/`fail-closed` keep the existing stop semantics.
- */
-type SessionPublicationOutcome =
-  | { type: 'published' | 'unchanged' }
-  | { type: 'locally-blocked'; reason: 'content'; blockedSessionCount: number; recipientSetVersion: number }
-  | { type: 'deferred'; reason: 'network' | 'recipient-set' }
-  | { type: 'fail-closed' };
 
 /**
  * §6.3 in-memory rate-limited Session publication block/recovery logger.
@@ -236,10 +238,10 @@ export class SessionPublicationBlockLogger {
 
 export class BridgeDaemon {
   private relayClient?: RelayClient;
+  private activeRuntime?: BridgeDaemonActiveRuntime;
   private readonly stateStore: BridgeStateStore;
   private readonly runtimeCoordinator: RuntimeCoordinator;
   private readonly adapterRegistry: AgentAdapterRegistry;
-  private readonly adapterClient: AgentAdapterClient;
   private readonly adapterServer: AgentAdapterServer;
   private readonly drivers: AgentDriver[];
   private readonly router: CommandRouter;
@@ -247,6 +249,7 @@ export class BridgeDaemon {
   private encryptionIdentity?: HostEncryptionIdentity;
   private keyring?: LocalLinkKeyring;
   private keyringMigrationContext?: ConstructorParameters<typeof LocalLinkKeyring>[2];
+  private uploadActions!: EncryptedUploadActions;
   private filesystemVerified = false;
   private startupValidated = false;
   private syncFlight?: Promise<BridgeSyncResult>;
@@ -254,8 +257,7 @@ export class BridgeDaemon {
   private presenceHeartbeatTimer?: unknown;
   private presenceFlight?: Promise<void>;
   private reconciliationRequested = true;
-  private currentSessionsSnapshotFailureCount = 0;
-  private lastCurrentSessionsSnapshotFailureLogAt = 0;
+  private snapshotFailureState: SnapshotFailureState = createInitialSnapshotFailureState();
   private readonly encryptedEventFailureLogger = new EncryptedEventFailureLogger();
   private readonly sessionPublicationBlockLogger = new SessionPublicationBlockLogger();
   private readonly runtimeHealthLogger = new RuntimeHealthLogger();
@@ -274,42 +276,31 @@ export class BridgeDaemon {
     private readonly reconciliationScheduler: ReconciliationScheduler = DEFAULT_RECONCILIATION_SCHEDULER,
     private readonly pollWaitScheduler: PollWaitScheduler = DEFAULT_POLL_WAIT_SCHEDULER,
   ) {
-    this.assertHostDomainResetStartAllowed();
-    this.runtimeCoordinator = acquireRuntimeCoordinator(config.statePath);
-    let stateStore: BridgeStateStore | undefined;
-    try {
-      stateStore = new BridgeStateStore(config.statePath, undefined, {
-        deferRuntimePreflight: true,
-        runtimeCoordinator: this.runtimeCoordinator,
-      });
-      this.stateStore = stateStore;
-      this.adapterRegistry = new AgentAdapterRegistry(
-        config.hostId, this.stateStore, () => this.scheduleRegistryReconciliation(), registryNow,
-      );
-      this.adapterClient = new AgentAdapterClient(this.adapterRegistry);
-      this.adapterServer = new AgentAdapterServer(
-        { port: config.agentAdapter.port, secret: config.agentAdapter.secret, hostId: config.hostId },
-        this.adapterRegistry,
-        () => this.stateStore.getRuntimeHealth(),
-      );
-      this.drivers = drivers ?? [new PaiDriver(this.adapterClient, config.hostId)];
-      this.router = new CommandRouter(this.stateStore, new Map(this.drivers.map((driver) => [driver.name, driver])), config.hostId);
-    } catch (error) {
-      stateStore?.dispose();
-      this.runtimeCoordinator.dispose();
-      throw error;
-    }
+    const shell = createBridgeDaemonShell({
+      config,
+      drivers,
+      registryNow,
+      onRegistryMutation: () => this.scheduleRegistryReconciliation(),
+    });
+    this.runtimeCoordinator = shell.runtimeCoordinator;
+    this.stateStore = shell.stateStore;
+    this.adapterRegistry = shell.adapterRegistry;
+    this.adapterServer = shell.adapterServer;
+    this.drivers = shell.drivers;
+    this.router = shell.router;
+  }
+  private writeAdapterConfig(configPath: string, config: AgentAdapterDiscoveryFile): void {
+    writeAgentAdapterConfig(configPath, config);
   }
 
   private stopped = false;
   private relayAbortController = new AbortController();
   async start(): Promise<void> {
     await this.validateStartup();
-    await this.adapterServer.start();
-    writeAgentAdapterConfig(this.config.agentAdapter.configPath, {
-      url: this.adapterServer.url,
-      secret: this.config.agentAdapter.secret,
-      protocolVersion: AGENT_ADAPTER_PROTOCOL_VERSION,
+    await activateBridgeDaemonServer({
+      adapterServer: this.adapterServer,
+      config: this.config,
+      writeDiscovery: (evidence) => this.writeAdapterConfig(this.config.agentAdapter.configPath, evidence),
     });
     this.schedulePresenceHeartbeat();
   }
@@ -328,46 +319,54 @@ export class BridgeDaemon {
   private async validateStartup(): Promise<void> {
     if (this.startupValidated) return;
     try {
-      assertProductionNodeRuntime();
-      assertNodeCryptoSelfTest();
-      this.verifyFilesystem();
-      const identity = await this.resolveIdentityStore().load();
-      if (!identity) throw new HostIdentityError('ERR_IDENTITY_NOT_INITIALIZED', 'Host identity is not initialized; run `ariava init`');
-      if (!this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
-        throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Configured identity metadata does not match the local Host identity');
-      }
-      // Preflight runtime state before creating dependent encryption material in Bun and Node.
-      const recovery = this.stateStore.initializeEncryptedSpool(
-        identity.hostId, this.config.identityPath, this.config.runtimePlatform ?? process.platform,
-      );
-      if (recovery.droppedUnreadableItems > 0) {
-        process.stderr.write(`Ariava dropped ${recovery.droppedUnreadableItems} unreadable encrypted spool item(s).\n`);
-      }
-      this.encryptionStore = createRuntimeHostEncryptionIdentityStore(this.config.identityPath, this.config.runtimePlatform ?? process.platform);
-      this.encryptionIdentity = this.encryptionStore.loadOrCreate(identity.hostId);
-      const hostBinding = await createHostEncryptionBinding(identity, this.encryptionIdentity);
-      this.keyringMigrationContext = { currentHostIdentity: identity, signedCurrentHostBinding: hostBinding };
-      this.keyring = new LocalLinkKeyring(
-        `${this.config.identityPath}.e2e-keyring.json`, this.encryptionStore, this.keyringMigrationContext,
-      );
-      this.stateStore.validateCommandExecutionPins(this.keyring, { allowUnavailableForTerminal: true });
-      this.relayClient = new RelayClient(
-        { baseUrl: this.config.relayBaseUrl, signer: identity.signer },
-        () => this.relayAbortController.signal,
-      );
-      try {
-        await this.refreshCommandAuthority();
-        this.stateStore.recoverOrphanedCommandExecutions();
-        await recoverBlockedCommandReceipts(this.stateStore, this.keyring, this.commandReceiptConstruction);
-        await drainPendingCommandReceipts(this.stateStore, this.keyring, this.client());
-        this.pruneCommandRuntime();
-      } catch {
-        // Command recovery stays frozen until an authoritative snapshot succeeds.
-      }
+      const active = await activateBridgeRuntime({
+        config: this.config,
+        stateStore: this.stateStore,
+        signal: () => this.relayAbortController.signal,
+        verifyFilesystem: () => this.verifyFilesystem(),
+        loadValidatedIdentity: async () => {
+          const identity = await this.resolveIdentityStore().load();
+          if (!identity) throw new HostIdentityError('ERR_IDENTITY_NOT_INITIALIZED', 'Host identity is not initialized; run `ariava init`');
+          if (!this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
+            throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Configured identity metadata does not match the local Host identity');
+          }
+          return identity;
+        },
+        onDroppedUnreadableItems: (count) => {
+          if (count > 0) process.stderr.write(`Ariava dropped ${count} unreadable encrypted spool item(s).\n`);
+        },
+        runCommandRecovery: (relayClient, keyring) => this.recoverStartupCommands(relayClient, keyring),
+        onEventFailure: (failure) => this.encryptedEventFailureLogger.record(failure),
+        commit: (partial) => {
+          // Mirror each activation-created resource into its daemon field at
+          // the exact baseline assignment point, preserving characterized
+          // partial visibility when activation fails mid-way.
+          if (partial.encryptionStore !== undefined) this.encryptionStore = partial.encryptionStore;
+          if (partial.encryptionIdentity !== undefined) this.encryptionIdentity = partial.encryptionIdentity;
+          if (partial.keyringMigrationContext !== undefined) this.keyringMigrationContext = partial.keyringMigrationContext;
+          if (partial.keyring !== undefined) this.keyring = partial.keyring;
+          if (partial.relayClient !== undefined) this.relayClient = partial.relayClient;
+          if (partial.uploadActions !== undefined) this.uploadActions = partial.uploadActions;
+        },
+      });
+      this.activeRuntime = active;
       this.startupValidated = true;
     } catch (error) {
       this.disposeRuntimeCoordinator();
       throw error;
+    }
+  }
+
+  private async recoverStartupCommands(relayClient: RelayClient, keyring: LocalLinkKeyring): Promise<void> {
+    // Adopt the activation-created resources so the characterized recovery seams
+    // (refreshCommandAuthority / pruneCommandRuntime) run on the daemon fields
+    // exactly as they do during normal sync (Task 1 tests inject the Relay here).
+    this.relayClient = relayClient;
+    this.keyring = keyring;
+    try {
+      await recoverStartupCommandPipeline(this.commandDependencies());
+    } catch {
+      // Command recovery stays frozen until an authoritative snapshot succeeds.
     }
   }
 
@@ -469,92 +468,57 @@ export class BridgeDaemon {
   }
 
   private assertHostDomainResetStartAllowed(): void {
-    const journalPath = resolve(dirname(this.config.configPath), 'host-domain-reset.json');
-    if (!pathHasFilesystemEvidence(journalPath)) return;
-    const profile = configPathMatchesProfile(this.config.configPath, 'dev') ? createDevProfile() : createDefaultProfile();
-    const resources = profile.resolveResources(resolvePersistedAriavaConfig(this.config.configPath));
-    assertHostDomainResetRuntimeStartAllowed(resources);
+    assertHostDomainResetStartAllowed(this.config);
   }
 
   private async performSyncOnce(): Promise<BridgeSyncResult> {
-    try {
-      this.assertHostDomainResetStartAllowed();
-    } catch (error) {
-      this.stop();
-      throw error;
-    }
-    await this.validateStartup();
-    this.reconciliationRequested = false;
-    let offline = false;
-    try {
-      await this.ensureHostPresence();
-    } catch {
-      offline = true;
-    }
-    if (!offline) await this.reconcileRecipientsAndDrainReceipts();
+    // §9: one linear sync pass in `sync-workflow.ts`. Every effect stays
+    // daemon-owned (spec §8): single-flight/coalescing, stop, timers/scheduling,
+    // presence/receipt/command flights, snapshot failure state, and the
+    // logging/health authorities are reached only through this narrow contract.
+    return performBridgeSyncOnce({
+      assertHostDomainResetStartAllowed: () => this.assertHostDomainResetStartAllowed(),
+      stop: () => this.stop(),
+      validateStartup: () => this.validateStartup(),
+      acknowledgeSyncPass: () => { this.reconciliationRequested = false; },
+      ensureHostPresence: () => this.ensureHostPresence(),
+      reconcileRecipientsAndDrainReceipts: () => this.reconcileRecipientsAndDrainReceipts(),
+      drivers: () => this.drivers,
+      hostId: this.config.hostId,
+      pollIntervalMs: this.config.pollIntervalMs,
+      listSessions: () => this.stateStore.listSessions(),
+      getDriverNameForSession: (sessionId) => this.stateStore.getDriverNameForSession(sessionId),
+      replaceDriverSessions: (driverName, sessions) => this.stateStore.replaceDriverSessions(driverName, sessions),
+      recordDriverReconciliationFailure: (driverName, observedAt, nextRetryAt) => this.recordDriverReconciliationFailure(driverName, observedAt, nextRetryAt),
+      recordDriverReconciliationSuccess: (driverName) => this.recordDriverReconciliationSuccess(driverName),
+      flushCurrentSessionsSnapshot: (currentSessions) => this.flushCurrentSessionsSnapshot(currentSessions),
+      recordLocalSnapshotPublicationFailure: (error, activeSessions) => this.recordLocalSnapshotPublicationFailure(error, activeSessions),
+      handleCurrentSessionsSnapshotFailure: (error, activeSessions) => this.handleCurrentSessionsSnapshotFailure(error, activeSessions),
+      sessionPublicationRecovered: () => this.sessionPublicationBlockLogger.recovered(),
+      sessionPublicationBlocked: (blockedSessionCount) => this.sessionPublicationBlockLogger.blocked(blockedSessionCount),
+      eventsMayDrain: (outcome) => this.eventsMayDrain(outcome),
+      flushPendingEvents: () => this.flushPendingEvents(),
+      flushPendingHandles: () => this.flushPendingHandles(),
+      pullAndHandleCommands: () => this.pullAndHandleCommands(),
+      getHost: () => this.stateStore.getHost(),
+    });
+  }
 
-    const newEvents: CanonicalEvent[] = [];
-    let authoritativeSetComplete = true;
-    for (const driver of this.drivers) {
-      const observedAt = isoNow();
-      const nextRetryAt = new Date(Date.parse(observedAt) + this.config.pollIntervalMs).toISOString();
-      try {
-        const persistedDriverSessions = this.stateStore.listSessions()
-          .filter((session) => this.stateStore.getDriverNameForSession(session.sessionId) === driver.name);
-        const sessions = await driver.listSessions(this.config.hostId);
-        if (driver.isAuthoritativeSetReady?.(persistedDriverSessions) === false) {
-          authoritativeSetComplete = false;
-          const degradation = this.stateStore.recordDriverReconciliationFailure(driver.name, observedAt, nextRetryAt);
-          this.runtimeHealthLogger.failure('driver', driver.name, degradation.count);
-          continue;
-        }
-        this.stateStore.replaceDriverSessions(driver.name, sessions);
-        const recovered = this.stateStore.recordDriverReconciliationSuccess(driver.name);
-        if (recovered) this.runtimeHealthLogger.recovery('driver', driver.name, recovered.count);
-      } catch {
-        authoritativeSetComplete = false;
-        const degradation = this.stateStore.recordDriverReconciliationFailure(driver.name, observedAt, nextRetryAt);
-        this.runtimeHealthLogger.failure('driver', driver.name, degradation.count);
-      }
-    }
-    // A driver failure must never turn a partial list into an authoritative replacement.
-    // Successful drivers have been reconciled above, while failed drivers retain their last
-    // complete persisted set. Build the Host snapshot only from that reconciled store.
-    const nextSessions = this.stateStore.listSessions();
-    const activeSessions = nextSessions;
-    let sessionPublicationOutcome: SessionPublicationOutcome = { type: 'deferred', reason: 'network' };
-    if (authoritativeSetComplete && !offline) {
-      try {
-        sessionPublicationOutcome = await this.flushCurrentSessionsSnapshot(activeSessions);
-        if (sessionPublicationOutcome.type === 'deferred' && sessionPublicationOutcome.reason === 'network') offline = true;
-      }
-      catch (error) {
-        if (snapshotError(error, 'session_snapshot_conflict')) throw new Error('Relay rejected the persisted E2E lifecycle revision as conflicting', { cause: error });
-        if (!(error instanceof RelayClientError) && !(error instanceof RelayTransportError)) {
-          // Storage/canonicalization/keyring/crypto/Relay-response-shape faults are
-          // local fail-closed conditions, not evidence that the Host is offline.
-          // Keep unrelated handles/commands alive while Session/Event publication
-          // remains stopped for this pass.
-          this.logCurrentSessionsSnapshotFailure(error, activeSessions);
-          this.scheduleRegistryReconciliation();
-          sessionPublicationOutcome = { type: 'fail-closed' };
-        } else {
-          const recovery = await this.handleCurrentSessionsSnapshotFailure(error, activeSessions);
-          offline = !recovery.online;
-          sessionPublicationOutcome = recovery.outcome;
-        }
-      }
-    }
-    if (sessionPublicationOutcome.type === 'published' || sessionPublicationOutcome.type === 'unchanged') {
-      this.sessionPublicationBlockLogger.recovered();
-    } else if (sessionPublicationOutcome.type === 'locally-blocked') {
-      this.sessionPublicationBlockLogger.blocked(sessionPublicationOutcome.blockedSessionCount);
-    }
-    const eventsMayDrain = !offline && this.eventsMayDrain(sessionPublicationOutcome);
-    const flushedEvents = !eventsMayDrain ? 0 : await this.flushPendingEvents();
-    const flushedReads = offline ? 0 : await this.flushPendingHandles();
-    const handledCommands = offline ? [] : await this.pullAndHandleCommands();
-    return { host: this.stateStore.getHost(), sessions: nextSessions, emittedEvents: newEvents, flushedEvents, flushedReads, handledCommands, offline };
+  private recordDriverReconciliationFailure(driverName: string, observedAt: string, nextRetryAt: string): void {
+    const degradation = this.stateStore.recordDriverReconciliationFailure(driverName, observedAt, nextRetryAt);
+    this.runtimeHealthLogger.failure('driver', driverName, degradation.count);
+  }
+
+  private recordDriverReconciliationSuccess(driverName: string): void {
+    const recovered = this.stateStore.recordDriverReconciliationSuccess(driverName);
+    if (recovered) this.runtimeHealthLogger.recovery('driver', driverName, recovered.count);
+  }
+
+  private recordLocalSnapshotPublicationFailure(error: unknown, activeSessions: CanonicalSessionState[]): void {
+    const logDecision = decideSnapshotFailureLog(this.snapshotFailureState, Date.now(), 'publish');
+    this.snapshotFailureState = logDecision.next;
+    if (logDecision.shouldLog) this.logCurrentSessionsSnapshotFailure(error, logDecision.next.count, 'publish', activeSessions);
+    this.scheduleRegistryReconciliation();
   }
 
   /**
@@ -578,16 +542,24 @@ export class BridgeDaemon {
     return false;
   }
 
-  private resetCurrentSessionsSnapshotFailures(): void { this.currentSessionsSnapshotFailureCount = 0; }
+  private resetCurrentSessionsSnapshotFailures(): void {
+    this.snapshotFailureState = resetSnapshotFailures(this.snapshotFailureState);
+  }
 
   private async handleCurrentSessionsSnapshotFailure(error: unknown, activeSessions: CanonicalSessionState[]): Promise<{ online: boolean; outcome: SessionPublicationOutcome }> {
-    this.currentSessionsSnapshotFailureCount += 1;
-    this.logCurrentSessionsSnapshotFailure(error, activeSessions);
+    // The pure reducer runs first with only clock evidence and the next state is
+    // assigned before any active-session/revision inspection. Summary evidence is
+    // collected only when `shouldLog`, so throttled failures do no summary state-
+    // store reads; the baseline log-then-schedule effect order is preserved.
+    const decision = this.snapshotFailureDecision('publication-failure');
+    this.snapshotFailureState = decision.next;
+    if (decision.shouldLog) this.logCurrentSessionsSnapshotFailure(error, decision.next.count, 'publish', activeSessions);
     this.scheduleRegistryReconciliation();
-    if (this.currentSessionsSnapshotFailureCount < 2) return { online: false, outcome: { type: 'deferred', reason: 'network' } };
+    if (decision.action === 'retry') return { online: false, outcome: { type: 'deferred', reason: 'network' } };
+    if (decision.action !== 'recover-pipeline') throw new Error(`Unexpected snapshot failure action: ${decision.action}`);
     try {
       await this.recoverCurrentSessionsSnapshotPipeline(activeSessions);
-      const recoveredAfter = this.currentSessionsSnapshotFailureCount;
+      const recoveredAfter = this.snapshotFailureState.count;
       const outcome = await this.flushCurrentSessionsSnapshot(activeSessions);
       this.resetCurrentSessionsSnapshotFailures();
       if (outcome.type === 'deferred') {
@@ -600,36 +572,61 @@ export class BridgeDaemon {
       process.stderr.write(`Ariava recovered current-session snapshot publication after ${recoveredAfter} failure(s).\n`);
       return { online: true, outcome };
     } catch (recoveryError) {
-      this.logCurrentSessionsSnapshotFailure(recoveryError, activeSessions, 'recovery');
+      const recoveryDecision = this.snapshotFailureDecision('recovery-failure');
+      this.snapshotFailureState = recoveryDecision.next;
+      if (recoveryDecision.shouldLog) this.logCurrentSessionsSnapshotFailure(recoveryError, recoveryDecision.next.count, 'recovery', activeSessions);
       this.scheduleRegistryReconciliation();
-      return { online: false, outcome: { type: 'deferred', reason: 'network' } };
+      // Execute the returned action instead of hardcoding mark-offline.
+      if (recoveryDecision.action === 'mark-offline') return { online: false, outcome: { type: 'deferred', reason: 'network' } };
+      throw new Error(`Unexpected snapshot recovery action: ${recoveryDecision.action}`);
     }
+  }
+
+  private snapshotFailureDecision(type: 'publication-failure' | 'recovery-failure'): SnapshotFailureDecision {
+    return decideSnapshotFailure(this.snapshotFailureState, { type, now: Date.now() });
   }
 
   private async recoverCurrentSessionsSnapshotPipeline(_activeSessions: CanonicalSessionState[]): Promise<void> {
     if (this.encryptionStore) {
-      this.keyring = new LocalLinkKeyring(
+      const keyring = new LocalLinkKeyring(
         `${this.config.identityPath}.e2e-keyring.json`, this.encryptionStore, this.keyringMigrationContext,
       );
+      this.keyring = keyring;
+      // Rebind the upload actions to the rebuilt keyring so the bound instance
+      // captures the same keyring instance the daemon uses (the baseline facade
+      // captured the current keyring at each on-demand construction).
+      this.uploadActions = createEncryptedUploadActions({
+        stateStore: this.stateStore,
+        relayClient: this.client(),
+        crypto: DEFAULT_ENCRYPTED_UPLOAD_CRYPTO,
+        keyring,
+        hooks: { eventFailure: (failure) => this.encryptedEventFailureLogger.record(failure) },
+      });
+      if (this.activeRuntime) this.activeRuntime = { ...this.activeRuntime, keyring, uploadActions: this.uploadActions };
     }
     // `flushCurrentSessionsSnapshot()` performs the exact all-inflight reconcile
     // after immutable full-set preflight. Keeping one owner avoids reconciling and
     // then losing the fact that a replacement manifest must be forced.
   }
 
-  private logCurrentSessionsSnapshotFailure(error: unknown, activeSessions: CanonicalSessionState[], phase = 'publish'): void {
-    const now = Date.now();
-    if (phase === 'publish' && now - this.lastCurrentSessionsSnapshotFailureLogAt < 30_000) return;
-    this.lastCurrentSessionsSnapshotFailureLogAt = now;
+  private logCurrentSessionsSnapshotFailure(error: unknown, failures: number, phase: 'publish' | 'recovery', activeSessions: CanonicalSessionState[]): void {
+    // Called only when the pure decision says `shouldLog`. Summary evidence is
+    // aggregated here (state-store revision inspection + capping) so throttled
+    // failures perform no state-store reads; only the log effect remains in the
+    // class.
+    const summary = summarizeSnapshotFailures({
+      activeSessionCount: activeSessions.length,
+      sessionsWithoutRevision: activeSessions
+        .filter((session) => this.stateStore.currentSessionRevision(session.sessionId) === 0)
+        .map((session) => session.sessionId),
+    });
     const snapshot = this.stateStore.getCurrentSessionsSnapshotState();
-    const sessionsWithoutRevision = activeSessions.filter((session) => this.stateStore.currentSessionRevision(session.sessionId) === 0);
-    const sessionIdsWithoutRevision = sessionsWithoutRevision.slice(0, 10).map((session) => session.sessionId);
     const detail = {
       phase,
-      failures: this.currentSessionsSnapshotFailureCount,
-      activeSessionCount: activeSessions.length,
-      noRevisionSessionCount: sessionsWithoutRevision.length,
-      noRevisionSessionIds: sessionIdsWithoutRevision,
+      failures,
+      activeSessionCount: summary.activeSessionCount,
+      noRevisionSessionCount: summary.noRevisionSessionCount,
+      noRevisionSessionIds: summary.noRevisionSessionIds,
       lastAcceptedRevision: snapshot.lastAcceptedRevision,
       lastAllocatedRevision: snapshot.lastAllocatedRevision,
       lastAcceptedRecipientSetVersion: snapshot.lastAcceptedRecipientSetVersion,
@@ -688,15 +685,15 @@ export class BridgeDaemon {
 
   private async buildEnrollment(identity: HostIdentity): Promise<HostEnrollmentRequest> {
     if (!this.encryptionIdentity) throw new HostIdentityError('ERR_IDENTITY_MISSING', 'Host encryption identity is not loaded');
-    return {
-      hostId: identity.hostId, keyId: identity.keyId, algorithm: identity.algorithm, publicKey: identity.publicKey,
+    return buildHostEnrollmentRequest({
+      identity,
       encryptionBinding: await createHostEncryptionBinding(identity, this.encryptionIdentity),
-      ...this.buildHostMetadata(),
-    };
-  }
-
-  private buildHostMetadata(): HostMetadataUpdateRequest {
-    return { hostName: this.config.hostName, platform: this.config.hostPlatform, bridgeVersion: this.config.bridgeVersion };
+      hostMetadata: buildHostMetadata({
+        hostName: this.config.hostName,
+        hostPlatform: this.config.hostPlatform,
+        bridgeVersion: this.config.bridgeVersion,
+      }),
+    });
   }
 
   private ensureHostPresence(): Promise<void> {
@@ -725,14 +722,18 @@ export class BridgeDaemon {
     return flight;
   }
 
-  private async registerHostPresence(): Promise<void> {
-    const identity = await this.resolveIdentityStore().load();
-    if (!identity || !this.config.identity || !samePersistedIdentity(this.config.identity, identity, this.config)) {
-      throw new HostIdentityError('ERR_IDENTITY_INVALID', 'Host identity changed while daemon was running');
-    }
-    const response = await this.client().enrollHost(await this.buildEnrollment(identity));
-    if (this.stopped) return;
-    this.stateStore.setHost(response.host);
+  private registerHostPresence(): Promise<void> {
+    // The enrollment/register effect body lives in the narrow presence runner;
+    // single-flight, timer, scheduling, clock, health recording, and stop
+    // ownership stay in this class (spec §8).
+    return performHostPresenceRegistration({
+      loadIdentity: () => this.resolveIdentityStore().load(),
+      matchesConfiguredIdentity: (identity) => this.config.identity !== undefined && samePersistedIdentity(this.config.identity, identity, this.config),
+      buildEnrollment: (identity) => this.buildEnrollment(identity),
+      enrollHost: (request) => this.client().enrollHost(request),
+      isStopped: () => this.stopped,
+      setHost: (host) => this.stateStore.setHost(host),
+    });
   }
 
   private async sendCurrentSessionsPublication(
@@ -766,13 +767,13 @@ export class BridgeDaemon {
       // content block never allocates a publication revision, never creates/replaces
       // inflight, and never sends a manifest. The Relay keeps its last accepted
       // membership; the local Sessions keep receiving heartbeats/content updates.
-      const blockedSessionCount = this.uploadOrchestrator().preflightAuthoritativeSessionSet(currentSessions);
+      const blockedSessionCount = this.uploadActions.preflightAuthoritativeSessionSet(currentSessions);
       if (blockedSessionCount > 0) {
         // §4.4: a content block must NOT strand committed Session inflight evidence;
         // converge it (revision + inflight removal) before returning locally-blocked.
         // Uncommitted/unknown evidence stays byte-preserved; malformed/cross-bound
         // evidence fails closed (recovery-required).
-        const reconciled = await this.uploadOrchestrator().reconcileSessionInflights(currentSessions);
+        const reconciled = await this.uploadActions.reconcileSessionInflights(currentSessions);
         if (reconciled.deferred) return { type: 'fail-closed' };
         return { type: 'locally-blocked', reason: 'content', blockedSessionCount, recipientSetVersion: recipientSnapshot.recipientSetVersion };
       }
@@ -781,7 +782,7 @@ export class BridgeDaemon {
       // response may leave a committed revision represented only by inflight evidence.
       // Reconcile every active/orphan V2 or legacy record before deciding `unchanged`.
       const hadSessionInflights = this.stateStore.listInflightSessionIds().length > 0;
-      const reconciled = await this.uploadOrchestrator().reconcileSessionInflights(currentSessions);
+      const reconciled = await this.uploadActions.reconcileSessionInflights(currentSessions);
       if (reconciled.deferred) return { type: 'fail-closed' };
       const minimumRevision = hadSessionInflights
         ? this.stateStore.getCurrentSessionsSnapshotState().lastAcceptedRevision + 1
@@ -790,7 +791,7 @@ export class BridgeDaemon {
         this.config.hostId, currentSessions, recipientSnapshot.recipientSetVersion, isoNow(), minimumRevision,
       );
       if (!publication) return { type: 'unchanged' };
-      const outcome = await this.uploadOrchestrator().publishAuthoritativeSnapshots(
+      const outcome = await this.uploadActions.publishAuthoritativeSnapshots(
         recipientSnapshot, recipients, currentSessions,
       );
       if (outcome.type !== 'published') {
@@ -836,18 +837,12 @@ export class BridgeDaemon {
     await this.validateStartup();
     if (!this.encryptionIdentity || !this.keyring) return false;
     const snapshot = await this.client().recipientSnapshot();
-    return this.uploadOrchestrator().publishRecipientChangeSnapshots(snapshot, this.keyring.reconcileRecipients(snapshot));
+    return this.uploadActions.publishRecipientChangeSnapshots(snapshot, this.keyring.reconcileRecipients(snapshot));
   }
 
   private async flushPendingEvents(): Promise<number> {
     if (!this.encryptionIdentity || !this.keyring) return 0;
-    return this.uploadOrchestrator().flushPendingEvents();
-  }
-
-  private uploadOrchestrator(): EncryptedUploadOrchestrator {
-    return new EncryptedUploadOrchestrator(this.stateStore, this.client(), this.keyring!, {
-      eventFailure: (failure) => this.encryptedEventFailureLogger.record(failure),
-    });
+    return this.uploadActions.flushPendingEvents();
   }
 
   private async flushPendingHandles(): Promise<number> {
@@ -879,107 +874,44 @@ export class BridgeDaemon {
   }
 
   private async performReconciledReceiptDrain(): Promise<number> {
-    if (!this.keyring || !this.stateStore.listCommandExecutions().some((execution) =>
-      execution.state === 'terminal' && execution.receiptOutbox?.state === 'pending')) return 0;
-    try {
-      await this.refreshCommandAuthority();
-    } catch {
-      return 0;
-    }
-    return drainPendingCommandReceipts(this.stateStore, this.keyring, this.client());
+    if (!this.keyring) return 0;
+    return performReconciledReceiptDrain(this.commandDependencies());
   }
 
   private async pullAndHandleCommands(): Promise<CommandResult[]> {
     if (this.commandFlightActive) return [];
     this.commandFlightActive = true;
     try {
-    if (!this.keyring) throw new Error('E2E command keyring is unavailable');
-    try {
-      await this.refreshCommandAuthority();
-    } catch {
-      return [];
-    }
-    await recoverBlockedCommandReceipts(this.stateStore, this.keyring, this.commandReceiptConstruction);
-    await drainPendingCommandReceipts(this.stateStore, this.keyring, this.client());
-    this.pruneCommandRuntime();
-    const commands = await this.client().pullCommands(this.config.hostId);
-    const handled: CommandResult[] = [];
-    for (const encrypted of commands) {
-      const preparation = await prepareCommandForExecution(encrypted, this.keyring, this.commandNow);
-      if (!preparation.ok) continue;
-      const { prepared } = preparation;
-      const claim = this.stateStore.claimCommandExecution({
-        originalEncryptedCommand: prepared.originalEncryptedCommand, commandDigest: prepared.commandDigest,
-        pinReference: prepared.pinReference, claimedAt: this.commandNow().toISOString(),
-      });
-      if (claim.status === 'conflict') throw new Error('Relay command replay nonce or body conflict');
-      if (claim.status === 'duplicate') continue;
-      let dispatchStarted = false;
-      let terminalResult: CommandResult | undefined;
-      try {
-        const outcome = await this.router.handle(prepared.loopbackCommand, { beforeDispatch: () => {
-          this.stateStore.markCommandDispatchStarted(encrypted.commandId, this.commandNow().toISOString());
-          dispatchStarted = true;
-        } });
-        if (!validateCommandResult(outcome.result)) {
-          if (dispatchStarted) this.markCommandOutcomeUnknownIfActive(encrypted.commandId);
-          continue;
-        }
-        terminalResult = outcome.result;
-      } catch {
-        this.markCommandOutcomeUnknownIfActive(encrypted.commandId);
-        continue;
-      }
-      if (this.stopped) continue;
-      try {
-        await this.refreshCommandAuthority();
-      } catch {
-        this.stateStore.persistTerminalReceiptBlocked(encrypted.commandId, terminalResult);
-        handled.push(terminalResult);
-        continue;
-      }
-      await persistTerminalCommandResult(
-        this.stateStore, this.keyring, encrypted.commandId, terminalResult, this.commandReceiptConstruction,
-      );
-      await drainPendingCommandReceipts(this.stateStore, this.keyring, this.client());
-      this.pruneCommandRuntime();
-      handled.push(terminalResult);
-    }
-    return handled;
+      return await performCommandPullAndDispatch(this.commandDependencies());
     } finally {
       this.commandFlightActive = false;
     }
   }
 
   private async refreshCommandAuthority(): Promise<E2ERecipientSnapshotV1> {
-    if (!this.keyring) throw new Error('E2E command keyring is unavailable');
-    const snapshot = await this.client().recipientSnapshot();
-    const acceptedVersion = this.stateStore.getRecipientSetVersion();
-    if (acceptedVersion !== undefined && snapshot.recipientSetVersion < acceptedVersion) {
-      throw new TypeError('recipient snapshot rollback rejected');
-    }
-    if (acceptedVersion === snapshot.recipientSetVersion) {
-      const active = this.keyring.listActive().map((pin) =>
-        `${pin.linkId}:${pin.linkGeneration}:${pin.epoch}:${pin.watchDeviceId}:${pin.watchBinding.encryptionKeyId}`).sort();
-      const received = snapshot.recipients.map((recipient) =>
-        `${recipient.linkId}:${recipient.linkGeneration}:${recipient.epoch}:${recipient.watchDeviceId}:${recipient.watchBinding.encryptionKeyId}`).sort();
-      if (JSON.stringify(active) !== JSON.stringify(received)) {
-        throw new TypeError('recipient snapshot version conflict rejected');
-      }
-    }
-    this.keyring.reconcileRecipients(snapshot);
-    this.stateStore.setRecipientSetVersion(snapshot.recipientSetVersion);
-    return snapshot;
+    return refreshCommandAuthority(this.commandDependencies());
   }
 
   private pruneCommandRuntime(now = this.commandNow().toISOString()): void {
     if (!this.keyring) return;
-    this.stateStore.pruneEligibleCommandExecutions(now);
-    const references = mergePinRetentionReferences(
-      this.stateStore.durableContentPinRetentionReferences(now),
-      this.stateStore.commandExecutionPinRetentionReferences(),
-    );
-    this.keyring.pruneRetiring(references, now);
+    pruneCommandRuntime(this.commandDependencies(), now);
+  }
+
+  private commandDependencies(): CommandWorkflowDependencies {
+    if (!this.keyring) throw new Error('E2E command keyring is unavailable');
+    return {
+      stateStore: this.stateStore,
+      keyring: this.keyring,
+      relayClient: () => this.client(),
+      router: this.router,
+      hostId: this.config.hostId,
+      now: () => this.commandNow(),
+      receiptConstruction: this.commandReceiptConstruction,
+      isStopped: () => this.stopped,
+      markOutcomeUnknownIfActive: (commandId) => this.markCommandOutcomeUnknownIfActive(commandId),
+      refreshAuthority: () => this.refreshCommandAuthority(),
+      prune: (now) => this.pruneCommandRuntime(now),
+    };
   }
 
 
@@ -1000,27 +932,8 @@ export class BridgeDaemon {
 }
 
 
-function mergePinRetentionReferences(...inputs: PinRetentionReferences[]): PinRetentionReferences {
-  const merged: PinRetentionReferences = {};
-  for (const input of inputs) {
-    for (const [category, values] of Object.entries(input) as Array<
-      [keyof PinRetentionReferences, Record<string, string> | undefined]
-    >) {
-      if (!values) continue;
-      const target = merged[category] ?? {};
-      for (const [key, timestamp] of Object.entries(values)) {
-        if (!target[key] || target[key]! < timestamp) target[key] = timestamp;
-      }
-      merged[category] = target;
-    }
-  }
-  return merged;
-}
 
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === 'AbortError';
-}
 
 
 function samePersistedIdentity(
@@ -1042,24 +955,4 @@ function samePersistedIdentity(
     && configured.algorithm === actual.algorithm
     && configured.createdAt === actual.createdAt
     && storageMatches;
-}
-
-
-function configPathMatchesProfile(configPath: string, profile: 'dev'): boolean {
-  return profile === 'dev' && resolve(configPath) === resolve(resolveAriavaDevProfilePaths().configPath);
-}
-
-
-function snapshotError(
-  error: unknown,
-  code: 'session_snapshot_stale' | 'session_snapshot_conflict' | 'e2e_recipient_not_ready' | 'e2e_recipient_set_changed' | 'e2e_session_reference_invalid',
-): { acceptedRevision?: number } | undefined {
-  if (!(error instanceof RelayClientError) || error.status !== 409 || !error.body || typeof error.body !== 'object') return undefined;
-  const body = error.body as Record<string, unknown>;
-  const reason = typeof body.code === 'string' ? body.code
-    : typeof body.error === 'string' ? body.error
-      : typeof body.reason === 'string' ? body.reason : error.reason;
-  if (reason !== code) return undefined;
-  if (code === 'session_snapshot_stale' && (typeof body.acceptedRevision !== 'number' || !Number.isSafeInteger(body.acceptedRevision))) return undefined;
-  return typeof body.acceptedRevision === 'number' ? { acceptedRevision: body.acceptedRevision } : {};
 }

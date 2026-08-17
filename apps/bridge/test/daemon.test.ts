@@ -337,6 +337,81 @@ async function createReconciledReceiptHarness(input: {
   };
 }
 
+function instrumentDaemonStoreDisposal(
+  daemon: BridgeDaemon,
+  onDispose: () => void = () => {},
+): { stateStore: BridgeStateStore; count(): number } {
+  const stateStore = (daemon as any).stateStore as BridgeStateStore;
+  const original = stateStore.dispose.bind(stateStore);
+  let count = 0;
+  stateStore.dispose = () => {
+    count += 1;
+    onDispose();
+    original();
+  };
+  return { stateStore, count: () => count };
+}
+
+function installFakeStartupRelay(
+  daemon: BridgeDaemon,
+  overrides: Record<string, (...args: any[]) => unknown> = {},
+): { recipientSnapshotCalls(): number; relay: Record<string, (...args: any[]) => unknown> } {
+  const internals = daemon as any;
+  const originalRefreshCommandAuthority = internals.refreshCommandAuthority.bind(daemon);
+  const snapshot = {
+    version: 1 as const,
+    hostId: internals.config.hostId,
+    recipientSetVersion: 1,
+    recipients: [],
+  };
+  const overrideRecipientSnapshot = overrides.recipientSnapshot;
+  let recipientSnapshotCalls = 0;
+  const relay = {
+    ...overrides,
+    recipientSnapshot: async () => {
+      recipientSnapshotCalls += 1;
+      return overrideRecipientSnapshot ? overrideRecipientSnapshot() : snapshot;
+    },
+  };
+  internals.refreshCommandAuthority = async () => {
+    internals.relayClient = relay;
+    return originalRefreshCommandAuthority();
+  };
+  return { recipientSnapshotCalls: () => recipientSnapshotCalls, relay };
+}
+
+function instrumentConstructorRollbackDisposal(order: string[]): {
+  coordinatorDisposes(): number;
+  restore(): void;
+} {
+  const prototype = BridgeStateStore.prototype as unknown as { dispose(): void };
+  const originalStoreDispose = prototype.dispose;
+  let coordinator: { dispose(): void } | undefined;
+  let originalCoordinatorDispose: (() => void) | undefined;
+  let coordinatorDisposes = 0;
+  prototype.dispose = function (this: BridgeStateStore): void {
+    order.push('state-store');
+    const currentCoordinator = (this as any).runtimeCoordinator as { dispose(): void };
+    if (!coordinator) {
+      coordinator = currentCoordinator;
+      originalCoordinatorDispose = currentCoordinator.dispose;
+      currentCoordinator.dispose = () => {
+        coordinatorDisposes += 1;
+        order.push('coordinator');
+        originalCoordinatorDispose!.call(currentCoordinator);
+      };
+    }
+    originalStoreDispose.call(this);
+  };
+  return {
+    coordinatorDisposes: () => coordinatorDisposes,
+    restore: () => {
+      prototype.dispose = originalStoreDispose;
+      if (coordinator && originalCoordinatorDispose) coordinator.dispose = originalCoordinatorDispose;
+    },
+  };
+}
+
 describe('BridgeDaemon', () => {
   test('loads PaiDriver by default', () => {
     const config = loadBridgeConfig();
@@ -971,9 +1046,20 @@ describe('BridgeDaemon', () => {
     expect(context.currentHostIdentity.hostId).toBe(identity.hostId);
     expect(context.signedCurrentHostBinding.identityKeyId).toBe(identity.keyId);
     const original = (daemon as any).keyring;
+    const originalUploadActions = (daemon as any).uploadActions;
+    const originalActiveRuntime = (daemon as any).activeRuntime;
+    // Pre-recovery the daemon fields mirror the activation bundle.
+    expect(original).toBe(originalActiveRuntime.keyring);
+    expect(originalUploadActions).toBe(originalActiveRuntime.uploadActions);
     await (daemon as any).recoverCurrentSessionsSnapshotPipeline([]);
     expect((daemon as any).keyring).not.toBe(original);
     expect((daemon as any).keyringMigrationContext).toBe(context);
+    // Both daemon fields and the active bundle are replaced consistently:
+    // the bundle carries the exact post-recovery instances, never stale ones.
+    expect((daemon as any).keyring).toBe((daemon as any).activeRuntime.keyring);
+    expect((daemon as any).uploadActions).toBe((daemon as any).activeRuntime.uploadActions);
+    expect((daemon as any).uploadActions).not.toBe(originalUploadActions);
+    expect((daemon as any).activeRuntime).not.toBe(originalActiveRuntime);
     daemon.stop();
   });
 
@@ -1498,5 +1584,452 @@ describe('BridgeDaemon', () => {
     const result = await new BridgeDaemon(config).pairWatch('peyx7k');
     expect(result.watchDevice.watchDeviceId).toBe(`watch_${'C'.repeat(43)}`);
     expect(paths).toEqual(['/v2/bridge/e2e/recipients', '/v2/bridge/enroll', '/v2/bridge/pair-watch']);
+  });
+  test('constructor reverse-rolls back the deferred state store before disposing the coordinator exactly once', () => {
+    const root = join(tmpdir(), `bridge-daemon-ctor-registry-${Date.now()}-${roots.length}`); roots.push(root);
+    mkdirSync(root, { mode: 0o700 });
+    const statePath = join(root, 'state.json');
+    const config = loadBridgeConfig();
+    Object.assign(config, {
+      hostId: 'host-ctor-registry', statePath, identityPath: join(root, 'identity.json'), configPath: join(root, 'config.json'),
+      relayBaseUrl: 'http://relay.invalid',
+      agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+    });
+    const order: string[] = [];
+    const disposal = instrumentConstructorRollbackDisposal(order);
+    let registryClockCalls = 0;
+    try {
+      expect(() => new BridgeDaemon(config, [{ name: 'test', listSessions: async () => [] }], undefined, () => {
+        registryClockCalls += 1;
+        throw new Error('injected registry clock failure');
+      })).toThrow('injected registry clock failure');
+      expect(registryClockCalls).toBe(1);
+      expect(order).toEqual(['state-store', 'coordinator']);
+      expect(disposal.coordinatorDisposes()).toBe(1);
+    } finally {
+      disposal.restore();
+    }
+    expect(existsSync(`${statePath}.runtime.lock`)).toBe(false);
+    const retried = new BridgeDaemon(config, []);
+    expect(existsSync(`${statePath}.runtime.lock`)).toBe(true);
+    retried.stop();
+    expect((retried as any).runtimeDisposed).toBe(true);
+    expect(existsSync(`${statePath}.runtime.lock`)).toBe(false);
+  });
+
+  test('public start validation failure disposes runtime exactly once before server, discovery, or timers run', async () => {
+    const root = join(tmpdir(), `bridge-daemon-validation-${Date.now()}-${roots.length}`); roots.push(root);
+    mkdirSync(root, { mode: 0o700 });
+    const identityPath = join(root, 'identity.json');
+    const statePath = join(root, 'state.json');
+    const config = loadBridgeConfig();
+    Object.assign(config, {
+      runtimePlatform: 'linux', hostPlatform: 'linux', hostId: 'host-mismatch',
+      relayBaseUrl: 'http://relay.invalid', configPath: join(root, 'config.json'), statePath, identityPath,
+      agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+    });
+    const scheduler = new ControllableScheduler();
+    const daemon = new BridgeDaemon(config, [], undefined, undefined, scheduler);
+    const startupRelay = installFakeStartupRelay(daemon);
+    const disposal = instrumentDaemonStoreDisposal(daemon);
+    let serverStarts = 0;
+    let serverStops = 0;
+    let discoveryWrites = 0;
+    (daemon as any).adapterServer = {
+      url: 'http://127.0.0.1:0',
+      start: async () => { serverStarts += 1; },
+      stop: () => { serverStops += 1; },
+    };
+    (daemon as any).writeAdapterConfig = () => { discoveryWrites += 1; };
+    try {
+      await expect(daemon.start()).rejects.toMatchObject({ code: 'ERR_IDENTITY_NOT_INITIALIZED' });
+      expect((daemon as any).startupValidated).toBe(false);
+      expect((daemon as any).runtimeDisposed).toBe(true);
+      expect(serverStarts).toBe(0);
+      expect(discoveryWrites).toBe(0);
+      expect(scheduler.scheduled).toEqual([]);
+      expect(startupRelay.recipientSnapshotCalls()).toBe(0);
+      expect(existsSync(config.agentAdapter.configPath)).toBe(false);
+    } finally {
+      daemon.stop();
+    }
+    expect(serverStops).toBe(0);
+    expect(disposal.count()).toBe(1);
+    expect(existsSync(`${statePath}.runtime.lock`)).toBe(false);
+    const retried = new BridgeDaemon(config, []);
+    retried.stop();
+    expect((retried as any).runtimeDisposed).toBe(true);
+  });
+
+  test('adapter server start failure leaves the initialized runtime owned until explicit stop()', async () => {
+    const root = join(tmpdir(), `bridge-daemon-server-start-${Date.now()}-${roots.length}`); roots.push(root);
+    mkdirSync(root, { mode: 0o700 });
+    const identityPath = join(root, 'identity.json');
+    const identityStore = new LinuxJsonHostIdentityStore(identityPath);
+    const identity = await identityStore.createFirstRun();
+    const statePath = join(root, 'state.json');
+    const config = loadBridgeConfig();
+    Object.assign(config, {
+      runtimePlatform: 'linux', hostPlatform: 'linux', hostId: identity.hostId, identity: publicIdentityMetadata(identity),
+      relayBaseUrl: 'http://relay.invalid', pollIntervalMs: 60_000,
+      configPath: join(root, 'config.json'), statePath, identityPath,
+      agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+    });
+    const scheduler = new ControllableScheduler();
+    const daemon = new BridgeDaemon(config, [{ name: 'test', listSessions: async () => [] }], identityStore, undefined, scheduler);
+    const startupRelay = installFakeStartupRelay(daemon);
+    const disposal = instrumentDaemonStoreDisposal(daemon);
+    let serverStarts = 0;
+    let serverStops = 0;
+    let discoveryWrites = 0;
+    (daemon as any).adapterServer = {
+      url: 'http://127.0.0.1:0',
+      start: async () => { serverStarts += 1; throw new Error('injected adapter server start failure'); },
+      stop: () => { serverStops += 1; },
+    };
+    (daemon as any).writeAdapterConfig = () => { discoveryWrites += 1; };
+    try {
+      await expect(daemon.start()).rejects.toThrow('injected adapter server start failure');
+      expect((daemon as any).startupValidated).toBe(true);
+      expect((daemon as any).runtimeDisposed).toBe(false);
+      expect(serverStarts).toBe(1);
+      expect(serverStops).toBe(0);
+      expect(discoveryWrites).toBe(0);
+      expect(scheduler.scheduled).toEqual([]);
+      expect(startupRelay.recipientSnapshotCalls()).toBe(1);
+      expect(disposal.count()).toBe(0);
+      expect(existsSync(`${statePath}.runtime.lock`)).toBe(true);
+    } finally {
+      daemon.stop();
+    }
+    expect(serverStops).toBe(1);
+    expect(disposal.count()).toBe(1);
+    expect((daemon as any).runtimeDisposed).toBe(true);
+    expect(existsSync(`${statePath}.runtime.lock`)).toBe(false);
+  });
+
+  test('adapter discovery write failure leaves the started server and runtime owned for explicit cleanup', async () => {
+    const root = join(tmpdir(), `bridge-daemon-discovery-${Date.now()}-${roots.length}`); roots.push(root);
+    mkdirSync(root, { mode: 0o700 });
+    const identityPath = join(root, 'identity.json');
+    const identityStore = new LinuxJsonHostIdentityStore(identityPath);
+    const identity = await identityStore.createFirstRun();
+    const statePath = join(root, 'state.json');
+    const config = loadBridgeConfig();
+    Object.assign(config, {
+      runtimePlatform: 'linux', hostPlatform: 'linux', hostId: identity.hostId, identity: publicIdentityMetadata(identity),
+      relayBaseUrl: 'http://relay.invalid', pollIntervalMs: 60_000,
+      configPath: join(root, 'config.json'), statePath, identityPath,
+      agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+    });
+    const scheduler = new ControllableScheduler();
+    const daemon = new BridgeDaemon(config, [{ name: 'test', listSessions: async () => [] }], identityStore, undefined, scheduler);
+    const startupRelay = installFakeStartupRelay(daemon);
+    const disposal = instrumentDaemonStoreDisposal(daemon);
+    let serverStarts = 0;
+    let serverStops = 0;
+    let discoveryWrites = 0;
+    (daemon as any).adapterServer = {
+      url: 'http://127.0.0.1:0',
+      start: async () => { serverStarts += 1; },
+      stop: () => { serverStops += 1; },
+    };
+    (daemon as any).writeAdapterConfig = () => {
+      discoveryWrites += 1;
+      throw new Error('injected discovery write failure');
+    };
+    try {
+      await expect(daemon.start()).rejects.toThrow('injected discovery write failure');
+      expect((daemon as any).startupValidated).toBe(true);
+      expect((daemon as any).runtimeDisposed).toBe(false);
+      expect(serverStarts).toBe(1);
+      expect(serverStops).toBe(0);
+      expect(discoveryWrites).toBe(1);
+      expect(scheduler.scheduled).toEqual([]);
+      expect(startupRelay.recipientSnapshotCalls()).toBe(1);
+      expect(disposal.count()).toBe(0);
+      expect(existsSync(`${statePath}.runtime.lock`)).toBe(true);
+    } finally {
+      daemon.stop();
+    }
+    expect(serverStops).toBe(1);
+    expect(disposal.count()).toBe(1);
+    expect((daemon as any).runtimeDisposed).toBe(true);
+    expect(existsSync(`${statePath}.runtime.lock`)).toBe(false);
+  });
+
+  test('timer scheduling failure rejects start without implicit rollback and keeps the runtime owned', async () => {
+    const root = join(tmpdir(), `bridge-daemon-timer-fail-${Date.now()}-${roots.length}`); roots.push(root);
+    mkdirSync(root, { mode: 0o700 });
+    const identityPath = join(root, 'identity.json');
+    const identityStore = new LinuxJsonHostIdentityStore(identityPath);
+    const identity = await identityStore.createFirstRun();
+    const statePath = join(root, 'state.json');
+    const config = loadBridgeConfig();
+    Object.assign(config, {
+      runtimePlatform: 'linux', hostPlatform: 'linux', hostId: identity.hostId, identity: publicIdentityMetadata(identity),
+      relayBaseUrl: 'http://relay.invalid', pollIntervalMs: 60_000,
+      configPath: join(root, 'config.json'), statePath, identityPath,
+      agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+    });
+    let scheduleCalls = 0;
+    const throwingScheduler = {
+      schedule: () => { scheduleCalls += 1; throw new Error('injected scheduling failure'); },
+      cancel: () => {},
+    };
+    const daemon = new BridgeDaemon(config, [{ name: 'test', listSessions: async () => [] }], identityStore, undefined, throwingScheduler);
+    const startupRelay = installFakeStartupRelay(daemon);
+    const disposal = instrumentDaemonStoreDisposal(daemon);
+    let serverStarts = 0;
+    let serverStops = 0;
+    (daemon as any).adapterServer = {
+      url: 'http://127.0.0.1:0',
+      start: async () => { serverStarts += 1; },
+      stop: () => { serverStops += 1; },
+    };
+    try {
+      await expect(daemon.start()).rejects.toThrow('injected scheduling failure');
+      expect((daemon as any).startupValidated).toBe(true);
+      expect((daemon as any).runtimeDisposed).toBe(false);
+      expect(serverStarts).toBe(1);
+      expect(serverStops).toBe(0);
+      expect(scheduleCalls).toBe(1);
+      expect(startupRelay.recipientSnapshotCalls()).toBe(1);
+      expect(disposal.count()).toBe(0);
+      expect(existsSync(config.agentAdapter.configPath)).toBe(true);
+      expect(existsSync(`${statePath}.runtime.lock`)).toBe(true);
+    } finally {
+      daemon.stop();
+    }
+    expect(serverStops).toBe(1);
+    expect(disposal.count()).toBe(1);
+    expect((daemon as any).runtimeDisposed).toBe(true);
+    expect(existsSync(`${statePath}.runtime.lock`)).toBe(false);
+  });
+
+  test('stop does not invoke optional dispose hooks on supplied executable dependencies', async () => {
+    const root = join(tmpdir(), `bridge-daemon-borrowed-${Date.now()}-${roots.length}`); roots.push(root);
+    mkdirSync(root, { mode: 0o700 });
+    const identityPath = join(root, 'identity.json');
+    const statePath = join(root, 'state.json');
+    const innerStore = new LinuxJsonHostIdentityStore(identityPath);
+    const identity = await innerStore.createFirstRun();
+    let identityDisposes = 0;
+    const identityStore = {
+      inspect: () => innerStore.inspect(),
+      load: () => innerStore.load(),
+      createFirstRun: () => innerStore.createFirstRun(),
+      resetAfterExplicitConfirmation: (operationId?: string) => innerStore.resetAfterExplicitConfirmation(operationId),
+      dispose: () => { identityDisposes += 1; },
+    };
+    const config = loadBridgeConfig();
+    Object.assign(config, {
+      runtimePlatform: 'linux', hostPlatform: 'linux', hostId: identity.hostId, identity: publicIdentityMetadata(identity),
+      relayBaseUrl: 'http://relay.invalid', pollIntervalMs: 60_000,
+      configPath: join(root, 'config.json'), statePath, identityPath,
+      agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+    });
+    let driverDisposes = 0;
+    let schedulerDisposes = 0;
+    let clockDisposes = 0;
+    let clockCalls = 0;
+    const driver = { name: 'test', listSessions: async () => [], dispose: () => { driverDisposes += 1; } };
+    const scheduler = Object.assign(new ControllableScheduler(), { dispose: () => { schedulerDisposes += 1; } });
+    const registryNow = Object.assign(
+      () => { clockCalls += 1; return new Date('2026-08-12T00:00:00.000Z'); },
+      { dispose: () => { clockDisposes += 1; } },
+    );
+    const daemon = new BridgeDaemon(config, [driver], identityStore as never, registryNow, scheduler);
+    const startupRelay = installFakeStartupRelay(daemon);
+    const disposal = instrumentDaemonStoreDisposal(daemon);
+    let serverStarts = 0;
+    let serverStops = 0;
+    (daemon as any).adapterServer = {
+      url: 'http://127.0.0.1:0',
+      start: async () => { serverStarts += 1; },
+      stop: () => { serverStops += 1; },
+    };
+    try {
+      await daemon.start();
+      expect(existsSync(config.agentAdapter.configPath)).toBe(true);
+      expect(clockCalls).toBe(1);
+      expect(serverStarts).toBe(1);
+      expect(scheduler.scheduled).toHaveLength(1);
+      expect(startupRelay.recipientSnapshotCalls()).toBe(1);
+    } finally {
+      daemon.stop();
+    }
+    expect(driverDisposes).toBe(0);
+    expect(identityDisposes).toBe(0);
+    expect(schedulerDisposes).toBe(0);
+    expect(clockDisposes).toBe(0);
+    expect(serverStops).toBe(1);
+    expect(disposal.count()).toBe(1);
+    expect((daemon as any).runtimeDisposed).toBe(true);
+    expect(existsSync(`${statePath}.runtime.lock`)).toBe(false);
+  });
+
+  test('stop during active sync suppresses late post-Relay presence mutations and preserves cleanup ordering', async () => {
+    const root = join(tmpdir(), `bridge-daemon-active-presence-${Date.now()}-${roots.length}`); roots.push(root);
+    mkdirSync(root, { mode: 0o700 });
+    const identityPath = join(root, 'identity.json');
+    const identityStore = new LinuxJsonHostIdentityStore(identityPath);
+    const identity = await identityStore.createFirstRun();
+    const statePath = join(root, 'state.json');
+    const config = loadBridgeConfig();
+    Object.assign(config, {
+      runtimePlatform: 'linux', hostPlatform: 'linux', hostId: identity.hostId, identity: publicIdentityMetadata(identity),
+      relayBaseUrl: 'http://relay.invalid', pollIntervalMs: 60_000,
+      configPath: join(root, 'config.json'), statePath, identityPath,
+      agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+    });
+    const scheduler = new ControllableScheduler();
+    const daemon = new BridgeDaemon(config, [], identityStore, undefined, scheduler);
+    const stateStore = (daemon as any).stateStore as BridgeStateStore;
+    const enrollmentStarted = deferred<Record<string, unknown>>();
+    const enrollmentResponse = deferred<{ host: Record<string, unknown> }>();
+    let enrollmentCalls = 0;
+    const startupRelay = installFakeStartupRelay(daemon, {
+      enrollHost: async (...args: any[]) => {
+        enrollmentCalls += 1;
+        enrollmentStarted.resolve(args[0] as Record<string, unknown>);
+        return enrollmentResponse.promise;
+      },
+    });
+    const command = {
+      ...structuredClone(commandFixture.interrupt.envelope),
+      commandId: `command_${crypto.randomUUID()}`,
+      hostId: identity.hostId,
+      nonce: `nonce_${crypto.randomUUID()}`,
+      issuedAt: '2026-08-12T00:00:00.000Z',
+      expiresAt: '2026-08-12T00:05:00.000Z',
+    } as EncryptedCommandEnvelopeV1;
+
+    const order: string[] = [];
+    const latePresenceMutations: string[] = [];
+    const registry = (daemon as any).adapterRegistry;
+    const originalRegistryDispose = registry.dispose.bind(registry);
+    registry.dispose = () => { order.push('registry'); originalRegistryDispose(); };
+    const originalRecover = stateStore.recoverOrphanedCommandExecutions.bind(stateStore);
+    stateStore.recoverOrphanedCommandExecutions = () => { order.push('recover'); return originalRecover(); };
+    const originalSetHost = stateStore.setHost.bind(stateStore);
+    (stateStore as any).setHost = (...args: any[]) => {
+      if ((daemon as any).stopped) latePresenceMutations.push('setHost');
+      return originalSetHost(args[0]);
+    };
+    const originalPresenceSuccess = stateStore.recordRelayPresenceSuccess.bind(stateStore);
+    (stateStore as any).recordRelayPresenceSuccess = () => {
+      if ((daemon as any).stopped) latePresenceMutations.push('recordRelayPresenceSuccess');
+      return originalPresenceSuccess();
+    };
+    const originalPresenceFailure = stateStore.recordRelayPresenceFailure.bind(stateStore);
+    (stateStore as any).recordRelayPresenceFailure = (...args: any[]) => {
+      if ((daemon as any).stopped) latePresenceMutations.push('recordRelayPresenceFailure');
+      return originalPresenceFailure(args[0], args[1]);
+    };
+    const disposal = instrumentDaemonStoreDisposal(daemon, () => order.push('state-store'));
+    const coordinator = (daemon as any).runtimeCoordinator as { dispose(): void };
+    const originalCoordinatorDispose = coordinator.dispose.bind(coordinator);
+    coordinator.dispose = () => { order.push('coordinator'); originalCoordinatorDispose(); };
+    (daemon as any).adapterServer = {
+      url: 'http://127.0.0.1:0',
+      start: async () => {},
+      stop: () => { order.push('server'); },
+    };
+    const abortController = (daemon as any).relayAbortController as AbortController;
+    const originalAbort = abortController.abort.bind(abortController);
+    abortController.abort = () => { order.push('abort'); originalAbort(); };
+    const heartbeatHandle = scheduler.schedule(() => {}, 30_000);
+    const reconciliationHandle = scheduler.schedule(() => {}, 300);
+    (daemon as any).presenceHeartbeatTimer = heartbeatHandle;
+    (daemon as any).reconciliationTimer = reconciliationHandle;
+
+    const sync = daemon.syncOnce();
+    const enrollment = await waitForPromise(enrollmentStarted.promise, 'active sync to reach fake Relay enrollment');
+    expect(enrollment).toMatchObject({ hostId: identity.hostId, platform: 'linux' });
+    expect(enrollmentCalls).toBe(1);
+    expect(startupRelay.recipientSnapshotCalls()).toBe(1);
+    order.length = 0;
+    stateStore.claimCommandExecution({
+      originalEncryptedCommand: command, commandDigest: await deriveEncryptedCommandDigest(command),
+      pinReference: {
+        version: 1, linkId: command.linkId, linkGeneration: command.linkGeneration, epoch: command.epoch,
+        transcriptDigest: 'T'.repeat(43), hostEncryptionKeyId: command.payload.keyWrap.recipientEncryptionKeyId,
+        watchEncryptionKeyId: command.payload.keyWrap.senderEncryptionKeyId,
+      },
+      claimedAt: '2026-08-12T00:00:00.100Z',
+    });
+    stateStore.markCommandDispatchStarted(command.commandId, '2026-08-12T00:00:00.500Z');
+
+    daemon.stop();
+    expect(order).toEqual(['recover', 'registry', 'abort', 'server', 'state-store', 'coordinator']);
+    const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(persisted.commandExecutions[command.commandId].state).toBe('outcome_unknown');
+    expect(disposal.count()).toBe(1);
+    expect((daemon as any).runtimeDisposed).toBe(true);
+    expect(abortController.signal.aborted).toBe(true);
+    expect(scheduler.scheduled[0]?.canceled).toBe(true);
+    expect(scheduler.scheduled[1]?.canceled).toBe(true);
+    expect((daemon as any).presenceHeartbeatTimer).toBeUndefined();
+    expect((daemon as any).reconciliationTimer).toBeUndefined();
+
+    enrollmentResponse.resolve({
+      host: {
+        hostId: identity.hostId, hostName: 'Late Relay host', platform: 'linux', bridgeVersion: config.bridgeVersion,
+        registeredAt: '2026-08-12T00:00:00.000Z', lastSeenAt: '2026-08-12T00:00:01.000Z', bridgeStatus: 'online',
+      },
+    });
+    await waitForPromise(sync.then(() => undefined, () => undefined), 'active sync to settle after late Relay response');
+    expect(latePresenceMutations).toEqual([]);
+    expect((daemon as any).presenceFlight).toBeUndefined();
+    expect((daemon as any).syncFlight).toBeUndefined();
+    expect((daemon as any).runtimeDisposed).toBe(true);
+  });
+
+  test('start binds the active runtime bundle: one upload actions instance, recovery seams intact', async () => {
+    const root = join(tmpdir(), `bridge-daemon-active-bundle-${Date.now()}-${roots.length}`); roots.push(root);
+    mkdirSync(root, { mode: 0o700 });
+    const identityPath = join(root, 'identity.json');
+    const identityStore = new LinuxJsonHostIdentityStore(identityPath);
+    const identity = await identityStore.createFirstRun();
+    const statePath = join(root, 'state.json');
+    const config = loadBridgeConfig();
+    Object.assign(config, {
+      runtimePlatform: 'linux', hostPlatform: 'linux', hostId: identity.hostId, identity: publicIdentityMetadata(identity),
+      relayBaseUrl: 'http://relay.invalid', pollIntervalMs: 60_000,
+      configPath: join(root, 'config.json'), statePath, identityPath,
+      agentAdapter: { ...config.agentAdapter, port: 0, configPath: join(root, 'adapter.json') },
+    });
+    const scheduler = new ControllableScheduler();
+    const daemon = new BridgeDaemon(config, [{ name: 'test', listSessions: async () => [] }], identityStore, undefined, scheduler);
+    const startupRelay = installFakeStartupRelay(daemon);
+    (daemon as any).adapterServer = {
+      url: 'http://127.0.0.1:0',
+      start: async () => {},
+      stop: () => {},
+    };
+    try {
+      await daemon.start();
+      expect((daemon as any).startupValidated).toBe(true);
+      const internals = daemon as any;
+      expect(internals.activeRuntime).toBeDefined();
+      expect(internals.uploadActions).toBeDefined();
+      expect(internals.uploadActions).toBe(internals.activeRuntime.uploadActions);
+      expect(internals.keyring).toBe(internals.activeRuntime.keyring);
+      expect(internals.encryptionStore).toBe(internals.activeRuntime.encryptionStore);
+      expect(internals.activeRuntime.ownership.uploadActions).toBe('owned');
+      // The characterized recovery seam still routes through the daemon fields.
+      expect(internals.relayClient).toBe(startupRelay.relay);
+      expect(startupRelay.recipientSnapshotCalls()).toBe(1);
+      // Flush routes through the single bound actions instance (no on-demand construction).
+      const boundFlush = internals.uploadActions.flushPendingEvents as () => Promise<number>;
+      let boundFlushes = 0;
+      internals.uploadActions.flushPendingEvents = () => { boundFlushes += 1; return boundFlush(); };
+      const flushed = await daemon.flushEncryptedUploadsForTest();
+      expect(flushed).toBe(0);
+      expect(boundFlushes).toBe(1);
+    } finally {
+      daemon.stop();
+    }
   });
 });

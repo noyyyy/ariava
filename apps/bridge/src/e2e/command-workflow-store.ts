@@ -5,6 +5,7 @@ import type {
   PersistedCommandPinReferenceV1,
 } from '../types';
 import type { CommandExecutionPinResolver } from '../state-store/command-transitions';
+import type { PinRetentionReferences } from './link-keyring';
 
 /**
  * Narrow capability port for the durable command execution workflow (spec §3.2).
@@ -19,6 +20,10 @@ import type { CommandExecutionPinResolver } from '../state-store/command-transit
 export interface CommandWorkflowStateStore {
   listCommandExecutions(): PersistedCommandExecutionV4[];
   getCommandExecution(commandId: string): PersistedCommandExecutionV4 | undefined;
+  getRecipientSetVersion(): number | undefined;
+  setRecipientSetVersion(version: number): void;
+  durableContentPinRetentionReferences(retainThrough: string): PinRetentionReferences;
+  commandExecutionPinRetentionReferences(): PinRetentionReferences;
   pruneEligibleCommandExecutions(now: string): PersistedCommandExecutionV4[];
   validateCommandExecutionPins(
     resolver: CommandExecutionPinResolver,

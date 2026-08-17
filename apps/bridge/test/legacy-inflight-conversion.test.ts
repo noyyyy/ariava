@@ -13,12 +13,22 @@ mock.module('../src/e2e/node-crypto', () => ({
   hkdfSha256: () => new Uint8Array(32).fill(5),
 }));
 
-const { EncryptedUploadOrchestrator } = await import('../src/e2e/upload-orchestrator');
+const { createEncryptedUploadActions, DEFAULT_ENCRYPTED_UPLOAD_CRYPTO } = await import('../src/e2e/upload-actions');
 const { BridgeStateStore } = await import('../src/state-store');
 const { eventSourceDigest, sessionSourceDigest } = await import('../src/e2e/upload-preflight');
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+
+/** Mirrors the removed compatibility facade's constructor shape; binds the single actions implementation. */
+function createOrchestrator(
+  stateStore: any,
+  relayClient: any,
+  keyring: any,
+  hooks?: Parameters<typeof createEncryptedUploadActions>[0]['hooks'],
+) {
+  return createEncryptedUploadActions({ stateStore, relayClient, crypto: DEFAULT_ENCRYPTED_UPLOAD_CRYPTO, keyring, hooks });
+}
 
 function fixture() {
   const root = join(tmpdir(), `bridge-inflight-conv-${Date.now()}-${roots.length}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
@@ -102,7 +112,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     store.queuePendingEvent(event, session);
     store.persistInflightEventUpload(event.eventId, session.sessionId, eventUpload(event.eventId));
     const client = makeClient();
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(true);
     const record = rawInflightRecord(store, `inflight:event:${event.eventId}`);
@@ -122,7 +132,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     const client = makeClient({
       reconcileEncryptedEvent: async () => ({ committed: true }),
     });
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(true);
     // Full completion consumes the journal and removes inflight + source; the
@@ -139,7 +149,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     store.replaceDriverSessions('pi', [terminalSession()]);
     store.persistInflightSessionUpload('session-test', sessionUpload());
     const client = makeClient();
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(true);
     const record = rawInflightRecord(store, 'inflight:session:session-test');
@@ -153,7 +163,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     store.replaceDriverSessions('pi', [terminalSession()]);
     store.persistInflightSessionUpload('session-test', sessionUpload());
     const client = makeClient({ reconcileEncryptedSession: async () => true });
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(true);
     expect(store.currentSessionRevision('session-test')).toBe(1);
@@ -169,7 +179,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     const client = makeClient({
       reconcileEncryptedEvent: async () => { throw new Error('relay unavailable'); },
     });
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(false);
     const after = rawInflightRecord(store, `inflight:event:${event.eventId}`);
@@ -185,7 +195,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     store.persistInflightEventUpload(event.eventId, session.sessionId, eventUpload(event.eventId), eventSourceDigest(event, session));
     const before = rawInflightRecord(store, `inflight:event:${event.eventId}`);
     const client = makeClient();
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(true);
     expect(client.reconcileEventCalls).toHaveLength(0);
@@ -202,7 +212,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     store.persistInflightEventUpload(event.eventId, session.sessionId, eventUpload(event.eventId));
     const before = rawInflightRecord(store, `inflight:event:${event.eventId}`);
     const client = makeClient();
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(true);
     expect(client.reconcileEventCalls).toHaveLength(0);
@@ -215,7 +225,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     store.queuePendingEvent(event, session);
     store.persistInflightEventUpload(event.eventId, session.sessionId, eventUpload(event.eventId));
     const client = makeClient();
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(true);
     const first = rawInflightRecord(store, `inflight:event:${event.eventId}`);
@@ -232,7 +242,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     store.persistInflightEventUpload('event-orphan', 'session-test', eventUpload('event-orphan'));
     const before = rawInflightRecord(store, 'inflight:event:event-orphan');
     const client = makeClient(); // uncommitted
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(false);
     expect(rawInflightRecord(store, 'inflight:event:event-orphan')).toEqual(before);
@@ -243,7 +253,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     const store = fixture();
     store.persistInflightEventUpload('event-orphan', 'session-test', eventUpload('event-orphan'));
     const client = makeClient({ reconcileEncryptedEvent: async () => ({ committed: true }) });
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(true);
     expect(store.hasEventUploadCompletion('event-orphan')).toBe(false); // journal fully consumed
@@ -255,12 +265,12 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     const store = fixture();
     store.persistInflightSessionUpload('session-test', sessionUpload()); // correctly bound, but no runtime Session exists
     const client = makeClient(); // uncommitted
-    expect(await new EncryptedUploadOrchestrator(store, client as any, emptyKeyring).convertLegacyInflightToV2()).toBe(false);
+    expect(await createOrchestrator(store, client as any, emptyKeyring).convertLegacyInflightToV2()).toBe(false);
     expect(store.getLegacyInflightSessionUpload('session-test')).toBeDefined(); // raw evidence preserved
     expect(store.currentSessionRevision('session-test')).toBe(0);
 
     const committing = makeClient({ reconcileEncryptedSession: async () => true });
-    expect(await new EncryptedUploadOrchestrator(store, committing as any, emptyKeyring).convertLegacyInflightToV2()).toBe(true);
+    expect(await createOrchestrator(store, committing as any, emptyKeyring).convertLegacyInflightToV2()).toBe(true);
     expect(store.currentSessionRevision('session-test')).toBe(1);
     expect((store as any).spool.get('inflight:session:session-test')).toBeUndefined();
   });
@@ -275,7 +285,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
       plaintext: new TextEncoder().encode(JSON.stringify(crossBound)) });
     const before = rawInflightRecord(store, 'inflight:session:session-ghost');
     const client = makeClient({ reconcileEncryptedSession: async () => true }); // even a committed answer must not advance the wrong cursor
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.convertLegacyInflightToV2()).toBe(false);
     expect(rawInflightRecord(store, 'inflight:session:session-ghost')).toEqual(before); // byte-preserved
@@ -291,7 +301,7 @@ describe('§4.5.5 online legacy-inflight conversion', () => {
     store.setRecipientSetVersion(1);
     store.persistInflightEventUpload('event-orphan', 'session-test', eventUpload('event-orphan'));
     const client = makeClient(); // uncommitted → conversion defers → drain stops
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
 
     expect(await orchestrator.flushPendingEvents()).toBe(0);
     expect(store.getQuarantinedEventRecord('event-orphan')).toBeUndefined();

@@ -5,7 +5,6 @@ import type {
   E2ERecipientSnapshotV1,
   EncryptedSessionSnapshotUploadV3,
 } from '@ariava/protocol';
-import type { RelayClient } from '../relay-client';
 import type { EventUploadCompletionV1 } from '../types';
 import type {
   EventDeadLetterReasonCode,
@@ -16,14 +15,13 @@ import type {
   SessionInflightRecordV2,
 } from '../state-store';
 import { encryptEventUpload, encryptSessionSnapshot, type ActiveRecipientMaterial } from './envelope';
-import type { LocalLinkKeyring } from './link-keyring';
 import { RECIPIENT_SET_CHANGED_REASON, decideEventUpload, decideSessionUpload, type EventUploadDecision, type SessionUploadDecision } from './upload-decisions';
 import { isPermanentEventConflict, isRelayConflict, relayErrorStatus, relayFailureCategory, type UploadFailureCategory } from './upload-failures';
 import { attachNotificationPreviews, eventEncryptionInput, sessionEncryptionInput, type EncryptedEventAndSession } from './upload-inputs';
 import { digestsEqual, eventSourceDigest, preflightEventSource, preflightSessionSource, sessionSourceDigest } from './upload-preflight';
 
 /** Consumer-owned State Store capability port for encrypted uploads. */
-export interface UploadOrchestratorStateStore {
+export interface EncryptedUploadStateStore {
   getSession(sessionId: string): CanonicalSessionState | undefined;
   listSessions(): CanonicalSessionState[];
   listPendingEventDescriptors(): PendingEventDescriptor[];
@@ -55,6 +53,40 @@ export interface UploadOrchestratorStateStore {
   ): boolean;
 }
 
+/** Relay capabilities used by encrypted upload workflows, and no others. */
+export interface EncryptedUploadRelayClient {
+  recipientSnapshot(): Promise<E2ERecipientSnapshotV1>;
+  publishEncryptedEvent(event: E2EEventAndSessionUploadV3['event'], session: E2EEventAndSessionUploadV3['session']): Promise<unknown>;
+  reconcileEncryptedEvent(event: E2EEventAndSessionUploadV3['event'], session: E2EEventAndSessionUploadV3['session']): Promise<{ committed: boolean }>;
+  reconcileEncryptedSession(session: EncryptedSessionSnapshotUploadV3): Promise<boolean>;
+  publishEncryptedSession(session: EncryptedSessionSnapshotUploadV3): Promise<unknown>;
+}
+
+/** Opaque recipient capability; its secret-bearing material is visible only to crypto. */
+export type EncryptedUploadRecipientMaterial = unknown;
+
+/** Keyring capability used to reconcile one authoritative recipient snapshot. */
+export interface EncryptedUploadKeyring {
+  reconcileRecipients(snapshot: E2ERecipientSnapshotV1): EncryptedUploadRecipientMaterial[];
+}
+
+/** Imperative encryption boundary. Secret key bytes never enter upload decisions or results. */
+export interface EncryptedUploadCryptoPort {
+  encryptSessionSnapshot(input: {
+    session: CanonicalSessionState;
+    revision: number;
+    recipientSetVersion: number;
+    recipients: EncryptedUploadRecipientMaterial[];
+  }): EncryptedSessionSnapshotUploadV3;
+  encryptEventUpload(input: {
+    event: CanonicalEvent;
+    session: CanonicalSessionState;
+    revision: number;
+    recipientSetVersion: number;
+    recipients: EncryptedUploadRecipientMaterial[];
+  }): EncryptedEventAndSession;
+}
+
 export interface EncryptedEventFailure {
   eventId: string;
   sessionId: string;
@@ -67,6 +99,28 @@ export interface EncryptedUploadHooks {
   eventCompletionStep?: (phase: 'journaled' | 'revision-committed' | 'inflight-removed' | 'source-removed' | 'journal-removed', eventId: string) => void;
   eventFailure?: (failure: EncryptedEventFailure) => void;
 }
+
+export interface CreateEncryptedUploadActionsParameters {
+  stateStore: EncryptedUploadStateStore;
+  relayClient: EncryptedUploadRelayClient;
+  crypto: EncryptedUploadCryptoPort;
+  keyring: EncryptedUploadKeyring;
+  hooks?: EncryptedUploadHooks;
+}
+
+/** Production crypto adapter used only by the actions factory. */
+export const DEFAULT_ENCRYPTED_UPLOAD_CRYPTO: EncryptedUploadCryptoPort = {
+  encryptSessionSnapshot: ({ session, revision, recipientSetVersion, recipients }) =>
+    encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision, recipientSetVersion,
+      recipients: recipients as ActiveRecipientMaterial[] }),
+  encryptEventUpload: ({ event, session, revision, recipientSetVersion, recipients }) => {
+    const activeRecipients = recipients as ActiveRecipientMaterial[];
+    const upload = encryptEventUpload({ ...eventEncryptionInput(event, session), revision, recipientSetVersion,
+      recipients: activeRecipients } as Parameters<typeof encryptEventUpload>[0]);
+    attachNotificationPreviews(upload, event, session, activeRecipients);
+    return upload;
+  },
+};
 
 /**
  * §6.2 Session publication outcome taxonomy for one authoritative publish pass.
@@ -81,16 +135,14 @@ export type AuthoritativeSnapshotOutcome =
   | { type: 'deferred'; reason: 'network' | 'recipient-set' }
   | { type: 'fail-closed' };
 
-export class EncryptedUploadOrchestrator {
-  constructor(private readonly stateStore: UploadOrchestratorStateStore, private readonly client: RelayClient,
-    private readonly keyring: LocalLinkKeyring,
-    private readonly hooks?: EncryptedUploadHooks) {}
+export function createEncryptedUploadActions(parameters: CreateEncryptedUploadActionsParameters) {
+  const { stateStore, relayClient, crypto, keyring, hooks } = parameters;
 
-  async publishAuthoritativeSnapshots(snapshot: E2ERecipientSnapshotV1, recipients: ActiveRecipientMaterial[], sessions: readonly CanonicalSessionState[]): Promise<AuthoritativeSnapshotOutcome> {
+  async function publishAuthoritativeSnapshots(snapshot: E2ERecipientSnapshotV1, recipients: EncryptedUploadRecipientMaterial[], sessions: readonly CanonicalSessionState[]): Promise<AuthoritativeSnapshotOutcome> {
     // §6.1 full-set preflight FIRST, before any revision allocation / inflight
     // creation / manifest. Any invalid-content returns locally-blocked with zero
     // mutation; keyring/crypto/storage errors throw and keep fail-closed semantics.
-    const blockedBeforeStart = this.preflightAuthoritativeSessionSet(sessions);
+    const blockedBeforeStart = preflightAuthoritativeSessionSet(sessions);
     if (blockedBeforeStart > 0) return { type: 'locally-blocked', reason: 'content' };
 
     // A recipient change invalidates the whole authoritative set, including Sessions
@@ -106,7 +158,7 @@ export class EncryptedUploadOrchestrator {
       // store is never re-read mid-pass (no split snapshot / TOCTOU).
       for (const session of sessions) {
         const sessionId = session.sessionId;
-        let upload = this.stateStore.getInflightSessionUpload(sessionId) as EncryptedSessionSnapshotUploadV3 | undefined;
+        let upload = stateStore.getInflightSessionUpload(sessionId) as EncryptedSessionSnapshotUploadV3 | undefined;
 
         // §4.4 / §6.1: an existing Session inflight must be reconciled BEFORE reuse or
         // rebuild. Committed → complete the old evidence first (old revision committed,
@@ -116,25 +168,25 @@ export class EncryptedUploadOrchestrator {
         // current source keeping the inflight's approved revision (never drop below it).
         if (upload) {
           let committed: boolean;
-          try { committed = await this.client.reconcileEncryptedSession(upload); }
+          try { committed = await relayClient.reconcileEncryptedSession(upload); }
           catch (error) {
-            this.reportDeferredFailure({ eventId: sessionId, sessionId }, error);
+            reportDeferredFailure({ eventId: sessionId, sessionId }, error);
             return { type: 'deferred', reason: 'network' };
           }
           if (committed) {
-            this.stateStore.commitSessionRevision(sessionId, upload.revision);
-            this.stateStore.removeInflightSessionUpload(sessionId);
+            stateStore.commitSessionRevision(sessionId, upload.revision);
+            stateStore.removeInflightSessionUpload(sessionId);
             upload = undefined;
           } else {
             let sourceDigest: string;
             try { sourceDigest = sessionSourceDigest(session); } catch { sourceDigest = ''; }
-            const v2 = this.stateStore.getSessionInflightRecordV2(sessionId);
+            const v2 = stateStore.getSessionInflightRecordV2(sessionId);
             const digestMatches = v2 !== undefined && sourceDigest !== '' && digestsEqual(v2.sourceDigest, sourceDigest);
             if (!digestMatches || upload.recipientSetVersion !== passVersion) {
               if (preflightSessionSource(session).type !== 'ready') return { type: 'locally-blocked', reason: 'content' };
-              const replacement = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: upload.revision,
+              const replacement = crypto.encryptSessionSnapshot({ session, revision: upload.revision,
                 recipientSetVersion: passVersion, recipients });
-              this.stateStore.replaceInflightSessionUpload(sessionId, replacement, sourceDigest);
+              stateStore.replaceInflightSessionUpload(sessionId, replacement, sourceDigest);
               upload = replacement;
             }
           }
@@ -142,9 +194,9 @@ export class EncryptedUploadOrchestrator {
 
         if (!upload || upload.recipientSetVersion !== passVersion) {
           if (preflightSessionSource(session).type !== 'ready') return { type: 'locally-blocked', reason: 'content' };
-          const next = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: upload?.revision ?? this.stateStore.nextSessionRevision(sessionId),
+          const next = crypto.encryptSessionSnapshot({ session, revision: upload?.revision ?? stateStore.nextSessionRevision(sessionId),
             recipientSetVersion: passVersion, recipients });
-          if (upload) this.stateStore.replaceInflightSessionUpload(sessionId, next, sessionSourceDigest(session)); else this.stateStore.persistInflightSessionUpload(sessionId, next, sessionSourceDigest(session));
+          if (upload) stateStore.replaceInflightSessionUpload(sessionId, next, sessionSourceDigest(session)); else stateStore.persistInflightSessionUpload(sessionId, next, sessionSourceDigest(session));
           upload = next;
         }
         let currentSnapshot = snapshot;
@@ -152,20 +204,20 @@ export class EncryptedUploadOrchestrator {
         let refreshed = false;
         let decision: SessionUploadDecision;
         for (;;) {
-          try { await this.client.publishEncryptedSession(upload); } catch (error) {
+          try { await relayClient.publishEncryptedSession(upload); } catch (error) {
             if (!isRelayConflict(error)) return { type: 'deferred', reason: 'network' };
             // §4.4: a reconcile network/identity failure is not an explicit uncommitted
             // verdict; defer with the inflight evidence preserved.
             let committed: boolean;
-            try { committed = await this.client.reconcileEncryptedSession(upload); }
+            try { committed = await relayClient.reconcileEncryptedSession(upload); }
             catch (reconcileError) {
-              this.reportDeferredFailure({ eventId: sessionId, sessionId }, reconcileError);
+              reportDeferredFailure({ eventId: sessionId, sessionId }, reconcileError);
               return { type: 'deferred', reason: 'network' };
             }
             if (error.reason === RECIPIENT_SET_CHANGED_REASON) {
               try {
-                currentSnapshot = await this.client.recipientSnapshot();
-                currentRecipients = this.keyring.reconcileRecipients(currentSnapshot);
+                currentSnapshot = await relayClient.recipientSnapshot();
+                currentRecipients = keyring.reconcileRecipients(currentSnapshot);
               } catch { return { type: 'deferred', reason: 'recipient-set' }; }
               refreshed = true;
             }
@@ -181,8 +233,8 @@ export class EncryptedUploadOrchestrator {
             });
             switch (decision.type) {
               case 'commit':
-                this.stateStore.commitSessionRevision(sessionId, decision.acceptedRevision);
-                this.stateStore.removeInflightSessionUpload(sessionId);
+                stateStore.commitSessionRevision(sessionId, decision.acceptedRevision);
+                stateStore.removeInflightSessionUpload(sessionId);
                 revisions.set(sessionId, decision.acceptedRevision);
                 break;
               case 'defer':
@@ -193,17 +245,17 @@ export class EncryptedUploadOrchestrator {
                 return { type: 'deferred', reason: 'network' };
               case 'refresh-reencrypt': {
                 if (preflightSessionSource(session).type !== 'ready') return { type: 'locally-blocked', reason: 'content' };
-                const replacement = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: decision.revision,
+                const replacement = crypto.encryptSessionSnapshot({ session, revision: decision.revision,
                   recipientSetVersion: currentSnapshot.recipientSetVersion, recipients: currentRecipients });
-                this.stateStore.replaceInflightSessionUpload(sessionId, replacement, sessionSourceDigest(session));
+                stateStore.replaceInflightSessionUpload(sessionId, replacement, sessionSourceDigest(session));
                 snapshot = currentSnapshot; recipients = currentRecipients;
                 restart = true;
                 break;
               }
               case 'retry-next-revision': {
                 sameVersionCommitRetryExhausted = currentSnapshot.recipientSetVersion === passVersion;
-                this.stateStore.commitSessionRevision(sessionId, upload.revision);
-                this.stateStore.removeInflightSessionUpload(sessionId);
+                stateStore.commitSessionRevision(sessionId, upload.revision);
+                stateStore.removeInflightSessionUpload(sessionId);
                 snapshot = currentSnapshot; recipients = currentRecipients;
                 restart = true;
                 break;
@@ -212,15 +264,15 @@ export class EncryptedUploadOrchestrator {
             // Every decision ends this pass; refresh/retry re-run the outer loop via `restart`.
             break;
           }
-          this.stateStore.commitSessionRevision(sessionId, upload.revision);
-          this.stateStore.removeInflightSessionUpload(sessionId);
+          stateStore.commitSessionRevision(sessionId, upload.revision);
+          stateStore.removeInflightSessionUpload(sessionId);
           revisions.set(sessionId, upload.revision);
           break;
         }
         if (restart) break;
       }
       if (restart) continue;
-      this.stateStore.setRecipientSetVersion(passVersion);
+      stateStore.setRecipientSetVersion(passVersion);
       return { type: 'published', recipientSetVersion: passVersion, revisions };
     }
   }
@@ -233,7 +285,7 @@ export class EncryptedUploadOrchestrator {
    * (fail-closed) on keyring/crypto/storage/invariant errors — those must NOT be
    * reclassified as content blocks.
    */
-  preflightAuthoritativeSessionSet(sessions: readonly CanonicalSessionState[]): number {
+  function preflightAuthoritativeSessionSet(sessions: readonly CanonicalSessionState[]): number {
     let blocked = 0;
     for (const session of sessions) {
       if (preflightSessionSource(session).type !== 'ready') blocked += 1;
@@ -248,11 +300,11 @@ export class EncryptedUploadOrchestrator {
    * explicitly uncommitted evidence stays byte-preserved for a later pass, and
    * malformed/cross-bound evidence defers (fail-closed — never cleared).
    */
-  async reconcileSessionInflights(sessions: readonly CanonicalSessionState[]): Promise<{ deferred: boolean }> {
+  async function reconcileSessionInflights(sessions: readonly CanonicalSessionState[]): Promise<{ deferred: boolean }> {
     const activeSessionIds = new Set(sessions.map((session) => session.sessionId));
     let deferred = false;
-    for (const sessionId of this.stateStore.listInflightSessionIds()) {
-      const lookup = this.stateStore.getSessionInflightLookup(sessionId);
+    for (const sessionId of stateStore.listInflightSessionIds()) {
+      const lookup = stateStore.getSessionInflightLookup(sessionId);
       if (lookup.kind === 'missing') continue;
       if (lookup.kind === 'malformed' || lookup.kind === 'cross-bound') {
         // §4.4: unknown/malformed/cross-bound evidence is never removed without an
@@ -261,15 +313,15 @@ export class EncryptedUploadOrchestrator {
         continue;
       }
       let committed: boolean;
-      try { committed = await this.client.reconcileEncryptedSession(lookup.upload); }
+      try { committed = await relayClient.reconcileEncryptedSession(lookup.upload); }
       catch (error) {
-        this.reportDeferredFailure({ eventId: sessionId, sessionId }, error);
+        reportDeferredFailure({ eventId: sessionId, sessionId }, error);
         deferred = true;
         continue;
       }
       if (committed) {
-        this.stateStore.commitSessionRevision(sessionId, lookup.upload.revision);
-        this.stateStore.removeInflightSessionUpload(sessionId);
+        stateStore.commitSessionRevision(sessionId, lookup.upload.revision);
+        stateStore.removeInflightSessionUpload(sessionId);
       } else if (!activeSessionIds.has(sessionId)) {
         // Explicitly uncommitted orphan evidence has no authoritative source from
         // which it can be rebuilt. Preserve it byte-for-byte and fail closed.
@@ -292,17 +344,17 @@ export class EncryptedUploadOrchestrator {
    * Content-blocked sources are skipped so the §5.2 flow reconciles + dead-letters
    * them instead of the conversion pass.
    */
-  async convertLegacyInflightToV2(): Promise<boolean> {
+  async function convertLegacyInflightToV2(): Promise<boolean> {
     let deferred = false;
     // §4.5.5: enumerate every event inflight item (NOT only descriptors with a
     // source). Source-less legacy records are otherwise unreachable forever.
-    for (const record of this.stateStore.listEventInflightRecords()) {
+    for (const record of stateStore.listEventInflightRecords()) {
       if (record.kind === 'v2') continue; // already converted
       if (record.kind === 'malformed') { deferred = true; continue; } // byte-preserved, fail closed
-      const upload = this.stateStore.getInflightEventUpload(record.eventId) as E2EEventAndSessionUploadV3;
+      const upload = stateStore.getInflightEventUpload(record.eventId) as E2EEventAndSessionUploadV3;
       if (!upload) { deferred = true; continue; }
       const sessionId = record.sessionId || upload.session.sessionId;
-      const loaded = this.stateStore.loadPendingEventParts({ eventId: record.eventId, sessionId });
+      const loaded = stateStore.loadPendingEventParts({ eventId: record.eventId, sessionId });
       let wrapDigest: string | undefined;
       if (loaded.ok) {
         const preflight = preflightEventSource(loaded.source.event, loaded.source.session);
@@ -316,24 +368,24 @@ export class EncryptedUploadOrchestrator {
       // §4.5.5: only the reconcile round-trip is network-dependent; local completion/
       // wrap failures propagate (fail-closed) and are never reclassified as deferrals.
       let committed: boolean;
-      try { committed = (await this.client.reconcileEncryptedEvent(upload.event, upload.session)).committed; }
+      try { committed = (await relayClient.reconcileEncryptedEvent(upload.event, upload.session)).committed; }
       catch (error) {
-        this.reportDeferredFailure({ eventId: record.eventId, sessionId }, error);
+        reportDeferredFailure({ eventId: record.eventId, sessionId }, error);
         deferred = true;
         continue;
       }
       if (committed) {
-        this.completeFromInflight(record.eventId, sessionId, upload);
+        completeFromInflight(record.eventId, sessionId, upload);
       } else if (wrapDigest !== undefined) {
-        this.stateStore.replaceInflightEventUpload(record.eventId, sessionId, upload, wrapDigest);
+        stateStore.replaceInflightEventUpload(record.eventId, sessionId, upload, wrapDigest);
       } else {
         // Explicitly uncommitted with no wrap-able source: keep the raw legacy
         // evidence byte-preserved and fail closed — nothing else can resolve it.
         deferred = true;
       }
     }
-    for (const sessionId of this.stateStore.listInflightSessionIds()) {
-      const lookup = this.stateStore.getSessionInflightLookup(sessionId);
+    for (const sessionId of stateStore.listInflightSessionIds()) {
+      const lookup = stateStore.getSessionInflightLookup(sessionId);
       if (lookup.kind === 'missing' || lookup.kind === 'v2') continue; // nothing to convert
       if (lookup.kind === 'malformed' || lookup.kind === 'cross-bound') {
         // §4.4/§5.1: byte-preserved and fail closed — recovery-required surfaces
@@ -342,23 +394,26 @@ export class EncryptedUploadOrchestrator {
         continue;
       }
       const legacy = lookup.upload;
-      const session = this.stateStore.getSession(sessionId);
+      const session = stateStore.getSession(sessionId);
       if (session && preflightSessionSource(session).type !== 'ready') continue; // content-blocked: §6.1/§4.4 own it
       // §4.5.5: the reconcile round-trip is the only network-dependent step; local
       // completion/wrap failures propagate (fail-closed) and are never reclassified
       // as network deferrals.
       let committed: boolean;
-      try { committed = await this.client.reconcileEncryptedSession(legacy); }
+      try { committed = await relayClient.reconcileEncryptedSession(legacy); }
       catch (error) {
-        this.reportDeferredFailure({ eventId: sessionId, sessionId }, error);
+        reportDeferredFailure({ eventId: sessionId, sessionId }, error);
         deferred = true;
         continue;
       }
       if (committed) {
-        this.stateStore.commitSessionRevision(sessionId, legacy.revision);
-        this.stateStore.removeInflightSessionUpload(sessionId);
+        stateStore.commitSessionRevision(sessionId, legacy.revision);
+        stateStore.removeInflightSessionUpload(sessionId);
       } else if (session) {
-        this.stateStore.replaceInflightSessionUpload(sessionId, legacy, preflightSessionSource(session).sourceDigest);
+        const readySource = preflightSessionSource(session) as Extract<
+          ReturnType<typeof preflightSessionSource>, { type: 'ready' }
+        >;
+        stateStore.replaceInflightSessionUpload(sessionId, legacy, readySource.sourceDigest);
       } else {
         // Explicitly uncommitted with no runtime Session to derive a source digest:
         // keep the raw legacy evidence byte-preserved and fail closed.
@@ -369,29 +424,29 @@ export class EncryptedUploadOrchestrator {
   }
 
 
-  async flushPendingEvents(): Promise<number> {
+  async function flushPendingEvents(): Promise<number> {
     // §4.5.5: run the online legacy-inflight conversion first; it is idempotent
     // and interruptible. When conversion cannot converge (source-less/malformed
     // legacy evidence or a network-unknown reconcile), Event drain stops — §6.2
     // keeps the stop semantics for unconverged legacy inflight evidence.
-    if (!await this.convertLegacyInflightToV2()) return 0;
+    if (!await convertLegacyInflightToV2()) return 0;
     let snapshot: E2ERecipientSnapshotV1;
-    try { snapshot = await this.client.recipientSnapshot(); } catch (error) {
-      this.reportDeferredFailure(undefined, error);
+    try { snapshot = await relayClient.recipientSnapshot(); } catch (error) {
+      reportDeferredFailure(undefined, error);
       return 0;
     }
-    let recipients: ActiveRecipientMaterial[];
-    try { recipients = this.keyring.reconcileRecipients(snapshot); } catch (error) {
-      this.reportDeferredFailure(undefined, error);
+    let recipients: EncryptedUploadRecipientMaterial[];
+    try { recipients = keyring.reconcileRecipients(snapshot); } catch (error) {
+      reportDeferredFailure(undefined, error);
       return 0;
     }
-    if (snapshot.recipientSetVersion !== this.stateStore.getRecipientSetVersion()) {
-      if (!await this.publishRecipientChangeSnapshots(snapshot, recipients)) return 0;
+    if (snapshot.recipientSetVersion !== stateStore.getRecipientSetVersion()) {
+      if (!await publishRecipientChangeSnapshots(snapshot, recipients)) return 0;
     }
     const ctx: EventFlushContext = { snapshot, recipients };
     let flushed = 0;
-    for (const descriptor of this.stateStore.listPendingEventDescriptors()) {
-      const outcome = await this.processPendingEventDescriptor(descriptor, ctx);
+    for (const descriptor of stateStore.listPendingEventDescriptors()) {
+      const outcome = await processPendingEventDescriptor(descriptor, ctx);
       switch (outcome.outcome) {
         case 'completed':
         case 'flushed':
@@ -412,18 +467,18 @@ export class EncryptedUploadOrchestrator {
    * reconciliation (entry point 6 of §4.2). A malformed inflight or an internal
    * spool/AEAD failure never reaches the quarantine path.
    */
-  private async processPendingEventDescriptor(descriptor: PendingEventDescriptor, ctx: EventFlushContext): Promise<PendingEventDescriptorOutcome> {
+  async function processPendingEventDescriptor(descriptor: PendingEventDescriptor, ctx: EventFlushContext): Promise<PendingEventDescriptorOutcome> {
     const { eventId, sessionId } = descriptor;
 
     // §5.2 step 1: completion journal recovery wins over everything.
-    if (this.stateStore.hasEventUploadCompletion(eventId)) {
-      this.stateStore.completeEventUpload(eventId, (phase) => this.hooks?.eventCompletionStep?.(phase, eventId));
+    if (stateStore.hasEventUploadCompletion(eventId)) {
+      stateStore.completeEventUpload(eventId, (phase) => hooks?.eventCompletionStep?.(phase, eventId));
       return { outcome: 'completed' };
     }
 
     // §5.2 steps 2-3: load inflight first; malformed inflight is recovery-required.
-    const loaded = this.stateStore.loadPendingEventParts(descriptor);
-    if (!loaded.ok && loaded.reason.startsWith('inflight-')) {
+    const loaded = stateStore.loadPendingEventParts(descriptor);
+    if (isInflightLoadFailure(loaded)) {
       return { outcome: 'recovery-required' };
     }
     const inflight = loaded.inflight;
@@ -433,10 +488,10 @@ export class EncryptedUploadOrchestrator {
         const reason = sourceDeadLetterReason(loaded.reason);
         if (!reason) return { outcome: 'recovery-required' };
         if (inflight) {
-          const reconciled = await this.reconcileInflightBeforeOverwrite(eventId, sessionId, inflight);
+          const reconciled = await reconcileInflightBeforeOverwrite(eventId, sessionId, inflight);
           if ('outcome' in reconciled) return reconciled;
         }
-        return this.quarantineEvent(descriptor, reason, inflight?.raw);
+        return quarantineEvent(descriptor, reason, inflight?.raw);
       }
 
       const { event, session } = loaded.source;
@@ -446,15 +501,15 @@ export class EncryptedUploadOrchestrator {
       if (preflight.type !== 'ready') {
         const reason = preflight.type === 'invalid-content' ? 'protected-content-invalid' : 'event-session-binding-invalid';
         if (inflight) {
-          const reconciled = await this.reconcileInflightBeforeOverwrite(eventId, sessionId, inflight);
+          const reconciled = await reconcileInflightBeforeOverwrite(eventId, sessionId, inflight);
           if ('outcome' in reconciled) return reconciled;
           // Explicitly uncommitted: dead-letter only when no proven digest mismatch.
-          const currentDigest = this.sourceDigestOrUndefined(event, session);
+          const currentDigest = sourceDigestOrUndefined(event, session);
           if (currentDigest !== undefined && inflight.kind === 'v2' && !digestsEqual(inflight.sourceDigest, currentDigest)) {
             return { outcome: 'recovery-required' };
           }
         }
-        return this.quarantineEvent(descriptor, reason, inflight?.raw);
+        return quarantineEvent(descriptor, reason, inflight?.raw);
       }
       const sourceDigest = preflight.sourceDigest;
 
@@ -466,7 +521,7 @@ export class EncryptedUploadOrchestrator {
         && (inflight.upload.event.recipientSetVersion !== ctx.snapshot.recipientSetVersion
           || inflight.upload.session.recipientSetVersion !== ctx.snapshot.recipientSetVersion);
       if (inflight && (digestMismatch || recipientMismatch)) {
-        const reconciled = await this.reconcileInflightBeforeOverwrite(eventId, sessionId, inflight);
+        const reconciled = await reconcileInflightBeforeOverwrite(eventId, sessionId, inflight);
         if ('outcome' in reconciled) return reconciled;
         if (digestMismatch) return { outcome: 'recovery-required' };
       }
@@ -477,12 +532,12 @@ export class EncryptedUploadOrchestrator {
       if (canReuse) {
         upload = inflight.upload;
       } else {
-        upload = this.encryptEvent(event, session, inflight?.upload.session.revision ?? this.stateStore.nextSessionRevision(event.sessionId),
+        upload = encryptEvent(event, session, inflight?.upload.session.revision ?? stateStore.nextSessionRevision(event.sessionId),
           ctx.snapshot.recipientSetVersion, ctx.recipients);
-        if (inflight) this.stateStore.replaceInflightEventUpload(eventId, sessionId, upload, sourceDigest);
-        else this.stateStore.persistInflightEventUpload(eventId, sessionId, upload, sourceDigest);
+        if (inflight) stateStore.replaceInflightEventUpload(eventId, sessionId, upload, sourceDigest);
+        else stateStore.persistInflightEventUpload(eventId, sessionId, upload, sourceDigest);
       }
-      return this.publishEventUpload(event, session, eventId, sessionId, upload, ctx);
+      return publishEventUpload(event, session, eventId, sessionId, upload, ctx);
     } finally {
       inflight?.raw.fill(0);
     }
@@ -494,57 +549,57 @@ export class EncryptedUploadOrchestrator {
    * complete old evidence; network/identity/malformed/uncertain → defer with all
    * evidence preserved (never treated as uncommitted).
    */
-  private async reconcileInflightBeforeOverwrite(
+  async function reconcileInflightBeforeOverwrite(
     eventId: string,
     sessionId: string,
     inflight: LoadedEventInflight,
   ): Promise<PendingEventDescriptorOutcome | { committed: false; provenUncommitted: true }> {
     let committed: boolean;
     try {
-      committed = (await this.client.reconcileEncryptedEvent(inflight.upload.event, inflight.upload.session)).committed;
+      committed = (await relayClient.reconcileEncryptedEvent(inflight.upload.event, inflight.upload.session)).committed;
     } catch (error) {
-      this.reportDeferredFailure({ eventId, sessionId }, error);
+      reportDeferredFailure({ eventId, sessionId }, error);
       return { outcome: 'deferred' };
     }
     if (committed) {
-      this.completeFromInflight(eventId, sessionId, inflight.upload);
+      completeFromInflight(eventId, sessionId, inflight.upload);
       return { outcome: 'completed' };
     }
     return { committed: false as const, provenUncommitted: true as const };
   }
 
-  private completeFromInflight(eventId: string, sessionId: string, upload: EncryptedEventAndSession): void {
-    this.stateStore.beginEventUploadCompletion({
+  function completeFromInflight(eventId: string, sessionId: string, upload: EncryptedEventAndSession): void {
+    stateStore.beginEventUploadCompletion({
       version: 1, eventId, sessionId, revision: upload.session.revision,
       eventContentId: upload.event.content.contentId, sessionContentId: upload.session.content.contentId,
       committedAt: new Date().toISOString(),
     });
-    this.hooks?.eventCompletionStep?.('journaled', eventId);
-    this.stateStore.completeEventUpload(eventId, (phase) => this.hooks?.eventCompletionStep?.(phase, eventId));
+    hooks?.eventCompletionStep?.('journaled', eventId);
+    stateStore.completeEventUpload(eventId, (phase) => hooks?.eventCompletionStep?.(phase, eventId));
   }
 
-  private quarantineEvent(
+  function quarantineEvent(
     descriptor: PendingEventDescriptor,
     reasonCode: EventDeadLetterReasonCode,
     provenUncommittedInflight?: Uint8Array,
   ): PendingEventDescriptorOutcome {
     let quarantined: boolean;
     try {
-      quarantined = this.stateStore.quarantinePendingEventRaw(descriptor, reasonCode, provenUncommittedInflight);
+      quarantined = stateStore.quarantinePendingEventRaw(descriptor, reasonCode, provenUncommittedInflight);
     } catch (error) {
       // The source and inflight records stay untouched and retryable; a local
       // spool write failure is a storage fault, never a Relay network category.
-      this.reportDeferredFailure({ eventId: descriptor.eventId, sessionId: descriptor.sessionId }, error, 'local-spool-record');
+      reportDeferredFailure({ eventId: descriptor.eventId, sessionId: descriptor.sessionId }, error, 'local-spool-record');
       return { outcome: 'deferred' };
     }
     if (!quarantined) return { outcome: 'deferred' };
-    this.hooks?.eventFailure?.({
+    hooks?.eventFailure?.({
       eventId: descriptor.eventId, sessionId: descriptor.sessionId, outcome: 'quarantined', category: 'local-validation',
     });
     return { outcome: 'quarantined' };
   }
 
-  private sourceDigestOrUndefined(
+  function sourceDigestOrUndefined(
     event: import('@ariava/protocol').CanonicalEvent,
     session: import('@ariava/protocol').CanonicalSessionState,
   ): string | undefined {
@@ -555,7 +610,7 @@ export class EncryptedUploadOrchestrator {
    * §5.2 step 7 publish loop: reuse-or-fresh upload, conflict handling via the
    * existing decision model, recipient refresh at most once, completion journal.
    */
-  private async publishEventUpload(
+  async function publishEventUpload(
     event: import('@ariava/protocol').CanonicalEvent,
     session: import('@ariava/protocol').CanonicalSessionState,
     eventId: string,
@@ -567,12 +622,12 @@ export class EncryptedUploadOrchestrator {
     let decision: EventUploadDecision;
     let conflictError: unknown;
     try {
-      await this.client.publishEncryptedEvent(inflight.event, inflight.session);
+      await relayClient.publishEncryptedEvent(inflight.event, inflight.session);
       decision = { type: 'complete' };
     } catch (error) {
       conflictError = error;
       if (!isRelayConflict(error)) {
-        this.reportDeferredFailure({ eventId, sessionId }, error);
+        reportDeferredFailure({ eventId, sessionId }, error);
         return { outcome: 'deferred' };
       }
       // §4.4: reconcile the ORIGINAL envelope exactly; a reconcile network/identity
@@ -580,9 +635,9 @@ export class EncryptedUploadOrchestrator {
       // preserved and never quarantine on unknown commit state.
       let reconciled: { committed: boolean };
       try {
-        reconciled = await this.client.reconcileEncryptedEvent(inflight.event, inflight.session);
+        reconciled = await relayClient.reconcileEncryptedEvent(inflight.event, inflight.session);
       } catch (reconcileError) {
-        this.reportDeferredFailure({ eventId, sessionId }, reconcileError);
+        reportDeferredFailure({ eventId, sessionId }, reconcileError);
         return { outcome: 'deferred' };
       }
       decision = decideEventUpload({
@@ -595,17 +650,17 @@ export class EncryptedUploadOrchestrator {
     }
     if (decision.type === 'refresh-session-and-reencrypt') {
       try {
-        ctx.snapshot = await this.client.recipientSnapshot();
-        ctx.recipients = this.keyring.reconcileRecipients(ctx.snapshot);
+        ctx.snapshot = await relayClient.recipientSnapshot();
+        ctx.recipients = keyring.reconcileRecipients(ctx.snapshot);
       } catch (refreshError) {
-        this.reportDeferredFailure({ eventId, sessionId }, refreshError);
+        reportDeferredFailure({ eventId, sessionId }, refreshError);
         return { outcome: 'deferred' };
       }
-      const replacement = this.encryptEvent(event, session, inflight.session.revision, ctx.snapshot.recipientSetVersion, ctx.recipients);
-      this.stateStore.replaceInflightEventUpload(eventId, sessionId, replacement, eventSourceDigest(event, session));
+      const replacement = encryptEvent(event, session, inflight.session.revision, ctx.snapshot.recipientSetVersion, ctx.recipients);
+      stateStore.replaceInflightEventUpload(eventId, sessionId, replacement, eventSourceDigest(event, session));
       inflight = replacement;
       try {
-        await this.client.publishEncryptedEvent(inflight.event, inflight.session);
+        await relayClient.publishEncryptedEvent(inflight.event, inflight.session);
         decision = { type: 'complete' };
       } catch (retryError) {
         conflictError = retryError;
@@ -614,9 +669,9 @@ export class EncryptedUploadOrchestrator {
         let retryReconciled: { committed: boolean } | undefined;
         if (isRelayConflict(retryError)) {
           try {
-            retryReconciled = await this.client.reconcileEncryptedEvent(inflight.event, inflight.session);
+            retryReconciled = await relayClient.reconcileEncryptedEvent(inflight.event, inflight.session);
           } catch (reconcileError) {
-            this.reportDeferredFailure({ eventId, sessionId }, reconcileError);
+            reportDeferredFailure({ eventId, sessionId }, reconcileError);
             return { outcome: 'deferred' };
           }
         }
@@ -631,23 +686,23 @@ export class EncryptedUploadOrchestrator {
       }
     }
     if (decision.type === 'complete') {
-      this.completeFromInflight(eventId, sessionId, inflight);
+      completeFromInflight(eventId, sessionId, inflight);
       return { outcome: 'flushed' };
     }
     if (decision.type === 'quarantine') {
-      if (!this.quarantinePermanentlyConflictingEvent(event, conflictError)) return { outcome: 'deferred' };
+      if (!quarantinePermanentlyConflictingEvent(event, conflictError)) return { outcome: 'deferred' };
       return { outcome: 'quarantined' };
     }
-    this.reportDeferredFailure({ eventId, sessionId }, conflictError);
+    reportDeferredFailure({ eventId, sessionId }, conflictError);
     return { outcome: 'deferred' };
   }
 
-  private quarantinePermanentlyConflictingEvent(event: import('@ariava/protocol').CanonicalEvent, error: unknown): boolean {
+  function quarantinePermanentlyConflictingEvent(event: import('@ariava/protocol').CanonicalEvent, error: unknown): boolean {
     const relayError = isRelayConflict(error) ? error : undefined;
-    const inflightRaw = this.stateStore.openInflightEventRaw(event.eventId);
+    const inflightRaw = stateStore.openInflightEventRaw(event.eventId);
     let quarantined: boolean;
     try {
-      quarantined = this.stateStore.quarantinePendingEventRaw(
+      quarantined = stateStore.quarantinePendingEventRaw(
         { eventId: event.eventId, sessionId: event.sessionId },
         'relay-permanent-conflict',
         inflightRaw,
@@ -655,16 +710,16 @@ export class EncryptedUploadOrchestrator {
     } catch {
       // The encrypted source and inflight records must remain retryable; a local
       // spool write failure is a storage fault, never a Relay network category.
-      this.reportDeferredFailure(event, error, 'local-spool-record');
+      reportDeferredFailure(event, error, 'local-spool-record');
       return false;
     } finally {
       inflightRaw?.fill(0);
     }
     if (!quarantined) {
-      this.reportDeferredFailure(event, error, 'local-spool-record');
+      reportDeferredFailure(event, error, 'local-spool-record');
       return false;
     }
-    this.hooks?.eventFailure?.({
+    hooks?.eventFailure?.({
       eventId: event.eventId,
       sessionId: event.sessionId,
       outcome: 'quarantined',
@@ -674,45 +729,43 @@ export class EncryptedUploadOrchestrator {
     return true;
   }
 
-  private encryptEvent(
+  function encryptEvent(
     event: import('@ariava/protocol').CanonicalEvent,
     session: import('@ariava/protocol').CanonicalSessionState,
     revision: number,
     recipientSetVersion: number,
-    recipients: ActiveRecipientMaterial[],
+    recipients: EncryptedUploadRecipientMaterial[],
   ): EncryptedEventAndSession {
-    const upload = encryptEventUpload({ ...eventEncryptionInput(event, session), revision, recipientSetVersion, recipients });
-    attachNotificationPreviews(upload, event, session, recipients);
-    return upload;
+    return crypto.encryptEventUpload({ event, session, revision, recipientSetVersion, recipients });
   }
 
-  private reportDeferredFailure(event: { eventId?: string; sessionId?: string } | undefined, error: unknown, categoryOverride?: UploadFailureCategory): void {
+  function reportDeferredFailure(event: { eventId?: string; sessionId?: string } | undefined, error: unknown, categoryOverride?: UploadFailureCategory): void {
     const status = relayErrorStatus(error);
-    this.hooks?.eventFailure?.({ eventId: event?.eventId ?? 'pending-events', sessionId: event?.sessionId ?? 'unknown',
+    hooks?.eventFailure?.({ eventId: event?.eventId ?? 'pending-events', sessionId: event?.sessionId ?? 'unknown',
       outcome: 'retry-deferred', ...(status !== undefined ? { status } : {}), category: categoryOverride ?? relayFailureCategory(error) });
   }
 
-  async publishRecipientChangeSnapshots(snapshot: E2ERecipientSnapshotV1, recipients: ActiveRecipientMaterial[]): Promise<boolean> {
-    const pendingIds = new Set(this.stateStore.listInflightSessionIds());
-    for (const session of this.stateStore.listSessions()) {
-      if (!this.stateStore.getInflightSessionUpload(session.sessionId)) {
+  async function publishRecipientChangeSnapshots(snapshot: E2ERecipientSnapshotV1, recipients: EncryptedUploadRecipientMaterial[]): Promise<boolean> {
+    const pendingIds = new Set(stateStore.listInflightSessionIds());
+    for (const session of stateStore.listSessions()) {
+      if (!stateStore.getInflightSessionUpload(session.sessionId)) {
         if (preflightSessionSource(session).type !== 'ready') return false;
-        const upload = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: this.stateStore.nextSessionRevision(session.sessionId),
+        const upload = crypto.encryptSessionSnapshot({ session, revision: stateStore.nextSessionRevision(session.sessionId),
           recipientSetVersion: snapshot.recipientSetVersion, recipients });
-        this.stateStore.persistInflightSessionUpload(session.sessionId, upload, sessionSourceDigest(session)); pendingIds.add(session.sessionId);
+        stateStore.persistInflightSessionUpload(session.sessionId, upload, sessionSourceDigest(session)); pendingIds.add(session.sessionId);
       }
     }
     for (const sessionId of pendingIds) {
-      let upload = this.stateStore.getInflightSessionUpload(sessionId) as EncryptedSessionSnapshotUploadV3 | undefined; if (!upload) return false;
+      let upload = stateStore.getInflightSessionUpload(sessionId) as EncryptedSessionSnapshotUploadV3 | undefined; if (!upload) return false;
       let sameVersionCommitRetryExhausted = false;
       for (;;) {
         let decision: SessionUploadDecision;
         let conflictError: unknown;
         let currentSnapshot: E2ERecipientSnapshotV1 | undefined;
-        let currentRecipients: ActiveRecipientMaterial[] | undefined;
+        let currentRecipients: EncryptedUploadRecipientMaterial[] | undefined;
         let session: import('@ariava/protocol').CanonicalSessionState | undefined;
         try {
-          await this.client.publishEncryptedSession(upload);
+          await relayClient.publishEncryptedSession(upload);
           decision = decideSessionUpload({
             publishSucceeded: true,
             attemptedRecipientVersion: upload.recipientSetVersion,
@@ -730,17 +783,17 @@ export class EncryptedUploadOrchestrator {
             });
           } else {
             let committed: boolean;
-            try { committed = await this.client.reconcileEncryptedSession(upload); }
+            try { committed = await relayClient.reconcileEncryptedSession(upload); }
             catch (reconcileError) {
-              this.reportDeferredFailure(undefined, reconcileError);
+              reportDeferredFailure(undefined, reconcileError);
               return false;
             }
             if (error.reason === RECIPIENT_SET_CHANGED_REASON) {
-              session = this.stateStore.getSession(sessionId);
+              session = stateStore.getSession(sessionId);
               if (!session) return false;
               try {
-                currentSnapshot = await this.client.recipientSnapshot();
-                currentRecipients = this.keyring.reconcileRecipients(currentSnapshot);
+                currentSnapshot = await relayClient.recipientSnapshot();
+                currentRecipients = keyring.reconcileRecipients(currentSnapshot);
               } catch { return false; }
               snapshot = currentSnapshot;
               recipients = currentRecipients;
@@ -759,21 +812,21 @@ export class EncryptedUploadOrchestrator {
         }
         switch (decision.type) {
           case 'commit':
-            this.stateStore.commitSessionRevision(sessionId, decision.acceptedRevision);
-            this.stateStore.removeInflightSessionUpload(sessionId);
+            stateStore.commitSessionRevision(sessionId, decision.acceptedRevision);
+            stateStore.removeInflightSessionUpload(sessionId);
             break;
           case 'defer':
           case 'reconcile':
             return false;
           case 'fail-closed':
-            this.reportDeferredFailure(undefined, conflictError);
+            reportDeferredFailure(undefined, conflictError);
             return false;
           case 'refresh-reencrypt': {
             if (!session || !currentSnapshot || !currentRecipients) return false;
             if (preflightSessionSource(session).type !== 'ready') return false;
-            const replacement = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: decision.revision,
+            const replacement = crypto.encryptSessionSnapshot({ session, revision: decision.revision,
               recipientSetVersion: currentSnapshot.recipientSetVersion, recipients: currentRecipients });
-            this.stateStore.replaceInflightSessionUpload(sessionId, replacement, sessionSourceDigest(session));
+            stateStore.replaceInflightSessionUpload(sessionId, replacement, sessionSourceDigest(session));
             upload = replacement;
             break;
           }
@@ -781,21 +834,32 @@ export class EncryptedUploadOrchestrator {
             if (!session || !currentSnapshot || !currentRecipients) return false;
             if (preflightSessionSource(session).type !== 'ready') return false;
             sameVersionCommitRetryExhausted = currentSnapshot.recipientSetVersion === upload.recipientSetVersion;
-            this.stateStore.commitSessionRevision(sessionId, upload.revision);
-            this.stateStore.removeInflightSessionUpload(sessionId);
-            upload = encryptSessionSnapshot({ ...sessionEncryptionInput(session), revision: decision.revision,
+            stateStore.commitSessionRevision(sessionId, upload.revision);
+            stateStore.removeInflightSessionUpload(sessionId);
+            upload = crypto.encryptSessionSnapshot({ session, revision: decision.revision,
               recipientSetVersion: currentSnapshot.recipientSetVersion, recipients: currentRecipients });
-            this.stateStore.persistInflightSessionUpload(sessionId, upload, sessionSourceDigest(session));
+            stateStore.persistInflightSessionUpload(sessionId, upload, sessionSourceDigest(session));
             break;
           }
         }
         if (decision.type === 'commit') break;
       }
     }
-    this.stateStore.setRecipientSetVersion(snapshot.recipientSetVersion);
+    stateStore.setRecipientSetVersion(snapshot.recipientSetVersion);
     return true;
   }
+
+  return {
+    publishAuthoritativeSnapshots,
+    preflightAuthoritativeSessionSet,
+    reconcileSessionInflights,
+    convertLegacyInflightToV2,
+    flushPendingEvents,
+    publishRecipientChangeSnapshots,
+  };
 }
+
+export type EncryptedUploadActions = ReturnType<typeof createEncryptedUploadActions>;
 
 /** Per-descriptor outcome taxonomy (§5.2/§5.4). `deferred` keeps the existing
  * network stop semantics; `recovery-required` preserves evidence and fails
@@ -806,7 +870,16 @@ type PendingEventDescriptorOutcome = { outcome: 'completed' | 'flushed' | 'quara
 
 interface EventFlushContext {
   snapshot: E2ERecipientSnapshotV1;
-  recipients: ActiveRecipientMaterial[];
+  recipients: EncryptedUploadRecipientMaterial[];
+}
+
+type InflightLoadFailure = Extract<
+  LoadPendingEventPartsResult,
+  { ok: false; reason: `inflight-${string}` }
+>;
+
+function isInflightLoadFailure(result: LoadPendingEventPartsResult): result is InflightLoadFailure {
+  return !result.ok && result.reason.startsWith('inflight-');
 }
 
 function sourceDeadLetterReason(

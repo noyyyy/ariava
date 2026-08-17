@@ -14,11 +14,21 @@ mock.module('../src/e2e/node-crypto', () => ({
   hkdfSha256: () => new Uint8Array(32).fill(5),
 }));
 
-const { EncryptedUploadOrchestrator } = await import('../src/e2e/upload-orchestrator');
+const { createEncryptedUploadActions, DEFAULT_ENCRYPTED_UPLOAD_CRYPTO } = await import('../src/e2e/upload-actions');
 const { BridgeStateStore } = await import('../src/state-store');
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+
+/** Mirrors the removed compatibility facade's constructor shape; binds the single actions implementation. */
+function createOrchestrator(
+  stateStore: any,
+  relayClient: any,
+  keyring: any,
+  hooks?: Parameters<typeof createEncryptedUploadActions>[0]['hooks'],
+) {
+  return createEncryptedUploadActions({ stateStore, relayClient, crypto: DEFAULT_ENCRYPTED_UPLOAD_CRYPTO, keyring, hooks });
+}
 
 function fixture() {
   const root = join(tmpdir(), `bridge-pending-${Date.now()}-${roots.length}`); roots.push(root); mkdirSync(root, { mode: 0o700 });
@@ -112,7 +122,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     store.queuePendingEvent(oversized, { ...terminalSession(), lastEventId: 'event-bad' } as any);
     enqueueGood(store, 0);
     enqueueGood(store, 1);
-    const orchestrator = new EncryptedUploadOrchestrator(store, okClient as any, emptyKeyring, { eventFailure: (f) => failures.push(f) });
+    const orchestrator = createOrchestrator(store, okClient as any, emptyKeyring, { eventFailure: (f) => failures.push(f) });
     expect(await orchestrator.flushPendingEvents()).toBe(2);
     const dead = store.getQuarantinedEventRecord('event-bad') as any;
     expect(dead).toMatchObject({ version: 2, eventId: 'event-bad', reasonCode: 'protected-content-invalid' });
@@ -129,7 +139,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     store.queuePendingEvent(legal, { ...terminalSession(), lastEventId: 'event-big' } as any);
     const uploads: any[] = [];
     const client = { ...okClient, publishEncryptedEvent: async (event: any, session: any) => { uploads.push({ event, session }); } };
-    expect(await new EncryptedUploadOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(2);
+    expect(await createOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(2);
     expect(uploads.some((u) => u.event.eventId === 'event-big')).toBe(true);
   });
 
@@ -138,7 +148,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     store.setRecipientSetVersion(1);
     enqueueRawSource(store, 'bad', 'session-bad', encoder.encode('{ definitely not json'));
     enqueueGood(store, 1);
-    const orchestrator = new EncryptedUploadOrchestrator(store, okClient as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, okClient as any, emptyKeyring);
     expect(await orchestrator.flushPendingEvents()).toBe(1);
     const dead = store.getQuarantinedEventRecord('bad') as any;
     expect(dead).toMatchObject({ version: 2, eventId: 'bad', reasonCode: 'source-json-invalid' });
@@ -155,7 +165,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     restarted.initializeEncryptedSpool('host-test', identityPath, 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
     restarted.setRecipientSetVersion(1);
     expect(restarted.listPendingEventDescriptors().map((d) => d.eventId).sort()).toEqual(['bad', 'event-1']);
-    const orchestrator = new EncryptedUploadOrchestrator(restarted, okClient as any, emptyKeyring);
+    const orchestrator = createOrchestrator(restarted, okClient as any, emptyKeyring);
     expect(await orchestrator.flushPendingEvents()).toBe(1);
     const dead = restarted.getQuarantinedEventRecord('bad') as any;
     expect(dead).toMatchObject({ version: 2, eventId: 'bad', reasonCode: 'source-utf8-invalid' });
@@ -170,7 +180,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
       recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
       publishEncryptedEvent: async () => { if (offline) throw new Error('offline'); },
     };
-    const orchestrator = new EncryptedUploadOrchestrator(store, client as any, emptyKeyring);
+    const orchestrator = createOrchestrator(store, client as any, emptyKeyring);
     expect(await orchestrator.flushPendingEvents()).toBe(0); // inflight created, publish deferred
     expect(store.getInflightEventUpload('event-1')).toBeDefined();
     replaceSource(store, 'event-1', 'session-1', encoder.encode('{ corrupted source'));
@@ -178,7 +188,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
       ...okClient,
       reconcileEncryptedEvent: async () => { reconciles += 1; return { committed: true }; },
     };
-    expect(await new EncryptedUploadOrchestrator(store, reconcilingClient as any, emptyKeyring).flushPendingEvents()).toBe(1);
+    expect(await createOrchestrator(store, reconcilingClient as any, emptyKeyring).flushPendingEvents()).toBe(1);
     expect(reconciles).toBe(1);
     expect(store.getQuarantinedEventRecord('event-1')).toBeUndefined();
     expect(store.getInflightEventUpload('event-1')).toBeUndefined();
@@ -195,13 +205,13 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
       recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
       publishEncryptedEvent: async () => { if (offline) throw new Error('offline'); },
     };
-    expect(await new EncryptedUploadOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(0);
     replaceSource(store, 'event-1', 'session-1', encoder.encode('{ corrupted source'));
     const reconcilingClient = {
       ...okClient,
       reconcileEncryptedEvent: async () => ({ committed: false }),
     };
-    expect(await new EncryptedUploadOrchestrator(store, reconcilingClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, reconcilingClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
     const dead = store.getQuarantinedEventRecord('event-1') as any;
     expect(dead).toMatchObject({ version: 2, eventId: 'event-1', reasonCode: 'source-json-invalid' });
     expect(typeof dead.inflightArchive?.bytes).toBe('string');
@@ -217,9 +227,9 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
       recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
       publishEncryptedEvent: async () => { if (offline) throw new Error('offline'); },
     };
-    expect(await new EncryptedUploadOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(0);
     replaceInflight(store, 'event-1', 'session-1', encoder.encode('{ broken inflight'));
-    expect(await new EncryptedUploadOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
     expect(store.getQuarantinedEventRecord('event-1')).toBeUndefined();
     expect(store.peekPendingUploads().map((p) => p.event.eventId)).toEqual(['event-1']);
     expect(store.getInflightEventUpload('event-1')).toBeUndefined(); // unwrap of malformed wrapper is not a valid upload
@@ -235,7 +245,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     });
     let publishes = 0;
     const client = { ...okClient, publishEncryptedEvent: async () => { publishes += 1; } };
-    expect(await new EncryptedUploadOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(1);
+    expect(await createOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(1);
     expect(publishes).toBe(0);
     expect(store.peekPendingUploads()).toEqual([]);
     expect(store.currentSessionRevision('session-1')).toBe(1);
@@ -250,14 +260,14 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
       recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
       publishEncryptedEvent: async () => { if (offline) throw new Error('offline'); },
     };
-    expect(await new EncryptedUploadOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(0);
     // Immutable source replaced under the same eventId with different content → digest mismatch.
     replaceSource(store, 'event-1', 'session-1', encoder.encode(JSON.stringify({ event: eventN(1, { agentText: 'different content' }), session: sessionN(1) })));
     const reconcilingClient = {
       ...okClient,
       reconcileEncryptedEvent: async () => { reconciles += 1; return { committed: true }; },
     };
-    expect(await new EncryptedUploadOrchestrator(store, reconcilingClient as any, emptyKeyring).flushPendingEvents()).toBe(1);
+    expect(await createOrchestrator(store, reconcilingClient as any, emptyKeyring).flushPendingEvents()).toBe(1);
     expect(reconciles).toBe(1);
     expect(store.getQuarantinedEventRecord('event-1')).toBeUndefined();
     expect(store.peekPendingUploads()).toEqual([]);
@@ -272,13 +282,13 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
       recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
       publishEncryptedEvent: async () => { if (offline) throw new Error('offline'); },
     };
-    expect(await new EncryptedUploadOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(0);
     replaceSource(store, 'event-1', 'session-1', encoder.encode(JSON.stringify({ event: eventN(1, { agentText: 'different content' }), session: sessionN(1) })));
     const reconcilingClient = {
       ...okClient,
       reconcileEncryptedEvent: async () => { reconciles += 1; return { committed: false }; },
     };
-    expect(await new EncryptedUploadOrchestrator(store, reconcilingClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, reconcilingClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
     expect(reconciles).toBe(1);
     expect(store.getQuarantinedEventRecord('event-1')).toBeUndefined();
     expect(store.peekPendingUploads().map((p) => p.event.eventId)).toEqual(['event-1']);
@@ -290,7 +300,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     enqueueGood(store, 1);
     const bigSession = { ...terminalSession(), lastEventId: 'event-bad-session', openingText: 'a'.repeat(64 * 1024) } as any;
     store.queuePendingEvent(doneEvent({ eventId: 'event-bad-session', sessionId: 'session-test' }), bigSession);
-    expect(await new EncryptedUploadOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(1);
+    expect(await createOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(1);
     const dead = store.getQuarantinedEventRecord('event-bad-session') as any;
     expect(dead).toMatchObject({ version: 2, eventId: 'event-bad-session', reasonCode: 'protected-content-invalid' });
     expect(store.peekPendingUploads()).toEqual([]);
@@ -310,14 +320,14 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     throwing.setRecipientSetVersion(1);
     enqueueRawSource(throwing, 'bad', 'session-bad', encoder.encode('{ not json'));
     enqueueGood(throwing, 1);
-    expect(await new EncryptedUploadOrchestrator(throwing as any, okClient as any, emptyKeyring, { eventFailure: (f) => failures.push(f) }).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(throwing as any, okClient as any, emptyKeyring, { eventFailure: (f) => failures.push(f) }).flushPendingEvents()).toBe(0);
     expect(attempts).toBe(1);
     expect(failures).toEqual([{ eventId: 'bad', sessionId: 'session-bad', outcome: 'retry-deferred', category: 'local-spool-record' }]);
     throwing.dispose();
     const restarted = new BridgeStateStore(statePath);
     restarted.initializeEncryptedSpool('host-test', identityPath, 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
     restarted.setRecipientSetVersion(1);
-    expect(await new EncryptedUploadOrchestrator(restarted, okClient as any, emptyKeyring).flushPendingEvents()).toBe(1);
+    expect(await createOrchestrator(restarted, okClient as any, emptyKeyring).flushPendingEvents()).toBe(1);
     expect(restarted.getQuarantinedEventRecord('bad')).toMatchObject({ version: 2, eventId: 'bad', reasonCode: 'source-json-invalid' });
   });
 
@@ -330,7 +340,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     throwing.initializeEncryptedSpool('host-test', identityPath, 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
     throwing.setRecipientSetVersion(1);
     enqueueGood(throwing, 1);
-    const orchestrator = new EncryptedUploadOrchestrator(throwing as any, okClient as any, emptyKeyring);
+    const orchestrator = createOrchestrator(throwing as any, okClient as any, emptyKeyring);
     await expect(orchestrator.flushPendingEvents()).rejects.toThrow('internal keyring fault');
     expect(throwing.getQuarantinedEventRecord('event-1')).toBeUndefined();
     expect(throwing.peekPendingUploads().map((p) => p.event.eventId)).toEqual(['event-1']);
@@ -345,7 +355,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     throwing.initializeEncryptedSpool('host-test', identityPath, 'linux', { loadOrCreate: () => new Uint8Array(32).fill(7) });
     throwing.setRecipientSetVersion(1);
     enqueueGood(throwing, 1);
-    const orchestrator = new EncryptedUploadOrchestrator(throwing as any, okClient as any, emptyKeyring);
+    const orchestrator = createOrchestrator(throwing as any, okClient as any, emptyKeyring);
     await expect(orchestrator.flushPendingEvents()).rejects.toThrow();
     expect(throwing.getQuarantinedEventRecord('event-1')).toBeUndefined();
     expect(throwing.peekPendingUploads().map((p) => p.event.eventId)).toEqual(['event-1']);
@@ -360,7 +370,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
       recipientSnapshot: async () => ({ version: 1, hostId: 'host-test', recipientSetVersion: 1, recipients: [] }),
       publishEncryptedEvent: async () => { if (offline) throw new Error('offline'); },
     };
-    expect(await new EncryptedUploadOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, client as any, emptyKeyring).flushPendingEvents()).toBe(0);
     const inflight = store.getInflightEventUpload('event-1') as any;
     expect(inflight).toBeDefined();
     expect(inflight.event.eventId).toBe('event-1');
@@ -386,14 +396,14 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     store.setRecipientSetVersion(1);
     enqueueGood(store, 1);
     const offlineClient = { ...okClient, publishEncryptedEvent: async () => { throw new Error('offline'); } };
-    expect(await new EncryptedUploadOrchestrator(store, offlineClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, offlineClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
     const wrapper = JSON.parse(new TextDecoder().decode(readRawSpool(store, 'inflight:event:event-1')));
     mutate(wrapper);
     const malformed = encoder.encode(JSON.stringify(wrapper));
     const expectedMalformed = malformed.slice();
     replaceInflight(store, 'event-1', 'session-1', malformed);
     const sourceBefore = readRawSpool(store, 'event-1');
-    expect(await new EncryptedUploadOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
     expect(store.getQuarantinedEventRecord('event-1')).toBeUndefined();
     expect(readRawSpool(store, 'event-1')).toEqual(sourceBefore);
     expect(readRawSpool(store, 'inflight:event:event-1')).toEqual(expectedMalformed);
@@ -405,7 +415,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     const raw = encoder.encode(JSON.stringify({ event: eventN(1), session: sessionN(1), unknown: true }));
     const expectedRaw = raw.slice();
     enqueueRawSource(store, 'event-1', 'session-1', raw);
-    expect(await new EncryptedUploadOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
     const dead = store.getQuarantinedEventRecord('event-1') as any;
     expect(dead).toMatchObject({ version: 2, reasonCode: 'source-json-invalid' });
     const { base64UrlDecode } = await import('@ariava/protocol');
@@ -430,7 +440,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
         keyWraps: [] },
     };
     store.persistInflightEventUpload('event-1', 'session-1', foreign, 'A'.repeat(43));
-    expect(await new EncryptedUploadOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
     expect(store.getQuarantinedEventRecord('event-1')).toBeUndefined();
     expect(store.peekPendingUploads().map((p) => p.event.eventId)).toEqual(['event-1']);
     expect(store.currentSessionRevision('session-1')).toBe(0);
@@ -441,7 +451,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     store.setRecipientSetVersion(1);
     enqueueGood(store, 1);
     store.persistInflightEventUpload('event-1', 'session-1', { event: {}, session: {} });
-    expect(await new EncryptedUploadOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
     expect(store.getQuarantinedEventRecord('event-1')).toBeUndefined();
     expect(store.peekPendingUploads().map((p) => p.event.eventId)).toEqual(['event-1']);
   });
@@ -453,7 +463,7 @@ describe('PendingEventProcessor §5.2/§5.4 queue isolation', () => {
     // Tuple B (event-2/session-2) stored under descriptor A (event-1/session-1):
     // internally consistent but not bound to the outer descriptor.
     replaceSource(store, 'event-1', 'session-1', encoder.encode(JSON.stringify({ event: eventN(2), session: sessionN(2) })));
-    expect(await new EncryptedUploadOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
+    expect(await createOrchestrator(store, okClient as any, emptyKeyring).flushPendingEvents()).toBe(0);
     const dead = store.getQuarantinedEventRecord('event-1') as any;
     expect(dead).toMatchObject({ version: 2, eventId: 'event-1', reasonCode: 'event-session-binding-invalid' });
     expect(store.peekPendingUploads()).toEqual([]);
