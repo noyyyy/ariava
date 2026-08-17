@@ -15,13 +15,15 @@ Both profiles share one command shell (`apps/bridge/src/cli/app.ts`), one comman
 | Config file | `<root>/config.json` | `<root>/config.json` |
 | Identity | `<root>/host-identity.json`, Keychain profile `default` | `<root>/host-identity.json`, Keychain profile `dev` (separate evidence account) |
 | State | `<root>/state/bridge-state.json` | `<root>/state/bridge-state.json` |
-| Agent Adapter discovery | `<root>/agent-adapter.json` | `<root>/agent-adapter.json` |
+| Agent Adapter discovery | `<root>/agent-adapter.json` — six-key protocol-4 `{url, secret, protocolVersion: 4, provider, profileId, hostId}` | `<root>/agent-adapter.json` — same six-key protocol-4 shape with dev profileId |
 | Agent Adapter port | `7272` | `7273` |
 | Default Relay base URL | `https://ariava-relay.noyx.io` | `http://127.0.0.1:8790` |
 | Default host name | machine hostname | `<hostname> (Dev)` |
 | pi extension log | `<root>/pi-extension.log` | `<root>/pi-extension.log` |
 
 Both descriptors are validated by `apps/bridge/src/cli/profile.ts`: fixed resources per profile (ports, identity profile, root name), normalized absolute paths, no lexical or canonical (symlink) overlap with the counterpart profile.
+
+Both profiles share the Agent Adapter Protocol 4 owner-bound wire: authenticated `GET /v2/health`, owner-bound `/v2/agent/**` operations carrying driver-instance/owner-lease headers, and the persistent six-key discovery above. The discovery file holds the persistent `agentAdapterSecret` shared by all providers; it is not Relay authentication. Pi Event publication is best-effort single-attempt: a normal Pi native API return submits `executed`, a throw after possible invocation stays internal `outcome_unknown`, and uncertain commands are never replayed.
 
 ## 2. Command surface
 
@@ -78,7 +80,7 @@ Unavailable commands fail with `ERR_COMMAND_UNAVAILABLE_FOR_PROFILE` before any 
 | Config env defaults | `allowProductionEnvironmentDefaults: true`, `saveBaseBeforeIdentity: true` | Both forced `false` | Dev must not silently inherit ambient production Relay/port overrides |
 | Version resolution | Installed semver; invalid version is a hard error | Source version; invalid falls back to `0.0.0-dev` | Dev should never block on version metadata |
 | Service lifecycle | Full `service` + `logs` + `upgrade`/`uninstall` surface | None | Dev runs the Bridge in the foreground; no user service exists |
-| pi management | Managed npm package (`npm:@ariava/pi-extension@<version>`) | Source extension (`pi --no-extensions -e extensions/pi/index.ts`) | Prod installs use the published package; source dev uses the checkout |
+| pi management | Managed npm package (`npm:@ariava/pi-extension@<exact-cli-version>`) | Source extension (`pi --no-extensions -e extensions/pi/index.ts`) | Prod installs use the published package; source dev uses the checkout. The Bridge and `@ariava/pi-extension` must be the exact same version; existing Pi sessions need `/reload` after the coordinated upgrade. |
 | `setup` | Guided onboarding (§5) | `init` + foreground source Bridge + optional source pi | See §5 |
 | Help | Full product reference + examples | Compact dev reference | Audience differs |
 | `status pi` | Available | Rejected | Dev has no managed pi package to inspect |
