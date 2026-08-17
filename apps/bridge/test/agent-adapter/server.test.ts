@@ -415,7 +415,7 @@ describe('AgentAdapterServer', () => {
     const eventId = registry.pushEvent('sess-1', canonical('First', '2026-07-16T00:00:02.000Z'));
     const response = await fetch(url('/v2/agent/sessions/sess-1/handle'), {
       method: 'POST', headers: ownerHeaders(),
-      body: JSON.stringify({ handledThroughEventId: eventId, handledAt: '2026-07-16T00:00:02Z', action: 'pi_input' }),
+      body: JSON.stringify({ handledThroughEventId: eventId, handledAt: '2026-07-16T00:00:02Z', action: 'local_input' }),
     });
     expect(store.peekPendingSessionHandles()[0]).toMatchObject({
       handledThroughEventId: eventId, handledThroughEventCreatedAt: '2026-07-16T00:00:02.000Z', action: 'pi_input',
@@ -428,6 +428,7 @@ describe('AgentAdapterServer', () => {
     expect(removed.status).toBe(404);
 
     for (const legacyBody of [
+      { handledThroughEventId: eventId, action: 'pi_input' },
       { handledThroughEventId: eventId, latestReadEventId: eventId },
       { handledThroughEventId: eventId, action: 'watch_reply' },
       { handledThroughEventId: eventId, actorId: 'host-spoofed' },
@@ -735,19 +736,30 @@ describe('AgentAdapterServer', () => {
         expect(headersOnly.status, `${method} ${path} without owner headers`).toBe(400);
         expect(await headersOnly.json()).toEqual({ error: { code: 'INVALID_REQUEST', retryable: false } });
       }
-      // Malformed header values are rejected the same way.
-      const malformed = await fetch(url('/v2/agent/sessions/sess-1/heartbeat'), {
-        method: 'POST', headers: { ...headers(), 'x-ariava-driver-instance': '', 'x-ariava-owner-lease': activeLease },
-        body: JSON.stringify({ status: 'working' }),
-      });
-      expect(malformed.status).toBe(400);
-      expect(await malformed.json()).toEqual({ error: { code: 'INVALID_REQUEST', retryable: false } });
+      for (const [driverInstance, ownerLease] of [
+        ['A', activeLease],
+        [DRIVER_INSTANCE_ID, 'A'.repeat(42)],
+        [DRIVER_INSTANCE_ID, 'A'.repeat(44)],
+        [DRIVER_INSTANCE_ID, `${'A'.repeat(42)}!`],
+      ]) {
+        const malformed = await fetch(url('/v2/agent/sessions/sess-1/heartbeat'), {
+          method: 'POST',
+          headers: {
+            ...headers(),
+            [AGENT_ADAPTER_OWNER_HEADERS.driverInstance]: driverInstance,
+            [AGENT_ADAPTER_OWNER_HEADERS.ownerLease]: ownerLease,
+          },
+          body: JSON.stringify({ status: 'working' }),
+        });
+        expect(malformed.status).toBe(400);
+        expect(await malformed.json()).toEqual({ error: { code: 'INVALID_REQUEST', retryable: false } });
+      }
     });
 
-    test('a stale or wrong owner lease is rejected with 409 STALE_OWNER (not retryable)', async () => {
+    test('a syntactically valid but stale owner lease is rejected with 409 STALE_OWNER (not retryable)', async () => {
       registerDirect(registry);
       const stale = await fetch(url('/v2/agent/sessions/sess-1/heartbeat'), {
-        method: 'POST', headers: ownerHeaders('a-different-lease'), body: JSON.stringify({ status: 'working' }),
+        method: 'POST', headers: ownerHeaders('AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI'), body: JSON.stringify({ status: 'working' }),
       });
       expect(stale.status).toBe(409);
       expect(await stale.json()).toEqual({ error: { code: 'STALE_OWNER', retryable: false } });

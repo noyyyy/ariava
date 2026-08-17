@@ -1,4 +1,5 @@
 import {
+  AGENT_ADAPTER_HEALTH_PATH,
   AGENT_ADAPTER_PROTOCOL_HEADER,
   AGENT_ADAPTER_PROTOCOL_VERSION,
 } from '@ariava/protocol';
@@ -86,7 +87,7 @@ export async function pollForDiscoveryAndHealth(
         if (Number(parsed.port) !== input.config.agentAdapterPort) {
           throw readinessError('ERR_AGENT_ADAPTER_DISCOVERY', 'Agent Adapter discovery port does not match persisted configuration.');
         }
-        const response = await fetchBounded(new URL('/v1/health', parsed.origin), {
+        const response = await fetchBounded(new URL(AGENT_ADAPTER_HEALTH_PATH, parsed.origin), {
           headers: {
             authorization: `Bearer ${discovery.secret}`,
             [AGENT_ADAPTER_PROTOCOL_HEADER]: String(AGENT_ADAPTER_PROTOCOL_VERSION),

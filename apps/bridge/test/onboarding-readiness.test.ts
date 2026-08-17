@@ -807,7 +807,7 @@ describe('strict onboarding readiness', () => {
     await expect(checkRelayDomainHealth(candidate.input, candidate.deps)).resolves.toBeUndefined();
     await expect(checkRelayDomainEnrollment(candidate.input, candidate.deps)).resolves.toBeUndefined();
     expect(observedUrls).toEqual([
-      'http://127.0.0.1:7272/v1/health',
+      'http://127.0.0.1:7272/v2/health',
       'https://relay.example/health',
     ]);
   });

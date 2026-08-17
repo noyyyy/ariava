@@ -87,7 +87,12 @@ const server = Bun.serve({
     if (protocolVersion !== String(agentAdapterProtocolVersion)) return new Response('Upgrade Required', { status: 426 });
     if (request.method === 'POST' && url.pathname === '/v2/agent/sessions') {
       const session = await request.json();
-      return Response.json({ hostId: 'host-smoke', sessionId: session.sessionId, ownerLease }, { status: 201 });
+      return Response.json({
+        sessionId: session.sessionId,
+        registeredAt: new Date().toISOString(),
+        ownership: 'owned',
+        ownerLease,
+      }, { status: 201 });
     }
     const ownerRoute = url.pathname.startsWith('/v2/agent/sessions/');
     if (ownerRoute && (request.headers.get(driverInstanceHeader) === null || request.headers.get(ownerLeaseHeader) !== ownerLease)) {
@@ -127,11 +132,18 @@ const context = {
 };
 extensionModule.default(pi);
 await handlers.get('session_start')({}, context);
-for (let attempt = 0; attempt < 100 && !requests.some((request) => request.method === 'POST' && request.path === '/v2/agent/sessions'); attempt += 1) {
+for (let attempt = 0; attempt < 100 && !requests.some((request) =>
+  request.path.startsWith('/v2/agent/sessions/smoke-session/')
+  && request.driverInstanceId !== null
+  && request.ownerLease === ownerLease); attempt += 1) {
   await Bun.sleep(20);
 }
 if (!requests.some((request) => request.method === 'POST' && request.path === '/v2/agent/sessions')) {
   throw new Error('installed extension did not resolve discovery and register with the loopback adapter');
+}
+if (!requests.some((request) => request.path.startsWith('/v2/agent/sessions/smoke-session/')
+  && request.driverInstanceId !== null && request.ownerLease === ownerLease)) {
+  throw new Error('installed extension did not accept registration and authenticate an owner route');
 }
 await handlers.get('session_shutdown')({ reason: 'quit' }, context);
 await Bun.sleep(20);
@@ -200,6 +212,13 @@ describe('pi extension disposable-home install and discovery smoke', () => {
         driverInstanceId: null,
         ownerLease: null,
       });
+      expect(result.requests).toContainEqual(expect.objectContaining({
+        path: expect.stringMatching(/^\/v2\/agent\/sessions\/smoke-session\//),
+        authorization: 'Bearer temporary-loopback-secret',
+        protocolVersion: String(AGENT_ADAPTER_PROTOCOL_VERSION),
+        driverInstanceId: expect.any(String),
+        ownerLease: 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE',
+      }));
       expect(discoveryPath).toStartWith(home);
       expect(installRoot).toStartWith(home);
       expect(home).not.toBe(homedir());

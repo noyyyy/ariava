@@ -8,6 +8,7 @@ import {
   AGENT_ADAPTER_ROUTE_PREFIX,
   ProtectedContentValidationError,
   isAgentAdapterDriverInstanceId,
+  isAgentAdapterOwnerLease,
   protocol4ErrorEnvelope,
   SESSION_STATUSES,
   type SessionStatus,
@@ -252,7 +253,7 @@ export class AgentAdapterServer {
     const driverInstance = request.headers[AGENT_ADAPTER_OWNER_HEADERS.driverInstance];
     const ownerLease = request.headers[AGENT_ADAPTER_OWNER_HEADERS.ownerLease];
     if (typeof driverInstance !== 'string' || typeof ownerLease !== 'string'
-      || !isBoundedAgentAdapterIdentifier(driverInstance) || !isBoundedAgentAdapterIdentifier(ownerLease)) {
+      || !isAgentAdapterDriverInstanceId(driverInstance) || !isAgentAdapterOwnerLease(ownerLease)) {
       throw new AgentAdapterClientInputError('Owner route requires a valid X-Ariava-Driver-Instance and X-Ariava-Owner-Lease header');
     }
     this.registry.assertCurrentOwner(sessionId, driverInstance, ownerLease);
@@ -418,11 +419,11 @@ function parseHandleInput(value: unknown): import('@ariava/protocol').HandleSess
     'handle',
   );
   const action = optionalString(obj, 'action');
-  if (action !== undefined && action !== 'local_input' && action !== 'pi_input' && action !== 'bridge_recovery') {
+  if (action !== undefined && action !== 'local_input' && action !== 'bridge_recovery') {
     throw new AgentAdapterClientInputError('handle.action is invalid');
   }
-  // Wire `local_input` (and the tolerated legacy `pi_input`) both mean the
-  // persisted `pi_input` handle action; only `bridge_recovery` differs.
+  // Wire `local_input` maps to the persisted `pi_input` handle action; only
+  // `bridge_recovery` differs.
   let handleAction: 'pi_input' | 'bridge_recovery' | undefined;
   if (action === 'bridge_recovery') {
     handleAction = 'bridge_recovery';
