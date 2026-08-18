@@ -13,3 +13,4 @@ tmp/
 ariava-*.tgz
 .pi-subagents
 .pi
+.artifacts/
