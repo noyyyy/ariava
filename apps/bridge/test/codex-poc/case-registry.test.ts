@@ -51,6 +51,9 @@ describe('canonical case registry', () => {
     expect(tui.requiredCaseIds.length).toBeGreaterThan(0);
     const desktop = selectCasesForTuple({ surface: 'macos_desktop', os: 'macos', architecture: 'x86_64' });
     expect(desktop.requiredCaseIds.length).toBeGreaterThan(0);
+    expect(desktop.requiredCaseIds).toContain('case-commit-reply-live-turn-rejected');
+    expect(desktop.requiredCaseIds).not.toContain('case-commit-reply-steer-predicate');
+    expect(desktop.diagnosticCaseIds).toContain('case-commit-reply-steer-predicate');
     // Desktop is macOS-only: no desktop-specific cases for linux, but shared
     // cases (schema/identity/order/commit/approval/fanout/containment) still
     // apply because desktop tuples on non-macOS are out of scope entirely.

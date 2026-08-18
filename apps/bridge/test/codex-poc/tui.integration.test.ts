@@ -45,8 +45,8 @@ import {
 import {
   classifyAfterDisconnect,
   evaluateCommitPredicate,
+  mapWatchCommand,
   proveCommitAfterRestart,
-  verifyRequestBinding,
   type CommandRequest,
 } from './command-commit';
 import {
@@ -190,7 +190,7 @@ describe('codex-poc TUI integration experiments (opt-in)', () => {
       const client = server.connect('authoritative');
       const thread = server.createThread('stable thread', '/tmp/work');
       // Generate a buffered event so replay is non-empty.
-      server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'turn.start', params: { threadId: thread.threadId } }));
+      server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'turn/start', params: { threadId: thread.threadId } }));
       const before = server.replayThread(thread.threadId, client);
       const threadIdBefore = thread.threadId;
       server.restart();
@@ -235,8 +235,8 @@ describe('codex-poc TUI integration experiments (opt-in)', () => {
       const server = createFakeAppServer();
       server.connect('client-a');
       const thread = server.createThread('order', '/tmp/order');
-      server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'turn.start', params: { threadId: thread.threadId } }));
-      server.handleFrame('client-a', JSON.stringify({ id: 2, method: 'turn.steer', params: { threadId: thread.threadId } }));
+      server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'turn/start', params: { threadId: thread.threadId } }));
+      server.handleFrame('client-a', JSON.stringify({ id: 2, method: 'turn/steer', params: { threadId: thread.threadId } }));
       const events = server.replayThread(thread.threadId, 'client-a');
       if (events.length === 0) return 'no events';
       // Every event has a stable sourceEventId + order + type; ids unique.
@@ -252,8 +252,8 @@ describe('codex-poc TUI integration experiments (opt-in)', () => {
       const server = createFakeAppServer();
       server.connect('client-a');
       const thread = server.createThread('arrival', '/tmp/arrival');
-      server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'turn.start', params: { threadId: thread.threadId } }));
-      server.handleFrame('client-a', JSON.stringify({ id: 2, method: 'turn.steer', params: { threadId: thread.threadId } }));
+      server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'turn/start', params: { threadId: thread.threadId } }));
+      server.handleFrame('client-a', JSON.stringify({ id: 2, method: 'turn/steer', params: { threadId: thread.threadId } }));
       const events = server.replayThread(thread.threadId, 'client-a');
       const stream = createEventStream(thread.threadId);
       for (const event of events) {
@@ -275,9 +275,9 @@ describe('codex-poc TUI integration experiments (opt-in)', () => {
       server.connect('client-a');
       const thread = server.createThread('reconnect', '/tmp/reconnect');
       // Generate three buffered events so the middle can be dropped.
-      server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'turn.start', params: { threadId: thread.threadId } }));
-      server.handleFrame('client-a', JSON.stringify({ id: 2, method: 'turn.steer', params: { threadId: thread.threadId } }));
-      server.handleFrame('client-a', JSON.stringify({ id: 3, method: 'turn.steer', params: { threadId: thread.threadId } }));
+      server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'turn/start', params: { threadId: thread.threadId } }));
+      server.handleFrame('client-a', JSON.stringify({ id: 2, method: 'turn/steer', params: { threadId: thread.threadId } }));
+      server.handleFrame('client-a', JSON.stringify({ id: 3, method: 'turn/steer', params: { threadId: thread.threadId } }));
       const stream = createEventStream(thread.threadId);
       const events = server.replayThread(thread.threadId, 'client-a');
       if (events.length < 3) return 'not enough events';
@@ -309,7 +309,7 @@ describe('codex-poc TUI integration experiments (opt-in)', () => {
       const authoritative = server.connect('authoritative');
       const observer = server.connect('observer');
       const thread = server.createThread('fanout', '/tmp/fanout');
-      server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'thread.read', params: { threadId: thread.threadId } }));
+      server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'thread/read', params: { threadId: thread.threadId } }));
       const authRequests = authoritative.seenRequestIds.size;
       const obsRequests = observer.seenRequestIds.size;
       return obsRequests === 0 && authRequests >= 0;
@@ -338,8 +338,8 @@ describe('codex-poc TUI integration experiments (opt-in)', () => {
       const server = createFakeAppServer();
       const client = server.connect('client-a');
       const thread = server.createThread('approval-fanout', '/tmp/approval');
-      server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'approval.request', params: { threadId: thread.threadId } }));
-      const events = server.emittedNotifications('client-a').filter((event) => event.type === 'approval.request');
+      server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'item/commandExecution/requestApproval', params: { threadId: thread.threadId } }));
+      const events = server.emittedNotifications('client-a').filter((event) => event.type === 'item/commandExecution/requestApproval');
       return approvalNotDuplicatedByFanout(events.map((event) => event.sourceEventId));
     });
     if (result.status === 'PASS') expect(result.outcomeCode).toBe('pass');
@@ -352,9 +352,9 @@ describe('codex-poc TUI integration experiments (opt-in)', () => {
       const authoritative = server.connect('authoritative');
       const observer = server.connect('observer');
       const thread = server.createThread('approval', '/tmp/approval');
-      const approval = server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'approval.request', params: { threadId: thread.threadId } }));
-      const authNotifications = server.emittedNotifications('authoritative').filter((event) => event.type === 'approval.request');
-      const obsNotifications = server.emittedNotifications('observer').filter((event) => event.type === 'approval.request');
+      const approval = server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'item/commandExecution/requestApproval', params: { threadId: thread.threadId } }));
+      const authNotifications = server.emittedNotifications('authoritative').filter((event) => event.type === 'item/commandExecution/requestApproval');
+      const obsNotifications = server.emittedNotifications('observer').filter((event) => event.type === 'item/commandExecution/requestApproval');
       return approval.ok === false || authNotifications.length > 0;
     });
     if (result.status === 'PASS') expect(result.outcomeCode).toBe('pass');
@@ -395,24 +395,14 @@ describe('codex-poc TUI integration experiments (opt-in)', () => {
     else assertUnavailable(result, 'unavailable-environment');
   });
 
-  test('command: positive commit predicate for start/steer/interrupt', () => {
-    const result = runFakeServerExperiment('case-commit-reply-steer-predicate', () => {
+  test('command: live-turn Watch reply is rejected without steer', () => {
+    const result = runFakeServerExperiment('case-commit-reply-live-turn-rejected', () => {
       const server = createFakeAppServer();
       server.connect('client-a');
-      const thread = server.createThread('commit', '/tmp/commit');
-      const request: CommandRequest = {
-        correlationId: 'corr-1',
-        operation: 'turn.steer',
-        rawThreadId: thread.threadId,
-        providerGeneration: thread.generation,
-        preSendEvidence: { threadSnapshotOrder: 0, threadLoaded: true, approvalPending: false },
-      };
-      const binding = verifyRequestBinding(request, thread.generation, true);
-      // Provider commit: a unique steer event at/after the snapshot order.
-      const events = server.replayThread(thread.threadId, 'client-a');
-      const providerEvents = events.map((event) => ({ sourceEventId: event.sourceEventId, type: event.type, generation: event.generation, order: event.order }));
-      const predicate = evaluateCommitPredicate(request, providerEvents);
-      return binding.ok === true && predicate.autoReplayAttempted === false;
+      const thread = server.createThread('commit-live', '/tmp/commit-live');
+      const mapped = mapWatchCommand({ type: 'reply', turnLive: true });
+      const start = server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'turn/start', params: { threadId: thread.threadId } }));
+      return start.ok === true && 'reject' in mapped && mapped.reason === 'live-reply-no-steer';
     });
     if (result.status === 'PASS') expect(result.outcomeCode).toBe('pass');
     else assertUnavailable(result, 'unavailable-environment');
@@ -425,7 +415,7 @@ describe('codex-poc TUI integration experiments (opt-in)', () => {
       const thread = server.createThread('commit2', '/tmp/commit2');
       const request: CommandRequest = {
         correlationId: 'corr-2',
-        operation: 'turn.start',
+        operation: 'turn/start',
         rawThreadId: thread.threadId,
         providerGeneration: thread.generation,
         preSendEvidence: { threadSnapshotOrder: 0, threadLoaded: true, approvalPending: false },

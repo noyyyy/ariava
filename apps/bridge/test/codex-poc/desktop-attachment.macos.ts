@@ -1,3 +1,6 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
 /**
  * macOS Desktop attachment model for the Codex Exact-Release Capability PoC
  * (spec §8.8).
@@ -31,12 +34,51 @@ export const LOCAL_DAEMON_ENV_VAR = 'CODEX_APP_SERVER_USE_LOCAL_DAEMON';
 /** Desktop attachment strategy identity (reviewed stable id; spec §5.1). */
 export const DESKTOP_ATTACHMENT_STRATEGY_ID = 'reviewed-macos-desktop-local-daemon-socket';
 
+/**
+ * Bundled app-server binary inside a Codex `.app`.
+ * This is the tuple fingerprint target — not `Contents/MacOS/ChatGPT`.
+ */
+export const BUNDLED_APP_SERVER_RELATIVE_PATH = 'Contents/Resources/codex';
+
+/**
+ * Control socket relative to `CODEX_HOME` (not inside the `.app` bundle).
+ * Exact-release field location: `{CODEX_HOME}/app-server-control/app-server-control.sock`.
+ */
+export const CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME = 'app-server-control/app-server-control.sock';
+
+/**
+ * On-disk bundle name for reviewed closed candidate roots.
+ * Bundle id remains `com.openai.codex`; the `.app` filename is `ChatGPT.app`.
+ */
+export const DESKTOP_CLOSED_CANDIDATE_BUNDLE_NAME = 'ChatGPT.app';
+
+export function desktopClosedCandidateRoots(userHome: string): readonly [string, string] {
+  return [
+    `/Applications/${DESKTOP_CLOSED_CANDIDATE_BUNDLE_NAME}`,
+    join(userHome, 'Applications', DESKTOP_CLOSED_CANDIDATE_BUNDLE_NAME),
+  ];
+}
+
+/** Inherit the current environment: `CODEX_HOME` if set, otherwise `~/.codex`. */
+export function defaultCodexHome(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
+  const fromEnv = env.CODEX_HOME?.trim();
+  return fromEnv && fromEnv.length > 0 ? fromEnv : join(home, '.codex');
+}
+
+export function bundledAppServerAbsolutePath(appRoot: string): string {
+  return join(appRoot, ...BUNDLED_APP_SERVER_RELATIVE_PATH.split('/'));
+}
+
+export function controlSocketAbsolutePath(codexHome: string): string {
+  return join(codexHome, ...CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME.split('/'));
+}
+
 export interface MacAppIdentity {
   /** Bundle id (CFBundleIdentifier). */
   bundleId: string;
   shortVersion: string;
   build: string;
-  /** Path relative to the bundle root, e.g. Contents/MacOS/codex. */
+  /** Path relative to the bundle root, e.g. Contents/MacOS/ChatGPT. */
   bundleRelativeExecutable: string;
   /** Verified absolute realpath of the bundle root. */
   bundleRealpath: string;
@@ -51,7 +93,10 @@ export interface MacAppIdentity {
   designatedRequirementDigest: string;
   /** App-server schema fingerprint (from schema inventory). */
   appServerSchemaFingerprint: string;
-  /** Fixed socket position (bundle-relative or reviewed classification). */
+  /**
+   * Reviewed socket classification: relative to `CODEX_HOME`, never a path
+   * inside the `.app` bundle.
+   */
   fixedSocket: string;
   attachmentStrategy: string;
 }
@@ -106,12 +151,16 @@ export function validateMacAppIdentity(identity: MacAppIdentity): { ok: boolean;
   if (!identity.shortVersion) return { ok: false, reason: 'missing shortVersion' };
   if (!identity.build) return { ok: false, reason: 'missing build' };
   if (!identity.bundleRelativeExecutable) return { ok: false, reason: 'missing bundleRelativeExecutable' };
+  if (!identity.bundleRelativeExecutable.startsWith('Contents/MacOS/')) return { ok: false, reason: 'bundleRelativeExecutable must be Contents/MacOS/<name>' };
   if (!identity.bundleRealpath.startsWith('/')) return { ok: false, reason: 'bundleRealpath must be absolute' };
   if (!/^[0-9a-f]{64}$/u.test(identity.binarySha256)) return { ok: false, reason: 'binarySha256 must be sha256 hex' };
   if (identity.architecture !== 'arm64' && identity.architecture !== 'x86_64') return { ok: false, reason: 'architecture must be arm64 or x86_64' };
   if (!identity.signingIdentifier) return { ok: false, reason: 'missing signingIdentifier' };
   if (!identity.signingTeam) return { ok: false, reason: 'missing signingTeam' };
   if (!/^[0-9a-f]{64}$/u.test(identity.appServerSchemaFingerprint)) return { ok: false, reason: 'appServerSchemaFingerprint must be sha256 hex' };
+  if (identity.fixedSocket !== CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME) {
+    return { ok: false, reason: 'fixedSocket must be CODEX_HOME-relative app-server-control socket' };
+  }
   if (identity.attachmentStrategy !== DESKTOP_ATTACHMENT_STRATEGY_ID) return { ok: false, reason: 'attachmentStrategy mismatch' };
   return { ok: true };
 }

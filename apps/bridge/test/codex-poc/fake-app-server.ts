@@ -6,12 +6,12 @@
  * exercise client framing/parsing and experiment drivers without a real Codex
  * binary:
  *   - initialize/initialized
- *   - thread list/read (exact-release equivalent)
- *   - loaded/unloaded
+ *   - thread list/read (exact-release slash methods)
+ *   - thread/started, thread/closed, thread/loaded/list
  *   - turn start/steer/interrupt
  *   - turn/item completion and error notifications
- *   - approval/blocking server requests
- *   - daemon version/status
+ *   - approval/blocking server requests (`item/<kind>/requestApproval`)
+ *   - runtime identity via initialize result
  *
  * The fake is deterministic (no randomness), in-memory, and research-only. It
  * is never part of the production import graph. It enforces bounded frame
@@ -22,6 +22,8 @@
 
 import { createHash } from 'node:crypto';
 import { jcs } from './jcs';
+import { REVIEWED_SCHEMA_SURFACE } from './schema-inventory';
+import { commitEventType, type CodexTurnMethod } from './command-commit';
 
 /** Bounded frame size (bytes of serialized JSON). */
 export const MAX_FRAME_BYTES = 64 * 1024;
@@ -41,33 +43,14 @@ export const MAX_NOTIFICATIONS_PER_SECOND = 256;
 /** Bounded threads per app-server instance. */
 export const MAX_THREADS = 4096;
 
-/** Reviewed app-server methods (spec §8.1). */
-export const FAKE_METHODS = [
-  'initialize',
-  'thread.list',
-  'thread.read',
-  'turn.start',
-  'turn.steer',
-  'turn.interrupt',
-  'daemon.version',
-  'daemon.status',
-] as const;
+/** Reviewed app-server methods (spec §8.1 exact-release slash names). */
+export const FAKE_METHODS = REVIEWED_SCHEMA_SURFACE.methods;
 
-/** Reviewed notifications (spec §8.1). */
-export const FAKE_NOTIFICATIONS = [
-  'initialized',
-  'loaded',
-  'unloaded',
-  'turn.item.completed',
-  'turn.completed',
-  'turn.error',
-  'approval.request',
-] as const;
+/** Reviewed notifications (spec §8.1 exact-release slash names). */
+export const FAKE_NOTIFICATIONS = REVIEWED_SCHEMA_SURFACE.notifications;
 
-/** Reviewed server requests (spec §8.1). */
-export const FAKE_SERVER_REQUESTS = [
-  'approval.request',
-] as const;
+/** Reviewed server requests (spec §8.1 exact-release slash names). */
+export const FAKE_SERVER_REQUESTS = REVIEWED_SCHEMA_SURFACE.serverRequests;
 
 export type FakeMethod = (typeof FAKE_METHODS)[number];
 export type FakeNotification = (typeof FAKE_NOTIFICATIONS)[number];
@@ -289,13 +272,17 @@ export function createFakeAppServer(options: FakeAppServerOptions = {}): FakeApp
           timestampMs: Date.now(),
           payload: { protocolVersion: 1 },
         });
-        return { ok: true, frames: [{ id: frame.id, method: 'initialize', params: {}, result: { protocolVersion: 1 } }] };
+        return { ok: true, frames: [{ id: frame.id, method: 'initialize', params: {}, result: { protocolVersion: 1, userAgent: { name: 'codex-fake', version: '0.0.0-fake' } } }] };
       }
-      case 'thread.list': {
+      case 'thread/list': {
         const list = [...threads.values()].map((thread) => ({ threadId: thread.threadId, title: thread.title, cwd: thread.cwd, loaded: thread.loaded, generation: thread.generation }));
-        return { ok: true, frames: [{ id: frame.id, method: 'thread.list', params: {}, result: { threads: list } }] };
+        return { ok: true, frames: [{ id: frame.id, method: 'thread/list', params: {}, result: { data: list, nextCursor: null } }] };
       }
-      case 'thread.read': {
+      case 'thread/loaded/list': {
+        const list = [...threads.values()].filter((thread) => thread.loaded).map((thread) => ({ threadId: thread.threadId, generation: thread.generation }));
+        return { ok: true, frames: [{ id: frame.id, method: 'thread/loaded/list', params: {}, result: { data: list, nextCursor: null } }] };
+      }
+      case 'thread/read': {
         const params = frame.params as { threadId?: string };
         const threadId = params?.threadId ?? '';
         const thread = threads.get(threadId);
@@ -304,7 +291,7 @@ export function createFakeAppServer(options: FakeAppServerOptions = {}): FakeApp
           ok: true,
           frames: [{
             id: frame.id,
-            method: 'thread.read',
+            method: 'thread/read',
             params: {},
             result: {
               threadId: thread.threadId,
@@ -315,29 +302,23 @@ export function createFakeAppServer(options: FakeAppServerOptions = {}): FakeApp
           }],
         };
       }
-      case 'turn.start':
-      case 'turn.steer':
-      case 'turn.interrupt': {
+      case 'turn/start':
+      case 'turn/steer':
+      case 'turn/interrupt': {
         const params = frame.params as { threadId?: string };
         const threadId = params?.threadId ?? '';
         const thread = threads.get(threadId);
         if (!thread) return failClosed(`unknown thread ${threadId}`);
-        if (frame.method === 'turn.interrupt' && thread.turnState === 'idle') {
+        if (frame.method === 'turn/interrupt' && thread.turnState === 'idle') {
           return failClosed('cannot interrupt an idle turn');
         }
-        if (frame.method === 'turn.start' && thread.turnState !== 'idle') {
+        if (frame.method === 'turn/start' && thread.turnState !== 'idle') {
           return failClosed('cannot start a turn while working');
         }
-        const record = pushEvent(threadId, `turn.${frame.method.slice(5)}`, { requested: true });
-        thread.turnState = frame.method === 'turn.interrupt' ? 'idle' : 'working';
+        const record = pushEvent(threadId, commitEventType(frame.method as CodexTurnMethod), { requested: true });
+        thread.turnState = frame.method === 'turn/interrupt' ? 'idle' : 'working';
         emitToAll(record);
         return { ok: true, frames: [{ id: frame.id, method: frame.method, params: {}, result: { threadId, generation: thread.generation, eventOrder: record.order } }] };
-      }
-      case 'daemon.version': {
-        return { ok: true, frames: [{ id: frame.id, method: 'daemon.version', params: {}, result: { version: '0.0.0-fake' } }] };
-      }
-      case 'daemon.status': {
-        return { ok: true, frames: [{ id: frame.id, method: 'daemon.status', params: {}, result: { running: true, generation } }] };
       }
       default:
         return failClosed(`unknown method ${frame.method}`);
@@ -349,14 +330,14 @@ export function createFakeAppServer(options: FakeAppServerOptions = {}): FakeApp
     // authoritative client must not be preempted by an observer (spec §8.5).
     // The fake only emits these to the authoritative client; an observer that
     // tries to respond is rejected (fail closed).
-    if (frame.method !== 'approval.request') {
+    if (!FAKE_SERVER_REQUESTS.includes(frame.method as FakeServerRequest)) {
       return failClosed(`unknown server request ${frame.method}`);
     }
     emit(clientId, {
-      threadId: String(frame.params?.threadId ?? ''),
+      threadId: String((frame.params as { threadId?: string } | undefined)?.threadId ?? ''),
       generation,
       order: 0,
-      type: 'approval.request',
+      type: frame.method,
       sourceEventId: nextSourceEventId(),
       timestampMs: Date.now(),
       payload: { requestId: frame.id },
@@ -391,7 +372,7 @@ export function createFakeAppServer(options: FakeAppServerOptions = {}): FakeApp
       }
       disconnectedClients.delete(clientId);
       // Reconnect: no duplicate side effects; a fresh authoritative snapshot is
-      // provided via thread.read (spec §8.3 reconnect/replay).
+      // provided via thread/read (spec §8.3 reconnect/replay).
       return client;
     },
     disconnect(clientId: string): void {
@@ -498,6 +479,17 @@ export function createFakeAppServer(options: FakeAppServerOptions = {}): FakeApp
       // Preserve threads (identity survives restart) but bump their generation.
       for (const thread of threads.values()) {
         thread.generation = generation;
+        if (thread.loaded) {
+          emitToAll({
+            threadId: thread.threadId,
+            generation,
+            order: 0,
+            type: 'thread/closed',
+            sourceEventId: nextSourceEventId(),
+            timestampMs: Date.now(),
+            payload: {},
+          });
+        }
         thread.loaded = false;
         thread.turnState = 'idle';
       }
@@ -523,7 +515,7 @@ export function createFakeAppServer(options: FakeAppServerOptions = {}): FakeApp
         threadId,
         generation,
         order: 0,
-        type: 'loaded',
+        type: 'thread/started',
         sourceEventId: nextSourceEventId(),
         timestampMs: Date.now(),
         payload: { title },

@@ -24,18 +24,18 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { lstatSync, realpathSync, readdirSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 
 import { fingerprintCliSurface, classifyAttachability } from '../../apps/bridge/test/codex-poc/cli-equivalence';
 import { schemaFingerprint, REVIEWED_SCHEMA_SURFACE } from '../../apps/bridge/test/codex-poc/schema-inventory';
 import { TUI_ATTACHMENT_STRATEGY_ID } from '../../apps/bridge/test/codex-poc/tui-attachment';
-import { DESKTOP_ATTACHMENT_STRATEGY_ID } from '../../apps/bridge/test/codex-poc/desktop-attachment.macos';
+import { DESKTOP_ATTACHMENT_STRATEGY_ID, bundledAppServerAbsolutePath, CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME } from '../../apps/bridge/test/codex-poc/desktop-attachment.macos';
 import { SURFACES, type Surface } from '../../apps/bridge/test/codex-poc/constants';
 import { parseArgs, flagString, sha256Hex } from './harness-common';
 
 /** Reviewed production closed-candidate classifications (spec §8.7/§8.8). */
-export const PRODUCTION_CLOSED_CHANNELS = ['npm', 'homebrew', 'dmg', 'app-store'] as const;
+export const PRODUCTION_CLOSED_CHANNELS = ['npm', 'homebrew', 'dmg', 'app-store', 'signed-bundle'] as const;
 export const PRODUCTION_CLOSED_PROVENANCES = ['registry', 'signed-bundle', 'notarized-dmg'] as const;
 
 export interface AncestorAudit {
@@ -202,12 +202,13 @@ export function inspectRelease(options: { surface: Surface; candidate: string })
   }
   const realpath = discovered.realpath;
 
-  const binaryPath = surface === 'macos_desktop' ? join(realpath, 'Contents', 'MacOS') : realpath;
+  const binaryPath = surface === 'macos_desktop' ? bundledAppServerAbsolutePath(realpath) : realpath;
   const binary = surface === 'macos_desktop'
     ? (() => {
         try {
-          const entries = readdirSync(binaryPath).sort();
-          return entries.length > 0 ? join(binaryPath, entries[0]!) : undefined;
+          const stat = lstatSync(binaryPath);
+          if (stat.isFile() || stat.isSymbolicLink()) return realpathSync(binaryPath);
+          return undefined;
         } catch {
           return undefined;
         }
@@ -225,8 +226,9 @@ export function inspectRelease(options: { surface: Surface; candidate: string })
   let version: string | undefined;
   if (surface === 'macos_desktop') {
     const plist = parseInfoPlist(realpath);
-    const bundleRelativeExecutable = plist?.CFBundleExecutable ?? '';
-    const executablePath = bundleRelativeExecutable ? join(realpath, 'Contents', 'MacOS', bundleRelativeExecutable) : binary;
+    const executableName = plist?.CFBundleExecutable ?? '';
+    const bundleRelativeExecutable = executableName ? `Contents/MacOS/${executableName}` : '';
+    const executablePath = executableName ? join(realpath, 'Contents', 'MacOS', executableName) : binary;
     const designated = executablePath ? codeSigningDesignatedRequirement(executablePath) : '';
     bundle = {
       bundleId: plist?.CFBundleIdentifier ?? '',
@@ -236,9 +238,9 @@ export function inspectRelease(options: { surface: Surface; candidate: string })
       signingIdentifier: plist?.CFBundleIdentifier ?? '',
       signingTeam: codeSigningTeamOf(executablePath),
       designatedRequirementDigest: designated,
-      fixedSocket: 'Contents/Resources/codex.sock',
+      fixedSocket: CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME,
     };
-    version = plist?.CFBundleShortVersionString ?? versionOf(realpath);
+    version = plist?.CFBundleShortVersionString ?? (binary ? versionOf(binary) : undefined);
   } else {
     version = versionOf(realpath);
   }

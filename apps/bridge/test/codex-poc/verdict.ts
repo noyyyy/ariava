@@ -6,8 +6,8 @@
  *
  * - `GO` requires: complete exact release identity + schema; every
  *   `requiredForGo` capability case PASS; stable thread identity; event source
- *   identity/order/gap repair; three command-specific positive commit
- *   predicates; approval authority; multi-client fanout; surface
+ *   identity/order/gap repair; Watch command-specific positive commit
+ *   predicates (`turn/start` and `turn/interrupt`) plus live-turn reply reject; approval authority; multi-client fanout; surface
  *   attachment/lifecycle; platform containment; privacy/workspace/cleanup
  *   audits all PASS; no unknown authority-changing request/notification; and an
  *   independent review record.
@@ -186,10 +186,10 @@ function isEventOrderEstablished(artifact: EvidenceArtifact): boolean {
     capability.capabilityId === 'cap-event-order' && capability.status === 'PASS');
 }
 
-function hasThreeCommandCommitPredicates(artifact: EvidenceArtifact): boolean {
+function hasWatchCommandCommitPredicates(artifact: EvidenceArtifact): boolean {
   const capability = artifact.capabilities.find((entry) => entry.capabilityId === 'cap-command-commit');
   return capability?.status === 'PASS' &&
-    capability.caseIds.includes('case-commit-reply-steer-predicate') &&
+    capability.caseIds.includes('case-commit-reply-live-turn-rejected') &&
     capability.caseIds.includes('case-commit-done-start-predicate') &&
     capability.caseIds.includes('case-commit-interrupt-predicate');
 }
@@ -327,7 +327,7 @@ export function computeVerdict(input: VerdictInput): VerdictResult {
   goReasons.push('thread-identity-stable');
   if (!isEventOrderEstablished(artifact)) return { verdict: 'INCONCLUSIVE', reasons: ['event-no-stable-identity-order'] };
   goReasons.push('event-identity-order-gap-repair');
-  if (!hasThreeCommandCommitPredicates(artifact)) return { verdict: 'INCONCLUSIVE', reasons: ['command-no-positive-commit-predicate'] };
+  if (!hasWatchCommandCommitPredicates(artifact)) return { verdict: 'INCONCLUSIVE', reasons: ['command-no-positive-commit-predicate'] };
   goReasons.push('three-command-commit-predicates');
   if (!isApprovalAuthorityEstablished(artifact)) return { verdict: 'INCONCLUSIVE', reasons: ['approval-preemption'] };
   goReasons.push('approval-authority');

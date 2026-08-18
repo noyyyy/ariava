@@ -139,6 +139,13 @@ export function requireOptIn(): void {
   }
 }
 
+/** Desktop real-run is operator-invoked only; never CI / GitHub Actions. */
+export function refuseAutomatedContext(scriptName: string): void {
+  if (process.env.CI === 'true' || process.env.CI === '1' || process.env.GITHUB_ACTIONS === 'true') {
+    throw new Error(`${scriptName} is manual-only and must not run in CI or GitHub Actions.`);
+  }
+}
+
 export function isOptInSet(): boolean {
   return process.env[OPT_IN_ENV] === '1';
 }

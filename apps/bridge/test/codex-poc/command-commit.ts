@@ -2,11 +2,13 @@
  * Command commit predicate model for the Codex Exact-Release Capability PoC
  * (spec §8.4).
  *
- * Three watch commands must each prove an operation-specific positive provider
- * commit:
- *   - question reply  -> turn/steer
- *   - done reply      -> turn/start
- *   - working interrupt -> turn/interrupt
+ * Watch has one `reply` world (same as pi `sendUserMessage`) plus `interrupt`.
+ * question/done are Alert presentation, not two commands. Watch `working` is
+ * interrupt-only; this PoC does not add a Steer feature. Codex may still expose
+ * `turn/steer` on the wire (schema inventory), but Watch reply never uses it:
+ *   - Watch reply, idle thread -> RPC `turn/start`     -> `turn/started`
+ *   - Watch reply, live turn   -> pre-RPC reject (not `turn/steer`)
+ *   - Watch interrupt          -> RPC `turn/interrupt` -> `turn/completed`
  *
  * The model encodes the spec's requirements:
  *   - request correlation pre-assignment;
@@ -22,9 +24,46 @@
  * Research-only harness code; never part of the production import graph.
  */
 
-/** The three operations that must have commit predicates (spec §8.4). */
-export const COMMIT_OPERATIONS = ['turn.steer', 'turn.start', 'turn.interrupt'] as const;
+/** Watch-mapped operations that must have commit predicates (spec §8.4). */
+export const COMMIT_OPERATIONS = ['turn/start', 'turn/interrupt'] as const;
 export type CommitOperation = (typeof COMMIT_OPERATIONS)[number];
+
+/** Codex wire methods, including `turn/steer` which is not a Watch command. */
+export const CODEX_TURN_METHODS = ['turn/start', 'turn/steer', 'turn/interrupt'] as const;
+export type CodexTurnMethod = (typeof CODEX_TURN_METHODS)[number];
+
+/**
+ * Exact-release notification type that proves a positive commit for one RPC.
+ * The wire does not emit `turn/start`, `turn/steer`, or `turn/interrupt` as
+ * event types; those names are request methods only. `turn/steer` stays in this
+ * map for schema/fake coverage only.
+ */
+export const COMMIT_EVENT_TYPE = Object.freeze({
+  'turn/start': 'turn/started',
+  'turn/steer': 'item/started',
+  'turn/interrupt': 'turn/completed',
+} as const satisfies Record<CodexTurnMethod, string>);
+
+export type CommitEventType = (typeof COMMIT_EVENT_TYPE)[CommitOperation];
+
+export function commitEventType(operation: CodexTurnMethod): (typeof COMMIT_EVENT_TYPE)[CodexTurnMethod] {
+  return COMMIT_EVENT_TYPE[operation];
+}
+
+export type WatchCommandType = 'reply' | 'interrupt';
+
+/** Watch → Codex mapping. Live reply is fail-closed; `turn/steer` is never a Watch RPC. */
+export function mapWatchCommand(input: {
+  type: WatchCommandType;
+  turnLive: boolean;
+}): { rpc: CommitOperation } | { reject: true; reason: 'live-reply-no-steer' | 'idle-interrupt' } {
+  if (input.type === 'interrupt') {
+    if (!input.turnLive) return { reject: true, reason: 'idle-interrupt' };
+    return { rpc: 'turn/interrupt' };
+  }
+  if (input.turnLive) return { reject: true, reason: 'live-reply-no-steer' };
+  return { rpc: 'turn/start' };
+}
 
 export interface CommandRequest {
   /** Pre-assigned request correlation id. */
@@ -105,7 +144,7 @@ export function evaluateCommitPredicate(
   providerEvents: Array<{ sourceEventId: string; type: string; generation: number; order: number }>,
   options: { acceptedResponse?: { correlationId: string }; disconnected?: boolean; timedOut?: boolean; rejected?: boolean } = {},
 ): CommitPredicateResult {
-  const expectedCommitType = request.operation; // turn.steer / turn.start / turn.interrupt
+  const expectedCommitType = commitEventType(request.operation);
   const matching = providerEvents.filter((event) =>
     event.type === expectedCommitType &&
     event.generation === request.providerGeneration &&
@@ -138,13 +177,13 @@ export function evaluateCommitPredicate(
   };
 }
 
-/** Restart commit proof: after restart, thread.read must show the commit event. */
+/** Restart commit proof: after restart, thread/read must show the commit event. */
 export function proveCommitAfterRestart(
   request: CommandRequest,
   authoritativeAfterRestart: Array<{ sourceEventId: string; type: string; generation: number; order: number }>,
 ): { proof: 'committed' | 'not-committed' | 'unknown' } {
   const commitEvent = authoritativeAfterRestart.find((event) =>
-    event.type === request.operation &&
+    event.type === commitEventType(request.operation) &&
     event.generation === request.providerGeneration &&
     event.order >= request.preSendEvidence.threadSnapshotOrder);
   if (commitEvent) return { proof: 'committed' };

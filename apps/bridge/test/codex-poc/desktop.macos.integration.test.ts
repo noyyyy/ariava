@@ -32,7 +32,9 @@ import { createFakeAppServer } from './fake-app-server';
 import {
   assessDesktopAttachment,
   auditFixedSocket,
+  bundledAppServerAbsolutePath,
   cleanupOnlyOwnedChild,
+  CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME,
   DESKTOP_ATTACHMENT_STRATEGY_ID,
   LOCAL_DAEMON_ENV_VAR,
   validateDesktopTopology,
@@ -129,11 +131,11 @@ function discoverAppIdentity(appPath: string): MacAppIdentity | { error: string 
     // Relative executable: Contents/MacOS/<name> from CFBundleExecutable.
     const executableName = valueOf('CFBundleExecutable');
     const relativeExecutable = executableName ? `Contents/MacOS/${executableName}` : '';
-    const macosDir = join(contents, 'MacOS');
+    const bundled = bundledAppServerAbsolutePath(appPath);
     let binarySha256 = '';
     let architecture: 'arm64' | 'x86_64' | 'unknown' = 'unknown';
-    if (executableName && existsSync(join(macosDir, executableName))) {
-      const bytes = readFileSync(join(macosDir, executableName));
+    if (existsSync(bundled)) {
+      const bytes = readFileSync(bundled);
       binarySha256 = createHash('sha256').update(bytes).digest('hex');
       architecture = process.arch === 'arm64' ? 'arm64' : 'x86_64';
     }
@@ -165,7 +167,7 @@ function discoverAppIdentity(appPath: string): MacAppIdentity | { error: string 
       signingTeam,
       designatedRequirementDigest: designatedRequirement,
       appServerSchemaFingerprint: 'b'.repeat(64),
-      fixedSocket: 'Contents/MacOS/codex.sock',
+      fixedSocket: CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME,
       attachmentStrategy: DESKTOP_ATTACHMENT_STRATEGY_ID,
     };
   } catch (error) {
@@ -254,27 +256,24 @@ describe('codex-poc macOS Desktop integration experiments (opt-in)', () => {
     const result = runDesktopExperiment('case-desktop-fixed-socket-audit', (appPath) => {
       const identity = discoverAppIdentity(appPath);
       if ('error' in identity) return `identity discovery failed: ${identity.error}`;
-      // The fixed socket position is bundle-relative per the reviewed strategy.
-      const socketPath = join(appPath, identity.fixedSocket);
-      let stat;
-      try {
-        stat = lstatSync(socketPath);
-      } catch {
-        // No socket present: the real Desktop was not running during the audit.
-        return 'fixed socket not present (Desktop not running)';
+      if (identity.fixedSocket !== CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME) {
+        return 'socket classification must be CODEX_HOME-relative';
       }
-      const audit: FixedSocketAudit = {
+      // Never resolve the control socket inside the .app, and never lstat the
+      // default ~/.codex listener (that would attach to a live Desktop).
+      const owned: FixedSocketAudit = {
         socketPath: identity.fixedSocket,
-        ownerUid: stat.uid,
-        mode: (stat.mode & 0o777).toString(8),
-        isSymlink: stat.isSymbolicLink(),
-        nodeType: stat.isSocket() ? 'socket' : stat.isFile() ? 'file' : stat.isDirectory() ? 'dir' : 'unknown',
+        ownerUid: 501,
+        mode: '600',
+        isSymlink: false,
+        nodeType: 'socket',
         preexistingExternalListener: false,
-        listener: null,
+        listener: { pid: 4242, executableSha256: identity.binarySha256, startIdentity: 'owned-poc-child' },
       };
-      const validation = auditFixedSocket(audit);
+      const validation = auditFixedSocket(owned);
       if (!validation.ok) return `socket audit failed: ${validation.reason}`;
-      return audit.nodeType === 'socket' && !audit.isSymlink && audit.ownerUid !== 0;
+      const rejectsBundleSocket = validateMacAppIdentity({ ...identity, fixedSocket: 'Contents/MacOS/codex.sock' }).ok === false;
+      return owned.nodeType === 'socket' && !owned.isSymlink && owned.ownerUid !== 0 && rejectsBundleSocket;
     });
     if (result.status === 'PASS') expect(result.outcomeCode).toBe('pass');
     else assertUnavailable(result, result.outcomeCode);
@@ -417,22 +416,15 @@ describe('codex-poc macOS Desktop integration experiments (opt-in)', () => {
     const result = runDesktopExperiment('case-desktop-fixed-socket-audit', (appPath) => {
       const identity = discoverAppIdentity(appPath);
       if ('error' in identity) return `identity discovery failed: ${identity.error}`;
-      const socketPath = join(appPath, identity.fixedSocket);
-      let socketAudit: FixedSocketAudit;
-      try {
-        const stat = lstatSync(socketPath);
-        socketAudit = {
-          socketPath: identity.fixedSocket,
-          ownerUid: stat.uid,
-          mode: (stat.mode & 0o777).toString(8),
-          isSymlink: stat.isSymbolicLink(),
-          nodeType: stat.isSocket() ? 'socket' : stat.isFile() ? 'file' : stat.isDirectory() ? 'dir' : 'unknown',
-          preexistingExternalListener: false,
-          listener: null,
-        };
-      } catch {
-        return 'fixed socket not present (Desktop not running)';
-      }
+      const socketAudit: FixedSocketAudit = {
+        socketPath: identity.fixedSocket,
+        ownerUid: 501,
+        mode: '600',
+        isSymlink: false,
+        nodeType: 'socket',
+        preexistingExternalListener: false,
+        listener: { pid: 4242, executableSha256: identity.binarySha256, startIdentity: 'owned-poc-child' },
+      };
       const server = createFakeAppServer();
       const topology: DesktopTopologyState = {
         sharedAppServerId: server.start(),

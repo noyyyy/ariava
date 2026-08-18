@@ -5,6 +5,11 @@ import {
   cleanupOnlyOwnedChild,
   DESKTOP_ATTACHMENT_STRATEGY_ID,
   LOCAL_DAEMON_ENV_VAR,
+  CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME,
+  BUNDLED_APP_SERVER_RELATIVE_PATH,
+  DESKTOP_CLOSED_CANDIDATE_BUNDLE_NAME,
+  defaultCodexHome,
+  desktopClosedCandidateRoots,
   validateLocalDaemonEnvScope,
   validateMacAppIdentity,
   validateDesktopTopology,
@@ -19,8 +24,8 @@ function makeIdentity(overrides: Partial<MacAppIdentity> = {}): MacAppIdentity {
     bundleId: 'io.noyx.codex',
     shortVersion: '1.2.3',
     build: '42',
-    bundleRelativeExecutable: 'Contents/MacOS/codex',
-    bundleRealpath: '/Applications/Codex.app',
+    bundleRelativeExecutable: 'Contents/MacOS/ChatGPT',
+    bundleRealpath: '/Applications/ChatGPT.app',
     ancestorAudit: 'verified',
     ownerMode: '0755',
     binarySha256: 'a'.repeat(64),
@@ -29,7 +34,7 @@ function makeIdentity(overrides: Partial<MacAppIdentity> = {}): MacAppIdentity {
     signingTeam: 'ABC123',
     designatedRequirementDigest: 'b'.repeat(64),
     appServerSchemaFingerprint: 'c'.repeat(64),
-    fixedSocket: 'Contents/MacOS/codex.sock',
+    fixedSocket: CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME,
     attachmentStrategy: DESKTOP_ATTACHMENT_STRATEGY_ID,
     ...overrides,
   };
@@ -37,7 +42,7 @@ function makeIdentity(overrides: Partial<MacAppIdentity> = {}): MacAppIdentity {
 
 function makeSocketAudit(overrides: Partial<FixedSocketAudit> = {}): FixedSocketAudit {
   return {
-    socketPath: '/tmp/codex.sock',
+    socketPath: '/tmp/codex-home/app-server-control/app-server-control.sock',
     ownerUid: 501,
     mode: '0600',
     isSymlink: false,
@@ -75,7 +80,7 @@ describe('macOS Desktop identity (spec §5.3, §8.8)', () => {
   });
 
   test('rejects non-absolute bundle realpath', () => {
-    expect(validateMacAppIdentity(makeIdentity({ bundleRealpath: 'Applications/Codex.app' })).ok).toBe(false);
+    expect(validateMacAppIdentity(makeIdentity({ bundleRealpath: 'Applications/ChatGPT.app' })).ok).toBe(false);
   });
 
   test('rejects wrong architecture or attachment strategy', () => {
@@ -86,6 +91,27 @@ describe('macOS Desktop identity (spec §5.3, §8.8)', () => {
 
   test('strategy id is the reviewed stable desktop id', () => {
     expect(DESKTOP_ATTACHMENT_STRATEGY_ID).toBe('reviewed-macos-desktop-local-daemon-socket');
+  });
+
+  test('fingerprints the bundled app-server binary and CODEX_HOME control socket', () => {
+    expect(BUNDLED_APP_SERVER_RELATIVE_PATH).toBe('Contents/Resources/codex');
+    expect(CONTROL_SOCKET_RELATIVE_TO_CODEX_HOME).toBe('app-server-control/app-server-control.sock');
+    expect(DESKTOP_CLOSED_CANDIDATE_BUNDLE_NAME).toBe('ChatGPT.app');
+    expect(desktopClosedCandidateRoots('/Users/owner')).toEqual([
+      '/Applications/ChatGPT.app',
+      '/Users/owner/Applications/ChatGPT.app',
+    ]);
+  });
+
+  test('default Codex home inherits CODEX_HOME or ~/.codex', () => {
+    expect(defaultCodexHome({}, '/Users/owner')).toBe('/Users/owner/.codex');
+    expect(defaultCodexHome({ CODEX_HOME: '/tmp/explicit-codex-home' }, '/Users/owner')).toBe('/tmp/explicit-codex-home');
+  });
+
+  test('rejects a bundle-relative socket or a GUI-stub executable path', () => {
+    expect(validateMacAppIdentity(makeIdentity({ fixedSocket: 'Contents/MacOS/codex.sock' })).ok).toBe(false);
+    expect(validateMacAppIdentity(makeIdentity({ fixedSocket: 'Contents/Resources/codex.sock' })).ok).toBe(false);
+    expect(validateMacAppIdentity(makeIdentity({ bundleRelativeExecutable: 'ChatGPT' })).ok).toBe(false);
   });
 });
 

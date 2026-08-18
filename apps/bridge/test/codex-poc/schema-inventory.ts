@@ -24,29 +24,44 @@ export interface SchemaSurface {
   unknownAuthorityChanging: string[];
 }
 
-/** Reviewed canonical schema allowlist (placeholder pending real inventory). */
+/**
+ * Reviewed exact-release schema allowlist (slash RPC names from
+ * `codex app-server generate-json-schema`).
+ *
+ * Dotted placeholders (`thread.list`, `daemon.version`, `approval.request`,
+ * `loaded`/`unloaded`) are not on the exact-release wire. Equivalents:
+ *   - thread list/read → `thread/list`, `thread/read`
+ *   - loaded-set → `thread/loaded/list` plus `thread/started` / `thread/closed`
+ *   - turn start/steer/interrupt RPC → `turn/start`, `turn/steer`, `turn/interrupt`
+ *   - turn/item lifecycle notifications → `turn/started`, `item/started`,
+ *     `item/completed`, `turn/completed`, `thread/realtime/error`
+ *   - approval/blocking → `item/<kind>/requestApproval` server requests
+ *   - runtime identity → `initialize` result (no `daemon/version` method)
+ */
 export const REVIEWED_SCHEMA_SURFACE: SchemaSurface = Object.freeze({
   methods: Object.freeze([
     'initialize',
-    'thread.list',
-    'thread.read',
-    'turn.start',
-    'turn.steer',
-    'turn.interrupt',
-    'daemon.version',
-    'daemon.status',
+    'thread/list',
+    'thread/read',
+    'thread/loaded/list',
+    'turn/start',
+    'turn/steer',
+    'turn/interrupt',
   ]),
   notifications: Object.freeze([
     'initialized',
-    'loaded',
-    'unloaded',
-    'turn.item.completed',
-    'turn.completed',
-    'turn.error',
-    'approval.request',
+    'thread/started',
+    'thread/closed',
+    'turn/started',
+    'item/started',
+    'item/completed',
+    'turn/completed',
+    'thread/realtime/error',
   ]),
   serverRequests: Object.freeze([
-    'approval.request',
+    'item/commandExecution/requestApproval',
+    'item/fileChange/requestApproval',
+    'item/permissions/requestApproval',
   ]),
   unknownAuthorityChanging: Object.freeze([]),
 });

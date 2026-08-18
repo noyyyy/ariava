@@ -4,19 +4,26 @@ import { inventorySchema, REVIEWED_SCHEMA_SURFACE, schemaFingerprint, type Schem
 describe('schema inventory', () => {
   test('reviewed schema surface has complete methods/notifications/server requests', () => {
     expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('initialize');
-    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('thread.list');
-    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('thread.read');
-    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('turn.start');
-    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('turn.steer');
-    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('turn.interrupt');
+    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('thread/list');
+    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('thread/read');
+    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('thread/loaded/list');
+    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('turn/start');
+    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('turn/steer');
+    expect(REVIEWED_SCHEMA_SURFACE.methods).toContain('turn/interrupt');
+    expect(REVIEWED_SCHEMA_SURFACE.methods).not.toContain('daemon.version');
+    expect(REVIEWED_SCHEMA_SURFACE.methods).not.toContain('thread.list');
     expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('initialized');
-    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('loaded');
-    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('unloaded');
-    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('turn.item.completed');
-    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('turn.completed');
-    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('turn.error');
-    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('approval.request');
-    expect(REVIEWED_SCHEMA_SURFACE.serverRequests).toContain('approval.request');
+    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('thread/started');
+    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('thread/closed');
+    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('turn/started');
+    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('item/started');
+    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('item/completed');
+    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('turn/completed');
+    expect(REVIEWED_SCHEMA_SURFACE.notifications).toContain('thread/realtime/error');
+    expect(REVIEWED_SCHEMA_SURFACE.notifications).not.toContain('approval.request');
+    expect(REVIEWED_SCHEMA_SURFACE.serverRequests).toContain('item/commandExecution/requestApproval');
+    expect(REVIEWED_SCHEMA_SURFACE.serverRequests).toContain('item/fileChange/requestApproval');
+    expect(REVIEWED_SCHEMA_SURFACE.serverRequests).toContain('item/permissions/requestApproval');
   });
 
   test('schema fingerprint is stable sha256 over canonical allowlist', () => {
@@ -44,7 +51,7 @@ describe('schema inventory', () => {
 
   test('inventory reports incomplete when a reviewed method is missing', () => {
     const missing: SchemaSurface = {
-      methods: REVIEWED_SCHEMA_SURFACE.methods.filter((method) => method !== 'turn.interrupt'),
+      methods: REVIEWED_SCHEMA_SURFACE.methods.filter((method) => method !== 'turn/interrupt'),
       notifications: REVIEWED_SCHEMA_SURFACE.notifications,
       serverRequests: REVIEWED_SCHEMA_SURFACE.serverRequests,
       unknownAuthorityChanging: [],
@@ -56,7 +63,7 @@ describe('schema inventory', () => {
   test('inventory reports incomplete when a reviewed notification is missing', () => {
     const missing: SchemaSurface = {
       methods: REVIEWED_SCHEMA_SURFACE.methods,
-      notifications: REVIEWED_SCHEMA_SURFACE.notifications.filter((notification) => notification !== 'approval.request'),
+      notifications: REVIEWED_SCHEMA_SURFACE.notifications.filter((notification) => notification !== 'thread/closed'),
       serverRequests: REVIEWED_SCHEMA_SURFACE.serverRequests,
       unknownAuthorityChanging: [],
     };
@@ -67,11 +74,11 @@ describe('schema inventory', () => {
   test('unknown authority-changing notifications are surfaced for verdict input', () => {
     const withUnknown: SchemaSurface = {
       methods: REVIEWED_SCHEMA_SURFACE.methods,
-      notifications: [...REVIEWED_SCHEMA_SURFACE.notifications, 'approval.dismiss'],
+      notifications: [...REVIEWED_SCHEMA_SURFACE.notifications, 'item/tool/call'],
       serverRequests: REVIEWED_SCHEMA_SURFACE.serverRequests,
-      unknownAuthorityChanging: ['approval.dismiss'],
+      unknownAuthorityChanging: ['item/tool/call'],
     };
     const result = inventorySchema(withUnknown);
-    expect(result.surface.unknownAuthorityChanging).toContain('approval.dismiss');
+    expect(result.surface.unknownAuthorityChanging).toContain('item/tool/call');
   });
 });

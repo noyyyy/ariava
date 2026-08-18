@@ -111,7 +111,7 @@ function makeDesktopGoArtifact(): EvidenceArtifact {
       bundleId: 'io.noyx.codex',
       bundleShortVersion: '1.2.3',
       bundleBuild: '42',
-      bundleRelativeExecutable: 'Contents/MacOS/codex',
+      bundleRelativeExecutable: 'Contents/MacOS/ChatGPT',
       signingIdentifier: 'Developer ID Application: X',
       signingTeam: 'ABC123',
       designatedRequirementDigest: '',
@@ -316,14 +316,14 @@ describe('verdict truth table', () => {
   });
 
   test('schema incomplete when a reviewed method is missing', () => {
-    const schema = { ...REVIEWED_SCHEMA_SURFACE, methods: REVIEWED_SCHEMA_SURFACE.methods.filter((method) => method !== 'turn.steer') };
+    const schema = { ...REVIEWED_SCHEMA_SURFACE, methods: REVIEWED_SCHEMA_SURFACE.methods.filter((method) => method !== 'turn/steer') };
     const result = computeVerdict(makeInput({ schema }));
     expect(result.verdict).toBe('NO-GO');
     expect(result.reasons).toContain('missing-seam');
   });
 
   test('schema incomplete when a reviewed notification is missing', () => {
-    const schema = { ...REVIEWED_SCHEMA_SURFACE, notifications: REVIEWED_SCHEMA_SURFACE.notifications.filter((notification) => notification !== 'turn.completed') };
+    const schema = { ...REVIEWED_SCHEMA_SURFACE, notifications: REVIEWED_SCHEMA_SURFACE.notifications.filter((notification) => notification !== 'turn/completed') };
     const result = computeVerdict(makeInput({ schema }));
     expect(result.verdict).toBe('NO-GO');
   });

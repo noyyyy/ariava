@@ -1,14 +1,17 @@
 import { describe, expect, test } from 'bun:test';
 import {
   classifyAfterDisconnect,
+  COMMIT_EVENT_TYPE,
   COMMIT_OPERATIONS,
+  commitEventType,
   evaluateCommitPredicate,
+  mapWatchCommand,
   proveCommitAfterRestart,
   verifyRequestBinding,
   type CommandRequest,
 } from './command-commit';
 
-function makeRequest(operation: 'turn.steer' | 'turn.start' | 'turn.interrupt', overrides: Partial<CommandRequest> = {}): CommandRequest {
+function makeRequest(operation: 'turn/start' | 'turn/interrupt', overrides: Partial<CommandRequest> = {}): CommandRequest {
   return {
     correlationId: `corr-${operation}`,
     operation,
@@ -20,8 +23,15 @@ function makeRequest(operation: 'turn.steer' | 'turn.start' | 'turn.interrupt', 
 }
 
 describe('command commit predicate (spec §8.4)', () => {
+  test('Watch reply on a live turn is rejected and never mapped to turn/steer', () => {
+    expect(mapWatchCommand({ type: 'reply', turnLive: true })).toEqual({ reject: true, reason: 'live-reply-no-steer' });
+    expect(mapWatchCommand({ type: 'reply', turnLive: false })).toEqual({ rpc: 'turn/start' });
+    expect(mapWatchCommand({ type: 'interrupt', turnLive: true })).toEqual({ rpc: 'turn/interrupt' });
+    expect(mapWatchCommand({ type: 'interrupt', turnLive: false })).toEqual({ reject: true, reason: 'idle-interrupt' });
+  });
+
   test('accepted/queued response is NOT a commit', () => {
-    const request = makeRequest('turn.steer');
+    const request = makeRequest('turn/start');
     const result = evaluateCommitPredicate(request, [], { acceptedResponse: { correlationId: request.correlationId } });
     expect(result.hasPositiveCommit).toBe(false);
     expect(result.observation.state).toBe('accepted-queued');
@@ -29,9 +39,9 @@ describe('command commit predicate (spec §8.4)', () => {
   });
 
   test('positive provider commit: unique event with matching type/generation/order', () => {
-    const request = makeRequest('turn.start');
+    const request = makeRequest('turn/start');
     const result = evaluateCommitPredicate(request, [
-      { sourceEventId: 'commit-1', type: 'turn.start', generation: 1, order: 6 },
+      { sourceEventId: 'commit-1', type: 'turn/started', generation: 1, order: 6 },
     ]);
     expect(result.hasPositiveCommit).toBe(true);
     expect(result.observation.state).toBe('committed');
@@ -39,24 +49,24 @@ describe('command commit predicate (spec §8.4)', () => {
   });
 
   test('duplicate commit events (same type, two source ids) do NOT prove commit', () => {
-    const request = makeRequest('turn.steer');
+    const request = makeRequest('turn/start');
     const result = evaluateCommitPredicate(request, [
-      { sourceEventId: 'commit-1', type: 'turn.steer', generation: 1, order: 6 },
-      { sourceEventId: 'commit-2', type: 'turn.steer', generation: 1, order: 7 },
+      { sourceEventId: 'commit-1', type: 'turn/started', generation: 1, order: 6 },
+      { sourceEventId: 'commit-2', type: 'turn/started', generation: 1, order: 7 },
     ]);
     expect(result.hasPositiveCommit).toBe(false);
     expect(result.observation.state).toBe('accepted-queued');
   });
 
   test('rejection is not a commit', () => {
-    const request = makeRequest('turn.interrupt');
+    const request = makeRequest('turn/interrupt');
     const result = evaluateCommitPredicate(request, [], { rejected: true });
     expect(result.hasPositiveCommit).toBe(false);
     expect(result.observation.state).toBe('rejected');
   });
 
   test('timeout is not a commit and never auto-replays', () => {
-    const request = makeRequest('turn.steer');
+    const request = makeRequest('turn/start');
     const result = evaluateCommitPredicate(request, [], { timedOut: true });
     expect(result.hasPositiveCommit).toBe(false);
     expect(result.observation.state).toBe('timeout');
@@ -64,7 +74,7 @@ describe('command commit predicate (spec §8.4)', () => {
   });
 
   test('disconnect after possible invocation enters unknown, never replay', () => {
-    const request = makeRequest('turn.start');
+    const request = makeRequest('turn/start');
     const result = evaluateCommitPredicate(request, [], { disconnected: true });
     expect(result.observation.state).toBe('disconnected');
     const after = classifyAfterDisconnect(request, false);
@@ -72,19 +82,24 @@ describe('command commit predicate (spec §8.4)', () => {
     expect(after.autoReplayAttempted).toBe(false);
   });
 
-  test('all three operations have distinct commit predicates', () => {
-    expect(COMMIT_OPERATIONS).toEqual(['turn.steer', 'turn.start', 'turn.interrupt']);
+  test('Watch commit operations are start and interrupt; steer is not a Watch command', () => {
+    expect(COMMIT_OPERATIONS).toEqual(['turn/start', 'turn/interrupt']);
+    expect(COMMIT_EVENT_TYPE['turn/start']).toBe('turn/started');
+    expect(COMMIT_EVENT_TYPE['turn/interrupt']).toBe('turn/completed');
+    expect(COMMIT_EVENT_TYPE['turn/steer']).toBe('item/started');
+    expect(new Set(COMMIT_OPERATIONS.map(commitEventType)).size).toBe(2);
+    expect(COMMIT_OPERATIONS.includes('turn/steer' as (typeof COMMIT_OPERATIONS)[number])).toBe(false);
     for (const operation of COMMIT_OPERATIONS) {
       const request = makeRequest(operation);
       const result = evaluateCommitPredicate(request, [
-        { sourceEventId: `commit-${operation}`, type: operation, generation: 1, order: 6 },
+        { sourceEventId: `commit-${operation}`, type: commitEventType(operation), generation: 1, order: 6 },
       ]);
       expect(result.hasPositiveCommit).toBe(true);
     }
   });
 
   test('request binding requires matching generation and loaded thread', () => {
-    const request = makeRequest('turn.steer', { providerGeneration: 1 });
+    const request = makeRequest('turn/start', { providerGeneration: 1 });
     expect(verifyRequestBinding(request, 1, true).ok).toBe(true);
     expect(verifyRequestBinding(request, 2, true).ok).toBe(false);
     expect(verifyRequestBinding(request, 1, false).ok).toBe(false);
@@ -92,32 +107,48 @@ describe('command commit predicate (spec §8.4)', () => {
   });
 
   test('approval pending means never a reply target', () => {
-    const request = makeRequest('turn.steer', { preSendEvidence: { threadSnapshotOrder: 5, threadLoaded: true, approvalPending: true } });
+    const request = makeRequest('turn/start', { preSendEvidence: { threadSnapshotOrder: 5, threadLoaded: true, approvalPending: true } });
     const binding = verifyRequestBinding(request, 1, true);
     expect(binding.ok).toBe(false);
     expect(binding.reason).toContain('approval pending');
   });
 
   test('restart commit proof: committed event visible after restart', () => {
-    const request = makeRequest('turn.start');
+    const request = makeRequest('turn/start');
     const proof = proveCommitAfterRestart(request, [
-      { sourceEventId: 'commit-1', type: 'turn.start', generation: 1, order: 6 },
+      { sourceEventId: 'commit-1', type: 'turn/started', generation: 1, order: 6 },
     ]);
     expect(proof.proof).toBe('committed');
   });
 
   test('restart without commit event is unknown, not assumed not-committed', () => {
-    const request = makeRequest('turn.start');
+    const request = makeRequest('turn/start');
     const proof = proveCommitAfterRestart(request, [
-      { sourceEventId: 'other-1', type: 'turn.item.completed', generation: 1, order: 6 },
+      { sourceEventId: 'other-1', type: 'item/completed', generation: 1, order: 6 },
     ]);
     expect(proof.proof).toBe('unknown');
   });
 
-  test('missing predicate produces NO-GO at the verdict level (all three required)', () => {
-    // The verdict module requires all three commit predicates; a single missing
+  test('item/started is not Watch reply commit evidence', () => {
+    const request = makeRequest('turn/start');
+    const result = evaluateCommitPredicate(request, [
+      { sourceEventId: 'commit-1', type: 'item/started', generation: 1, order: 6 },
+    ]);
+    expect(result.hasPositiveCommit).toBe(false);
+  });
+
+  test('RPC method names are not commit evidence', () => {
+    const request = makeRequest('turn/start');
+    const result = evaluateCommitPredicate(request, [
+      { sourceEventId: 'commit-1', type: 'turn/start', generation: 1, order: 6 },
+    ]);
+    expect(result.hasPositiveCommit).toBe(false);
+  });
+
+  test('missing predicate produces NO-GO at the verdict level (Watch start and interrupt required)', () => {
+    // The verdict module requires Watch start/interrupt commit predicates; a single missing
     // operation means hasPositiveCommit=false for that operation.
-    const request = makeRequest('turn.interrupt');
+    const request = makeRequest('turn/interrupt');
     const result = evaluateCommitPredicate(request, [], { acceptedResponse: { correlationId: 'x' } });
     expect(result.hasPositiveCommit).toBe(false);
   });

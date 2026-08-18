@@ -119,13 +119,13 @@ export const REQUIREMENT_REGISTRY: readonly RequirementEntry[] = Object.freeze([
   },
   {
     id: 'CODEX-POC-COMMIT-001',
-    requirement: 'Question reply maps to turn/steer with an operation-specific positive commit predicate.',
-    caseIds: ['case-commit-reply-steer-predicate'],
+    requirement: 'Watch reply on a live/working turn is rejected before any provider RPC and is never implemented as turn/steer.',
+    caseIds: ['case-commit-reply-live-turn-rejected'],
     specSection: '§8.4',
   },
   {
     id: 'CODEX-POC-COMMIT-002',
-    requirement: 'Done reply maps to turn/start with an operation-specific positive commit predicate.',
+    requirement: 'Watch reply on an idle thread maps to turn/start with an operation-specific positive commit predicate.',
     caseIds: ['case-commit-done-start-predicate'],
     specSection: '§8.4',
   },
@@ -133,6 +133,12 @@ export const REQUIREMENT_REGISTRY: readonly RequirementEntry[] = Object.freeze([
     id: 'CODEX-POC-COMMIT-003',
     requirement: 'Working interrupt maps to turn/interrupt with an operation-specific positive commit predicate.',
     caseIds: ['case-commit-interrupt-predicate'],
+    specSection: '§8.4',
+  },
+  {
+    id: 'CODEX-POC-COMMIT-004',
+    requirement: 'Codex turn/steer may exist on the reviewed schema, but it is diagnostic-only and is not a Watch command.',
+    caseIds: ['case-commit-reply-steer-predicate'],
     specSection: '§8.4',
   },
   {

@@ -17,28 +17,28 @@ describe('fake app-server: framing and correlation', () => {
     server.connect('client-a');
     const result = server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'initialize', params: {} }));
     expect(result.ok).toBe(true);
-    expect(result.frames[0]?.result).toEqual({ protocolVersion: 1 });
+    expect(result.frames[0]?.result).toEqual({ protocolVersion: 1, userAgent: { name: 'codex-fake', version: '0.0.0-fake' } });
     const events = server.emittedNotifications('client-a');
     expect(events.some((event) => event.type === 'initialized')).toBe(true);
   });
 
-  test('thread.list returns deterministic thread summaries', () => {
+  test('thread/list returns deterministic thread summaries', () => {
     const server = createFakeAppServer();
     server.connect('client-a');
     const thread = server.createThread('fix bug', '/tmp/work');
-    const result = server.handleFrame('client-a', JSON.stringify({ id: 2, method: 'thread.list', params: {} }));
+    const result = server.handleFrame('client-a', JSON.stringify({ id: 2, method: 'thread/list', params: {} }));
     expect(result.ok).toBe(true);
-    const threads = result.frames[0]?.result as { threads: Array<{ threadId: string; title: string; cwd: string }> };
-    expect(threads.threads[0]?.threadId).toBe(thread.threadId);
-    expect(threads.threads[0]?.title).toBe('fix bug');
+    const threads = result.frames[0]?.result as { data: Array<{ threadId: string; title: string; cwd: string }> };
+    expect(threads.data[0]?.threadId).toBe(thread.threadId);
+    expect(threads.data[0]?.title).toBe('fix bug');
   });
 
-  test('thread.read returns authoritative events with order and sourceEventId', () => {
+  test('thread/read returns authoritative events with order and sourceEventId', () => {
     const server = createFakeAppServer();
     server.connect('client-a');
     const thread = server.createThread('read me', '/tmp/work');
-    server.handleFrame('client-a', JSON.stringify({ id: 3, method: 'turn.start', params: { threadId: thread.threadId } }));
-    const result = server.handleFrame('client-a', JSON.stringify({ id: 4, method: 'thread.read', params: { threadId: thread.threadId } }));
+    server.handleFrame('client-a', JSON.stringify({ id: 3, method: 'turn/start', params: { threadId: thread.threadId } }));
+    const result = server.handleFrame('client-a', JSON.stringify({ id: 4, method: 'thread/read', params: { threadId: thread.threadId } }));
     expect(result.ok).toBe(true);
     const read = result.frames[0]?.result as { events: Array<{ order: number; type: string; sourceEventId: string }> };
     expect(read.events.length).toBeGreaterThan(0);
@@ -48,19 +48,20 @@ describe('fake app-server: framing and correlation', () => {
     }
   });
 
-  test('daemon.version and daemon.status return runtime identity', () => {
+  test('initialize result carries runtime identity (no daemon.version method)', () => {
     const server = createFakeAppServer();
     server.connect('client-a');
-    const version = server.handleFrame('client-a', JSON.stringify({ id: 5, method: 'daemon.version', params: {} }));
-    expect(version.frames[0]?.result).toEqual({ version: '0.0.0-fake' });
-    const status = server.handleFrame('client-a', JSON.stringify({ id: 6, method: 'daemon.status', params: {} }));
-    expect(status.frames[0]?.result).toEqual({ running: true, generation: 1 });
+    const initialized = server.handleFrame('client-a', JSON.stringify({ id: 5, method: 'initialize', params: {} }));
+    const result = initialized.frames[0]?.result as { userAgent?: { name: string; version: string } };
+    expect(result.userAgent).toEqual({ name: 'codex-fake', version: '0.0.0-fake' });
+    const missing = server.handleFrame('client-a', JSON.stringify({ id: 6, method: 'daemon.version', params: {} }));
+    expect(missing.ok).toBe(false);
   });
 
   test('request/response correlation: pending queue tracks ids', () => {
     const server = createFakeAppServer();
     server.connect('client-a');
-    server.handleFrame('client-a', JSON.stringify({ id: 'req-1', method: 'thread.list', params: {} }));
+    server.handleFrame('client-a', JSON.stringify({ id: 'req-1', method: 'thread/list', params: {} }));
     const client = server.getClient('client-a');
     expect(client?.pendingRequests.has('req-1')).toBe(true);
     expect(client?.seenRequestIds.has('req-1')).toBe(true);
@@ -68,8 +69,8 @@ describe('fake app-server: framing and correlation', () => {
 
   test('encodeFrame produces canonical JSON-RPC frame', () => {
     const server = createFakeAppServer();
-    const wire = server.encodeFrame({ id: 1, method: 'daemon.version', params: {} });
-    expect(wire).toBe('{"id":1,"method":"daemon.version","params":{}}');
+    const wire = server.encodeFrame({ id: 1, method: 'thread/list', params: {} });
+    expect(wire).toBe('{"id":1,"method":"thread/list","params":{}}');
   });
 
   test('validateFrameShape accepts reviewed methods and rejects unknown', () => {
@@ -93,7 +94,7 @@ describe('fake app-server: negative cases (spec §8.1)', () => {
   test('oversized frame fails closed', () => {
     const server = createFakeAppServer();
     server.connect('client-a');
-    const big = JSON.stringify({ id: 1, method: 'thread.list', params: { padding: 'x'.repeat(MAX_FRAME_BYTES + 1) } });
+    const big = JSON.stringify({ id: 1, method: 'thread/list', params: { padding: 'x'.repeat(MAX_FRAME_BYTES + 1) } });
     const result = server.handleFrame('client-a', big);
     expect(result.ok).toBe(false);
     expect(result.error).toContain('bytes');
@@ -104,7 +105,7 @@ describe('fake app-server: negative cases (spec §8.1)', () => {
     server.connect('client-a');
     let nested: unknown = 'leaf';
     for (let index = 0; index < MAX_MESSAGE_DEPTH + 2; index += 1) nested = { nested };
-    const result = server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'thread.list', params: nested }));
+    const result = server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'thread/list', params: nested }));
     expect(result.ok).toBe(false);
     expect(result.error).toContain('depth');
   });
@@ -112,11 +113,11 @@ describe('fake app-server: negative cases (spec §8.1)', () => {
   test('duplicate response id is rejected (not treated as commit)', () => {
     const server = createFakeAppServer();
     server.connect('client-a');
-    server.handleFrame('client-a', JSON.stringify({ id: 'dup-1', method: 'thread.list', params: {} }));
+    server.handleFrame('client-a', JSON.stringify({ id: 'dup-1', method: 'thread/list', params: {} }));
     // First response resolves the pending request.
-    server.handleFrame('client-a', JSON.stringify({ id: 'dup-1', method: 'thread.list', params: {}, result: { threads: [] } }));
+    server.handleFrame('client-a', JSON.stringify({ id: 'dup-1', method: 'thread/list', params: {}, result: { threads: [] } }));
     // Duplicate response for an already-resolved id must fail closed.
-    const dup = server.handleFrame('client-a', JSON.stringify({ id: 'dup-1', method: 'thread.list', params: {}, result: { threads: [] } }));
+    const dup = server.handleFrame('client-a', JSON.stringify({ id: 'dup-1', method: 'thread/list', params: {}, result: { threads: [] } }));
     expect(dup.ok).toBe(false);
     expect(dup.error).toContain('duplicate response id');
   });
@@ -133,8 +134,8 @@ describe('fake app-server: negative cases (spec §8.1)', () => {
     const server = createFakeAppServer();
     server.connect('client-a');
     const thread = server.createThread('order', '/tmp/work');
-    server.handleFrame('client-a', JSON.stringify({ id: 'first', method: 'thread.read', params: { threadId: thread.threadId } }));
-    server.handleFrame('client-a', JSON.stringify({ id: 'second', method: 'thread.read', params: { threadId: thread.threadId } }));
+    server.handleFrame('client-a', JSON.stringify({ id: 'first', method: 'thread/read', params: { threadId: thread.threadId } }));
+    server.handleFrame('client-a', JSON.stringify({ id: 'second', method: 'thread/read', params: { threadId: thread.threadId } }));
     const client = server.getClient('client-a');
     expect(client?.seenRequestIds.has('first')).toBe(true);
     expect(client?.seenRequestIds.has('second')).toBe(true);
@@ -143,7 +144,7 @@ describe('fake app-server: negative cases (spec §8.1)', () => {
   test('disconnect: pending requests cleared; reconnecting client gets fresh state', () => {
     const server = createFakeAppServer();
     server.connect('client-a');
-    server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'thread.list', params: {} }));
+    server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'thread/list', params: {} }));
     server.disconnect('client-a');
     const client = server.getClient('client-a');
     expect(client?.connected).toBe(false);
@@ -155,11 +156,11 @@ describe('fake app-server: negative cases (spec §8.1)', () => {
   test('pending request queue is bounded', () => {
     const server = createFakeAppServer({ maxPendingRequests: 2 });
     server.connect('client-a');
-    const first = server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'thread.list', params: {} }));
+    const first = server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'thread/list', params: {} }));
     expect(first.ok).toBe(true);
-    const second = server.handleFrame('client-a', JSON.stringify({ id: 2, method: 'thread.list', params: {} }));
+    const second = server.handleFrame('client-a', JSON.stringify({ id: 2, method: 'thread/list', params: {} }));
     expect(second.ok).toBe(true);
-    const third = server.handleFrame('client-a', JSON.stringify({ id: 3, method: 'thread.list', params: {} }));
+    const third = server.handleFrame('client-a', JSON.stringify({ id: 3, method: 'thread/list', params: {} }));
     expect(third.ok).toBe(false);
     expect(third.error).toContain('queue full');
   });
@@ -177,14 +178,14 @@ describe('fake app-server: multi-client fanout (spec §8.6)', () => {
     server.connect('authoritative');
     server.connect('observer');
     const thread = server.createThread('fanout', '/tmp/work');
-    server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'turn.start', params: { threadId: thread.threadId } }));
+    server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'turn/start', params: { threadId: thread.threadId } }));
     const authEvents = server.emittedNotifications('authoritative');
     const obsEvents = server.emittedNotifications('observer');
-    expect(authEvents.some((event) => event.type === 'turn.start')).toBe(true);
-    expect(obsEvents.some((event) => event.type === 'turn.start')).toBe(true);
+    expect(authEvents.some((event) => event.type === 'turn/started')).toBe(true);
+    expect(obsEvents.some((event) => event.type === 'turn/started')).toBe(true);
     // Same source event id in both (consistent fanout).
-    const authTurn = authEvents.find((event) => event.type === 'turn.start');
-    const obsTurn = obsEvents.find((event) => event.type === 'turn.start');
+    const authTurn = authEvents.find((event) => event.type === 'turn/started');
+    const obsTurn = obsEvents.find((event) => event.type === 'turn/started');
     expect(authTurn?.sourceEventId).toBe(obsTurn?.sourceEventId);
   });
 
@@ -192,8 +193,8 @@ describe('fake app-server: multi-client fanout (spec §8.6)', () => {
     const server = createFakeAppServer();
     server.connect('client-a');
     server.connect('client-b');
-    server.handleFrame('client-a', JSON.stringify({ id: 'a-1', method: 'thread.list', params: {} }));
-    server.handleFrame('client-b', JSON.stringify({ id: 'b-1', method: 'thread.list', params: {} }));
+    server.handleFrame('client-a', JSON.stringify({ id: 'a-1', method: 'thread/list', params: {} }));
+    server.handleFrame('client-b', JSON.stringify({ id: 'b-1', method: 'thread/list', params: {} }));
     const clientA = server.getClient('client-a');
     const clientB = server.getClient('client-b');
     expect(clientA?.seenRequestIds.has('a-1')).toBe(true);
@@ -209,15 +210,15 @@ describe('fake app-server: multi-client fanout (spec §8.6)', () => {
     server.connect('observer');
     server.disconnect('observer');
     server.connect('observer');
-    server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'turn.start', params: { threadId: thread.threadId } }));
-    expect(server.emittedNotifications('authoritative').some((event) => event.type === 'turn.start')).toBe(true);
+    server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'turn/start', params: { threadId: thread.threadId } }));
+    expect(server.emittedNotifications('authoritative').some((event) => event.type === 'turn/started')).toBe(true);
   });
 
   test('reconnect provides authoritative replay without duplicate side effects', () => {
     const server = createFakeAppServer();
     server.connect('authoritative');
     const thread = server.createThread('replay', '/tmp/work');
-    server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'turn.start', params: { threadId: thread.threadId } }));
+    server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'turn/start', params: { threadId: thread.threadId } }));
     const before = server.emittedNotifications('authoritative').filter((event) => event.threadId === thread.threadId);
     server.disconnect('authoritative');
     server.connect('authoritative');
@@ -235,8 +236,8 @@ describe('fake app-server: multi-client fanout (spec §8.6)', () => {
     const thread = server.createThread('slow', '/tmp/work');
     // The fake is synchronous; a slow observer is simulated by not consuming.
     // The authoritative client still receives events immediately.
-    server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'turn.start', params: { threadId: thread.threadId } }));
-    expect(server.emittedNotifications('authoritative').some((event) => event.type === 'turn.start')).toBe(true);
+    server.handleFrame('authoritative', JSON.stringify({ id: 1, method: 'turn/start', params: { threadId: thread.threadId } }));
+    expect(server.emittedNotifications('authoritative').some((event) => event.type === 'turn/started')).toBe(true);
   });
 
   test('approval/blocking server request goes only to authoritative client', () => {
@@ -246,14 +247,14 @@ describe('fake app-server: multi-client fanout (spec §8.6)', () => {
     const thread = server.createThread('approve', '/tmp/work');
     const result = server.handleFrame('authoritative', JSON.stringify({
       id: 'approval-1',
-      method: 'approval.request',
+      method: 'item/commandExecution/requestApproval',
       params: { threadId: thread.threadId },
       isServerRequest: true,
     }));
     expect(result.ok).toBe(true);
     // The observer never receives the approval request (authoritative only).
     const obsEvents = server.emittedNotifications('observer');
-    expect(obsEvents.some((event) => event.type === 'approval.request')).toBe(false);
+    expect(obsEvents.some((event) => event.type === 'item/commandExecution/requestApproval')).toBe(false);
   });
 });
 
@@ -276,9 +277,9 @@ describe('fake app-server: restart and generation (spec §8.3)', () => {
     server.connect('client-a');
     const thread = server.createThread('gen', '/tmp/work');
     server.restart();
-    server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'turn.start', params: { threadId: thread.threadId } }));
+    server.handleFrame('client-a', JSON.stringify({ id: 1, method: 'turn/start', params: { threadId: thread.threadId } }));
     const events = server.emittedNotifications('client-a');
-    const after = events.find((event) => event.type === 'turn.start');
+    const after = events.find((event) => event.type === 'turn/started');
     expect(after?.generation).toBe(2);
   });
 
@@ -294,18 +295,21 @@ describe('fake app-server: restart and generation (spec §8.3)', () => {
 describe('fake app-server: schema constants match reviewed surface', () => {
   test('fake methods/notifications/server requests are the reviewed allowlist', () => {
     expect(FAKE_METHODS).toContain('initialize');
-    expect(FAKE_METHODS).toContain('thread.list');
-    expect(FAKE_METHODS).toContain('thread.read');
-    expect(FAKE_METHODS).toContain('turn.start');
-    expect(FAKE_METHODS).toContain('turn.steer');
-    expect(FAKE_METHODS).toContain('turn.interrupt');
+    expect(FAKE_METHODS).toContain('thread/list');
+    expect(FAKE_METHODS).toContain('thread/read');
+    expect(FAKE_METHODS).toContain('thread/loaded/list');
+    expect(FAKE_METHODS).toContain('turn/start');
+    expect(FAKE_METHODS).toContain('turn/steer');
+    expect(FAKE_METHODS).toContain('turn/interrupt');
     expect(FAKE_NOTIFICATIONS).toContain('initialized');
-    expect(FAKE_NOTIFICATIONS).toContain('loaded');
-    expect(FAKE_NOTIFICATIONS).toContain('unloaded');
-    expect(FAKE_NOTIFICATIONS).toContain('turn.item.completed');
-    expect(FAKE_NOTIFICATIONS).toContain('turn.completed');
-    expect(FAKE_NOTIFICATIONS).toContain('turn.error');
-    expect(FAKE_SERVER_REQUESTS).toContain('approval.request');
+    expect(FAKE_NOTIFICATIONS).toContain('thread/started');
+    expect(FAKE_NOTIFICATIONS).toContain('thread/closed');
+    expect(FAKE_NOTIFICATIONS).toContain('turn/started');
+    expect(FAKE_NOTIFICATIONS).toContain('item/started');
+    expect(FAKE_NOTIFICATIONS).toContain('item/completed');
+    expect(FAKE_NOTIFICATIONS).toContain('turn/completed');
+    expect(FAKE_NOTIFICATIONS).toContain('thread/realtime/error');
+    expect(FAKE_SERVER_REQUESTS).toContain('item/commandExecution/requestApproval');
   });
 
   test('MAX_PENDING_REQUESTS is the reviewed bound', () => {

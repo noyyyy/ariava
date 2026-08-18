@@ -16,7 +16,7 @@ function tuple(partial: Partial<EventSourceTuple> & Pick<EventSourceTuple, 'sour
     rawThreadId: 'thread-1',
     providerGeneration: 1,
     authoritativeOrder: 1,
-    type: 'turn.item.completed',
+    type: 'item/completed',
     ...partial,
   };
 }
@@ -24,10 +24,10 @@ function tuple(partial: Partial<EventSourceTuple> & Pick<EventSourceTuple, 'sour
 describe('event source ordering (spec §8.3)', () => {
   test('source tuple is stable: rawThreadId + generation + order + sourceEventId', () => {
     const stream = createEventStream('thread-1');
-    recordEvent(stream, tuple({ sourceEventId: 'evt-1', authoritativeOrder: 1, type: 'loaded' }));
-    recordEvent(stream, tuple({ sourceEventId: 'evt-2', authoritativeOrder: 2, type: 'turn.start' }));
-    expect(stream.events[0]).toMatchObject({ rawThreadId: 'thread-1', providerGeneration: 1, authoritativeOrder: 1, sourceEventId: 'evt-1', type: 'loaded' });
-    expect(stream.events[1]).toMatchObject({ sourceEventId: 'evt-2', type: 'turn.start' });
+    recordEvent(stream, tuple({ sourceEventId: 'evt-1', authoritativeOrder: 1, type: 'thread/started' }));
+    recordEvent(stream, tuple({ sourceEventId: 'evt-2', authoritativeOrder: 2, type: 'turn/started' }));
+    expect(stream.events[0]).toMatchObject({ rawThreadId: 'thread-1', providerGeneration: 1, authoritativeOrder: 1, sourceEventId: 'evt-1', type: 'thread/started' });
+    expect(stream.events[1]).toMatchObject({ sourceEventId: 'evt-2', type: 'turn/started' });
   });
 
   test('duplicates are identifiable by sourceEventId', () => {
