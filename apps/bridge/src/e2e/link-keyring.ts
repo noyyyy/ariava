@@ -66,6 +66,7 @@ export class LocalLinkKeyring implements EncryptedCommandKeyring {
   private pendingActivations: PendingActivationV2[];
   private readonly identities: HostIdentityResolver;
   private readonly currentHostId: string;
+  private persistedState = '';
 
   constructor(
     private readonly path: string,
@@ -79,6 +80,7 @@ export class LocalLinkKeyring implements EncryptedCommandKeyring {
     const state = this.load(migrationContext);
     this.pins = state.pins;
     this.pendingActivations = state.pendingActivations;
+    this.persistedState = JSON.stringify(state);
   }
 
   listActive(): ActiveLinkPinV2[] { return this.pins.filter((pin) => pin.status === 'active').map((pin) => structuredClone(pin)); }
@@ -190,19 +192,43 @@ export class LocalLinkKeyring implements EncryptedCommandKeyring {
   }
   reconcileRecipients(snapshot: E2ERecipientSnapshotV1) {
     if (snapshot.hostId !== this.currentHostId || !Number.isSafeInteger(snapshot.recipientSetVersion) || snapshot.recipientSetVersion < 1) throw new TypeError('recipient snapshot is invalid');
-    const recipients = snapshot.recipients.map((recipient) => this.materialForRecipient(recipient));
-    const activeKeys = new Set(snapshot.recipients.map((recipient) => pinKey(recipient)));
-    const authoritativeByWatch = new Map(snapshot.recipients.map((recipient) => [recipient.watchDeviceId, recipient]));
-    const before = JSON.stringify(this.pins);
-    this.pins = this.pins.map((pin) => {
-      if (pin.status === 'revoked' || activeKeys.has(pinKey(pin))) return pin;
-      const successor = authoritativeByWatch.get(pin.watchDeviceId);
-      if (pin.status === 'retiring' && successor && comparePinTuple(successor, pin) > 0) return pin;
-      const { retiringAt: _retiringAt, ...revoked } = pin;
-      return { ...revoked, status: 'revoked' as const };
-    });
-    if (before !== JSON.stringify(this.pins)) this.persist();
-    return recipients;
+    const knownBeforeRefresh = new Set(this.pins.map((pin) => pinKey(pin)));
+    let refreshed = false;
+    let recipients;
+    try {
+      recipients = snapshot.recipients.map((recipient) => this.materialForRecipient(recipient));
+    } catch (error) {
+      this.refreshPersisted();
+      refreshed = true;
+      try {
+        recipients = snapshot.recipients.map((recipient) => this.materialForRecipient(recipient));
+      } catch {
+        throw error;
+      }
+    }
+    const reconciled = this.reconciledPins(snapshot, refreshed ? knownBeforeRefresh : undefined);
+    if (JSON.stringify(reconciled) === JSON.stringify(this.pins)) return recipients;
+    const lock = acquireProcessAwareLock(
+      `${this.path}.mutation.lock`,
+      () => new TypeError('local E2E keyring mutation is already in progress'),
+    );
+    try {
+      const latest = this.load();
+      const latestState = JSON.stringify(latest);
+      if (latestState !== this.persistedState) {
+        this.pins = latest.pins;
+        this.pendingActivations = latest.pendingActivations;
+        this.persistedState = latestState;
+        recipients = snapshot.recipients.map((recipient) => this.materialForRecipient(recipient));
+        this.pins = this.reconciledPins(snapshot, knownBeforeRefresh);
+      } else {
+        this.pins = reconciled;
+      }
+      this.persist();
+      return recipients;
+    } finally {
+      lock.release();
+    }
   }
   revokeWatch(watchDeviceId: string): void {
     const before = JSON.stringify(this.pins);
@@ -246,6 +272,27 @@ export class LocalLinkKeyring implements EncryptedCommandKeyring {
       watchEncryptionKeyId: material.pin.watchBinding.encryptionKeyId,
     }, loopbackCommand };
   }
+  private reconciledPins(snapshot: E2ERecipientSnapshotV1, knownBeforeRefresh?: ReadonlySet<string>): ActiveLinkPinV2[] {
+    const activeKeys = new Set(snapshot.recipients.map((recipient) => pinKey(recipient)));
+    const authoritativeByWatch = new Map(snapshot.recipients.map((recipient) => [recipient.watchDeviceId, recipient]));
+    if (knownBeforeRefresh && this.pins.some((pin) => pin.status === 'active'
+      && !activeKeys.has(pinKey(pin)) && !knownBeforeRefresh.has(pinKey(pin)))) {
+      throw new TypeError('recipient snapshot predates a locally persisted active pin');
+    }
+    return this.pins.map((pin) => {
+      if (pin.status === 'revoked' || activeKeys.has(pinKey(pin))) return pin;
+      const successor = authoritativeByWatch.get(pin.watchDeviceId);
+      if (pin.status === 'retiring' && successor && comparePinTuple(successor, pin) > 0) return pin;
+      const { retiringAt: _retiringAt, ...revoked } = pin;
+      return { ...revoked, status: 'revoked' as const };
+    });
+  }
+  private refreshPersisted(): void {
+    const latest = this.load();
+    this.pins = latest.pins;
+    this.pendingActivations = latest.pendingActivations;
+    this.persistedState = JSON.stringify(latest);
+  }
   private tryResolvePinMaterial(linkId: string, generation: number, epoch: number) {
     try { return this.resolvePinMaterial(linkId, generation, epoch); } catch { return undefined; }
   }
@@ -266,7 +313,10 @@ export class LocalLinkKeyring implements EncryptedCommandKeyring {
     return state;
   }
   private persist(): void { this.persistState({ version: 2, pins: this.pins, pendingActivations: this.pendingActivations }); }
-  private persistState(state: PersistedKeyringV2): void { writeSecureJson(this.path, state); }
+  private persistState(state: PersistedKeyringV2): void {
+    writeSecureJson(this.path, state);
+    this.persistedState = JSON.stringify(state);
+  }
   private updatePersisted(mutate: () => void): void {
     const lock = acquireProcessAwareLock(
       `${this.path}.mutation.lock`,
@@ -277,6 +327,7 @@ export class LocalLinkKeyring implements EncryptedCommandKeyring {
       this.pins = latest.pins;
       this.pendingActivations = latest.pendingActivations;
       const before = JSON.stringify(latest);
+      this.persistedState = before;
       mutate();
       const next = { version: 2 as const, pins: this.pins, pendingActivations: this.pendingActivations };
       validateState(next, this.currentHostId, this.identities);

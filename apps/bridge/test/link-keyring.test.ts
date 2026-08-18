@@ -193,6 +193,62 @@ describe('verified local E2E pins', () => {
     expect(keyring.getUsable('second', 2, 1)).toBeDefined();
   });
 
+  test('recipient reconciliation observes an activation persisted by another keyring instance', () => {
+    const path = join(root('snapshot-stale-instance'), 'pins.json');
+    const host = generateHostEncryptionIdentity(`host_${'H'.repeat(43)}`);
+    const daemonKeyring = new LocalLinkKeyring(path, host);
+    const pairingKeyring = new LocalLinkKeyring(path, host);
+    const activated = pin(host, 'paired-after-daemon-start', 1, 1);
+    pairingKeyring.persistActive(activated);
+
+    const recipients = daemonKeyring.reconcileRecipients({
+      hostId: host.hostId, recipientSetVersion: 1, recipients: [recipient(activated)],
+    });
+
+    expect(recipients).toHaveLength(1);
+    expect(recipients[0]).toMatchObject({
+      linkId: activated.linkId, watchDeviceId: activated.watchDeviceId,
+      transcriptDigest: activated.transcriptDigest,
+    });
+    expect(daemonKeyring.listActive()).toEqual([activated]);
+  });
+
+  test('recipient reconciliation never overwrites an activation persisted after an older snapshot was fetched', () => {
+    const path = join(root('snapshot-write-race'), 'pins.json');
+    const host = generateHostEncryptionIdentity(`host_${'H'.repeat(43)}`);
+    const daemonKeyring = new LocalLinkKeyring(path, host);
+    const oldPin = pin(host, 'old-before-pairing', 1, 1);
+    daemonKeyring.persistActive(oldPin);
+    const staleSnapshot = { hostId: host.hostId, recipientSetVersion: 1, recipients: [] };
+    const activated = pin(host, 'paired-after-snapshot', 2, 1);
+    new LocalLinkKeyring(path, host).persistActive(activated);
+
+    expect(() => daemonKeyring.reconcileRecipients(staleSnapshot)).toThrow(/predates/);
+    const reloaded = new LocalLinkKeyring(path, host);
+    expect(reloaded.listActive()).toEqual([activated]);
+    expect(reloaded.listRetiring().map((item) => item.linkId)).toEqual([oldPin.linkId]);
+  });
+
+  test('recipient refresh rejects a snapshot that omits a later durable activation', () => {
+    const path = join(root('snapshot-refresh-race'), 'pins.json');
+    const host = generateHostEncryptionIdentity(`host_${'H'.repeat(43)}`);
+    const daemonKeyring = new LocalLinkKeyring(path, host);
+    const firstWatch = pin(host, 'first-after-daemon-start', 1, 1);
+    const secondWatch = pin(host, 'second-after-snapshot', 1, 1, `watch_${'S'.repeat(43)}`);
+    const writer = new LocalLinkKeyring(path, host);
+    writer.persistActive(firstWatch);
+    const staleSnapshot = {
+      hostId: host.hostId, recipientSetVersion: 1, recipients: [recipient(firstWatch)],
+    };
+    writer.persistActive(secondWatch);
+
+    expect(() => daemonKeyring.reconcileRecipients(staleSnapshot)).toThrow(/predates/);
+    const reloaded = new LocalLinkKeyring(path, host);
+    expect(reloaded.listActive().map((item) => item.linkId).sort()).toEqual(
+      [firstWatch.linkId, secondWatch.linkId].sort(),
+    );
+  });
+
   test('authoritative snapshots preserve retiring history only for a confirmed same-Watch successor', () => {
     const path = join(root('snapshot-reconciliation'), 'pins.json');
     const host = generateHostEncryptionIdentity(`host_${'H'.repeat(43)}`);
