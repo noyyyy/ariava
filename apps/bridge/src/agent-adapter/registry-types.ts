@@ -50,7 +50,7 @@ export interface RegisterSessionInput {
 }
 
 export const SESSION_TTL_MS = 45_000;
-export const OWNER_LEASE_TTL_MS = SESSION_TTL_MS;
+export const OWNER_LEASE_TTL_MS = 6_000;
 export const TERMINAL_RETRY_DELAYS_MS = [100, 500, 2_000, 5_000] as const;
 
 /** Shared finite upper bounds for Agent Adapter v3 wire bodies (§3.4). */

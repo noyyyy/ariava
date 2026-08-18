@@ -24,9 +24,9 @@ import {
   withSessionStatus,
 } from './session';
 
-const REGISTRATION_WARNING_MS = 5_000;
+const REGISTRATION_WARNING_MS = 10_000;
 const REGISTRATION_WARNING_MESSAGE =
-  'Ariava bridge did not register this pi session within 5s. Check that the selected local bridge profile is running and its Agent Adapter discovery file is available.';
+  'Ariava bridge did not register this pi session within 10s. Check that the selected local bridge profile is running and its Agent Adapter discovery file is available.';
 const REGISTRATION_RETRY_MS = 1_000;
 const TERMINAL_ALERT_QUIET_WINDOW_MS = 1_500;
 

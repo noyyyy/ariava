@@ -668,7 +668,7 @@ describe('unchanged extension integration behavior', () => {
     await harness.shutdown();
   });
 
-  test('session_start does not wait for adapter registration and warns in TUI after 5 seconds', async () => {
+  test('session_start does not wait for adapter registration and warns in TUI after 10 seconds', async () => {
     const notifications: Array<{ message: string; level?: string }> = [];
     let resolveRegistration!: (value: { sessionId: string; registeredAt: string }) => void;
     const registration = new Promise<{ sessionId: string; registeredAt: string }>((resolve) => {
@@ -694,9 +694,12 @@ describe('unchanged extension integration behavior', () => {
     expect(registeredSessions).toHaveLength(1);
 
     await Bun.sleep(5_100);
+    expect(notifications).toEqual([]);
+
+    await Bun.sleep(5_100);
     expect(notifications).toEqual([{
       level: 'warning',
-      message: 'Ariava bridge did not register this pi session within 5s. Check that the selected local bridge profile is running and its Agent Adapter discovery file is available.',
+      message: 'Ariava bridge did not register this pi session within 10s. Check that the selected local bridge profile is running and its Agent Adapter discovery file is available.',
     }]);
 
     resolveRegistration({ sessionId: 'sess-1', registeredAt: '2026-07-08T00:00:00Z' });

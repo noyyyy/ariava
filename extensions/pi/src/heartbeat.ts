@@ -3,7 +3,7 @@ import type { SessionStatus } from '@ariava/protocol';
 import type { PiSessionInfo } from './session';
 import { logExtensionEventThrottled } from './logger';
 
-const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
 
 export interface HeartbeatContext {
   sessionId: string;

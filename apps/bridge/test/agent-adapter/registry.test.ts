@@ -8,6 +8,7 @@ import {
   AgentAdapterRequestValidationError,
   type AgentAdapterEventInput,
 } from '../../src/agent-adapter/registry';
+import { OWNER_LEASE_TTL_MS, SESSION_TTL_MS } from '../../src/agent-adapter/registry-types';
 import { BridgeStateStore, runtimeSchemaFloorPathForState } from '../../src/state-store';
 import { spoolPathForState } from '../../src/e2e/local-spool';
 
@@ -1048,7 +1049,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
 
   describe('owner lease, TTL, and producer source tuple semantics (Spec 08-16 §6)', () => {
     const OTHER_INSTANCE = 'BBBBBBBBBBBBBBBBBBBBBB';
-    const TTL_MS = 45_000;
+    const OCCUPANCY_TTL_MS = 6_000;
 
     function newRegistry(store: BridgeStateStore, monotonicStart = 1_000_000): { registry: AgentAdapterRegistry; advance: (ms: number) => void } {
       let clock = monotonicStart;
@@ -1086,6 +1087,123 @@ describe('AgentAdapterRegistry canonical ingest', () => {
       } finally { cleanup(); }
     });
 
+    test('owner occupancy TTL is 6000ms and is not aliased to the 45s recovery deadline', () => {
+      expect(OWNER_LEASE_TTL_MS).toBe(6_000);
+      expect(SESSION_TTL_MS).toBe(45_000);
+      expect(OWNER_LEASE_TTL_MS).not.toBe(SESSION_TTL_MS);
+    });
+
+    test('occupancy equal to 6000ms remains valid and a contender still gets OWNER_CONFLICT', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const { registry, advance } = newRegistry(store);
+        const owned = registry.register({
+          sessionId: 'exact-boundary', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        advance(OCCUPANCY_TTL_MS);
+        expect(() => registry.register({
+          sessionId: 'exact-boundary', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          driverInstanceId: OTHER_INSTANCE,
+        })).toThrow(expect.objectContaining({ code: 'owner_conflict' }));
+        expect(registry.hasSession('exact-boundary')).toBe(true);
+        expect(registry.assertCurrentOwner('exact-boundary', DRIVER_INSTANCE_ID, owned.ownerLease)).toBeUndefined();
+      } finally { cleanup(); }
+    });
+
+    test('after 6000ms plus 1ms without heartbeat a contender acquires a new owner lease', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const { registry, advance } = newRegistry(store);
+        const owned = registry.register({
+          sessionId: 'ttl-plus-one', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        advance(OCCUPANCY_TTL_MS + 1);
+        const contender = registry.register({
+          sessionId: 'ttl-plus-one', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          driverInstanceId: OTHER_INSTANCE,
+        });
+        expect(contender.ownerLease).not.toBe(owned.ownerLease);
+        expect(contender.driverInstanceId).toBe(OTHER_INSTANCE);
+      } finally { cleanup(); }
+    });
+
+    test('a successful heartbeat refreshes occupancy so 5000ms later a contender still conflicts', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const { registry, advance } = newRegistry(store);
+        const owned = registry.register({
+          sessionId: 'hb-refresh', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          driverInstanceId: DRIVER_INSTANCE_ID, status: 'idle',
+        });
+        // Advance first so lastOwnerLeaseMonotonic must change on heartbeat.
+        // Without a refresh, t=10_000 after register would already be past 6s occupancy.
+        advance(5_000);
+        const afterHeartbeat = registry.heartbeat('hb-refresh', 'working', 'still alive');
+        expect(afterHeartbeat?.ownerLease).toBe(owned.ownerLease);
+        advance(5_000);
+        expect(() => registry.register({
+          sessionId: 'hb-refresh', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          driverInstanceId: OTHER_INSTANCE,
+        })).toThrow(expect.objectContaining({ code: 'owner_conflict' }));
+        advance(1_001);
+        const contender = registry.register({
+          sessionId: 'hb-refresh', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          driverInstanceId: OTHER_INSTANCE,
+        });
+        expect(contender.ownerLease).not.toBe(owned.ownerLease);
+      } finally { cleanup(); }
+    });
+
+    test('unregister releases occupancy immediately without waiting 6s', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        const { registry } = newRegistry(store);
+        const owned = registry.register({
+          sessionId: 'unreg-now', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        expect(registry.unregister('unreg-now')).toBe(true);
+        const successor = registry.register({
+          sessionId: 'unreg-now', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          driverInstanceId: OTHER_INSTANCE,
+        });
+        expect(successor.ownerLease).not.toBe(owned.ownerLease);
+        expect(successor.driverInstanceId).toBe(OTHER_INSTANCE);
+      } finally { cleanup(); }
+    });
+
+    test('command recovery deadline stays 45s and does not become occupancy 6s', () => {
+      const { store, cleanup } = makeStore();
+      try {
+        let wall = 1_000_000;
+        const persisted = [{
+          sessionId: 'ghost',
+          hostId: 'host-1',
+          provider: 'pi',
+          projectName: 'p',
+          nameText: 'p',
+          status: 'idle' as const,
+          updatedAt: '2026-08-19T00:00:00.000Z',
+        }];
+        const registry = new AgentAdapterRegistry(
+          'host-1',
+          store,
+          () => {},
+          () => new Date(wall),
+          undefined as never,
+          undefined as never,
+          () => 1_000_000,
+        );
+        expect(registry.isAuthoritativeSetReady(persisted)).toBe(false);
+        wall += 6_001;
+        expect(registry.isAuthoritativeSetReady(persisted)).toBe(false);
+        wall = 1_000_000 + SESSION_TTL_MS + 1;
+        expect(registry.isAuthoritativeSetReady(persisted)).toBe(true);
+      } finally { cleanup(); }
+    });
+
     test('after the TTL elapses without activity a contender may acquire: lazy revocation', () => {
       const { store, cleanup } = makeStore();
       try {
@@ -1093,13 +1211,13 @@ describe('AgentAdapterRegistry canonical ingest', () => {
         registry.register({
           sessionId: 'ttl-takeover', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: DRIVER_INSTANCE_ID,
         });
-        advance(TTL_MS + 1);
+        advance(OCCUPANCY_TTL_MS + 1);
         const contender = registry.register({
           sessionId: 'ttl-takeover', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: OTHER_INSTANCE,
         });
         expect(contender.ownerLease).not.toBe(DRIVER_INSTANCE_ID);
         // Same-instance re-register across TTL also rotates the lease.
-        advance(TTL_MS + 1);
+        advance(OCCUPANCY_TTL_MS + 1);
         const rotated = registry.register({
           sessionId: 'ttl-takeover', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p', driverInstanceId: OTHER_INSTANCE,
         });
@@ -1123,7 +1241,7 @@ describe('AgentAdapterRegistry canonical ingest', () => {
         // Correct lease before TTL passes.
         expect(() => registry.assertCurrentOwner('stale-owner', DRIVER_INSTANCE_ID, owned.ownerLease)).not.toThrow();
         // After the TTL elapses the live lease is revoked.
-        advance(TTL_MS + 1);
+        advance(OCCUPANCY_TTL_MS + 1);
         expect(() => registry.assertCurrentOwner('stale-owner', DRIVER_INSTANCE_ID, owned.ownerLease))
           .toThrow(expect.objectContaining({ code: 'stale_owner' }));
         expect(registry.hasSession('stale-owner')).toBe(false);
