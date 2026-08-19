@@ -21,6 +21,21 @@
 > [!WARNING]
 > Ariava is early-stage. Breaking changes are expected.
 
+## What is Ariava?
+
+Coding agents work while you don't. They grind through long tasks on your Mac — refactors, test suites, research, release notes — but when they finish, or when they hit a decision only you can make, they wait silently until you come back to the desk.
+
+Ariava is an **Apple Watch-first companion for coding agents**. Your watch is the one screen that is always with you — notifications arrive on your wrist wherever you are, and acting on them takes seconds. It keeps your agents within arm's reach — literally:
+
+- **Know when you're needed.** A tap on your wrist the moment an agent finishes a task or needs your judgment.
+- **See what's happening.** Live session state — project, status, latest activity — at a glance, no laptop required.
+- **Act from your wrist.** Send a quick **reply** to steer an agent, or **interrupt** a task that has gone off track. The command surface is deliberately small: reply and interrupt, nothing more.
+- **Private by design.** End-to-end encryption, always. The relay only forwards ciphertext — no transcripts, no plaintext, no cloud copies of your work.
+
+Ariava doesn't replace your terminal or your agents. It sets you free from sitting next to them.
+
+*Walk away from the desk — your agents will tap you when they need you.*
+
 ## Roadmap
 
 - [x] Human Attention and Intervention
