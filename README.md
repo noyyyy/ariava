@@ -54,14 +54,6 @@ Install the Apple Watch app from [TestFlight](https://testflight.apple.com/join/
 ariava pair <PAIRING_CODE>
 ```
 
-Manual setup:
-
-```bash
-npm install --global ariava
-ariava init
-ariava service install
-ariava doctor
-```
 
 ## Usage
 
@@ -70,6 +62,7 @@ ariava status
 ariava pair <PAIRING_CODE>
 ariava watches list
 ariava logs
+ariava upgrade
 ```
 
 ## Roadmap

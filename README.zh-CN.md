@@ -53,14 +53,6 @@ npx --yes ariava@latest setup
 ariava pair <PAIRING_CODE>
 ```
 
-手动安装：
-
-```bash
-npm install --global ariava
-ariava init
-ariava service install
-ariava doctor
-```
 
 ## Usage
 
@@ -69,6 +61,7 @@ ariava status
 ariava pair <PAIRING_CODE>
 ariava watches list
 ariava logs
+ariava upgrade
 ```
 
 ## Roadmap
