@@ -6,7 +6,6 @@ const PUBLIC_VERSION_FILES = [
   'package.json',
   'apps/bridge/package.json',
   'extensions/pi/package.json',
-  'extensions/pi/bundle/package.json',
   'packages/protocol/package.json',
   'packages/shared-utils/package.json',
 ];
@@ -210,7 +209,7 @@ function bumpLockfile(root, current, next) {
   const original = readFileSync(path, 'utf8');
   const parsed = parseLockfile(original);
   const workspaceNames = PUBLIC_VERSION_FILES
-    .filter((file) => file !== 'package.json' && file !== 'extensions/pi/bundle/package.json')
+    .filter((file) => file !== 'package.json')
     .map((file) => file.replace(/\/package\.json$/u, ''));
 
   for (const workspacePath of workspaceNames) {

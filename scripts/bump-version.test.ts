@@ -8,7 +8,6 @@ const publicPackageFiles = [
   'package.json',
   'apps/bridge/package.json',
   'extensions/pi/package.json',
-  'extensions/pi/bundle/package.json',
   'packages/protocol/package.json',
   'packages/shared-utils/package.json',
 ];
