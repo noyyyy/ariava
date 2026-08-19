@@ -1,5 +1,7 @@
 # Production vs Development CLI
 
+English | [简体中文](./prod-vs-dev-cli.zh-CN.md)
+
 This document compares the two command-line surfaces of the Bridge package:
 
 - **Production (`default`) profile** — the installed `ariava` CLI (`apps/bridge/src/public-cli.ts`, lifecycle in `apps/bridge/src/cli/lifecycle/default.ts`).
