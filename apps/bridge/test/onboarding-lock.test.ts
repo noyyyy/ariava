@@ -163,6 +163,8 @@ describe('onboarding locks', () => {
     const macStart = 'Sun Jul 20 10:11:12 2026';
     expect(normalizeMacProcessStart(`  ${macStart}\n`)).toBe(macStart);
     expect(normalizeMacProcessStart('unknown')).toBeUndefined();
+    expect(normalizeMacProcessStart('Thu 20 Aug 00:08:35 2026')).toBeUndefined();
+    expect(normalizeMacProcessStart('四  8月/20 00:17:27 2026')).toBeUndefined();
 
     const calls: string[] = [];
     const inspector = createProcessInspector('darwin', {
@@ -173,5 +175,25 @@ describe('onboarding locks', () => {
     }, () => undefined);
     expect(inspector.inspect(111)).toEqual({ status: 'unprovable' });
     expect(calls).toEqual(['ps -p 111 -o lstart=']);
+  });
+
+  test('darwin process-start inspection canonicalizes lstart under C locale', () => {
+    for (const ambient of [
+      'Thu 20 Aug 00:08:35 2026    \n',
+      '四  8月/20 00:17:27 2026  \n',
+    ]) {
+      const inspector = createProcessInspector('darwin', {
+        run(_command, _args, options) {
+          const stdout = options?.env?.LC_ALL === 'C'
+            ? 'Thu Aug 20 00:08:35 2026    \n'
+            : ambient;
+          return { status: 0, stdout };
+        },
+      }, () => undefined);
+      expect(inspector.inspect(111)).toEqual({
+        status: 'alive',
+        processStart: 'Thu Aug 20 00:08:35 2026',
+      });
+    }
   });
 });

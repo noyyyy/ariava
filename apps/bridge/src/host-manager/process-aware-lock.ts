@@ -50,8 +50,16 @@ export interface OwnedProcessAwareLock {
   release(): void;
 }
 
+interface ProcessCommandRunOptions {
+  env?: NodeJS.ProcessEnv;
+}
+
 interface ProcessCommandRunner {
-  run(command: string, args: string[]): { status: number | null; stdout: string };
+  run(
+    command: string,
+    args: string[],
+    options?: ProcessCommandRunOptions,
+  ): { status: number | null; stdout: string };
 }
 
 export function acquireProcessAwareLock(
@@ -113,7 +121,9 @@ export function createProcessInspector(
         return start ? { status: 'alive', processStart: start } : { status: 'unprovable' };
       }
       if (platform === 'darwin') {
-        const result = runner.run('ps', ['-p', String(pid), '-o', 'lstart=']);
+        const result = runner.run('ps', ['-p', String(pid), '-o', 'lstart='], {
+          env: { ...process.env, LC_ALL: 'C' },
+        });
         if (result.status === 1 && !result.stdout.trim()) return { status: 'absent' };
         if (result.status !== 0) return { status: 'unprovable' };
         const normalized = normalizeMacProcessStart(result.stdout);
@@ -181,8 +191,12 @@ function defaultLockDependencies(): ProcessAwareLockDependencies {
   const uid = process.getuid?.();
   if (uid === undefined) throw new Error('Current uid is unavailable');
   const inspector = createProcessInspector(process.platform, {
-    run(command, args) {
-      const result = spawnSync(command, args, { encoding: 'utf8', shell: false });
+    run(command, args, options) {
+      const result = spawnSync(command, args, {
+        encoding: 'utf8',
+        shell: false,
+        env: options?.env,
+      });
       return { status: result.status, stdout: result.stdout ?? '' };
     },
   }, (path) => {

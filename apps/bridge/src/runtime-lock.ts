@@ -8,6 +8,7 @@ import {
   removeSecureFile,
   writeSecureJsonExclusive,
 } from './host-manager/secure-files';
+import { createProcessInspector } from './host-manager/process-aware-lock';
 
 type ProcessInspection = { status: 'alive'; processStart: string } | { status: 'absent' } | { status: 'unprovable' };
 interface ProcessInspector { inspect(pid: number): ProcessInspection }
@@ -371,28 +372,24 @@ function defaultDependencies(): RuntimeLockDependencies {
 }
 
 function createRuntimeProcessInspector(): ProcessInspector {
-  return {
-    inspect(pid: number): ProcessInspection {
-      if (process.platform === 'linux') {
-        let stat: string;
-        try { stat = readFileSync(`/proc/${pid}/stat`, 'utf8'); }
-        catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' ? { status: 'absent' } : { status: 'unprovable' }; }
-        const close = stat.lastIndexOf(')');
-        const start = close < 0 ? undefined : stat.slice(close + 1).trim().split(/\s+/)[19];
-        return start && /^\d+$/u.test(start) ? { status: 'alive', processStart: start } : { status: 'unprovable' };
-      }
-      if (process.platform === 'darwin') {
-        const childProcess = process.getBuiltinModule('node:child_process') as typeof import('node:child_process');
-        const result = childProcess.spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8', shell: false });
-        if (result.status === 1 && !result.stdout.trim()) return { status: 'absent' };
-        if (result.status !== 0) return { status: 'unprovable' };
-        const normalized = result.stdout.trim().replace(/\s+/g, ' ');
-        return /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?:[1-9]|[12]\d|3[01]) \d{2}:\d{2}:\d{2} \d{4}$/u.test(normalized)
-          ? { status: 'alive', processStart: normalized } : { status: 'unprovable' };
-      }
-      return { status: 'unprovable' };
+  return createProcessInspector(process.platform, {
+    run(command, args, options) {
+      const childProcess = process.getBuiltinModule('node:child_process') as typeof import('node:child_process');
+      const result = childProcess.spawnSync(command, args, {
+        encoding: 'utf8',
+        shell: false,
+        env: options?.env,
+      });
+      return { status: result.status, stdout: result.stdout ?? '' };
     },
-  };
+  }, (path) => {
+    try {
+      return readFileSync(path, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      return '';
+    }
+  });
 }
 
 function lockedError(): Error {
