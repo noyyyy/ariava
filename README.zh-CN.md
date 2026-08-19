@@ -22,33 +22,26 @@
 
 ## Ariava 是什么？
 
-编程 Agent 干活的时候，你往往不在场。它们在 Mac 上埋头跑长任务——重构、测试、调研、写文档——但等它们做完，或遇到只有你能拍板的问题时，只能静静等着，直到你回到电脑前才发现。
+Agent 的 loop 越来越长。它能在你的电脑上连续跑上几小时——重构、测试、调研、写文档——看着 Agent 的进度当监工，其实挺浪费时间的，人应该去做其他的事情。等它做完，或卡在只有你能拍板的问题上时，自然会来找你。
 
-Ariava 是**以 Apple Watch 为先的编程 Agent 伴侣**。手表是唯一一块永远跟着你的屏幕——无论你在哪里，通知都会到手腕上，处理只需要几秒钟。它让你的 Agent 始终近在腕间：
+Ariava 是 **Apple Watch 优先的 Agent 伴侣**。手表是一块永远跟着你的屏幕——无论你在哪里，通知都会到手腕上，处理只需要几秒钟：
 
 - **需要你时才打扰你。** Agent 完成任务、或需要你的判断时，手腕轻振提醒。
 - **进展随时可见。** 项目、状态、最新动态——抬腕即知，不用打开电脑。
-- **抬手即可行动。** 发一条简短 **reply** 引导 Agent，或一键 **interrupt** 打断跑偏的任务。命令面刻意保持极简：只有 reply 和 interrupt。
-- **天生私密。** 全程端到端加密，Relay 只转发密文——没有 transcript、没有明文、你的工作不会在云端留下副本。
+- **抬手即行动。** 发一条简短的语音 prompt 引导 Agent 就够了。
+- **隐私友好。** 全程端到端加密，Relay 只转发密文。
 
-Ariava 不替代你的终端，也不替代你的 Agent，而是让你不必守在它们旁边。
+Ariava 不是一个终端，也不是一个 Agent，而是让你不必守在它们旁边。
 
 *离开电脑桌吧——需要你的时候，Agent 会轻敲你的手腕。*
 
-## Roadmap
-
-- [x] Human Attention and Intervention
-- [x] APN Notification
-- [x] End-to-end encryption
-- [ ] **In progress:** Session Management
-- [ ] Project management
-- [ ] Invoke new session
-- [ ] More integration
-- [ ] Summary and memory
-
 ## Getting Started
 
-需要 Node.js 22+ 和 npm，运行在 macOS，或带 systemd user manager 的 Linux/WSL。[Pi](https://pi.dev/) 是可选的。
+Requirements：
+
+- **Node.js 22+ 和 npm**
+- **macOS**，或带 systemd user manager 的 **Linux/WSL**
+- **支持的 agent harness** —— Pi（支持列表在不断增加）
 
 ```bash
 npx --yes ariava@latest setup
@@ -77,6 +70,17 @@ ariava pair <PAIRING_CODE>
 ariava watches list
 ariava logs
 ```
+
+## Roadmap
+
+- [x] Human Attention and Intervention
+- [x] APN Notification
+- [x] End-to-end encryption
+- [ ] **In progress:** Session Management
+- [ ] Project management
+- [ ] Invoke new session
+- [ ] More Harness Integration
+- [ ] Summary and memory
 
 ## Architecture
 

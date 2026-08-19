@@ -20,6 +20,7 @@
   },
   "files": [
     "README.md",
+    "README.zh-CN.md",
     "LICENSE",
     "apps/bridge/dist",
     "packages/protocol/dist",

@@ -23,33 +23,26 @@
 
 ## What is Ariava?
 
-Coding agents work while you don't. They grind through long tasks on your Mac — refactors, test suites, research, release notes — but when they finish, or when they hit a decision only you can make, they wait silently until you come back to the desk.
+Agent loops are getting longer. An agent can run for hours on your computer — refactors, test suites, research, release notes — watching its progress like a foreman is a real waste of time; you should go do other things. When it finishes, or when it hits a decision only you can make, it'll come to you.
 
-Ariava is an **Apple Watch-first companion for coding agents**. Your watch is the one screen that is always with you — notifications arrive on your wrist wherever you are, and acting on them takes seconds. It keeps your agents within arm's reach — literally:
+Ariava is an **Apple Watch-first agent companion**. The watch is the one screen that's always with you — wherever you are, notifications arrive on your wrist, and acting on them takes seconds:
 
-- **Know when you're needed.** A tap on your wrist the moment an agent finishes a task or needs your judgment.
+- **Know when you're needed.** A tap on your wrist when an agent finishes or needs your judgment.
 - **See what's happening.** Live session state — project, status, latest activity — at a glance, no laptop required.
-- **Act from your wrist.** Send a quick **reply** to steer an agent, or **interrupt** a task that has gone off track. The command surface is deliberately small: reply and interrupt, nothing more.
-- **Private by design.** End-to-end encryption, always. The relay only forwards ciphertext — no transcripts, no plaintext, no cloud copies of your work.
+- **Act from your wrist.** A short voice prompt is all it takes to steer your agent.
+- **Privacy-friendly.** End-to-end encryption, always — the relay only forwards ciphertext.
 
-Ariava doesn't replace your terminal or your agents. It sets you free from sitting next to them.
+Ariava isn't a terminal, and it isn't an agent. It's what lets you stop sitting next to them.
 
 *Walk away from the desk — your agents will tap you when they need you.*
 
-## Roadmap
-
-- [x] Human Attention and Intervention
-- [x] APN Notification
-- [x] End-to-end encryption
-- [ ] **In progress:** Session Management
-- [ ] Project management
-- [ ] Invoke new session
-- [ ] More integration
-- [ ] Summary and memory
-
 ## Getting Started
 
-Requires Node.js 22+ and npm, on macOS or Linux/WSL with a systemd user manager. [Pi](https://pi.dev/) is optional.
+Requirements:
+
+- **Node.js 22+ and npm**
+- **macOS**, or **Linux/WSL** with a systemd user manager
+- **supported agent harness** — Pi (list keeps growing)
 
 ```bash
 npx --yes ariava@latest setup
@@ -78,6 +71,17 @@ ariava pair <PAIRING_CODE>
 ariava watches list
 ariava logs
 ```
+
+## Roadmap
+
+- [x] Human Attention and Intervention
+- [x] APN Notification
+- [x] End-to-end encryption
+- [ ] **In progress:** Session Management
+- [ ] Project management
+- [ ] Invoke new session
+- [ ] More Harness Integration
+- [ ] Summary and memory
 
 ## Architecture
 

@@ -218,7 +218,7 @@ const required = [
 ];
 const allowedPrefixes = ['apps/bridge/dist/', 'packages/protocol/dist/', 'packages/shared-utils/dist/', 'extensions/pi/bundle/'];
 const reviewedBridgeAssetSet = new Set(reviewedBridgeAssets);
-const allowedExactFiles = new Set(['package.json', 'README.md', 'LICENSE']);
+const allowedExactFiles = new Set(['package.json', 'README.md', 'README.zh-CN.md', 'LICENSE']);
 const missing = required.filter((path) => !files.has(path));
 if (missing.length > 0) fail(`missing ${missing.join(', ')}`);
 const unexpected = [...files].filter((path) => {
