@@ -420,11 +420,11 @@ describe('npm package artifact assertion', () => {
 
 
   test('accepts only the generated scoped package public files and validates its metadata', async () => {
-    const piFiles = ['package.json', 'index.js', '.ariava-release-bundle.json'];
+    const piFiles = ['package.json', 'index.js', 'README.md', '.ariava-release-bundle.json'];
     const valid = {
       'package.json': JSON.stringify({
         name: '@ariava/pi-extension', version: '1.2.3', type: 'module', main: './index.js',
-        files: ['index.js', '.ariava-release-bundle.json'], keywords: ['pi-package'],
+        files: ['index.js', 'README.md', '.ariava-release-bundle.json'], keywords: ['pi-package'],
         pi: { extensions: ['./index.js'] },
       }),
       '.ariava-release-bundle.json': JSON.stringify({
@@ -462,11 +462,11 @@ describe('npm package artifact assertion', () => {
     });
     expect(invalid.exitCode).toBe(1);
 
-    const piFiles = ['package.json', 'index.js', '.ariava-release-bundle.json'];
+    const piFiles = ['package.json', 'index.js', 'README.md', '.ariava-release-bundle.json'];
     const piPlaceholder = {
       'package.json': JSON.stringify({
         name: '@ariava/pi-extension', version: '0.0.0', type: 'module', main: './index.js',
-        files: ['index.js', '.ariava-release-bundle.json'], keywords: ['pi-package'],
+        files: ['index.js', 'README.md', '.ariava-release-bundle.json'], keywords: ['pi-package'],
         pi: { extensions: ['./index.js'] },
       }),
       '.ariava-release-bundle.json': JSON.stringify({

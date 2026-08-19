@@ -157,7 +157,7 @@ const forbiddenPatterns = [
 ];
 
 if (kind === 'pi') {
-  const required = ['package.json', 'index.js', '.ariava-release-bundle.json'];
+  const required = ['package.json', 'index.js', 'README.md', '.ariava-release-bundle.json'];
   const missing = required.filter((path) => !files.has(path));
   if (missing.length > 0) fail(`missing ${missing.join(', ')}`);
   const unexpected = [...files].filter((path) => !required.includes(path) || forbiddenPatterns.some((pattern) => pattern.test(path)));

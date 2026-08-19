@@ -7,6 +7,7 @@ const dist = join(root, 'extensions/pi/dist/index.js');
 const bundle = join(root, 'extensions/pi/bundle');
 const script = join(root, 'scripts/build-pi-release-bundle.mjs');
 const originalDist = existsSync(dist) ? readFileSync(dist) : undefined;
+const repoReadme = join(root, 'README.md');
 
 function ensureDist() {
   if (!existsSync(dist)) {
@@ -39,6 +40,7 @@ async function build(epoch: string) {
   return {
     manifest: readFileSync(join(bundle, 'package.json'), 'utf8'),
     marker: readFileSync(join(bundle, '.ariava-release-bundle.json'), 'utf8'),
+    bundleReadme: existsSync(join(bundle, 'README.md')) ? readFileSync(join(bundle, 'README.md'), 'utf8') : undefined,
   };
 }
 
@@ -48,6 +50,9 @@ describe('deterministic pi release bundle metadata', () => {
     const second = await build('1784678400');
     expect(second).toEqual(first);
     expect(JSON.parse(first.marker).createdAt).toBe('2026-07-22T00:00:00.000Z');
+    expect(JSON.parse(first.manifest).files).toContain('README.md');
+    expect(first.bundleReadme).toContain('## What is Ariava?');
+    expect(first.bundleReadme).toEqual(readFileSync(repoReadme, 'utf8'));
   });
 
   test('rejects invalid deterministic timestamps', () => {

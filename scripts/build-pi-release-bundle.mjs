@@ -29,6 +29,12 @@ mkdirSync(bundleRoot, { recursive: true });
 
 cpSync(distPath, join(bundleRoot, 'index.js'));
 
+const readmePath = join(repoRoot, 'README.md');
+if (!existsSync(readmePath)) {
+  throw new Error(`Missing public repo README: ${readmePath}. Add one so the published package is discoverable on pi.dev.`);
+}
+cpSync(readmePath, join(bundleRoot, 'README.md'));
+
 const sourcePackage = JSON.parse(readFileSync(join(sourceRoot, 'package.json'), 'utf8'));
 const version = sourcePackage.version ?? '0.1.2';
 
@@ -41,7 +47,7 @@ writeFileSync(
       description: sourcePackage.description ?? 'Ariava pi extension for Apple Watch-first agent collaboration.',
       type: 'module',
       main: './index.js',
-      files: ['index.js', '.ariava-release-bundle.json'],
+      files: ['index.js', 'README.md', '.ariava-release-bundle.json'],
       keywords: ['pi-package', 'pi-extension', 'ariava', 'apple-watch', 'coding-agent'],
       homepage: 'https://github.com/noyyyy/ariava',
       repository: { type: 'git', url: 'git+https://github.com/noyyyy/ariava.git' },
