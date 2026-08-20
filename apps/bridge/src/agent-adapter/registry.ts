@@ -18,9 +18,11 @@ import { asCommandResult, parseAgentAdapterCommandResult } from './result';
 import {
   assertCanonicalSessionWithinLimit,
   assertProducerContextMatchesSession,
+  canonicalProducerContextFingerprint,
   immutableCopy,
   normalizeHandledAt,
   parseCanonicalProducerEvent,
+  producerContextFingerprint,
   producerEventFingerprint,
   semanticFingerprint,
 } from './registry-codec';
@@ -160,7 +162,18 @@ export class AgentAdapterRegistry {
       throw new AgentAdapterRequestValidationError('driverInstanceId is required');
     }
     const previous = this.sessions.get(input.sessionId);
-    const persistedSession = this.stateStore.getSession(input.sessionId);
+    let persistedSession = this.stateStore.getSession(input.sessionId);
+    if (!previous && input.status === 'need_human'
+      && (!persistedSession || persistedSession.status !== 'need_human' || !persistedSession.lastEventId)) {
+      const recovery = this.restorePersistedTerminalForRegistration(input, persistedSession);
+      if (recovery?.kind === 'pending') {
+        this.stateStore.queuePendingEvent(recovery.terminal.event, recovery.terminal.session, producerEventFingerprint(recovery.terminal.event));
+        persistedSession = this.stateStore.getSession(input.sessionId);
+      } else if (recovery?.kind === 'committed') {
+        this.stateStore.setSessionDriver(input.sessionId, 'agent-adapter', recovery.session);
+        persistedSession = this.stateStore.getSession(input.sessionId);
+      }
+    }
     const authorization = authorizeRegistration({ previousLive: previous, persistedSession }, input);
     if (authorization.kind === 'collision') throw new SessionIdCollisionError(authorization.sessionId);
 
@@ -207,6 +220,49 @@ export class AgentAdapterRegistry {
     this.sessions.set(input.sessionId, owned);
     if (transition.semanticChanged) this.onMutation('register');
     return owned;
+  }
+
+  private restorePersistedTerminalForRegistration(
+    input: RegisterSessionInput,
+    persistedSession: CanonicalSessionState | undefined,
+  ): { kind: 'pending'; terminal: PendingTerminal } | { kind: 'committed'; session: CanonicalSessionState } | undefined {
+    const requestedContext = producerContextFingerprint(input);
+    if (persistedSession && canonicalProducerContextFingerprint(persistedSession) !== requestedContext) return undefined;
+    const reservations = this.stateStore.listProducerEventReservations(input.sessionId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    for (const reservation of reservations) {
+      const tuple = this.stateStore.getProducerEventTuple(reservation.eventId, reservation.fingerprint);
+      if (tuple && tuple.event.sessionId === input.sessionId && tuple.event.status === 'need_human'
+        && tuple.session.status === 'need_human' && tuple.session.lastEventId === tuple.event.eventId
+        && producerEventFingerprint(tuple.event) === reservation.fingerprint
+        && canonicalProducerContextFingerprint(tuple.session) === requestedContext) {
+        return { kind: 'pending', terminal: Object.freeze({
+          event: immutableCopy(tuple.event), session: immutableCopy(tuple.session),
+        }) };
+      }
+      const event = this.stateStore.getRecentEvent(reservation.eventId);
+      if (!event || event.sessionId !== input.sessionId || event.status !== 'need_human'
+        || producerEventFingerprint(event) !== reservation.fingerprint
+        || producerContextFingerprint({
+          provider: event.provider,
+          projectName: event.projectName ?? '',
+          cwd: event.workingDirectory ?? '',
+          harnessProvider: event.harnessProvider,
+        }) !== requestedContext) {
+        continue;
+      }
+      return {
+        kind: 'committed',
+        session: {
+          sessionId: input.sessionId, hostId: event.hostId, provider: input.provider,
+          projectName: input.projectName, nameText: input.nameText,
+          openingText: input.openingText, latestActivityText: event.agentText,
+          workingDirectory: input.cwd, harnessProvider: input.harnessProvider,
+          status: 'need_human', updatedAt: event.createdAt, lastEventId: event.eventId,
+        },
+      };
+    }
+    return undefined;
   }
 
   unregister(sessionId: string, reason: 'unregister' | 'ttl' = 'unregister'): boolean {

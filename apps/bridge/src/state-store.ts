@@ -628,6 +628,11 @@ export class BridgeStateStore {
     const reservation = this.state.producerEventReservations?.[producerReservationKey(sessionId, fingerprint)];
     return reservation && structuredClone(reservation);
   }
+  listProducerEventReservations(sessionId: string): PersistedProducerEventReservationV1[] {
+    return Object.values(this.state.producerEventReservations ?? {})
+      .filter((reservation) => reservation.sessionId === sessionId)
+      .map((reservation) => structuredClone(reservation));
+  }
   reserveProducerEvent(reservation: PersistedProducerEventReservationV1): void {
     spoolTransactions.reserveProducerEvent(this.transactionShell(), reservation);
   }
@@ -645,6 +650,10 @@ export class BridgeStateStore {
   getProducerEventCheckpoint(sessionId: string): ProducerEventSourceCheckpointV1 | undefined {
     const checkpoint = this.state.producerEventCheckpoints?.[sessionId];
     return checkpoint && structuredClone(checkpoint);
+  }
+  getRecentEvent(eventId: string): CanonicalEvent | undefined {
+    const event = this.state.recentEvents.find((candidate) => candidate.eventId === eventId);
+    return event && structuredClone(event);
   }
   getProducerEventTuple(eventId: string, fingerprint: string): { event: CanonicalEvent; session: CanonicalSessionState } | undefined {
     return this.openProducerTuple('event-reservation-v3', eventId, fingerprint)

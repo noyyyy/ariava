@@ -111,7 +111,9 @@ export type RegistryStateStore = {
     checkpoint: ProducerEventSourceCheckpointV1;
   }): void;
   getProducerEventReservation(sessionId: string, fingerprint: string): PersistedProducerEventReservationV1 | undefined;
+  listProducerEventReservations(sessionId: string): PersistedProducerEventReservationV1[];
   getProducerEventCheckpoint(sessionId: string): ProducerEventSourceCheckpointV1 | undefined;
+  getRecentEvent(eventId: string): CanonicalEvent | undefined;
   queuePendingEvent(event: CanonicalEvent, terminalSession: CanonicalSessionState, producerFingerprint?: string): void;
   queuePendingSessionHandle(handle: PendingSessionHandle): void;
   /** Durable execution-journal hook: mark a claimed/dispatched command outcome-unknown when its journal entry exists. */

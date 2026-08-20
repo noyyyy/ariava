@@ -460,6 +460,107 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     } finally { cleanup(); }
   });
 
+  test('restores a delayed terminal Event when need_human re-registers after restart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-delayed-terminal-restart-'));
+    try {
+      const store = initializedStore(dir);
+      const original = new AgentAdapterRegistry('host-1', store);
+      register(original);
+      original.enqueueCommand(makeCommand('sess-1'));
+      const eventId = original.pushEvent('sess-1', needHumanEvent());
+      expect(store.getSession('sess-1')).toMatchObject({ status: 'working', lastEventId: undefined });
+      expect(store.peekPendingEvents()).toEqual([]);
+      store.dispose();
+
+      const restartedStore = initializedStore(dir);
+      const restarted = new AgentAdapterRegistry('host-1', restartedStore);
+      expect(restarted.register({
+        sessionId: 'sess-1', provider: 'pi', projectName: 'project', cwd: '/project', nameText: 'Task',
+        status: 'need_human', latestActivityText: 'Which environment?', driverInstanceId: DRIVER_INSTANCE_ID,
+      })).toMatchObject({ status: 'need_human', lastEventId: eventId });
+      expect(restartedStore.peekPendingEvents()).toEqual([
+        expect.objectContaining({ eventId, sessionId: 'sess-1', status: 'need_human' }),
+      ]);
+      expect(restartedStore.getSession('sess-1')).toMatchObject({ status: 'need_human', lastEventId: eventId });
+      restartedStore.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('does not restore a delayed terminal Event across producer context changes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-delayed-terminal-context-'));
+    try {
+      const store = initializedStore(dir);
+      const original = new AgentAdapterRegistry('host-1', store);
+      register(original);
+      original.enqueueCommand(makeCommand('sess-1'));
+      original.pushEvent('sess-1', needHumanEvent());
+      store.dispose();
+
+      const restartedStore = initializedStore(dir);
+      const restarted = new AgentAdapterRegistry('host-1', restartedStore);
+      expect(() => restarted.register({
+        sessionId: 'sess-1', provider: 'pi', projectName: 'other', cwd: '/other', nameText: 'Task',
+        status: 'need_human', latestActivityText: 'Which environment?', driverInstanceId: DRIVER_INSTANCE_ID,
+      })).toThrow(AgentAdapterRequestValidationError);
+      expect(restartedStore.peekPendingEvents()).toEqual([]);
+      expect(restartedStore.getSession('sess-1')).toMatchObject({ status: 'working' });
+      expect(restartedStore.getSession('sess-1')?.lastEventId).toBeUndefined();
+      restartedStore.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('restores a committed need_human Event after owner TTL removed its canonical Session', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-terminal-owner-loss-'));
+    try {
+      const store = initializedStore(dir);
+      const original = new AgentAdapterRegistry('host-1', store);
+      register(original);
+      const eventId = original.pushEvent('sess-1', needHumanEvent());
+      expect(store.getSession('sess-1')).toMatchObject({ status: 'need_human', lastEventId: eventId });
+      expect(original.unregister('sess-1', 'ttl')).toBe(true);
+      expect(store.getSession('sess-1')).toBeUndefined();
+      expect(store.getProducerEventCheckpoint('sess-1')).toBeUndefined();
+      store.dispose();
+
+      const restartedStore = initializedStore(dir);
+      const restarted = new AgentAdapterRegistry('host-1', restartedStore);
+      expect(restarted.register({
+        sessionId: 'sess-1', provider: 'pi', projectName: 'project', cwd: '/project', nameText: 'Task',
+        status: 'need_human', latestActivityText: 'Which environment?', driverInstanceId: DRIVER_INSTANCE_ID,
+      })).toMatchObject({ status: 'need_human', lastEventId: eventId });
+      expect(restartedStore.getSession('sess-1')).toMatchObject({ status: 'need_human', lastEventId: eventId });
+      expect(restartedStore.peekPendingEvents()).toEqual([
+        expect.objectContaining({ eventId, type: 'need_human', status: 'need_human' }),
+      ]);
+      restartedStore.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('restores an uploaded need_human Event without queueing it again after owner TTL', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-uploaded-terminal-owner-loss-'));
+    try {
+      const store = initializedStore(dir);
+      const original = new AgentAdapterRegistry('host-1', store);
+      register(original);
+      const eventId = original.pushEvent('sess-1', needHumanEvent());
+      store.removePendingEvent(eventId);
+      expect(store.peekPendingEvents()).toEqual([]);
+      expect(original.unregister('sess-1', 'ttl')).toBe(true);
+      expect(store.getSession('sess-1')).toBeUndefined();
+      store.dispose();
+
+      const restartedStore = initializedStore(dir);
+      const restarted = new AgentAdapterRegistry('host-1', restartedStore);
+      expect(restarted.register({
+        sessionId: 'sess-1', provider: 'pi', projectName: 'project', cwd: '/project', nameText: 'Task',
+        status: 'need_human', latestActivityText: 'Which environment?', driverInstanceId: DRIVER_INSTANCE_ID,
+      })).toMatchObject({ status: 'need_human', lastEventId: eventId });
+      expect(restartedStore.getSession('sess-1')).toMatchObject({ status: 'need_human', lastEventId: eventId });
+      expect(restartedStore.peekPendingEvents()).toEqual([]);
+      restartedStore.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('restores a committed lastEventId for same-context need_human re-registration after restart', () => {
     const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-terminal-restart-'));
     try {
