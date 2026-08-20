@@ -19,9 +19,10 @@ export { PendingUploadBindingError };
  * (canonical protected-content exact-shape / well-formed Unicode / byte-limit
  * validation). `invalid-source-binding` is produced ONLY by
  * `PendingUploadBindingError` thrown after a successful source decode for
- * Event↔Session binding mismatches; recipient/keyring binding never produces
- * it. JSON/UTF-8 decode failures are reported by the per-item storage API as
- * fixed results (Slice 5), never inferred from exception class names here.
+ * Event↔Session binding mismatches or a `need_human` Session missing
+ * `lastEventId`; recipient/keyring binding never produces it. JSON/UTF-8
+ * decode failures are reported by the per-item storage API as fixed results
+ * (Slice 5), never inferred from exception class names here.
  * Every other error (crypto, keyring, X25519, AEAD, randomness, IO,
  * spool/state invariants) propagates and is NOT locally isolatable.
  */
@@ -121,6 +122,9 @@ export function preflightSessionSource(session: CanonicalSessionState): LocalUpl
   } catch (error) {
     if (error instanceof ProtectedContentValidationError) {
       return { type: 'invalid-content', code: error.code };
+    }
+    if (error instanceof PendingUploadBindingError) {
+      return { type: 'invalid-source-binding', code: error.code };
     }
     throw error;
   }

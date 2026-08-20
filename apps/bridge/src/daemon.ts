@@ -203,15 +203,20 @@ export class SessionPublicationBlockLogger {
   private lastLogAt = Number.NEGATIVE_INFINITY;
   private suppressed = 0;
   private active = false;
+  private activeCode: 'protected_content_invalid' | 'session_source_invalid' = 'protected_content_invalid';
 
   constructor(
     private readonly write: (line: string) => void = (line) => { process.stderr.write(line); },
     private readonly now: () => number = () => Date.now(),
   ) {}
 
-  blocked(blockedSessionCount: number): void {
+  blocked(
+    blockedSessionCount: number,
+    code: 'protected_content_invalid' | 'session_source_invalid' = 'protected_content_invalid',
+  ): void {
     const timestamp = this.now();
     if (!this.active) this.active = true;
+    this.activeCode = code;
     if (timestamp - this.lastLogAt < 30_000) {
       this.suppressed += 1;
       return;
@@ -220,7 +225,7 @@ export class SessionPublicationBlockLogger {
     this.suppressed = 0;
     this.lastLogAt = timestamp;
     this.write(`${JSON.stringify({
-      component: 'session_publication', outcome: 'blocked', code: 'protected_content_invalid',
+      component: 'session_publication', outcome: 'blocked', code,
       blockedSessionCount, suppressed,
     })}\n`);
   }
@@ -231,7 +236,7 @@ export class SessionPublicationBlockLogger {
     this.suppressed = 0;
     this.lastLogAt = 0;
     this.write(`${JSON.stringify({
-      component: 'session_publication', outcome: 'recovered', code: 'protected_content_invalid',
+      component: 'session_publication', outcome: 'recovered', code: this.activeCode,
     })}\n`);
   }
 }
@@ -495,7 +500,7 @@ export class BridgeDaemon {
       recordLocalSnapshotPublicationFailure: (error, activeSessions) => this.recordLocalSnapshotPublicationFailure(error, activeSessions),
       handleCurrentSessionsSnapshotFailure: (error, activeSessions) => this.handleCurrentSessionsSnapshotFailure(error, activeSessions),
       sessionPublicationRecovered: () => this.sessionPublicationBlockLogger.recovered(),
-      sessionPublicationBlocked: (blockedSessionCount) => this.sessionPublicationBlockLogger.blocked(blockedSessionCount),
+      sessionPublicationBlocked: (blockedSessionCount, reason) => this.sessionPublicationBlockLogger.blocked(blockedSessionCount, reason),
       eventsMayDrain: (outcome) => this.eventsMayDrain(outcome),
       flushPendingEvents: () => this.flushPendingEvents(),
       flushPendingHandles: () => this.flushPendingHandles(),
@@ -767,15 +772,19 @@ export class BridgeDaemon {
       // content block never allocates a publication revision, never creates/replaces
       // inflight, and never sends a manifest. The Relay keeps its last accepted
       // membership; the local Sessions keep receiving heartbeats/content updates.
-      const blockedSessionCount = this.uploadActions.preflightAuthoritativeSessionSet(currentSessions);
-      if (blockedSessionCount > 0) {
+      const preflight = this.uploadActions.preflightAuthoritativeSessionSet(currentSessions);
+      if (preflight.blockedSessionCount > 0) {
         // §4.4: a content block must NOT strand committed Session inflight evidence;
         // converge it (revision + inflight removal) before returning locally-blocked.
         // Uncommitted/unknown evidence stays byte-preserved; malformed/cross-bound
         // evidence fails closed (recovery-required).
         const reconciled = await this.uploadActions.reconcileSessionInflights(currentSessions);
         if (reconciled.deferred) return { type: 'fail-closed' };
-        return { type: 'locally-blocked', reason: 'content', blockedSessionCount, recipientSetVersion: recipientSnapshot.recipientSetVersion };
+        return {
+          type: 'locally-blocked', reason: preflight.reason,
+          blockedSessionCount: preflight.blockedSessionCount,
+          recipientSetVersion: recipientSnapshot.recipientSetVersion,
+        };
       }
 
       // Even when the canonical content digest is unchanged, a lost Session upload
@@ -798,7 +807,10 @@ export class BridgeDaemon {
         // Preserve the explicit publication taxonomy. Deterministic fail-closed and
         // recipient-set deferrals must not be reclassified as offline network faults.
         if (outcome.type === 'locally-blocked') {
-          return { type: 'locally-blocked', reason: 'content', blockedSessionCount: 1, recipientSetVersion: recipientSnapshot.recipientSetVersion };
+          return {
+            type: 'locally-blocked', reason: outcome.reason, blockedSessionCount: 1,
+            recipientSetVersion: recipientSnapshot.recipientSetVersion,
+          };
         }
         return outcome;
       }

@@ -8,7 +8,7 @@ const {
   preflightSessionSource,
   sessionSourceDigest,
 } = await import('../src/e2e/upload-preflight');
-const { assertEventSessionBinding } = await import('../src/e2e/upload-inputs');
+const { assertEventSessionBinding, sessionEncryptionInput } = await import('../src/e2e/upload-inputs');
 
 function terminalSession(overrides: Partial<CanonicalSessionState> = {}): CanonicalSessionState {
   return {
@@ -86,6 +86,17 @@ describe('LocalUploadPreflight (§4.1)', () => {
     expect(result).toEqual({ type: 'invalid-source-binding', code: 'event-session-binding-invalid' });
     expect(() => assertEventSessionBinding(doneEvent(), terminalSession({ sessionId: 'other-session' })))
       .toThrow(PendingUploadBindingError);
+  });
+
+  test('need_human Session without lastEventId is not Watch-uploadable', () => {
+    const session = terminalSession({ status: 'need_human', lastEventId: undefined });
+    expect(preflightSessionSource(session)).toEqual({
+      type: 'invalid-source-binding', code: 'event-session-binding-invalid',
+    });
+    expect(() => sessionEncryptionInput(session)).toThrow(PendingUploadBindingError);
+    expect(() => sessionEncryptionInput(session)).toThrow(/lastEventId/u);
+    expect(preflightSessionSource(terminalSession({ status: 'need_human', lastEventId: 'event-test' })).type).toBe('ready');
+    expect(preflightSessionSource(terminalSession({ status: 'idle', lastEventId: undefined })).type).toBe('ready');
   });
 
   test('arbitrary internal TypeError at source access propagates and is never classified as invalid-content', () => {

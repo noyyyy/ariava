@@ -661,7 +661,7 @@ export class BridgeStateStore {
     return reservation && structuredClone(reservation);
   }
   cancelTerminalEvent(input: { eventId: string; sessionId: string; fingerprint: string; removeSession?: boolean;
-    nextDriverName?: string; createdAt?: string }): void {
+    nextDriverName?: string; createdAt?: string; replacementSession?: CanonicalSessionState }): void {
     spoolTransactions.cancelTerminalEvent(this.transactionShell(), input);
   }
 

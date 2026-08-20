@@ -51,12 +51,16 @@ export class AgentAdapterServer {
   private server: Server | null = null;
   private activePort: number;
 
+  private readonly writeLog: (line: string) => void;
+
   constructor(
     private readonly config: AgentAdapterServerConfig,
     private readonly registry: AgentAdapterRegistry,
     private readonly health: () => BridgeRuntimeHealth = () => ({ status: 'healthy', drivers: [] }),
+    writeLog: (line: string) => void = (line) => { process.stderr.write(line); },
   ) {
     this.activePort = config.port;
+    this.writeLog = writeLog;
   }
 
   async start(): Promise<void> {
@@ -240,6 +244,12 @@ export class AgentAdapterServer {
       if (error instanceof ProtectedContentValidationError
         || error instanceof AgentAdapterClientInputError
         || error instanceof AgentAdapterRequestValidationError) {
+        if (error instanceof AgentAdapterRequestValidationError && error.code === 'terminal-session-event-missing') {
+          this.writeLog(`${JSON.stringify({
+            component: 'agent_adapter', outcome: 'rejected',
+            code: 'terminal_session_event_missing', route: adapterRouteCategory(request.url),
+          })}\n`);
+        }
         this.writeJson(response, 400, protocol4ErrorEnvelope('INVALID_REQUEST'));
         return;
       }
@@ -500,6 +510,14 @@ function parseResultInput(value: unknown, expectedCommandId: string): AgentAdapt
     throw new AgentAdapterClientInputError('commandId in result does not match URL');
   }
   return result;
+}
+
+function adapterRouteCategory(rawUrl: string | undefined): 'register' | 'heartbeat' | 'event' | 'other' {
+  const pathname = new URL(rawUrl ?? '/', 'http://127.0.0.1').pathname;
+  if (/\/sessions\/[^/]+\/heartbeat$/u.test(pathname)) return 'heartbeat';
+  if (/\/sessions\/[^/]+\/events$/u.test(pathname)) return 'event';
+  if (/\/sessions$/u.test(pathname)) return 'register';
+  return 'other';
 }
 
 function requireIdentifier(obj: Record<string, unknown>, key: string): string {

@@ -94,7 +94,7 @@ export function reserveProducerEventTuple(
  */
 export function cancelTerminalEvent(shell: SpoolTransactionShell, input: {
   eventId: string; sessionId: string; fingerprint: string; removeSession?: boolean;
-  nextDriverName?: string; createdAt?: string;
+  nextDriverName?: string; createdAt?: string; replacementSession?: CanonicalSessionState;
 }): void {
   if (!shell.spool) throw new Error('encrypted spool is not initialized');
   const reservationKey = producerReservationKey(input.sessionId, input.fingerprint);
@@ -126,8 +126,9 @@ export function cancelTerminalEvent(shell: SpoolTransactionShell, input: {
     delete nextState.sessions[input.sessionId];
     delete nextState.sessionDrivers[input.sessionId];
     delete nextState.producerEventCheckpoints?.[input.sessionId];
-  } else if (input.nextDriverName !== undefined) {
-    nextState.sessionDrivers[input.sessionId] = input.nextDriverName;
+  } else {
+    if (input.replacementSession !== undefined) nextState.sessions[input.sessionId] = structuredClone(input.replacementSession);
+    if (input.nextDriverName !== undefined) nextState.sessionDrivers[input.sessionId] = input.nextDriverName;
   }
   try {
     shell.commit(nextState);

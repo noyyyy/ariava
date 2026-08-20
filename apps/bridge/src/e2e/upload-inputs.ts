@@ -31,8 +31,15 @@ export function eventEncryptionInput(
   };
 }
 
+function assertNeedHumanHasLastEventId(session: import('@ariava/protocol').CanonicalSessionState): void {
+  if (session.status === 'need_human' && !session.lastEventId) {
+    throw new PendingUploadBindingError('need_human Session requires lastEventId');
+  }
+}
+
 /** Canonical encryption input builder for a Session snapshot. */
 export function sessionEncryptionInput(session: import('@ariava/protocol').CanonicalSessionState) {
+  assertNeedHumanHasLastEventId(session);
   return {
     session: { hostId: session.hostId, sessionId: session.sessionId, provider: session.provider, status: session.status,
       updatedAt: session.updatedAt, ...(session.lastEventId ? { lastEventId: session.lastEventId } : {}),

@@ -588,7 +588,7 @@ describe('ariavaPiExtension settled lifecycle', () => {
   });
 });
 
-  test('Event-disabled producer settles terminal status locally without push or handle retry loops', async () => {
+  test('Event-disabled producer settles locally without publishing a remote terminal status', async () => {
     let pushCalls = 0;
     let handleCalls = 0;
     const harness = createHarness({
@@ -602,21 +602,58 @@ describe('ariavaPiExtension settled lifecycle', () => {
       },
     });
     await harness.start();
-    await end(harness, { stopReason: 'stop', text: 'Settled without Event publication.' });
+    await harness.emit('agent_start');
+    await end(harness, { stopReason: 'stop', text: 'Settled without Event publication.', withoutStart: true });
     await settleAndWait(harness);
     await Bun.sleep(300);
 
     expect(pushCalls).toBe(0);
     expect(handleCalls).toBe(0);
     expect(harness.terminalEvents()).toEqual([]);
-    expect(harness.heartbeats.at(-1)).toMatchObject({
-      sessionId: 'sess-1', status: 'idle', latestActivityText: 'Settled without Event publication.',
-    });
+    expect(harness.heartbeats.some((call) => call.status === 'idle')).toBe(false);
 
     await harness.emit('input');
     await Bun.sleep(20);
     expect(handleCalls).toBe(0);
     await harness.shutdown();
+  });
+
+  test('failed terminal Event publication keeps the remote Session working and retries the Event', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pi-terminal-retry-'));
+    const logPath = join(directory, 'extension.log');
+    const originalLogPath = process.env.ARIAVA_PI_LOG_PATH;
+    process.env.ARIAVA_PI_LOG_PATH = logPath;
+    let pushCalls = 0;
+    const harness = createHarness({
+      adapter: {
+        pushEvent: async () => {
+          pushCalls += 1;
+          if (pushCalls === 1) throw new Error('protected terminal payload must not be logged');
+          return { eventId: 'event-retry' };
+        },
+      },
+    });
+    try {
+      await harness.start();
+      await harness.emit('agent_start');
+      await end(harness, { stopReason: 'stop', text: 'Retry this terminal Event.', withoutStart: true });
+      await settleAndWait(harness);
+      await waitForFile(logPath);
+
+      expect(pushCalls).toBe(1);
+      expect(harness.heartbeats.some((call) => call.status === 'idle')).toBe(false);
+      expect(readFileSync(logPath, 'utf8')).toContain('"event":"terminal_event_push_failed"');
+      expect(readFileSync(logPath, 'utf8')).not.toContain('protected terminal payload');
+
+      await harness.emit('agent_settled');
+      await Bun.sleep(QUIET_WAIT_MS);
+      expect(pushCalls).toBe(2);
+    } finally {
+      await harness.shutdown();
+      if (originalLogPath === undefined) delete process.env.ARIAVA_PI_LOG_PATH;
+      else process.env.ARIAVA_PI_LOG_PATH = originalLogPath;
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
 describe('unchanged extension integration behavior', () => {
@@ -815,34 +852,27 @@ describe('unchanged extension integration behavior', () => {
     await harness.shutdown();
   });
 
-  test('drops a failed terminal Event after one attempt and settles local terminal state', async () => {
+  test('retries a failed terminal Event without publishing a remote terminal heartbeat', async () => {
     const attempts: PushedEvent[] = [];
-    const handled: string[] = [];
     const harness = createHarness({
       adapter: {
         pushEvent: async (event) => {
           attempts.push(structuredClone(event));
-          throw new Error('Agent Adapter POST /events failed: 503 unavailable');
-        },
-        handleSession: async (sessionId, request) => {
-          handled.push(request.handledThroughEventId);
-          return { ok: true, hostId: 'host-1', sessionId, handledThroughEventId: request.handledThroughEventId };
+          if (attempts.length === 1) throw new Error('Agent Adapter POST /events failed: 503 unavailable');
+          return { eventId: 'event-retried' };
         },
       },
     });
     await harness.start();
-    await end(harness, { stopReason: 'stop', text: 'Best effort delivery failed.' });
+    await harness.emit('agent_start');
+    await end(harness, { stopReason: 'stop', text: 'Retry Event delivery.', withoutStart: true });
     await harness.emit('agent_settled');
-    await Bun.sleep(QUIET_WAIT_MS + 400);
+    await Bun.sleep(QUIET_WAIT_MS * 2 + 400);
 
-    expect(attempts).toHaveLength(1);
-    expect(attempts[0]).toMatchObject({ type: 'done', status: 'idle', agentText: 'Best effort delivery failed.' });
-    expect(harness.heartbeats.at(-1)).toMatchObject({
-      sessionId: 'sess-1', status: 'idle', latestActivityText: 'Best effort delivery failed.',
-    });
-    await harness.emit('input');
-    await Bun.sleep(20);
-    expect(handled).toEqual([]);
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]).toEqual(attempts[0]);
+    expect(attempts[0]).toMatchObject({ type: 'done', status: 'idle', agentText: 'Retry Event delivery.' });
+    expect(harness.heartbeats.filter((call) => call.status === 'idle')).toEqual([]);
     await harness.shutdown();
   });
 

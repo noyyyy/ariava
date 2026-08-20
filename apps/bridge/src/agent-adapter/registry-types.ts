@@ -101,6 +101,7 @@ export type RegistryStateStore = {
     removeSession?: boolean;
     nextDriverName?: string;
     createdAt?: string;
+    replacementSession?: CanonicalSessionState;
   }): void;
   reserveProducerEventTuple(event: CanonicalEvent, terminalSession: CanonicalSessionState, fingerprint: string): void;
   getProducerEventTuple(eventId: string, fingerprint: string): { event: CanonicalEvent; session: CanonicalSessionState } | undefined;

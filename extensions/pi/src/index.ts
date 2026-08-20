@@ -191,30 +191,23 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
       .trim();
     return text || undefined;
   }
-  async function settleTerminalLocally(
+  function settleTerminalWithoutPublication(
     loopState: PiReducerState,
     alert: PendingTerminalAlert,
     terminalSession: NonNullable<typeof session>,
-    sessionStatus: 'idle' | 'need_human',
-  ): Promise<void> {
+  ): void {
     if (alert.fingerprint) markFingerprintEmitted(alert.fingerprint);
-    session = terminalSession;
-    heartbeatContext.status = sessionStatus;
-    heartbeatContext.latestActivityText = terminalSession.latestActivityText;
+    if (session) {
+      session = withSessionStatus(session, session.status, terminalSession.latestActivityText);
+      heartbeatContext.latestActivityText = session.latestActivityText;
+    }
     loopState.terminalEmittedForCurrentLoop = true;
     loopState.latestPendingAlert = undefined;
     loopState.terminalDeliveryInFlight = false;
     loopState.pendingHandleCandidate = undefined;
-    try {
-      await adapter.heartbeat(
-        terminalSession.sessionId, sessionStatus, terminalSession.latestActivityText ?? null, terminalSession,
-      );
-    } catch {
-      logExtensionEvent('heartbeat_failed');
-    }
   }
 
-  async function emitTerminalAlert(alert: PendingTerminalAlert) {
+  async function emitTerminalAlert(alert: PendingTerminalAlert, ctx: ExtensionContext) {
     if (
       !session ||
       !state?.rootSessionActive ||
@@ -229,7 +222,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     const sessionStatus = alert.type === 'done' ? 'idle' : 'need_human';
     const terminalSession = withSessionStatus(session, sessionStatus, normalizedAgentText);
     if (adapter.eventPublicationEnabled === false) {
-      await settleTerminalLocally(state, alert, terminalSession, sessionStatus);
+      settleTerminalWithoutPublication(state, alert, terminalSession);
       return;
     }
 
@@ -304,7 +297,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
         currentState.flowRevision === deliveredFlowRevision &&
         currentState.settledRunGeneration === deliveredRunGeneration
       ) {
-        await settleTerminalLocally(currentState, alert, terminalSession, sessionStatus);
+        schedulePendingTerminal(ctx);
       }
       logExtensionEvent('terminal_event_push_failed');
     } finally {
@@ -355,7 +348,7 @@ export default function ariavaPiExtension(pi: ExtensionAPI, testAdapter?: AgentA
     }
     const alert = state.latestPendingAlert;
     clearQuietTimer(state);
-    await emitTerminalAlert(alert);
+    await emitTerminalAlert(alert, ctx);
   }
 
   function submitTerminalCandidate(

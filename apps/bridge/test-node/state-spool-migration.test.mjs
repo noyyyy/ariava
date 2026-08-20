@@ -392,7 +392,7 @@ test('schema 3 rejects a Session driver that disagrees with retained provider be
   } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
-test('schema 3 migration republishes exact encrypted Session v3 at revision 12 and commits its cursor', async () => {
+test('schema 3 migration blocks a need_human Session whose terminal evidence was intentionally discarded', async () => {
   const fixture = setupSchema3Runtime();
   try {
     const store = initialize(fixture);
@@ -411,18 +411,13 @@ test('schema 3 migration republishes exact encrypted Session v3 at revision 12 a
     const snapshot = { version: 1, hostId: HOST_ID, recipientSetVersion: 9, recipients: [material.recipient] };
     const active = store.listSessions()[0];
     assert.equal(active.sessionId, 'session');
-    const committed = await orchestrator.publishAuthoritativeSnapshots(snapshot, [material.recipient], [active]);
-    assert.deepEqual(committed && Object.fromEntries(committed.revisions), { session: 12 });
-    assert.equal(published.length, 1);
-    assert.equal(published[0].content.payloadKind, 'session-content-v3');
-    assert.equal(published[0].revision, 12);
-    assert.equal(published[0].revision > 11, true);
-    assert.deepEqual(material.openSession(published[0]), {
-      version: 3, projectName: 'project', nameText: 'name', openingText: 'opening', latestActivityText: 'latest',
-      workingDirectory: '/workspace', harnessProvider: 'pi',
-    });
-    assert.equal(store.currentSessionRevision('session'), 12);
-    assert.equal(JSON.parse(readFileSync(fixture.statePath, 'utf8')).sessionRevisions.session, 12);
+    assert.equal(active.status, 'need_human');
+    assert.equal(active.lastEventId, undefined);
+    const outcome = await orchestrator.publishAuthoritativeSnapshots(snapshot, [material.recipient], [active]);
+    assert.deepEqual(outcome, { type: 'locally-blocked', reason: 'session_source_invalid' });
+    assert.equal(published.length, 0);
+    assert.equal(store.currentSessionRevision('session'), 11);
+    assert.equal(JSON.parse(readFileSync(fixture.statePath, 'utf8')).sessionRevisions.session, 11);
   } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 

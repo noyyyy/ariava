@@ -42,8 +42,7 @@ export function authorizeRegistration(
 
 export type RegistrationPersistence =
   | { readonly kind: 'durable-cancel-terminal'; readonly nextDriverName: string; readonly persistedCancellation: PersistedTerminalCancellation }
-  | { readonly kind: 'durable-set-session-driver' }
-  | { readonly kind: 'no-op'; readonly nextDriverName: string; readonly persistedCancellation: undefined };
+  | { readonly kind: 'durable-set-session-driver' };
 
 export type RegistrationTransition = {
   readonly nextSession: Omit<RegisteredSession, 'driverInstanceId' | 'ownerLease' | 'lastOwnerLeaseMonotonic'>;
@@ -59,31 +58,38 @@ export function reduceRegistration(
   now: string,
 ): RegistrationTransition {
   const previous = evidence.previousLive;
+  const requestedStatus = input.status ?? 'idle';
+  const persistedSession = evidence.persistedSession;
+  const requestedContext = producerContextFingerprint({
+    provider: input.provider, projectName: input.projectName, cwd: input.cwd, harnessProvider: input.harnessProvider,
+  });
+  const liveContextMatches = previous !== undefined && producerContextFingerprint(previous) === requestedContext;
+  const persistedContextMatches = previous === undefined && persistedSession !== undefined
+    && canonicalProducerContextFingerprint(persistedSession) === requestedContext;
+  const inheritedLastEventId = liveContextMatches && previous.status === requestedStatus
+    ? previous.lastEventId
+    : persistedContextMatches && persistedSession.status === requestedStatus
+      ? persistedSession.lastEventId
+      : undefined;
   const nextSession: Omit<RegisteredSession, 'driverInstanceId' | 'ownerLease' | 'lastOwnerLeaseMonotonic'> = {
     sessionId: input.sessionId, provider: input.provider, projectName: input.projectName, cwd: input.cwd, nameText: input.nameText,
     openingText: input.openingText, latestActivityText: input.latestActivityText,
     harnessProvider: input.harnessProvider, pid: input.pid,
     hostId, registeredAt: previous?.registeredAt ?? now, lastHeartbeatAt: now,
-    status: input.status ?? 'idle', semanticUpdatedAt: previous?.semanticUpdatedAt ?? now,
-    lastEventId: previous?.lastEventId,
+    status: requestedStatus, semanticUpdatedAt: previous?.semanticUpdatedAt ?? now,
+    lastEventId: inheritedLastEventId,
   };
   const semanticChanged = !previous || semanticFingerprint(previous) !== semanticFingerprint(nextSession);
   if (semanticChanged && previous) nextSession.semanticUpdatedAt = now;
   const contextChanged = previous !== undefined
     && producerContextFingerprint(previous) !== producerContextFingerprint(nextSession);
   const persistedContextChanged = previous === undefined && evidence.persistedSession !== undefined
-    && canonicalProducerContextFingerprint(evidence.persistedSession) !== producerContextFingerprint(nextSession);
+    && !persistedContextMatches;
   const terminalCancellation = evidence.terminalCancellation;
-  const cancelTerminalRoute = contextChanged || (persistedContextChanged && terminalCancellation !== undefined);
-
-  let persistence: RegistrationPersistence;
-  if (!cancelTerminalRoute) {
-    persistence = { kind: 'durable-set-session-driver' };
-  } else if (terminalCancellation !== undefined) {
-    persistence = { kind: 'durable-cancel-terminal', nextDriverName: input.provider, persistedCancellation: terminalCancellation };
-  } else {
-    persistence = { kind: 'no-op', nextDriverName: input.provider, persistedCancellation: undefined };
-  }
+  const cancelTerminalRoute = (contextChanged || persistedContextChanged) && terminalCancellation !== undefined;
+  const persistence: RegistrationPersistence = cancelTerminalRoute
+    ? { kind: 'durable-cancel-terminal', nextDriverName: input.provider, persistedCancellation: terminalCancellation }
+    : { kind: 'durable-set-session-driver' };
   return { nextSession, semanticChanged, contextChanged, persistence };
 }
 

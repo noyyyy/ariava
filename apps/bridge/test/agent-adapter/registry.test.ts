@@ -421,6 +421,140 @@ describe('AgentAdapterRegistry canonical ingest', () => {
     } finally { cleanup(); }
   });
 
+  test('rejects need_human heartbeat and register until a terminal Event supplies lastEventId', () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const registry = new AgentAdapterRegistry('host-1', store);
+      expect(() => registry.register({
+        sessionId: 'sess-1', provider: 'pi', projectName: 'project', cwd: '/project', nameText: 'Task',
+        status: 'need_human', latestActivityText: 'Which environment?', driverInstanceId: DRIVER_INSTANCE_ID,
+      })).toThrow(AgentAdapterRequestValidationError);
+      expect(registry.listSessions()).toEqual([]);
+      register(registry);
+      const before = registry.listSessions()[0];
+      expect(() => registry.heartbeat('sess-1', 'need_human', 'Which environment?'))
+        .toThrow(AgentAdapterRequestValidationError);
+      expect(registry.listSessions()[0]).toEqual(before);
+      const eventId = registry.pushEvent('sess-1', needHumanEvent());
+      expect(registry.heartbeat('sess-1', 'need_human', 'Which environment?')).toMatchObject({
+        status: 'need_human', lastEventId: eventId,
+      });
+    } finally { cleanup(); }
+  });
+
+  test('defers need_human heartbeat status while its terminal Event is delayed by command work', () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const registry = new AgentAdapterRegistry('host-1', store);
+      register(registry);
+      registry.enqueueCommand(makeCommand('sess-1'));
+      const eventId = registry.pushEvent('sess-1', needHumanEvent());
+
+      expect(registry.heartbeat('sess-1', 'need_human', 'Which environment?')).toMatchObject({
+        status: 'working',
+        latestActivityText: 'Which environment?',
+        lastEventId: undefined,
+      });
+      expect(store.peekPendingEvents()).toEqual([]);
+      expect(eventId).toMatch(/^evt_/u);
+    } finally { cleanup(); }
+  });
+
+  test('restores a committed lastEventId for same-context need_human re-registration after restart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-terminal-restart-'));
+    try {
+      const store = initializedStore(dir);
+      const original = new AgentAdapterRegistry('host-1', store);
+      register(original);
+      const eventId = original.pushEvent('sess-1', needHumanEvent());
+      store.dispose();
+
+      const restartedStore = initializedStore(dir);
+      const restarted = new AgentAdapterRegistry('host-1', restartedStore);
+      expect(restarted.register({
+        sessionId: 'sess-1', provider: 'pi', projectName: 'project', cwd: '/project', nameText: 'Task',
+        status: 'need_human', latestActivityText: 'Which environment?', driverInstanceId: DRIVER_INSTANCE_ID,
+      })).toMatchObject({ status: 'need_human', lastEventId: eventId });
+      expect(restartedStore.getSession('sess-1')).toMatchObject({ status: 'need_human', lastEventId: eventId });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('does not restore a committed lastEventId across producer context changes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-terminal-context-'));
+    try {
+      const store = initializedStore(dir);
+      const original = new AgentAdapterRegistry('host-1', store);
+      register(original);
+      original.pushEvent('sess-1', needHumanEvent());
+      store.dispose();
+
+      const restarted = new AgentAdapterRegistry('host-1', initializedStore(dir));
+      expect(() => restarted.register({
+        sessionId: 'sess-1', provider: 'pi', projectName: 'other', cwd: '/other', nameText: 'Task',
+        status: 'need_human', latestActivityText: 'Which environment?', driverInstanceId: DRIVER_INSTANCE_ID,
+      })).toThrow(AgentAdapterRequestValidationError);
+      expect(restarted.listSessions()).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('live re-registration clears a committed cursor across status or producer-context changes and restart', () => {
+    for (const change of [
+      { status: 'working' as const, projectName: 'project', cwd: '/project' },
+      { status: 'need_human' as const, projectName: 'other', cwd: '/other' },
+    ]) {
+      const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-live-reregister-'));
+      try {
+        const store = initializedStore(dir);
+        const registry = new AgentAdapterRegistry('host-1', store);
+        register(registry);
+        registry.pushEvent('sess-1', needHumanEvent());
+        const input = {
+          sessionId: 'sess-1', provider: 'pi', projectName: change.projectName, cwd: change.cwd, nameText: 'Task',
+          status: change.status, latestActivityText: 'new state', driverInstanceId: DRIVER_INSTANCE_ID,
+        };
+        if (change.status === 'need_human') {
+          expect(() => registry.register(input)).toThrow(AgentAdapterRequestValidationError);
+        } else {
+          expect(registry.register(input)).toMatchObject({ status: 'working', lastEventId: undefined });
+          expect(store.getSession('sess-1')).toMatchObject({ status: 'working', lastEventId: undefined });
+          store.dispose();
+          const restarted = new AgentAdapterRegistry('host-1', initializedStore(dir));
+          expect(restarted.register(input)).toMatchObject({ status: 'working', lastEventId: undefined });
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    }
+  });
+
+  test('context-changing re-registration atomically cancels a delayed terminal tuple and persists its replacement', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-reregister-cancel-'));
+    const input = {
+      sessionId: 'sess-1', provider: 'pi', projectName: 'other', cwd: '/other', nameText: 'Task',
+      status: 'working' as const, latestActivityText: 'new context', driverInstanceId: DRIVER_INSTANCE_ID,
+    };
+    try {
+      const store = initializedStore(dir);
+      const registry = new AgentAdapterRegistry('host-1', store);
+      register(registry);
+      registry.enqueueCommand(makeCommand('sess-1'));
+      registry.pushEvent('sess-1', needHumanEvent());
+      expect(registry.register(input)).toMatchObject({
+        projectName: 'other', cwd: '/other', status: 'working', lastEventId: undefined,
+      });
+      expect(store.getTerminalEventCancellation('sess-1')).toBeUndefined();
+      expect(store.getSession('sess-1')).toMatchObject({
+        projectName: 'other', workingDirectory: '/other', status: 'working', lastEventId: undefined,
+      });
+      store.dispose();
+
+      const restartedStore = initializedStore(dir);
+      const restarted = new AgentAdapterRegistry('host-1', restartedStore);
+      expect(restarted.register(input)).toMatchObject({
+        projectName: 'other', cwd: '/other', status: 'working', lastEventId: undefined,
+      });
+      expect(restartedStore.peekPendingEvents()).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('accepts the complete pi DTO, adds only Bridge identity, and atomically binds done to idle', () => {
     const { store, cleanup } = makeStore();
     try {
@@ -1246,6 +1380,42 @@ describe('AgentAdapterRegistry canonical ingest', () => {
           .toThrow(expect.objectContaining({ code: 'stale_owner' }));
         expect(registry.hasSession('stale-owner')).toBe(false);
       } finally { cleanup(); }
+    });
+
+    test('replay after restart recovers an accepted delayed tuple and promotes it atomically', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'bridge-registry-source-replay-'));
+      const source = {
+        producerEventId: 'AAAAAAAAAAAAAAAAAAAAAA',
+        producerEventOrder: '00000000000000000000000000000001',
+        event: {
+          sessionId: 'tuple-session', provider: 'pi', type: 'done', status: 'idle',
+          agentText: 'Done', projectName: 'p', workingDirectory: '/', harnessProvider: 'pi',
+          createdAt: '2026-08-07T00:00:01.000Z',
+        },
+      } as const;
+      try {
+        const store = initializedStore(dir);
+        const original = new AgentAdapterRegistry('host-1', store);
+        original.register({
+          sessionId: 'tuple-session', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          status: 'working', driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        original.enqueueCommand(makeCommand('tuple-session'));
+        const accepted = original.pushEventSource('tuple-session', source);
+        expect(store.peekPendingEvents()).toEqual([]);
+        store.dispose();
+
+        const restartedStore = initializedStore(dir);
+        const restarted = new AgentAdapterRegistry('host-1', restartedStore);
+        restarted.register({
+          sessionId: 'tuple-session', provider: 'pi', projectName: 'p', cwd: '/', nameText: 'p',
+          status: 'working', driverInstanceId: DRIVER_INSTANCE_ID,
+        });
+        const replay = restarted.pushEventSource('tuple-session', source);
+        expect(replay).toEqual({ ...accepted, disposition: 'duplicate' });
+        expect(restarted.listSessions()[0]).toMatchObject({ status: 'idle', lastEventId: accepted.eventId });
+        expect(restartedStore.peekPendingEvents()).toHaveLength(1);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 
     test('producer source tuple: duplicate replay returns the original eventId, order conflicts fail closed', () => {

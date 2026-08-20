@@ -91,12 +91,13 @@ describe('reduceRegistration', () => {
     expect(transition.persistence).toEqual({ kind: 'durable-set-session-driver' });
   });
 
-  test('routes a same-owner context change without terminal evidence through live cancellation only', () => {
+  test('durably replaces a same-owner live context change without terminal evidence', () => {
     const transition = reduceRegistration(
       evidence({ previousLive: registeredSession() }), input({ projectName: 'other-project' }), HOST_ID, NOW,
     );
     expect(transition.contextChanged).toBe(true);
-    expect(transition.persistence).toEqual({ kind: 'no-op', nextDriverName: 'adapter', persistedCancellation: undefined });
+    expect(transition.persistence).toEqual({ kind: 'durable-set-session-driver' });
+    expect(transition.nextSession.lastEventId).toBeUndefined();
   });
 
   test('durably cancels terminal evidence for a same-owner context change', () => {

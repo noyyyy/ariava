@@ -100,7 +100,7 @@ describe('Authoritative Session publication §6.1', () => {
 
     const result = await orchestrator.publishAuthoritativeSnapshots(snapshotV1, [], [invalid]);
 
-    expect(result).toEqual({ type: 'locally-blocked', reason: 'content' });
+    expect(result).toEqual({ type: 'locally-blocked', reason: 'protected_content_invalid' });
     expect(publishes).toBe(0);
     expect(reconciles).toBe(0);
     expect(store.currentSessionRevision('session-test')).toBe(0);
@@ -110,13 +110,31 @@ describe('Authoritative Session publication §6.1', () => {
     expect(store.getQuarantinedEventRecord('event-test')).toBeUndefined();
   });
 
+  test('need_human Session without lastEventId blocks publication and never encrypts', async () => {
+    const store = fixture();
+    const invalid = terminalSession({ status: 'need_human', lastEventId: undefined });
+    store.replaceDriverSessions('pi', [invalid]);
+    let publishes = 0;
+    const client = {
+      publishEncryptedSession: async () => { publishes += 1; return { ok: true as const }; },
+      reconcileEncryptedSession: async () => true,
+    };
+    const orchestrator = createOrchestrator(store, client as any, { reconcileRecipients: () => [] } as any);
+    expect(await orchestrator.publishAuthoritativeSnapshots(snapshotV1, [], [invalid]))
+      .toEqual({ type: 'locally-blocked', reason: 'session_source_invalid' });
+    expect(publishes).toBe(0);
+    expect(store.getInflightSessionUpload('session-test')).toBeUndefined();
+  });
+
   test('full-set preflight counts every blocked Session and still does not mutate', () => {
     const store = fixture();
     const invalid = terminalSession({ openingText: 'a'.repeat(64 * 1024) });
     const valid = terminalSession({ sessionId: 'session-ok', lastEventId: undefined });
     store.replaceDriverSessions('pi', [invalid, valid]);
     const orchestrator = createOrchestrator(store, {} as any, { reconcileRecipients: () => [] } as any);
-    expect(orchestrator.preflightAuthoritativeSessionSet([invalid, valid])).toBe(1);
+    expect(orchestrator.preflightAuthoritativeSessionSet([invalid, valid])).toEqual({
+      blockedSessionCount: 1, reason: 'protected_content_invalid',
+    });
     expect(store.currentSessionRevision('session-test')).toBe(0);
     expect(store.currentSessionRevision('session-ok')).toBe(0);
     expect(store.listInflightSessionIds()).toEqual([]);
@@ -303,6 +321,18 @@ describe('SessionPublicationBlockLogger §6.3', () => {
     logger.blocked(1);
     expect(JSON.parse(lines[3]!)).toMatchObject({ outcome: 'blocked', blockedSessionCount: 1, suppressed: 0 });
   });
+
+  test('uses the fixed source-invalid code without logging Session data', () => {
+    const lines: string[] = [];
+    const logger = new SessionPublicationBlockLogger((line) => lines.push(line), () => 0);
+    logger.blocked(1, 'session_source_invalid');
+    logger.recovered();
+    expect(lines.map((line) => JSON.parse(line))).toEqual([
+      { component: 'session_publication', outcome: 'blocked', code: 'session_source_invalid', blockedSessionCount: 1, suppressed: 0 },
+      { component: 'session_publication', outcome: 'recovered', code: 'session_source_invalid' },
+    ]);
+    expect(lines.join('')).not.toMatch(/sessionId|eventId|status|message|reason|detail|path|driver/iu);
+  });
 });
 
 /** Daemon fixture with stubbed publication/event surfaces (like daemon-runtime-health). */
@@ -341,19 +371,19 @@ describe('Bridge Event drain decoupling §6.2', () => {
   }
 
   test('locally-blocked + stable accepted recipient version + no Session inflight lets legal Events drain', async () => {
-    const flushes = await drainProbe({ type: 'locally-blocked', reason: 'content', blockedSessionCount: 1, recipientSetVersion: 1 },
+    const flushes = await drainProbe({ type: 'locally-blocked', reason: 'protected_content_invalid', blockedSessionCount: 1, recipientSetVersion: 1 },
       (store) => acceptManifestAt(store, 1));
     expect(flushes).toBe(1);
   });
 
   test('locally-blocked with recipient churn defers Events (fail closed)', async () => {
-    const flushes = await drainProbe({ type: 'locally-blocked', reason: 'content', blockedSessionCount: 1, recipientSetVersion: 2 },
+    const flushes = await drainProbe({ type: 'locally-blocked', reason: 'protected_content_invalid', blockedSessionCount: 1, recipientSetVersion: 2 },
       (store) => acceptManifestAt(store, 1));
     expect(flushes).toBe(0);
   });
 
   test('locally-blocked with unconverged Session inflight defers Events', async () => {
-    const flushes = await drainProbe({ type: 'locally-blocked', reason: 'content', blockedSessionCount: 1, recipientSetVersion: 1 },
+    const flushes = await drainProbe({ type: 'locally-blocked', reason: 'protected_content_invalid', blockedSessionCount: 1, recipientSetVersion: 1 },
       (store) => { acceptManifestAt(store, 1); store.persistInflightSessionUpload('session-test', sessionUploadFixture(1)); });
     expect(flushes).toBe(0);
   });
@@ -362,7 +392,7 @@ describe('Bridge Event drain decoupling §6.2', () => {
     // The Bridge adopted recipient version 2 (Session ciphertexts committed) but
     // the v2 manifest was never accepted — the last accepted manifest still proves
     // version 1 coverage only, so Events must not drain under the content block.
-    const flushes = await drainProbe({ type: 'locally-blocked', reason: 'content', blockedSessionCount: 1, recipientSetVersion: 2 },
+    const flushes = await drainProbe({ type: 'locally-blocked', reason: 'protected_content_invalid', blockedSessionCount: 1, recipientSetVersion: 2 },
       (store) => { acceptManifestAt(store, 1); store.setRecipientSetVersion(2); });
     expect(flushes).toBe(0);
   });

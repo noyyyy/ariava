@@ -15,7 +15,7 @@ import { snapshotError } from './daemon-errors';
  */
 export type SessionPublicationOutcome =
   | { type: 'published' | 'unchanged' }
-  | { type: 'locally-blocked'; reason: 'content'; blockedSessionCount: number; recipientSetVersion: number }
+  | { type: 'locally-blocked'; reason: 'protected_content_invalid' | 'session_source_invalid'; blockedSessionCount: number; recipientSetVersion: number }
   | { type: 'deferred'; reason: 'network' | 'recipient-set' }
   | { type: 'fail-closed' };
 
@@ -73,7 +73,7 @@ export interface SyncWorkflowDependencies {
   ): Promise<{ online: boolean; outcome: SessionPublicationOutcome }>;
   /** §9 step 5 logging authority: daemon-owned Session publication block logger. */
   sessionPublicationRecovered(): void;
-  sessionPublicationBlocked(blockedSessionCount: number): void;
+  sessionPublicationBlocked(blockedSessionCount: number, reason: 'protected_content_invalid' | 'session_source_invalid'): void;
   /** §6.2 drain gate, evaluated by the daemon-owned method. */
   eventsMayDrain(outcome: SessionPublicationOutcome): boolean;
   /** §9 step 6: pending encrypted Event upload. */
@@ -167,7 +167,7 @@ export async function performBridgeSyncOnce(
   if (sessionPublicationOutcome.type === 'published' || sessionPublicationOutcome.type === 'unchanged') {
     deps.sessionPublicationRecovered();
   } else if (sessionPublicationOutcome.type === 'locally-blocked') {
-    deps.sessionPublicationBlocked(sessionPublicationOutcome.blockedSessionCount);
+    deps.sessionPublicationBlocked(sessionPublicationOutcome.blockedSessionCount, sessionPublicationOutcome.reason);
   }
   const eventsMayDrain = !offline && deps.eventsMayDrain(sessionPublicationOutcome);
   const flushedEvents = !eventsMayDrain ? 0 : await deps.flushPendingEvents();

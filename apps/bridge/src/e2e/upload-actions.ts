@@ -129,9 +129,11 @@ export const DEFAULT_ENCRYPTED_UPLOAD_CRYPTO: EncryptedUploadCryptoPort = {
  * inflight mutation, or manifest send); `deferred`/`fail-closed` keep the existing
  * network/recipient-churn/error semantics.
  */
+export type SessionPublicationBlockReason = 'protected_content_invalid' | 'session_source_invalid';
+
 export type AuthoritativeSnapshotOutcome =
   | { type: 'published'; recipientSetVersion: number; revisions: Map<string, number> }
-  | { type: 'locally-blocked'; reason: 'content' }
+  | { type: 'locally-blocked'; reason: SessionPublicationBlockReason }
   | { type: 'deferred'; reason: 'network' | 'recipient-set' }
   | { type: 'fail-closed' };
 
@@ -143,7 +145,9 @@ export function createEncryptedUploadActions(parameters: CreateEncryptedUploadAc
     // creation / manifest. Any invalid-content returns locally-blocked with zero
     // mutation; keyring/crypto/storage errors throw and keep fail-closed semantics.
     const blockedBeforeStart = preflightAuthoritativeSessionSet(sessions);
-    if (blockedBeforeStart > 0) return { type: 'locally-blocked', reason: 'content' };
+    if (blockedBeforeStart.blockedSessionCount > 0) {
+      return { type: 'locally-blocked', reason: blockedBeforeStart.reason };
+    }
 
     // A recipient change invalidates the whole authoritative set, including Sessions
     // already committed during this pass. Restart until every returned revision was
@@ -183,7 +187,8 @@ export function createEncryptedUploadActions(parameters: CreateEncryptedUploadAc
             const v2 = stateStore.getSessionInflightRecordV2(sessionId);
             const digestMatches = v2 !== undefined && sourceDigest !== '' && digestsEqual(v2.sourceDigest, sourceDigest);
             if (!digestMatches || upload.recipientSetVersion !== passVersion) {
-              if (preflightSessionSource(session).type !== 'ready') return { type: 'locally-blocked', reason: 'content' };
+              const preflight = preflightSessionSource(session);
+              if (preflight.type !== 'ready') return { type: 'locally-blocked', reason: publicationBlockReason(preflight) };
               const replacement = crypto.encryptSessionSnapshot({ session, revision: upload.revision,
                 recipientSetVersion: passVersion, recipients });
               stateStore.replaceInflightSessionUpload(sessionId, replacement, sourceDigest);
@@ -193,7 +198,8 @@ export function createEncryptedUploadActions(parameters: CreateEncryptedUploadAc
         }
 
         if (!upload || upload.recipientSetVersion !== passVersion) {
-          if (preflightSessionSource(session).type !== 'ready') return { type: 'locally-blocked', reason: 'content' };
+          const preflight = preflightSessionSource(session);
+          if (preflight.type !== 'ready') return { type: 'locally-blocked', reason: publicationBlockReason(preflight) };
           const next = crypto.encryptSessionSnapshot({ session, revision: upload?.revision ?? stateStore.nextSessionRevision(sessionId),
             recipientSetVersion: passVersion, recipients });
           if (upload) stateStore.replaceInflightSessionUpload(sessionId, next, sessionSourceDigest(session)); else stateStore.persistInflightSessionUpload(sessionId, next, sessionSourceDigest(session));
@@ -244,7 +250,8 @@ export function createEncryptedUploadActions(parameters: CreateEncryptedUploadAc
               case 'reconcile':
                 return { type: 'deferred', reason: 'network' };
               case 'refresh-reencrypt': {
-                if (preflightSessionSource(session).type !== 'ready') return { type: 'locally-blocked', reason: 'content' };
+                const preflight = preflightSessionSource(session);
+                if (preflight.type !== 'ready') return { type: 'locally-blocked', reason: publicationBlockReason(preflight) };
                 const replacement = crypto.encryptSessionSnapshot({ session, revision: decision.revision,
                   recipientSetVersion: currentSnapshot.recipientSetVersion, recipients: currentRecipients });
                 stateStore.replaceInflightSessionUpload(sessionId, replacement, sessionSourceDigest(session));
@@ -285,12 +292,19 @@ export function createEncryptedUploadActions(parameters: CreateEncryptedUploadAc
    * (fail-closed) on keyring/crypto/storage/invariant errors — those must NOT be
    * reclassified as content blocks.
    */
-  function preflightAuthoritativeSessionSet(sessions: readonly CanonicalSessionState[]): number {
-    let blocked = 0;
+  function preflightAuthoritativeSessionSet(sessions: readonly CanonicalSessionState[]): {
+    blockedSessionCount: number;
+    reason: SessionPublicationBlockReason;
+  } {
+    let blockedSessionCount = 0;
+    let reason: SessionPublicationBlockReason = 'protected_content_invalid';
     for (const session of sessions) {
-      if (preflightSessionSource(session).type !== 'ready') blocked += 1;
+      const result = preflightSessionSource(session);
+      if (result.type === 'ready') continue;
+      blockedSessionCount += 1;
+      if (result.type === 'invalid-source-binding') reason = 'session_source_invalid';
     }
-    return blocked;
+    return { blockedSessionCount, reason };
   }
 
   /**
@@ -877,6 +891,14 @@ type InflightLoadFailure = Extract<
   LoadPendingEventPartsResult,
   { ok: false; reason: `inflight-${string}` }
 >;
+
+function publicationBlockReason(
+  preflight: Exclude<ReturnType<typeof preflightSessionSource>, { type: 'ready' }>,
+): SessionPublicationBlockReason {
+  return preflight.type === 'invalid-source-binding'
+    ? 'session_source_invalid'
+    : 'protected_content_invalid';
+}
 
 function isInflightLoadFailure(result: LoadPendingEventPartsResult): result is InflightLoadFailure {
   return !result.ok && result.reason.startsWith('inflight-');

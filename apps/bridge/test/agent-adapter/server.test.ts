@@ -29,6 +29,7 @@ describe('AgentAdapterServer', () => {
   let registry: AgentAdapterRegistry;
   let server: AgentAdapterServer;
   let secret: string;
+  let logs: string[];
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'bridge-server-'));
@@ -38,7 +39,11 @@ describe('AgentAdapterServer', () => {
     });
     registry = new AgentAdapterRegistry('host-1', store);
     secret = 'test-secret-token';
-    server = new AgentAdapterServer({ port: 0, secret, hostId: 'host-1' }, registry);
+    logs = [];
+    server = new AgentAdapterServer(
+      { port: 0, secret, hostId: 'host-1' }, registry, undefined,
+      (line) => logs.push(line),
+    );
     await server.start();
   });
 
@@ -135,6 +140,30 @@ describe('AgentAdapterServer', () => {
       const response = await fetch(url(path), { method: 'POST', headers: headers(), body });
       expect(response.status).toBe(400);
     }
+  });
+
+  test('logs terminal-without-Event rejections without protected request data', async () => {
+    const registerBody = {
+      sessionId: 'secret-session-id', provider: 'pi', projectName: 'secret-project',
+      cwd: '/secret/path', nameText: 'secret-name', status: 'need_human',
+      latestActivityText: 'secret terminal text', driverInstanceId: DRIVER_INSTANCE_ID,
+    };
+    const rejectedRegister = await fetch(url('/v2/agent/sessions'), {
+      method: 'POST', headers: headers(), body: JSON.stringify(registerBody),
+    });
+    expect(rejectedRegister.status).toBe(400);
+
+    const lease = registerDirect(registry);
+    const rejectedHeartbeat = await fetch(url('/v2/agent/sessions/sess-1/heartbeat'), {
+      method: 'POST', headers: ownerHeaders(lease),
+      body: JSON.stringify({ status: 'need_human', latestActivityText: 'secret terminal text' }),
+    });
+    expect(rejectedHeartbeat.status).toBe(400);
+    expect(logs.map((line) => JSON.parse(line))).toEqual([
+      { component: 'agent_adapter', outcome: 'rejected', code: 'terminal_session_event_missing', route: 'register' },
+      { component: 'agent_adapter', outcome: 'rejected', code: 'terminal_session_event_missing', route: 'heartbeat' },
+    ]);
+    expect(logs.join('')).not.toMatch(/secret|session-id|terminal text|lastEventId/iu);
   });
 
   test('preserves genuine server faults as 500', async () => {

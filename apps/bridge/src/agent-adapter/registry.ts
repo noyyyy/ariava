@@ -83,9 +83,21 @@ export class AgentAdapterOrderConflictError extends Error {
 }
 
 export class AgentAdapterRequestValidationError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
+  readonly code?: 'terminal-session-event-missing';
+
+  constructor(message: string, options?: ErrorOptions & { code?: 'terminal-session-event-missing' }) {
     super(message, options);
     this.name = 'AgentAdapterRequestValidationError';
+    this.code = options?.code;
+  }
+}
+
+function assertNeedHumanHasLastEventId(session: { status: SessionStatus; lastEventId?: string }): void {
+  if (session.status === 'need_human' && !session.lastEventId) {
+    throw new AgentAdapterRequestValidationError(
+      'need_human Session requires lastEventId',
+      { code: 'terminal-session-event-missing' },
+    );
   }
 }
 
@@ -169,6 +181,7 @@ export class AgentAdapterRegistry {
     );
     try {
       assertCanonicalSessionWithinLimit(toCanonicalSessionState(transition.nextSession));
+      assertNeedHumanHasLastEventId(transition.nextSession);
     } catch (error) {
       if (error instanceof ProtectedContentValidationError) {
         throw new AgentAdapterRequestValidationError(error.message, { cause: error });
@@ -181,6 +194,7 @@ export class AgentAdapterRegistry {
       this.cancelTerminalRetry(input.sessionId, {
         nextDriverName: transition.persistence.nextDriverName,
         persistedCancellation: transition.persistence.persistedCancellation,
+        replacementSession: toCanonicalSessionState(transition.nextSession),
       });
     }
     const sameInstance = previous?.driverInstanceId === input.driverInstanceId && this.sessions.has(input.sessionId);
@@ -277,9 +291,13 @@ export class AgentAdapterRegistry {
   ): RegisteredSession | undefined {
     const session = this.sessions.get(sessionId); if (!session) return undefined;
     const now = this.nowIso();
-    const transition = reduceHeartbeat(session, { status, latestActivityText, metadata }, now);
+    const pendingTerminal = this.delayedTerminalEvents.get(sessionId);
+    const deferredStatus = pendingTerminal?.session.status === status && status !== session.status;
+    const effectiveStatus = deferredStatus ? session.status : status;
+    const transition = reduceHeartbeat(session, { status: effectiveStatus, latestActivityText, metadata }, now);
     try {
       assertCanonicalSessionWithinLimit(toCanonicalSessionState(transition.nextSession));
+      assertNeedHumanHasLastEventId(transition.nextSession);
     } catch (error) {
       if (error instanceof ProtectedContentValidationError) {
         throw new AgentAdapterRequestValidationError(error.message, { cause: error });
@@ -401,6 +419,19 @@ export class AgentAdapterRegistry {
       if (checkpoint.producerEventId === producerEventId && checkpoint.producerEventOrder === producerEventOrder) {
         if (checkpoint.fingerprint !== fingerprint) {
           throw new AgentAdapterOrderConflictError('same producer source tuple with a different content fingerprint');
+        }
+        const reservation = this.stateStore.getProducerEventReservation(sessionId, fingerprint);
+        if (reservation) {
+          if (reservation.eventId !== checkpoint.eventId) {
+            throw new AgentAdapterRequestValidationError('accepted Event checkpoint conflicts with its reservation');
+          }
+          const tuple = this.stateStore.getProducerEventTuple(checkpoint.eventId, fingerprint);
+          if (!tuple) {
+            throw new AgentAdapterRequestValidationError('accepted Event checkpoint is missing its durable terminal tuple');
+          }
+          const pending = Object.freeze({ event: immutableCopy(tuple.event), session: immutableCopy(tuple.session) });
+          this.delayedTerminalEvents.set(sessionId, pending);
+          if (!this.hasPendingCommandWork(sessionId)) this.promotePendingTerminal(sessionId, pending, fingerprint);
         }
         return { eventId: checkpoint.eventId, producerEventId, producerEventOrder, disposition: 'duplicate' };
       }
@@ -616,7 +647,7 @@ export class AgentAdapterRegistry {
   }
 
   private cancelTerminalRetry(sessionId: string, options: { committed?: boolean; removeSession?: boolean; nextDriverName?: string;
-    persistedCancellation?: { eventId: string; fingerprint: string } } = {}): void {
+    persistedCancellation?: { eventId: string; fingerprint: string }; replacementSession?: CanonicalSessionState } = {}): void {
     const pending = this.delayedTerminalEvents.get(sessionId);
     const cancellation = pending ? { eventId: pending.event.eventId, fingerprint: producerEventFingerprint(pending.event) }
       : options.persistedCancellation;
@@ -624,6 +655,7 @@ export class AgentAdapterRegistry {
       this.stateStore.cancelTerminalEvent({
         eventId: cancellation.eventId, sessionId, fingerprint: cancellation.fingerprint,
         removeSession: options.removeSession, nextDriverName: options.nextDriverName, createdAt: this.nowIso(),
+        replacementSession: options.replacementSession,
       });
     }
     const handle = this.terminalRetryTimers.get(sessionId);
